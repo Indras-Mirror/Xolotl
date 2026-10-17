@@ -1253,6 +1253,16 @@ int main(int argc, char ** argv) {
         // under 2K tokens were simply lost then: 20.10 card, conversations of 1.5-1.9K read again after an eviction)
         const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN")) : NS > 0 ? 256 : 2048;
         const int64_t park_max = std::getenv("STRATA_SERVE_PARK_MAX") ? std::atoll(std::getenv("STRATA_SERVE_PARK_MAX")) : 65536;
+        // STRATA_SERVE_PARK_FLOOR (default 8192): the window a parked conversation reserves for the side requests that
+        // FOLLOW it, not only for the one that triggered the park.  An agent harness sends several of them between two
+        // turns: s1 2026-10-17 a 1,013-token title call parked the 92,792-token conversation with the 1,125 positions
+        // THAT call needs, the next call (5,188 tokens) fell past that window, drop_park() threw the cache away, and
+        // the main turn re-read 94,320 tokens: 250.71 s (the log: "park dropped (request reaches past 1125
+        // positions)" -> "prompt=94320 -> reused=0").  Widening the window is nearly free: park() copies the snapshot
+        // rings whole whatever this is, and only the compressor caches grow with it (~16 KiB a position, so 8192 is
+        // ~130 MB on a 1 TB box).  0 = the old behaviour: the window of the one request that triggered the park.
+        static const int64_t park_floor = std::getenv("STRATA_SERVE_PARK_FLOOR")
+            ? std::atoll(std::getenv("STRATA_SERVE_PARK_FLOOR")) : 8192;
         std::vector<int> park_hist;       // the parked conversation's tokens (its snapshot length)
         std::vector<float> park_logits;
         int64_t park_rows = 0;            // positions saved: a request writing past this invalidates the park
@@ -1986,7 +1996,8 @@ int main(int argc, char ** argv) {
                 snap_len = -1;
             } else {
                 // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK)
-                const int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
+                int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
+                if (rows < park_floor) rows = std::min(park_floor, park_max);   // the window for the NEXT side call
                 if (park_on && !dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len && rows <= park_max
                     && dense.park(rows)) {
                     park_hist.assign(hist.begin(), hist.begin() + snap_len);

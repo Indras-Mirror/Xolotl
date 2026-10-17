@@ -345,6 +345,26 @@ F.CALL_START, F.CALL_END = INVOKE_OPEN, INVOKE_CLOSE
 F.FUNC_START = ""
 F.call_end = ds41_call_end
 F.parse_tool_call = ds41_parse_tool_call
+# frontend.forced_call writes the forced-call (tool_choice) prefix in Qwen's `<function=NAME>` shape; V4.1's
+# DSML puts the name in the call OPENER itself, so a forced call has to be written in that shape here.
+def ds41_forced_call(tool_choice, tools):
+    """tool_choice -> the DSML text that opens the call the reply must make (None: the model decides)."""
+    kind, name = F.tool_choice_of(tool_choice)
+    names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
+    if kind in ("auto", "none"):
+        return None
+    if kind == "required" and len(names) == 1:
+        kind, name = "named", next(iter(names))
+    if kind == "required" and names:
+        return INVOKE_OPEN + " "
+    if kind == "named" and name in names:
+        return INVOKE_OPEN + f' name="{name}">'
+    return None
+
+
+F.forced_call = ds41_forced_call
+if hasattr(S, "forced_call"):
+    S.forced_call = ds41_forced_call
 _op_init, _op_feed, _op_finish = F.OutputParser.__init__, F.OutputParser.feed, F.OutputParser.finish
 WRAPPERS = (CALLS_OPEN, CALLS_CLOSE)
 
