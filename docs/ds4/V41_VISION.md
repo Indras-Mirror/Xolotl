@@ -98,16 +98,61 @@ Other checks passed:
   error, correct span counts and byte-identical ENC protocol output.
 
 The original FP8 vision checkpoint shards were unavailable, so that independent
-weight comparison was not run. HIP/SYCL builds, long image conversations and
-OCR quality were not tested. Default-path byte identity against a separate
-release binary was not measured; opt-out graph construction was checked in
-the diff.
+weight comparison was not run. Long image conversations, OCR quality, a GPU
+image encoder and a CUDA byte-identity comparison were not tested.
 
 Repeat the image-content check against a running server with:
 
 ```sh
 python tools/v41/vision/check_api.py --url http://127.0.0.1:8150
 ```
+
+## Vision-disabled text regression
+
+Separate Release builds of upstream `f7c561b` and the PR's engine implementation
+`4e843f3` were compared on the CPU using the real 40-layer V41-GSQ model and
+Engram layers 1/14. Both used GCC 13.3.0, the same patched ggml checkout,
+2 CPU threads, 4096 context, 8 prompt tokens, temperature 0.8 and seed 17.
+`--vision` was absent. The repository had no published release/tag, so upstream
+`main` at the PR base was used as the baseline.
+
+The comparison passed with the fused fake-quant and HC-mix build options both
+ON, and again with both OFF (the stock options). These are correctness checks;
+the CPU runs do not measure CUDA byte identity or performance.
+
+| Path | Compared data | Result |
+| --- | --- | --- |
+| Sequential, chunk size 1 | All prompt logits, last logits, 3 sampled token IDs | Byte-identical |
+| Chunked, chunk size 4 | All prompt logits, last logits, 3 sampled token IDs | Byte-identical |
+| Layer-major, batch 8 / chunk 4 | All prompt logits, last logits, 3 sampled token IDs | Byte-identical |
+| Serve, batch 16 / chunk 4 | First prompt, regeneration and continuation logits, tokens and reuse protocol | Byte-identical |
+
+Each one-shot prompt-logit dump contains 4,136,960 bytes; its SHA-256 in all
+three paths is `87c76ccaa0993876d34d8522fb085aa02ed6a9bcc96299351ad63679ae0d3b36`.
+Each last-logit dump contains 517,120 bytes, with SHA-256
+`0f98cf9d18af6412694a371031a0a530e9b5e606a19704baca5881d3b4b8c5af`.
+The serving check confirms `RESUME 8` on regeneration and continuation.
+
+The repeatable check uses CPU inference only and saves a `results.json` with
+the compared sizes and hashes:
+
+```sh
+python tools/v41/vision/check_text_regression.py \
+  --baseline /path/to/base-cpu-build/ds41_generate \
+  --candidate /path/to/pr-cpu-build/ds41_generate \
+  --model /path/to/V41-GSQ.gguf \
+  --engram /path/to/layers.1:/path/to/layers.14 \
+  --out /path/to/results
+```
+
+### Backend build scope
+
+CPU-only Release builds and the CUDA engine build passed. DS41's current
+documented GPU target is Linux/NVIDIA (`docs/DEEPSEEK_V41.md`).
+`tools/v41/engine/v41_engine.cmake` defines a CUDA tier and a CPU fallback, not
+native HIP or SYCL DS41 GPU targets. The separate SYCL project returns before
+the fork's DS41 targets are included. HIP/SYCL toolchains were unavailable;
+no HIP/SYCL build or runtime support is claimed by this change.
 
 ## Current limits
 
