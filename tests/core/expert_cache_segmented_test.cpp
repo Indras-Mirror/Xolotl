@@ -92,6 +92,32 @@ int main() {
         c.close();
         if (c.valid() || c.slots() != 0) return fail("close");
     }
+    // A logical arena that is not allocation-granularity aligned. Full grow
+    // must restore its rounded physical tail; admission/pointers cannot use an
+    // unmapped slot while the cache is shrunk.
+    for (int sized = 0; sized < 2; ++sized) for (int per_layer = 0; per_layer < 2; ++per_layer) {
+        strata::core::ExpertCache c;
+        c.set_segment_bytes(kSeg);
+        constexpr int64_t slots = 97, blob = kBlob + 256;
+        std::string error;
+        const bool opened = sized ? c.open_sized(std::vector<int64_t>(slots, blob), 4, 128, error)
+                                  : c.open(slots, 4, 128, blob, error);
+        if (!opened) return fail("padded open", error);
+        c.set_per_layer_admission(per_layer != 0);
+        if (c.admit(0, 0) < 0) return fail("initial admission");
+        c.evict_from(0);
+        if (!c.shrink(0, error) || c.slots() != 0) return fail("unmap all", error);
+        for (int layer = 0; layer < 4; ++layer)
+            if (c.admit(layer, 1) != strata::core::kNotResident) return fail("admitted unmapped slot");
+        if (c.device_slot(0) != nullptr || c.device_slot(-1) != nullptr) return fail("unmapped pointer exposed");
+        if (!c.grow(c.full_bytes(), error) || c.slots() != slots ||
+            c.mapped_bytes() < c.full_bytes()) return fail("full grow lost padded tail", error);
+        std::vector<uint8_t> bytes((size_t) blob, 0xa7), readback(bytes.size());
+        if (!c.fill_slot_blocking((int32_t) slots - 1, bytes.data(), error, blob)) return fail("last slot fill", error);
+        if (cudaMemcpy(readback.data(), c.device_slot((int32_t) slots - 1), readback.size(),
+                       cudaMemcpyDeviceToHost) != cudaSuccess || readback != bytes) return fail("last slot bytes");
+        if (c.device_slot((int32_t) slots) != nullptr) return fail("past-end pointer exposed");
+    }
     // the default (no segment size): one allocation, shrink refused
     strata::core::ExpertCache d;
     std::string err;

@@ -426,6 +426,9 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
     int dev = 0;
     cudaGetDevice(&dev);
     const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
+    // full_bytes() is the logical slot extent; the physical tail is rounded to
+    // CUDA's allocation granularity. A full grow must include that padded tail.
+    if (want_bytes >= full_bytes()) want_bytes = (int64_t) reserved_;
     int64_t at = mapped_bytes();
     while (mapped_segs_ < (int64_t) segs_.size() && at + seg_size_[(size_t) mapped_segs_] <= want_bytes) {
         const size_t i = (size_t) mapped_segs_;
@@ -655,12 +658,13 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
         if (layer_next_.empty()) return kNotResident;
         int64_t lo = 0, hi = 0;
         layer_slot_range(layer, lo, hi);
+        hi = std::min(hi, live_slots_);
         if ((int64_t) layer_next_[(size_t) layer] >= hi) return kNotResident;   // this layer's quota is full
         residency_[at] = layer_next_[(size_t) layer]++;
         ++admitted_;
         return residency_[at];
     }
-    if (next_free_ >= slots_) return kNotResident;   // full: no eviction, deliberately - see the header
+    if (next_free_ >= live_slots_) return kNotResident;   // full: no eviction, deliberately - see the header
     residency_[at] = (int32_t) next_free_;
     return (int32_t) next_free_++;
 }
@@ -679,13 +683,13 @@ int32_t ExpertCache::admit_at(int64_t layer, int64_t expert, int32_t slot) {
 }
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {
-    if (slot < 0 || slot >= slots_) return nullptr;
+    if (slot < 0 || slot >= live_slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
 const uint8_t* ExpertCache::device_slot(int32_t slot) const {
-    if (slot < 0 || slot >= slots_) return nullptr;
+    if (slot < 0 || slot >= live_slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
