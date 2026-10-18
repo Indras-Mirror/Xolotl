@@ -4725,7 +4725,17 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     // every refusal says why (s6: the first A/B never kept the cache and logged nothing)
     if (!im_->gpu || !im_->gpu->cache) { err = "no VRAM cache"; return -1; }
     if (!im_->gpu->cache->segmented()) { err = "the cache is not segmented"; return -1; }
-    if (im_->cfg.vram_lru) { err = "--vram-lru"; return -1; }
+    // The layer-major path does not perform LRU admission. Keep its live slot
+    // mapping, remove the tail, and restore those exact (slot, layer, expert)
+    // records after the batch. Opt-in until real-model byte/quality gates pass.
+    static const bool keep_lru = [] {
+        const char * value = std::getenv("STRATA_SERVE_KEEP_LRU");
+        return value && value[0] == '1';
+    }();
+    if (im_->cfg.vram_lru && (!keep_lru || im_->mixed_sizes)) {
+        err = "--vram-lru (uniform cache needs STRATA_SERVE_KEEP_LRU=1)";
+        return -1;
+    }
     if (!im_->shrunk.empty()) { err = "still shrunk from the last batch (regrow_cache did not run)"; return -1; }
     strata::core::ExpertCache& c = *im_->gpu->cache;
     if (cudaDeviceSynchronize() != cudaSuccess) { err = "shrink_cache_for: device failed"; return -1; }
@@ -4739,7 +4749,12 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
               std::to_string(c.bytes() >> 20) + " MiB)";
         return -1;
     }
-    const int64_t keep = c.slots_within(keep_bytes);
+    // shrink rounds its byte argument UP. Choose a segment boundary DOWN so
+    // the batch really receives need_bytes; otherwise pb_cap splits a small
+    // continuation into two full expert sweeps.
+    const int64_t keep_boundary = keep_bytes / c.segment_bytes() * c.segment_bytes();
+    const int64_t keep = c.slots_within(keep_boundary);
+    if (keep <= 0) { err = "the batch needs every cache segment"; return -1; }
     const int64_t NX = im_->g.n_experts;
     std::vector<std::array<int32_t, 3>> gone;
     for (int64_t l = 0; l < im_->g.n_layers; ++l)
@@ -4749,7 +4764,7 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
         }
     std::sort(gone.begin(), gone.end());
     const int64_t n = c.evict_from(keep);
-    if (!c.shrink(c.bytes_of(keep), err)) return -1;
+    if (!c.shrink(keep_boundary, err)) return -1;
     im_->admitted = im_->admitted > n ? im_->admitted - n : 0;
     im_->pf_n = 0;   // staged prefetches may point at evicted experts' slots
     im_->shrunk = std::move(gone);
