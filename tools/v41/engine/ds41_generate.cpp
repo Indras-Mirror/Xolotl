@@ -641,8 +641,12 @@ int main(int argc, char ** argv) {
         // likely misses into the prefetch slots on the prefetch stream - they land under the attention.  PCIe is the
         // wall (nsys: ~100 expert DMAs per verify pass, 1.4 s of a 4.2 s decode), so a wrong guess costs a full blob:
         // docs prompt, same text: slots 0/1/2/3/6 -> verify 104.4/101.7/104.5/111.1/124.1 ms (precision 40% at 1).
+        // Its row cap stays 8 (the old kMaxMulti, i.e. the passes it was measured on): since kMaxMulti 16 a 9-16-row
+        // pass is ONE tier call too, but it ran without the prefetch before and still does (a separate experiment).
         static const int d3_pf = std::getenv("STRATA_D3_PF") ? std::atoi(std::getenv("STRATA_D3_PF")) : 1;
-        const bool pf_now = rdev1 && !no_tier_batch && d3_pf > 0 && m <= Ds41MoeTier::kMaxMulti;
+        constexpr int kD3PfRows = 8;
+        static_assert(kD3PfRows <= Ds41MoeTier::kMaxMulti, "the prefetch is consumed by ONE tier call per layer");
+        const bool pf_now = rdev1 && !no_tier_batch && d3_pf > 0 && m <= kD3PfRows;
         for (int l = 0; l < n_layer; ++l) {
             if (pf_now) {
                 pv_pred.resize((size_t) m * 16);
@@ -690,7 +694,8 @@ int main(int argc, char ** argv) {
             lap(0);
             if (rdev1 && !no_tier_batch) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
-                // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (8: a depth-4 pass is one call).
+                // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (16: a depth-4 pass and a 16-row
+                // lookup verify / prompt pass are one call each).
                 constexpr int kMM = Ds41MoeTier::kMaxMulti;
                 for (int off = 0; off < m; off += kMM) {
                     const int chunk = std::min(kMM, m - off);
@@ -1519,9 +1524,10 @@ int main(int argc, char ** argv) {
                 // A match of M tokens drafts M - G + 1 (<= L, <= the pass width).  STRATA_LOOKUP_AGREE (default 1): only
                 // when the copy's first token is DSpark's own first draft.  A lookup pass with less than half accepted
                 // sits the lookup out 1, 2, 4 .. 64 passes.  DSpark steps on the verified rows either way.
-                // kVerify (s6): rows one verify pass may take - 16, as the prompt passes (pass_m splits the tier calls at
-                // kMaxMulti = 8 and the pass buffers hold 17).  A copy is accepted ~96% on edits, so the draft length
-                // was the limit at kMaxMulti - 2 = 6 (s6: 932/972 accepted in 169 passes, only +3% over DSpark's own).
+                // kVerify (s6): rows one verify pass may take - 16, as the prompt passes (pass_v splits the tier calls at
+                // kMaxMulti - 8 then, 16 now - and the pass buffers hold 17).  A copy is accepted ~96% on edits, so the
+                // draft length was the limit at the old kMaxMulti - 2 = 6 (s6: 932/972 accepted in 169 passes, only +3%
+                // over DSpark's own).
                 constexpr int kVerify = 16;
                 static const int lk_max = std::getenv("STRATA_SERVE_LOOKUP") ? std::max(0, std::min(kVerify - 2, std::atoi(std::getenv("STRATA_SERVE_LOOKUP")))) : 0;
                 static const int lk_g = std::getenv("STRATA_LOOKUP_NGRAM") ? std::max(1, std::atoi(std::getenv("STRATA_LOOKUP_NGRAM"))) : 3;

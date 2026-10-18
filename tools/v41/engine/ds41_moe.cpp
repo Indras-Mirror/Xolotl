@@ -58,8 +58,14 @@ namespace {
 
 constexpr int kMaxParts = 8;   ///< the grouped kernel's group/entry cap; top-k 6 needs no more
 constexpr int kMaxTok = Ds41MoeTier::kMaxMulti;   ///< tokens one run_multi call takes (a verify pass: 5-6 at depth 4)
-static_assert(kMaxTok <= strata::kernels::cpu::MAXT, "a pool job carries at most MAXT tokens");
+/// A pool job carries at most cpu::MAXT tokens (the CPU kernels' register tiles); an expert that more of a call's
+/// tokens route to becomes up to this many jobs, each its own slice of the tokens (every row is computed on its own,
+/// so the outputs are the same as one job's).
+constexpr int kJobSplit = (kMaxTok + strata::kernels::cpu::MAXT - 1) / strata::kernels::cpu::MAXT;
 constexpr int kMaxEnt = kMaxTok * 8;   ///< (expert, token) entries and distinct experts of one run_multi call
+/// File-tier misses one gpu_run_n_ex call runs on the card (FILEG) - kMaxParts per cpu::MAXT tokens, as when a 16-row
+/// pass was two calls - and the blobs h_fstage holds (gpu_run uses the first kMaxParts)
+constexpr int kMaxFg = kMaxParts * kJobSplit;
 constexpr size_t kMetaBytes = 65536;   ///< one call's grouped-launch metadata (gpu_run: <= 12 launches x ~200 B; gpu_run_n_ex: <= ~20 x ~1 KB)
 constexpr int kMetaSites = 3;   ///< gpu_run's grouped-launch sites: the VRAM hits, the PCIe share, the file misses
 constexpr int kMetaClsMax = 9;  ///< DS4 is per_expert = 9 format classes, each getting a fixed metadata slot (slice B)
@@ -322,7 +328,7 @@ struct Gpu {
     cudaStream_t s = nullptr;
     void *d_meta = nullptr;            ///< run(): grouped-launch metadata (device side of h_meta)
     uint8_t* h_meta = nullptr;         ///< pinned staging for it
-    uint8_t* h_fstage = nullptr;       ///< run(): file-tier misses read here (pinned), then DMA'd (kMaxParts blobs)
+    uint8_t* h_fstage = nullptr;       ///< run(): file-tier misses read here (pinned), then DMA'd (kMaxFg blobs)
     void *d_x = nullptr, *d_xq = nullptr, *d_parts = nullptr, *d_grp_ptr = nullptr, *d_grp_start = nullptr,
          *d_ngroups = nullptr, *d_ent_dst = nullptr, *d_ent_tok = nullptr, *d_scratch = nullptr, *d_stage = nullptr;
     cudaEvent_t ev[4] = {};
@@ -1348,7 +1354,14 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     ck(cudaStreamCreate(&gp.s), "stream");
     const size_t H4 = (size_t) geom.n_embd * 4;
     ck(cudaMalloc(&gp.d_x, (size_t) kMaxTok * H4), "d_x");
-    ck(cudaMalloc(&gp.d_xq, strata::kernels::native_q8_1_bytes((int) geom.n_embd, kMaxTok)), "d_xq");
+    // d_xq: kMaxTok q8_1 rows.  native_q8_1_bytes (like the quantizer) takes at most 8 columns, so size one column
+    // and check the layout is per-column contiguous - quantize_rows_q8_1 steps through > 8 rows on that
+    const size_t xq_col = strata::kernels::native_q8_1_bytes((int) geom.n_embd, 1);
+    if (strata::kernels::native_q8_1_bytes((int) geom.n_embd, 8) != 8 * xq_col) {
+        err = "q8_1 layout is not per-column contiguous";
+        return false;
+    }
+    ck(cudaMalloc(&gp.d_xq, (size_t) kMaxTok * xq_col), "d_xq");
     ck(cudaMalloc(&gp.d_parts, (size_t) kMaxEnt * H4), "d_parts");
     ck(cudaMalloc(&gp.d_grp_ptr, sizeof(unsigned long long) * kMaxEnt), "d_grp_ptr");
     ck(cudaMalloc(&gp.d_grp_start, sizeof(int32_t) * (kMaxEnt + 1)), "d_grp_start");
@@ -2532,7 +2545,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     const uint8_t* fsrc[kMaxParts] = {};   // where each file-tier miss's bytes are: a spec_read slot or h_fstage
     int fread_b[kMaxParts], nfr = 0;       // the ones read now
     if (nfg > 0) {
-        if (!gp.h_fstage) ck(cudaMallocHost((void**) &gp.h_fstage, (size_t) kMaxParts * (size_t) B), "h_fstage");
+        if (!gp.h_fstage) ck(cudaMallocHost((void**) &gp.h_fstage, (size_t) kMaxFg * (size_t) B), "h_fstage");
         tfg = now_ms();
         for (int b = 0; b < nfg; ++b) {
             fsrc[b] = gp.spec ? gp.spec->take(layer, ids6[fg_k[b]], im.run_seq) : nullptr;
@@ -2849,6 +2862,18 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
 }
 
 
+/// q8_1 rows for `nt` tokens (nt <= kMaxTok) of `H` floats each: native_quantize_q8_1 takes at most 8 columns
+/// per call (MAX_NCOLS), so a wider call steps through them 8 at a time.  The columns are contiguous (init checks the
+/// layout) and every 32-element block lies inside one column, so the bytes are those of one call; nt <= 8 is the
+/// single call it always was.
+void quantize_rows_q8_1(const float* x, void* xq, int64_t H, int nt, cudaStream_t s) {
+    if (nt <= 8) { strata::kernels::native_quantize_q8_1(x, xq, (int) H, nt, s); return; }
+    const size_t col = strata::kernels::native_q8_1_bytes((int) H, 1);
+    for (int c0 = 0; c0 < nt; c0 += 8)
+        strata::kernels::native_quantize_q8_1(x + (size_t) c0 * (size_t) H, (uint8_t*) xq + (size_t) c0 * col, (int) H,
+                                              std::min(8, nt - c0), s);
+}
+
 /// `nt` tokens of one layer in one pass (draft verification): the distinct experts across the tokens are each
 /// fetched/read ONCE - a group with one entry per token that routed to it - so the second token's experts cost only
 /// what the first did not already pay.  Entry j = t*K + k writes output row j; token t's sum is taken over its own k
@@ -2926,7 +2951,7 @@ bool gpu_run_n(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const
     for (int t = 0; t < nt; ++t)
         cpu::native_quant_act(f, gp.h_x + (size_t) t * H, im.nact_n.data() + (size_t) t * im.f.act_bytes);
     ck(cudaMemcpyAsync(gp.d_x, gp.h_x, (size_t) nt * (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "x h2d");
-    strata::kernels::native_quantize_q8_1((const float*) gp.d_x, gp.d_xq, (int) H, nt, gp.s);
+    quantize_rows_q8_1((const float*) gp.d_x, gp.d_xq, H, nt, gp.s);   // > 8 rows: 8 per quantizer call
 
     // ---- one grouped launch per GPU class (hits, PCIe), groups = distinct experts, entries = their tokens ----
     auto launch = [&](int want) {
@@ -2965,24 +2990,27 @@ bool gpu_run_n(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const
     launch(PCIE);
 
     // ---- the pool on the CPU misses, while the card works: one job per distinct expert, one row per token ----
-    int nj = 0;
+    int nj = 0, ns = 0;   // ns: the distinct CPU experts so far (acquire's staging slot; a split job shares its blob)
     { int nc = 0; for (int u = 0; u < nu; ++u) nc += cls[u] == CPU; reserve_ftmp(im, nc); }
-    if ((int) im.jobs.size() < nu) im.jobs.resize((size_t) nu);
+    if ((int) im.jobs.size() < nu * kJobSplit) im.jobs.resize((size_t) nu * kJobSplit);
     for (int u = 0; u < nu; ++u) {
         if (cls[u] != CPU) continue;
         bool from_file = false;
-        cpu::ExpertJobMulti& jb = im.jobs[(size_t) nj];
-        jb.blob = acquire(im, layer, ue[u], nj, &from_file);
-        jb.nt = 0;
-        jb.fmt = nullptr;   // this batch is one format (`f`); a stale per-job fmt from a prior call must not leak in
-        for (int t = 0; t < cpu::MAXT; ++t) { jb.nact[t] = nullptr; jb.out[t] = nullptr; }
+        const uint8_t* blob = acquire(im, layer, ue[u], ns++, &from_file);
+        cpu::ExpertJobMulti* jb = nullptr;
         for (int j = 0; j < NE; ++j)
             if (ent_u[j] == u) {
-                jb.nact[jb.nt] = im.nact_n.data() + (size_t) (j / (int) K) * im.f.act_bytes;
-                jb.out[jb.nt] = im.parts_n.data() + (size_t) j * (size_t) H;
-                ++jb.nt;
+                if (!jb || jb->nt == cpu::MAXT) {   // a new job: the first slice, or the previous one is full
+                    jb = &im.jobs[(size_t) nj++];
+                    jb->blob = blob;
+                    jb->nt = 0;
+                    jb->fmt = nullptr;   // this batch is one format (`f`); a stale per-job fmt from a prior call must not leak in
+                    for (int t = 0; t < cpu::MAXT; ++t) { jb->nact[t] = nullptr; jb->out[t] = nullptr; }
+                }
+                jb->nact[jb->nt] = im.nact_n.data() + (size_t) (j / (int) K) * im.f.act_bytes;
+                jb->out[jb->nt] = im.parts_n.data() + (size_t) j * (size_t) H;
+                ++jb->nt;
             }
-        ++nj;
     }
     if (nj > 0) {
         const double c0 = now_ms();
@@ -3144,10 +3172,10 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // run in its grouped launch.  They used to be acquire()'d one at a time on the critical path before the pool
     // (DS41_PROF_X: 1.6 ms of a 2.9 ms call).  STRATA_FILE_GPU=0: the pool computes them (the old path).
     static const bool file_gpu = !(std::getenv("STRATA_FILE_GPU") && std::getenv("STRATA_FILE_GPU")[0] == '0');
-    int fg_u[kMaxParts], nfg = 0;
+    int fg_u[kMaxFg], nfg = 0;
     if (file_gpu) {
         for (int u = 0; u < nu; ++u)
-            if (cls[u] == CPU && !gp.arena.ptr(layer, ue[u]) && nfg < kMaxParts) { cls[u] = FILEG; fg_u[nfg++] = u; }   // h_fstage: kMaxParts blobs
+            if (cls[u] == CPU && !gp.arena.ptr(layer, ue[u]) && nfg < kMaxFg) { cls[u] = FILEG; fg_u[nfg++] = u; }   // h_fstage: kMaxFg blobs
     }
     // arena_adapt (as gpu_run): every lookup is a use; each FILEG blob is read STRAIGHT into the arena slot of the
     // layer's least-recently-used arena expert not routed now (its slot big enough) - the DMA then sources it there,
@@ -3155,20 +3183,20 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // h_fstage.  No copy of this call writes a victim slot: the vram_lru demotions D2H into the slot of an expert
     // routed NOW (never a victim), and FILEG experts are not LRU-admitted.
     const bool adapt = im.cfg.arena_adapt && gp.arena.base;
-    const uint8_t* fg_src[kMaxParts];
-    int32_t fg_vic[kMaxParts];
+    const uint8_t* fg_src[kMaxFg];
+    int32_t fg_vic[kMaxFg];
     if (im.cfg.arena_adapt) {
         const int64_t NXA = im.g.n_experts;
         if (im.last_use.empty()) im.last_use.assign((size_t) (im.g.n_layers * NXA), -1);
         ++im.tick;
         for (int u = 0; u < nu; ++u) im.last_use[(size_t) (layer * NXA + ue[u])] = im.tick;
     }
-    if (nfg > 0 && !gp.h_fstage) ck(cudaMallocHost((void**) &gp.h_fstage, (size_t) kMaxParts * (size_t) B), "h_fstage");
+    if (nfg > 0 && !gp.h_fstage) ck(cudaMallocHost((void**) &gp.h_fstage, (size_t) kMaxFg * (size_t) B), "h_fstage");
     bool any_vic = false;
     // a blob a spec_read (STRATA_D3_SPEC) already brought in sits in the stash: the DMA sources it there, and under
     // arena_adapt it is copied into its victim slot after the DMAs are queued (fg_copy); the rest are read now
-    uint8_t* fg_copy[kMaxParts] = {};
-    int fread_b[kMaxParts], nfr = 0;
+    uint8_t* fg_copy[kMaxFg] = {};
+    int fread_b[kMaxFg], nfr = 0;
     for (int b = 0; b < nfg; ++b) {
         fg_vic[b] = adapt ? arena_victim(im, layer, (uint64_t) BLX(ue[fg_u[b]]), fg_vic, b) : -1;
         uint8_t* vslot = fg_vic[b] >= 0
@@ -3217,7 +3245,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // ---- activations: q8_1 rows for the card (one per token); the pool's per-class quant runs with its jobs ----
     std::memcpy(gp.h_x, x_host, (size_t) nt * (size_t) H * 4);
     ck(cudaMemcpyAsync(gp.d_x, gp.h_x, (size_t) nt * (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "x h2d");
-    strata::kernels::native_quantize_q8_1((const float*) gp.d_x, gp.d_xq, (int) H, nt, gp.s);
+    quantize_rows_q8_1((const float*) gp.d_x, gp.d_xq, H, nt, gp.s);   // > 8 rows: 8 per quantizer call
     if (npf > 0) ck(cudaStreamWaitEvent(gp.s, gp.ev_pf, 0), "wait prefetch");
     xmark(1);
     // ---- one grouped launch per (site, class); groups = distinct experts, entries = the tokens routing to them ----
@@ -3269,7 +3297,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         start.push_back((int32_t) dst.size());
         const size_t ne = dst.size();
         auto span = [&](size_t at) { return al16(al16(al16(al16(al16(at + 8 * (size_t) ng) + 4 * (size_t) (ng + 1)) + 4) + 4 * ne) + 4 * ne); };
-        if (span(meta_at) > kMetaBytes) {   // cannot happen for top-k 6 at kMaxTok 8 (<= ~20 KB); wrap behind a sync
+        if (span(meta_at) > kMetaBytes) {   // cannot happen for top-k 6 at kMaxTok 16 (a few KB); wrap behind a sync
             ck(cudaStreamSynchronize(gp.s), "meta wrap");   // every earlier copy out of h_meta is done
             meta_at = kMetaW;
         }
@@ -3393,27 +3421,32 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     for (int b = 0; b < nfg; ++b)
         if (fg_copy[b]) std::memcpy(fg_copy[b], fg_src[b], (size_t) BLX(ue[fg_u[b]]));
     xmark(2);
-    // ---- the pool on the CPU misses: one job per distinct expert, its class's fmt + per-(token,class) quant ----
-    int nj = 0;
+    // ---- the pool on the CPU misses: one job per distinct expert (split into jobs of <= cpu::MAXT tokens, kJobSplit),
+    // its class's fmt + per-(token,class) quant ----
+    int nj = 0, ns = 0;   // ns: the distinct CPU experts so far (acquire's staging slot; a split job shares its blob)
     { int nc = 0; for (int u = 0; u < nu; ++u) nc += cls[u] == CPU; reserve_ftmp(im, nc); }
-    if ((int) im.jobs.size() < nu) im.jobs.resize((size_t) nu);
+    if ((int) im.jobs.size() < nu * kJobSplit) im.jobs.resize((size_t) nu * kJobSplit);
     std::vector<char> act_done(im.nact_multi_act.size() * (size_t) kMaxTok, 0);
     bool q2_done[kMaxTok] = {};   // a Q2_0-class job reads the token's ActQ (act_quant_any), not a native act slot
     for (int u = 0; u < nu; ++u) {
         if (cls[u] != CPU) continue;
         const cpu::NativeFmt& fc = im.fl[(size_t) im.g.cls(layer, ue[u])];
         bool from_file = false;
-        cpu::ExpertJobMulti& jb = im.jobs[(size_t) nj];
-        jb.blob = acquire(im, layer, ue[u], nj, &from_file);
-        jb.nt = 0;
-        jb.fmt = &fc;
-        for (int t = 0; t < cpu::MAXT; ++t) { jb.nact[t] = nullptr; jb.out[t] = nullptr; jb.act[t] = nullptr; }
+        const uint8_t* blob = acquire(im, layer, ue[u], ns++, &from_file);
+        cpu::ExpertJobMulti* jb = nullptr;
         for (int j = 0; j < NE; ++j) {
             if (ent_u[j] != u) continue;
+            if (!jb || jb->nt == cpu::MAXT) {   // a new job: the first slice, or the previous one is full
+                jb = &im.jobs[(size_t) nj++];
+                jb->blob = blob;
+                jb->nt = 0;
+                jb->fmt = &fc;
+                for (int t = 0; t < cpu::MAXT; ++t) { jb->nact[t] = nullptr; jb->out[t] = nullptr; jb->act[t] = nullptr; }
+            }
             const int tt = j / (int) K;
             if (cpu::q2_native_kernels(fc.gu_type)) {
                 if (!q2_done[tt]) { cpu::act_quant_any(gp.h_x + (size_t) tt * H, (int) fc.n_embd, im.actq_n[(size_t) tt]); q2_done[tt] = true; }
-                jb.act[jb.nt] = &im.actq_n[(size_t) tt];
+                jb->act[jb->nt] = &im.actq_n[(size_t) tt];
             } else {
                 uint8_t* slot = nact_slot_n(im, tt, fc.gu_act);
                 const size_t ai = (size_t) tt * im.nact_multi_act.size() + (size_t) std::max(0, nact_act_idx(im, fc.gu_act));
@@ -3421,12 +3454,11 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                     cpu::native_quant_act(fc, gp.h_x + (size_t) tt * H, slot);
                     act_done[ai] = 1;
                 }
-                jb.nact[jb.nt] = slot;
+                jb->nact[jb->nt] = slot;
             }
-            jb.out[jb.nt] = im.parts_n.data() + (size_t) j * (size_t) H;
-            ++jb.nt;
+            jb->out[jb->nt] = im.parts_n.data() + (size_t) j * (size_t) H;
+            ++jb->nt;
         }
-        ++nj;
     }
     if (nj > 0 && std::getenv("DS41_DBG_X")) {
         std::fprintf(stderr, "[dbg_x] nt=%d nu=%d nj=%d nact_multi_n=%zu nfmt=%zu\n", nt, nu, nj,
@@ -3532,7 +3564,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         }
     }
     // arena_adapt: the stream is synced above (every DMA out of a victim slot is done) - the slots change hands
-    int32_t fg_slot[kMaxParts];
+    int32_t fg_slot[kMaxFg];
     for (int b = 0; b < nfg; ++b)
         if (fg_vic[b] >= 0) fg_slot[b] = arena_publish_swap(im, layer, ue[fg_u[b]], fg_vic[b]);
     for (int b = 0; b < nfg; ++b)

@@ -376,9 +376,11 @@ struct Ds41MoeImpl;
 /// holds one and calls `run` 43 times per token.
 class Ds41MoeTier {
 public:
-    /// The most tokens one run_multi / run_multi_to_dev call takes (a depth-4 verify pass is 5-6 tokens: ONE call
-    /// per layer at 8, two at 4).  The pool's per-job cap (cpu::MAXT) is 8 too.
-    static constexpr int kMaxMulti = 8;
+    /// The most tokens one run_multi / run_multi_to_dev call takes (a depth-4 verify pass is 5-6 tokens; a lookup
+    /// verify and the DSpark prompt tail are 16 - ONE call per layer at 16, so the experts the two halves share cross
+    /// PCIe once instead of twice).  The pool's per-job cap (cpu::MAXT) stays 8: a CPU expert routed by more tokens
+    /// is split into several jobs (kJobSplit in ds41_moe.cpp).
+    static constexpr int kMaxMulti = 16;
 
     Ds41MoeTier();
     ~Ds41MoeTier();
