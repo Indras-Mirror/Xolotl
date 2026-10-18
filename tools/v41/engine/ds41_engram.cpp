@@ -250,10 +250,30 @@ void Ds41Engram::set_token(int64_t pos, int tid) {
     hist_[(size_t) pos] = g_->engram_token_map[(size_t) tid];
 }
 
+// An image-span position (NgramHashState.DEAD): not a real compressed id, and it blocks the look-back (below).
+static constexpr int64_t kEngramDead = -1;
+
+void Ds41Engram::set_dead(int64_t pos) {
+    if (pos >= (int64_t) hist_.size()) hist_.resize((size_t) pos + 1024, 0);
+    hist_[(size_t) pos] = kEngramDead;
+}
+
 void Ds41Engram::hash(int64_t pos, int e, int64_t * out) const {
     const int64_t N = g_->engram_ngram, H = g_->engram_heads;
     int64_t tok[8];
-    for (int64_t k = 0; k < N; ++k) tok[k] = pos - k >= 0 ? hist_[(size_t) (pos - k)] : g_->engram_pad;
+    // Look-back stops at the start of the sequence and at any DEAD token: once blocked, this and every earlier token
+    // of the n-gram is the pad id (model.py engram.py forward: blocked is cumulative over the shifts).
+    bool blocked = false;
+    for (int64_t k = 0; k < N; ++k) {
+        int64_t v = g_->engram_pad;
+        if (pos - k < 0) blocked = true;
+        else {
+            const int64_t h = hist_[(size_t) (pos - k)];
+            if (h == kEngramDead) blocked = true;
+            else if (!blocked) v = h;
+        }
+        tok[k] = v;
+    }
     const int64_t * mult = &g_->engram_mult[(size_t) (e * N)];
     int64_t rolling = tok[0] * mult[0];
     for (int64_t i = 1; i < N; ++i) {
