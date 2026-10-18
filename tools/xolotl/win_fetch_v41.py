@@ -55,8 +55,12 @@ def fetch(repo, rev, name, size, want_sha, dst: Path):
         if have > size:
             dst.unlink()
         log(f"get {name}: {have / 1e9:.1f}/{size / 1e9:.1f} GB (attempt {attempt})")
-        subprocess.run(["curl", "-L", "--fail", "-sS", "-A", UA, "--retry", "10", "--retry-delay", "5",
-                        "--speed-limit", "1000000", "--speed-time", "60", "-C", "-", "-o", str(dst), url])
+        # one attempt per curl run: curl's own --retry with -C - can resume from the first run's offset and append
+        # the same bytes twice (seen on a 47 GB file that came out 54.9 GB); this loop re-reads the size instead
+        rc = subprocess.run(["curl", "-L", "--fail", "-sS", "-A", UA, "--speed-limit", "1000000", "--speed-time", "60",
+                             "-C", "-", "-o", str(dst), url]).returncode
+        if rc != 0:
+            time.sleep(min(60, 5 * attempt))
     if not dst.exists() or dst.stat().st_size != size:
         raise SystemExit(f"{name}: download incomplete")
     if want_sha:
