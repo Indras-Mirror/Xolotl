@@ -61,6 +61,14 @@ DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221
   top-1 on the short prompts; **the default decode route bias costs 14 points (72.1%)** and causes repetition loops on some
   prompts.  Bias x0.25 keeps 85.2% at 12.6 / 7.4 tok/s - pick for your use (curve in `docs/ds4/V41_START_HERE.md` §5c).
   Smarter biases that only bend near-ties (`STRATA_RB_PROTECT`, `STRATA_RB_MARGIN`) are being measured.
+- **Routing per request, and a route meter** (`--serve`): the GEN keys `route_bias=` / `route_bias_file=` (from the
+  server's `strata_tune`) override the startup biases for one request, so one server answers exact-routing requests
+  beside the fast default; serve_ds41.py maps model names ending in `-exact` (no bias) and `-fast` (0.5 / 0.3).
+  `STRATA_RB_POOL=M` keeps every pick inside the exact top-M (colibri's CACHE_ROUTE window, arXiv:2412.00099 Max-Rank);
+  with `STRATA_RB_SMART=1` (or PROTECT / POOL set) the protect / pool ranks also change per request (`route_protect=`,
+  `route_pool=`) and each request logs `routing vs exact: X% of expert picks swapped, Y% of router weight kept`.
+  Measured on an RTX 3090 (Windows, 1017 dsx 2-bit, medians of 6 requests on one server): exact 9.7 tok/s; 0.5 / 0.3
+  21.7 tok/s, 37.1% swapped; 0.25 / 0.15 19.1 tok/s, 26.1%; protect 2 + pool 12 at 1.0 / 0.6 17.5 tok/s, 18.6%.
 - ggml upstream fixes applied (#30103 flash-attn race, #29953 MMQ OOB reads); prefill logits unchanged bit for bit.
 
 ## DeepSeek-V4.1-Flash
