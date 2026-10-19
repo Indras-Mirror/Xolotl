@@ -355,7 +355,21 @@ def _note_ds41(self, n, evs, st=None, rate=None):
     return _svc_note(self, n, evs, st, rate)
 
 
+# a model name ending in one of these (a config alias) = that routing for the request, for the strata_tune keys the
+# request doesn't name: -exact = no decode biases (quality mode), -fast = the stronger 0.5 / 0.3 nudge (speed mode); the
+# plain name gets the config's --route-bias / --route-bias-file
+ROUTE_SUFFIXES = {"-exact": {"route_bias": 0.0, "route_bias_file": 0.0},
+                  "-fast": {"route_bias": 0.5, "route_bias_file": 0.3}}
+
+
 def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # **kw: the server's newer keywords (0.1.44: force=)
+    model = sampling.get("model") if isinstance(sampling, dict) else None
+    suffix = next((s for s in ROUTE_SUFFIXES if isinstance(model, str) and model.endswith(s)), None)
+    if suffix:
+        tune = dict(sampling.get("strata_tune") or {}) if isinstance(sampling.get("strata_tune"), dict) else {}
+        for k, v in ROUTE_SUFFIXES[suffix].items():
+            tune.setdefault(k, v)
+        sampling = {**sampling, "strata_tune": tune}
     t0 = _time.time()
     _text_state["kind"] = None
     _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request: prompt {len(ids):,} tokens, max {max_new}, "

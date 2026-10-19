@@ -1166,6 +1166,16 @@ int main(int argc, char ** argv) {
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
+        // per-request decode biases (GEN keys route_bias= / route_bias_file=, from the server's "strata_tune"): a request
+        // that names neither gets the --route-bias / --route-bias-file the engine started with, so one server can answer
+        // exact-routing requests (both 0) beside the fast default without a restart.  apply_bias() writes zeros over a
+        // bias it set earlier, so an exact request never inherits the previous one's.
+        const float cfg_route_bias = a.route_bias, cfg_route_bias_file = a.route_bias_file;
+        // the smart router's ranks (route_protect= / route_pool=, engines built with STRATA_RB_SMART / _PROTECT / _POOL):
+        // a request that names neither gets the env's
+        auto env_rank = [](const char * k) { const char * e = std::getenv(k); return e ? std::max(0, std::atoi(e)) : 0; };
+        const int cfg_rprot = env_rank("STRATA_RB_PROTECT"), cfg_rpool = env_rank("STRATA_RB_POOL");
+        int cur_rprot = cfg_rprot, cur_rpool = cfg_rpool;
         std::string line;
         bool previous_vision = false;
         while (next_line(line)) {
@@ -1185,6 +1195,8 @@ int main(int argc, char ** argv) {
             std::string w, csv, emb_file;
             int max_new = 0, tk = 0;
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
+            float req_rb = cfg_route_bias, req_rbf = cfg_route_bias_file;
+            int req_rprot = cfg_rprot, req_rpool = cfg_rpool;
             ss >> w >> max_new;
             while (ss >> w) {
                 const size_t eq = w.find('=');
@@ -1198,6 +1210,26 @@ int main(int argc, char ** argv) {
                 else if (k == "top_k") tk = std::atoi(v.c_str());
                 else if (k == "min_p") min_p = (float) std::atof(v.c_str());
                 else if (k == "seed") rng.seed((uint64_t) std::atoll(v.c_str()));
+                else if (k == "route_bias") req_rb = std::max(0.0f, (float) std::atof(v.c_str()));
+                else if (k == "route_bias_file") req_rbf = std::max(0.0f, (float) std::atof(v.c_str()));
+                else if (k == "route_protect") req_rprot = std::max(0, std::atoi(v.c_str()));
+                else if (k == "route_pool") req_rpool = std::max(0, std::atoi(v.c_str()));
+            }
+            // a changed bias is applied again just before the decode: a repeated prompt (regenerate) runs no prompt pass,
+            // and the passes are what turn the decode bias on - without this it decoded with the previous request's
+            bool bias_changed = false;
+            if (req_rb != a.route_bias || req_rbf != a.route_bias_file) {
+                a.route_bias = req_rb;
+                a.route_bias_file = req_rbf;
+                bias_changed = true;
+                std::fprintf(stderr, "serve: decode route bias %.2f, file penalty %.2f%s\n", req_rb, req_rbf,
+                             (req_rb == 0.0f && req_rbf == 0.0f) ? " (exact routing)" : "");
+            }
+            if ((req_rprot != cur_rprot || req_rpool != cur_rpool) && dense.set_route_select(req_rprot, req_rpool)) {
+                cur_rprot = req_rprot;
+                cur_rpool = req_rpool;
+                std::fprintf(stderr, "serve: smart routing: exact top %d always kept, picks inside the exact top %d%s\n",
+                             req_rprot, req_rpool, (req_rprot == 0 && req_rpool == 0) ? " (off: the flat bias)" : "");
             }
             std::vector<int> ids = csv.empty() ? std::vector<int>() : parse_csv(csv);
             if (ids.empty()) { std::printf("ERR empty prompt\n"); std::fflush(stdout); continue; }
@@ -1608,7 +1640,12 @@ int main(int argc, char ** argv) {
                              (long long) tier.resident(), seed_s);
             }
             if (ok) tier.rebalance_plan();
+            if (bias_changed) {   // decode: this request's route bias + file penalty (see bias_changed)
+                bias_now = true;
+                apply_bias();
+            }
             tier.reset_stats();
+            dense.route_meter(true);
             const double td0 = now_ms();
             int gen = 0, pos = total;
             const char * finish = "length";
@@ -1757,6 +1794,9 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file\n",
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
                          (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
+            if (const Ds41Dense::RouteMeter rm = dense.route_meter(false); rm.on && rm.slots > 0)
+                std::fprintf(stderr, "serve: routing vs exact: %.2f%% of expert picks swapped, %.2f%% of router weight kept (%lld slots)\n",
+                             100.0 * (double) rm.swaps / (double) rm.slots, 100.0 * rm.weight_kept, rm.slots);
 #if defined(DS41_HAVE_DSPARK)
             if (rq_pass > 0)
                 std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", rq_pass,

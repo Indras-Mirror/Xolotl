@@ -56,5 +56,8 @@
   "temperature": 1,
   "top_p": 0.95
  },
- "reasoning_budget_tokens": 32768
+ "reasoning_budget_tokens": 32768,
+ "aliases": [
+  "deepseek-v4.1-flash-xolotl-exact"
+ ]
 }
