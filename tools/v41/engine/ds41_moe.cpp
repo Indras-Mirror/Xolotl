@@ -497,6 +497,10 @@ struct RemoteTier {
     const float* j_x = nullptr;
     int64_t calls = 0, entries = 0;
     double wait_ms = 0;
+    /// profile window (MIMO_CHUNK_PROF / DS41_PROF_X prints and resets it): the card's busy time per job (worker side,
+    /// H2D + kernels + D2H + sync) and the caller's wait for it
+    int64_t p_calls = 0, p_entries = 0;
+    double p_busy = 0, p_wait = 0;
     bool held(int64_t layer, int64_t e, int64_t nx) const {
         return !off.empty() && off[(size_t) (layer * nx + e)] >= 0;
     }
@@ -782,8 +786,11 @@ void remote_worker(Ds41MoeImpl& im, RemoteTier& r) {
         r.cv.wait(lk, [&] { return r.stop || r.pending; });
         if (r.stop) return;
         lk.unlock();
+        const double t0 = now_ms();
         const bool ok = remote_compute(im, r);
+        const double busy = now_ms() - t0;
         lk.lock();
+        r.p_busy += busy;
         r.ok = ok;
         r.pending = false;
         lk.unlock();
@@ -897,6 +904,16 @@ bool remote_build(Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>
     return true;
 }
 
+/// The remote card's profile window: calls, entries, its busy time and the caller's wait (then reset)
+void remote_prof_print(RemoteTier& r, const char* what) {
+    if (r.p_calls == 0) return;
+    std::fprintf(stderr, "[prof_remote] %s: %lld calls, %lld entries; card busy %.0f ms (%.3f ms/call), caller waited %.0f ms "
+                         "(%.3f ms/call)\n", what, (long long) r.p_calls, (long long) r.p_entries, r.p_busy,
+                 r.p_busy / (double) r.p_calls, r.p_wait, r.p_wait / (double) r.p_calls);
+    r.p_calls = r.p_entries = 0;
+    r.p_busy = r.p_wait = 0;
+}
+
 /// A tier call's remote share: the remote entries leave `ids`/`w` (pointed, with weight 0, at a non-remote expert the
 /// TOKEN does not route to - one the call already uses, else a layer proxy - so the call computes a row nobody adds
 /// and no (token, expert) pair repeats: the CPU pool's jobs hold at most MAXT tokens) and run on the card meanwhile; the
@@ -971,6 +988,8 @@ struct RemoteScope {
         r.cv.notify_all();
         ++r.calls;
         r.entries += cnt;
+        ++r.p_calls;
+        r.p_entries += cnt;
         ids_io = ids.data();
         w_io = w.data();
         on = true;
@@ -984,6 +1003,9 @@ struct RemoteScope {
             r.cv.wait(lk, [&] { return !r.pending; });
         }
         r.wait_ms += now_ms() - t0;
+        r.p_wait += now_ms() - t0;
+        static const bool xprof = std::getenv("DS41_PROF_X") != nullptr;
+        if (xprof && r.p_calls >= 640) remote_prof_print(r, "decode");
         if (!r.ok) {
             std::fprintf(stderr, "ds41_moe: the remote card failed a call\n");
             std::abort();
@@ -5337,6 +5359,7 @@ void Ds41MoeTier::release_chunk() {
                              "kernels) over %lld sub-runs, %.1f GB of ternary read = %.0f GB/s\n",
                      (long long) c.mmq_subruns, c.tc, (long long) c.tc_launches, c.tc_gb, c.tc > 0 ? c.tc_gb / (c.tc / 1000.0) : 0.0);
         g_cprof = ChunkProf{};
+        if (im_->remote) remote_prof_print(*im_->remote, "prompt");
     }
     if (chunk_prof() && (g_pf.blobs || g_pf.used)) {
         const ChunkPfProf& p = g_pf;
