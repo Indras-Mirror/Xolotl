@@ -338,6 +338,12 @@ struct Ds41MoeConfig {
     /// conversation (route_probe sim, 1800 slots: static 40.5% held-out hit, LRU 61.6%; FINDINGS s16).  Same math per
     /// expert; only where the blob sits changes.  Off = the static seed, as before.
     bool vram_lru = false;
+    /// A second CUDA device (its index in this process) that holds a static set of experts and computes them itself:
+    /// the ranking right after the VRAM cache's head, up to `remote_gib` (0 = its free memory less
+    /// `remote_reserve_gib`), kept out of the arena.  -1 = off.
+    int remote_device = -1;
+    double remote_gib = 0.0;
+    double remote_reserve_gib = 1.5;
     uint64_t seed = 20261005;     ///< the synthetic arm's generator (unused by the tier itself)
 
     static constexpr int kPredW = 16;   ///< ranked predictions the caller passes to `prefetch`
@@ -465,8 +471,13 @@ public:
     int64_t blob_bytes(int64_t layer) const;   ///< one expert's gate+up+down bytes in `layer` (0 if not routed)
     /// Whether `expert` of `layer` is resident in a VRAM slot right now (false in CPU-only mode).
     bool resident(int64_t layer, int64_t expert) const;
-    /// Whether `expert` of `layer` is in the host arena (false in CPU-only mode and for the file tier).
+    /// Whether `expert` of `layer` is in the host arena or on the remote card - anywhere but the file tier (false in
+    /// CPU-only mode and for the file tier).
     bool in_arena(int64_t layer, int64_t expert) const;
+    /// Ds41MoeConfig::remote_device: whether the remote card holds `expert` of `layer`, and how many it holds.
+    bool in_remote(int64_t layer, int64_t expert) const;
+    int64_t remote_experts() const;
+    double remote_gib() const;
     /// `nt` (1..4) tokens of one layer at once - draft verification: `ids`/`w` are nt*top_k (token-major), `x` and
     /// `out` nt*n_embd.  Each distinct expert is read/fetched once and applied to every token that routed to it.
     bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out);

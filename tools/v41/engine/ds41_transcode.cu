@@ -8,6 +8,7 @@
 // (code 3 = +2 is never used).  Rows stay rows: a row of K weights is K/128 PTQ1_0 blocks -> K/64 Q2_0 blocks.
 #include "ds41_transcode.hpp"
 
+#include <algorithm>
 #include <cstdint>
 
 #include <cuda_fp16.h>
@@ -99,4 +100,18 @@ void ds41_ptq1_to_q2_0(const void* src, void* dst, size_t ptq1_bytes, void* stre
     const int threads = 256;
     const int64_t grid = (nb * 32 + threads - 1) / threads;
     k_ptq1_to_q2_0<<<(unsigned) grid, threads, 0, (cudaStream_t) stream>>>((const Ptq1Block*) src, (Q20Block*) dst, nb);
+}
+
+namespace {
+__global__ void k_add_f32(float* dst, const float* src, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] += src[i];
+}
+}  // namespace
+
+void ds41_add_f32(float* dst, const float* src, size_t n, void* stream) {
+    if (n == 0) return;
+    const int threads = 256;
+    const int64_t grid = std::min<int64_t>(((int64_t) n + threads - 1) / threads, 4096);
+    k_add_f32<<<(unsigned) grid, threads, 0, (cudaStream_t) stream>>>(dst, src, (int64_t) n);
 }

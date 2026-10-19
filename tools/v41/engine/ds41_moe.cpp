@@ -460,10 +460,77 @@ struct Gpu {
     }
 };
 
+/// Ds41MoeConfig::remote_device: a second card that holds a STATIC set of experts and computes them itself (llm-server:
+/// a V100 32 GB beside the 3090, behind a gen3 x4 link with no P2P - too slow to feed the main card blobs, fast enough
+/// for a layer's activations in and its summed rows out).  The ranking right after the main card's VRAM head goes
+/// here and stays out of the arena, so the host RAM holds the next experts instead.  Every tier call takes the remote
+/// entries out (remote_begin: they point at a non-remote expert with weight 0), a worker thread bound to the card
+/// computes them and sums them per token, and remote_end adds those rows to the call's output.
+struct RemoteTier {
+    static constexpr int kRB = 2048;     ///< tokens per block on the card (a prompt batch runs in blocks)
+    static constexpr size_t kRMeta = 1 << 20;
+    int dev = -1;
+    uint8_t* base = nullptr;             ///< the experts, on `dev`
+    size_t cap = 0, used = 0;
+    std::vector<int64_t> off;            ///< (layer * n_experts + e) -> byte offset in base; -1 = not held
+    std::vector<int32_t> proxy;          ///< per layer: the non-remote expert a token whose top-k is all remote points at
+    int64_t n = 0;
+    cudaStream_t s = nullptr;
+    void *d_x = nullptr, *d_xq = nullptr, *d_parts = nullptr, *d_scratch = nullptr, *d_meta = nullptr, *d_w = nullptr,
+         *d_out = nullptr;
+    uint8_t* h_meta = nullptr;
+    float* h_w = nullptr;
+    float* h_out = nullptr;              ///< pinned: the call's remote rows, summed per token (n x H)
+    int64_t h_out_tok = 0;
+    float* h_xd = nullptr;               ///< pinned: run_dev's input copied off the main card
+    void* g_add = nullptr;               ///< on the main card: h_out's rows for an out_dev call
+    int64_t g_add_tok = 0;
+    std::thread th;
+    std::mutex mu;
+    std::condition_variable cv;
+    bool stop = false, pending = false, ok = true;
+    int64_t j_layer = 0;
+    int j_n = 0;
+    std::vector<int32_t> j_ids;
+    std::vector<float> j_w;
+    const float* j_x = nullptr;
+    int64_t calls = 0, entries = 0;
+    double wait_ms = 0;
+    bool held(int64_t layer, int64_t e, int64_t nx) const {
+        return !off.empty() && off[(size_t) (layer * nx + e)] >= 0;
+    }
+    void close() {
+        if (th.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                stop = true;
+            }
+            cv.notify_all();
+            th.join();
+        }
+        if (dev >= 0) {
+            int prev = 0;
+            cudaGetDevice(&prev);
+            cudaSetDevice(dev);
+            for (void* p : {(void*) base, d_x, d_xq, d_parts, d_scratch, d_meta, d_w, d_out})
+                if (p) cudaFree(p);
+            if (s) cudaStreamDestroy(s);
+            cudaSetDevice(prev);
+        }
+        if (g_add) cudaFree(g_add);
+        for (void* p : {(void*) h_meta, (void*) h_w, (void*) h_out, (void*) h_xd})
+            if (p) cudaFreeHost(p);
+    }
+};
+
 #else
 
 /// No CUDA in this flavour; the type exists only so `Ds41MoeImpl` compiles unchanged.
 struct Gpu {
+    void close() {}
+};
+struct RemoteTier {
+    bool held(int64_t, int64_t, int64_t) const { return false; }
     void close() {}
 };
 
@@ -559,6 +626,7 @@ struct Ds41MoeImpl {
     int32_t pf_e[Ds41MoeConfig::kMaxPf] = {};
     int pf_n = 0;                     ///< staging slots the last prefetch() filled
     std::unique_ptr<Gpu> gpu;         ///< null in a CPU-only tier
+    std::unique_ptr<RemoteTier> remote;   ///< Ds41MoeConfig::remote_device (null = off)
     std::vector<int64_t> last_use;    ///< arena_adapt: (layer, expert) -> the run() call that last used it
     int64_t tick = 0;
     int64_t run_seq = 0;              ///< gpu_run calls (spec_read tags its slots with the call that will use them)
@@ -579,6 +647,346 @@ struct Ds41MoeImpl {
 };
 
 void rebal_count(Ds41MoeImpl& im, int64_t layer, const int32_t* ids, int64_t n);   // defined with rebalance_*
+
+// ---- the remote card (Ds41MoeConfig::remote_device) ---------------------------------------------------------------
+
+/// `ranked` minus the experts the remote card holds (they take no VRAM slot and no arena space)
+std::vector<std::pair<int32_t, int32_t>> drop_remote(const Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& ranked) {
+    if (!im.remote) return ranked;
+    std::vector<std::pair<int32_t, int32_t>> kept;
+    kept.reserve(ranked.size());
+    for (const auto& le : ranked)
+        if (le.first < 0 || le.first >= im.g.n_layers || le.second < 0 || le.second >= im.g.n_experts ||
+            !im.remote->held(le.first, le.second, im.g.n_experts))
+            kept.push_back(le);
+    return kept;
+}
+
+#if defined(DS4_MOE_CUDA)
+/// The head of `ranked` the VRAM cache takes (arena_order's walk): ranked order, up to `slots` experts or `slot_gib`
+/// bytes.  The remote card takes the ranking right after it.
+std::vector<char> vram_head(const Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& ranked) {
+    std::vector<char> res((size_t) (im.g.n_layers * im.g.n_experts), 0);
+    if (im.cfg.no_cache || im.cfg.slots <= 0) return res;
+    const double budget = im.cfg.slot_gib > 0 ? im.cfg.slot_gib * 1073741824.0 : (double) im.cfg.slots * (double) im.blob;
+    double used = 0;
+    int64_t n = 0;
+    for (const auto& le : ranked) {
+        if (n >= im.cfg.slots) break;
+        if (!im.g.routed(le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
+        char& r = res[(size_t) (le.first * im.g.n_experts + le.second)];
+        if (r) continue;
+        const int64_t b = im.bl[(size_t) im.g.cls(le.first, le.second)];
+        if (used + (double) b > budget) break;
+        r = 1;
+        used += (double) b;
+        ++n;
+    }
+    return res;
+}
+
+/// One job on the remote card (its worker thread, bound to the card): the job's remote entries, in blocks of kRB
+/// tokens - activations up, one grouped launch per format class, the weighted sum per token (the other entries weigh
+/// 0 and their rows are zero), the summed rows back to h_out.
+bool remote_compute(Ds41MoeImpl& im, RemoteTier& r) {
+    const int64_t H = im.g.n_embd, K = im.g.top_k, NX = im.g.n_experts, layer = r.j_layer;
+    const int n = r.j_n;
+    const size_t col = strata::kernels::native_q8_1_bytes((int) H, 1);
+    auto al16 = [](size_t v) { return (v + 15) & ~(size_t) 15; };
+    std::vector<int32_t> ents;
+    for (int t0 = 0; t0 < n; t0 += RemoteTier::kRB) {
+        const int nb = std::min(RemoteTier::kRB, n - t0);
+        const int64_t NEb = (int64_t) nb * K;
+        const int32_t* ids = r.j_ids.data() + (size_t) t0 * (size_t) K;
+        const float* w = r.j_w.data() + (size_t) t0 * (size_t) K;
+        float* hout = r.h_out + (size_t) t0 * (size_t) H;
+        ents.clear();
+        for (int64_t j = 0; j < NEb; ++j)
+            if (r.held(layer, ids[j], NX)) ents.push_back((int32_t) j);
+        if (ents.empty()) {
+            std::memset(hout, 0, (size_t) nb * (size_t) H * 4);
+            continue;
+        }
+        std::sort(ents.begin(), ents.end(), [&](int32_t a, int32_t b) {
+            const int ca = im.g.cls(layer, ids[a]), cb = im.g.cls(layer, ids[b]);
+            if (ca != cb) return ca < cb;
+            if (ids[a] != ids[b]) return ids[a] < ids[b];
+            return a < b;
+        });
+        for (int64_t j = 0; j < NEb; ++j) r.h_w[j] = 0.0f;
+        for (int32_t j : ents) r.h_w[j] = w[j];
+        if (cudaMemcpyAsync(r.d_x, r.j_x + (size_t) t0 * (size_t) H, (size_t) nb * (size_t) H * 4, cudaMemcpyHostToDevice, r.s) != cudaSuccess) return false;
+        for (int c0 = 0; c0 < nb; c0 += 8)
+            strata::kernels::native_quantize_q8_1((const float*) r.d_x + (size_t) c0 * (size_t) H, (uint8_t*) r.d_xq + (size_t) c0 * col,
+                                                  (int) H, std::min(8, nb - c0), r.s);
+        if (cudaMemsetAsync(r.d_parts, 0, (size_t) NEb * (size_t) H * 4, r.s) != cudaSuccess) return false;
+        if (cudaMemcpyAsync(r.d_w, r.h_w, (size_t) NEb * 4, cudaMemcpyHostToDevice, r.s) != cudaSuccess) return false;
+        size_t at = 0;
+        std::vector<unsigned long long> ptr;
+        std::vector<int32_t> start, dst, tok;
+        for (size_t i = 0; i < ents.size();) {
+            const int c = im.g.cls(layer, ids[ents[i]]);
+            ptr.clear(); start.clear(); dst.clear(); tok.clear();
+            size_t i1 = i;
+            for (; i1 < ents.size() && im.g.cls(layer, ids[ents[i1]]) == c; ++i1) {
+                const int32_t e = ids[ents[i1]];
+                if (i1 == i || ids[ents[i1 - 1]] != e) {
+                    ptr.push_back((unsigned long long) (r.base + r.off[(size_t) (layer * NX + e)]));
+                    start.push_back((int32_t) dst.size());
+                }
+                dst.push_back(ents[i1]);
+                tok.push_back(ents[i1] / (int32_t) K);
+            }
+            start.push_back((int32_t) dst.size());
+            const int ng = (int) ptr.size();
+            const size_t ne = dst.size();
+            const size_t o_ptr = at, o_st = al16(o_ptr + 8 * (size_t) ng), o_ng = al16(o_st + 4 * (size_t) (ng + 1)),
+                         o_dst = al16(o_ng + 4), o_tok = al16(o_dst + 4 * ne), o_end = al16(o_tok + 4 * ne);
+            if (o_end > RemoteTier::kRMeta) {
+                std::fprintf(stderr, "ds41_moe: remote: %zu bytes of launch metadata (> %zu)\n", o_end, RemoteTier::kRMeta);
+                return false;
+            }
+            const int32_t ngv = ng;
+            std::memcpy(r.h_meta + o_ptr, ptr.data(), 8 * (size_t) ng);
+            std::memcpy(r.h_meta + o_st, start.data(), 4 * (size_t) (ng + 1));
+            std::memcpy(r.h_meta + o_ng, &ngv, 4);
+            std::memcpy(r.h_meta + o_dst, dst.data(), 4 * ne);
+            std::memcpy(r.h_meta + o_tok, tok.data(), 4 * ne);
+            if (cudaMemcpyAsync((uint8_t*) r.d_meta + o_ptr, r.h_meta + o_ptr, o_end - o_ptr, cudaMemcpyHostToDevice, r.s) != cudaSuccess)
+                return false;
+            uint8_t* dm = (uint8_t*) r.d_meta;
+            strata::kernels::native_expert_grouped(im.gpu->gll[(size_t) c], (const unsigned long long*) (dm + o_ptr),
+                                                  (const int32_t*) (dm + o_st), (const int32_t*) (dm + o_ng),
+                                                  (const int32_t*) (dm + o_dst), (const int32_t*) (dm + o_tok), ng,
+                                                  (int64_t) ne, r.d_xq, r.d_scratch, (float*) r.d_parts, r.s, ng);
+            at = o_end;
+            i = i1;
+        }
+        strata::kernels::weighted_rows_sum((const float*) r.d_parts, (const float*) r.d_w, (int) K, H, nb, (float*) r.d_out, r.s);
+        if (cudaMemcpyAsync(hout, r.d_out, (size_t) nb * (size_t) H * 4, cudaMemcpyDeviceToHost, r.s) != cudaSuccess) return false;
+        // h_meta / h_w are reused by the next block: its copies must have run
+        const cudaError_t e = cudaStreamSynchronize(r.s);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "ds41_moe: remote: %s\n", cudaGetErrorString(e));
+            return false;
+        }
+    }
+    return true;
+}
+
+void remote_worker(Ds41MoeImpl& im, RemoteTier& r) {
+    cudaSetDevice(r.dev);
+    for (;;) {
+        std::unique_lock<std::mutex> lk(r.mu);
+        r.cv.wait(lk, [&] { return r.stop || r.pending; });
+        if (r.stop) return;
+        lk.unlock();
+        const bool ok = remote_compute(im, r);
+        lk.lock();
+        r.ok = ok;
+        r.pending = false;
+        lk.unlock();
+        r.cv.notify_all();
+    }
+}
+
+/// Opens the remote card once (the first seed): its share of `ranked` (after the VRAM head, up to its budget) is
+/// read from the blob source and uploaded, and its worker starts.  The arena and the cache seeds drop those experts.
+bool remote_build(Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err) {
+    if (im.cfg.remote_device < 0 || im.remote || !im.gpu || im.cfg.cpu_only) return true;
+    const double t0 = now_ms();
+    std::unique_ptr<RemoteTier> rp(new RemoteTier());
+    RemoteTier& r = *rp;
+    int prev = 0, ndev = 0;
+    ck(cudaGetDevice(&prev), "remote: current device");
+    ck(cudaGetDeviceCount(&ndev), "remote: device count");
+    if (im.cfg.remote_device == prev || im.cfg.remote_device >= ndev) {
+        err = "remote device " + std::to_string(im.cfg.remote_device) + " is not a second card (" + std::to_string(ndev) +
+              " visible, the tier runs on " + std::to_string(prev) + ")";
+        return false;
+    }
+    r.dev = im.cfg.remote_device;
+    ck(cudaSetDevice(r.dev), "remote: set device");
+    struct Back { int d; ~Back() { cudaSetDevice(d); } } back{prev};
+    const int64_t H = im.g.n_embd, K = im.g.top_k, NL = im.g.n_layers, NX = im.g.n_experts;
+    const int64_t NEB = (int64_t) RemoteTier::kRB * K;
+    ck(cudaStreamCreateWithFlags(&r.s, cudaStreamNonBlocking), "remote: stream");
+    ck(cudaMalloc(&r.d_x, (size_t) RemoteTier::kRB * (size_t) H * 4), "remote: d_x");
+    ck(cudaMalloc(&r.d_xq, (size_t) RemoteTier::kRB * strata::kernels::native_q8_1_bytes((int) H, 1)), "remote: d_xq");
+    ck(cudaMalloc(&r.d_parts, (size_t) NEB * (size_t) H * 4), "remote: d_parts");
+    ck(cudaMalloc(&r.d_scratch, strata::kernels::native_expert_scratch_bytes(NEB, im.g.n_ff)), "remote: d_scratch");
+    ck(cudaMalloc(&r.d_meta, RemoteTier::kRMeta), "remote: d_meta");
+    ck(cudaMalloc(&r.d_w, (size_t) NEB * 4), "remote: d_w");
+    ck(cudaMalloc(&r.d_out, (size_t) RemoteTier::kRB * (size_t) H * 4), "remote: d_out");
+    ck(cudaHostAlloc((void**) &r.h_meta, RemoteTier::kRMeta, cudaHostAllocPortable), "remote: h_meta");
+    ck(cudaHostAlloc((void**) &r.h_w, (size_t) NEB * 4, cudaHostAllocPortable), "remote: h_w");
+    size_t fr = 0, tot = 0;
+    ck(cudaMemGetInfo(&fr, &tot), "remote: mem info");
+    double want = im.cfg.remote_gib > 0 ? im.cfg.remote_gib * 1073741824.0 : (double) fr - im.cfg.remote_reserve_gib * 1073741824.0;
+    want = std::min(want, (double) fr - 256.0 * 1048576.0);
+    if (want < (double) im.blob) {
+        err = "remote device has " + std::to_string(fr / 1048576) + " MiB free - no room for experts";
+        return false;
+    }
+    r.cap = (size_t) want & ~(size_t) 255;
+    while (cudaMalloc((void**) &r.base, r.cap) != cudaSuccess) {   // fragmentation: give back 256 MiB a try
+        (void) cudaGetLastError();
+        if (r.cap < (size_t) im.blob + (256u << 20)) {
+            err = "remote device: cannot allocate the expert region";
+            return false;
+        }
+        r.cap -= 256u << 20;
+    }
+    // the ranking after the VRAM head, in order, while it fits
+    const std::vector<char> head = vram_head(im, ranked);
+    r.off.assign((size_t) (NL * NX), -1);
+    std::vector<std::array<int64_t, 3>> jobs;   // layer, expert, offset
+    for (const auto& le : ranked) {
+        if (le.first < 0 || le.first >= NL || le.second < 0 || le.second >= NX || !im.g.routed(le.first)) continue;
+        const size_t at = (size_t) (le.first * NX + le.second);
+        if (head[at] || r.off[at] >= 0) continue;
+        const size_t b = ((size_t) im.bl[(size_t) im.g.cls(le.first, le.second)] + 255) & ~(size_t) 255;
+        if (r.used + b > r.cap) continue;   // a smaller class may still fit
+        r.off[at] = (int64_t) r.used;
+        r.used += b;
+        jobs.push_back({le.first, le.second, r.off[at]});
+    }
+    r.n = (int64_t) jobs.size();
+    // a token whose whole top-k is remote points its entries at the layer's best-ranked other expert (weight 0)
+    r.proxy.assign((size_t) NL, -1);
+    for (const auto& le : ranked)
+        if (le.first >= 0 && le.first < NL && le.second >= 0 && le.second < NX && r.proxy[(size_t) le.first] < 0 &&
+            r.off[(size_t) (le.first * NX + le.second)] < 0)
+            r.proxy[(size_t) le.first] = le.second;
+    for (int64_t l = 0; l < NL; ++l)
+        for (int64_t e = 0; e < NX && r.proxy[(size_t) l] < 0; ++e)
+            if (r.off[(size_t) (l * NX + e)] < 0) r.proxy[(size_t) l] = (int32_t) e;
+    // upload: 8 readers, each with its own pinned bounce
+    std::atomic<size_t> nx{0};
+    std::atomic<bool> bad{false};
+    std::vector<std::thread> th;
+    for (int k = 0; k < 8; ++k)
+        th.emplace_back([&]() {
+            cudaSetDevice(r.dev);
+            uint8_t* buf = nullptr;
+            if (cudaHostAlloc((void**) &buf, (size_t) im.blob, cudaHostAllocPortable) != cudaSuccess) { bad = true; return; }
+            for (size_t q; !bad && (q = nx.fetch_add(1)) < jobs.size();) {
+                const auto& j = jobs[q];
+                im.blobs->read(j[0], j[1], buf);
+                if (cudaMemcpy(r.base + j[2], buf, (size_t) im.bl[(size_t) im.g.cls(j[0], j[1])], cudaMemcpyHostToDevice) != cudaSuccess)
+                    bad = true;
+            }
+            cudaFreeHost(buf);
+        });
+    for (auto& t : th) t.join();
+    if (bad) {
+        err = "remote device: expert upload failed";
+        r.close();
+        return false;
+    }
+    std::fprintf(stderr, "remote tier: device %d holds %lld experts (%.2f GiB of %.2f), uploaded in %.1f s\n", r.dev,
+                 (long long) r.n, (double) r.used / 1073741824.0, (double) r.cap / 1073741824.0, (now_ms() - t0) / 1000.0);
+    r.th = std::thread([&im, &r]() { remote_worker(im, r); });
+    im.remote = std::move(rp);
+    return true;
+}
+
+/// A tier call's remote share: the remote entries leave `ids`/`w` (pointed at a non-remote expert of the same token,
+/// or the layer's proxy, with weight 0 - the call computes a row nobody adds) and run on the card meanwhile; the
+/// destructor waits and adds their summed rows to `out` (host) or `out_dev` (the main card).
+struct RemoteScope {
+    Ds41MoeImpl& im;
+    bool on = false;
+    int n = 0;
+    float* out = nullptr;
+    void* out_dev = nullptr;
+    std::vector<int32_t> ids;
+    std::vector<float> w;
+    RemoteScope(Ds41MoeImpl& im_, int64_t layer, int n_, const int32_t*& ids_io, const float*& w_io, const float* x,
+                const void* x_dev, float* out_, void* out_dev_)
+        : im(im_), n(n_), out(out_), out_dev(out_dev_) {
+        if (!im.remote || !ids_io || !w_io || n <= 0 || layer < 0 || layer >= im.g.n_layers || !im.g.routed(layer)) return;
+        RemoteTier& r = *im.remote;
+        const int64_t K = im.g.top_k, NX = im.g.n_experts, H = im.g.n_embd, NE = (int64_t) n * K;
+        int64_t cnt = 0;
+        for (int64_t j = 0; j < NE; ++j)
+            if (ids_io[j] >= 0 && ids_io[j] < NX && r.held(layer, ids_io[j], NX)) ++cnt;
+        if (cnt == 0) return;
+        ids.assign(ids_io, ids_io + NE);
+        w.assign(w_io, w_io + NE);
+        for (int64_t t = 0; t < n; ++t)
+            for (int64_t k = 0; k < K; ++k) {
+                const int64_t j = t * K + k;
+                if (ids[(size_t) j] < 0 || ids[(size_t) j] >= NX || !r.held(layer, ids[(size_t) j], NX)) continue;
+                int32_t sub = r.proxy[(size_t) layer];
+                for (int64_t k2 = 0; k2 < K; ++k2) {
+                    const int32_t e2 = ids_io[t * K + k2];
+                    if (e2 >= 0 && e2 < NX && !r.held(layer, e2, NX)) { sub = e2; break; }
+                }
+                ids[(size_t) j] = sub;
+                w[(size_t) j] = 0.0f;
+            }
+        if (n > r.h_out_tok) {
+            if (r.h_out) cudaFreeHost(r.h_out);
+            ck(cudaHostAlloc((void**) &r.h_out, (size_t) n * (size_t) H * 4, cudaHostAllocPortable), "remote: h_out");
+            r.h_out_tok = n;
+        }
+        if (!x && x_dev) {   // run_dev: the input is on the main card
+            if (!r.h_xd) ck(cudaHostAlloc((void**) &r.h_xd, (size_t) H * 4, cudaHostAllocPortable), "remote: h_xd");
+            ck(cudaMemcpy(r.h_xd, x_dev, (size_t) H * 4, cudaMemcpyDeviceToHost), "remote: x d2h");
+            x = r.h_xd;
+        }
+        {
+            std::lock_guard<std::mutex> lk(r.mu);
+            r.j_layer = layer;
+            r.j_n = n;
+            r.j_ids.assign(ids_io, ids_io + NE);
+            r.j_w.assign(w_io, w_io + NE);
+            r.j_x = x;
+            r.pending = true;
+        }
+        r.cv.notify_all();
+        ++r.calls;
+        r.entries += cnt;
+        ids_io = ids.data();
+        w_io = w.data();
+        on = true;
+    }
+    ~RemoteScope() {
+        if (!on) return;
+        RemoteTier& r = *im.remote;
+        const double t0 = now_ms();
+        {
+            std::unique_lock<std::mutex> lk(r.mu);
+            r.cv.wait(lk, [&] { return !r.pending; });
+        }
+        r.wait_ms += now_ms() - t0;
+        if (!r.ok) {
+            std::fprintf(stderr, "ds41_moe: the remote card failed a call\n");
+            std::abort();
+        }
+        const size_t cnt = (size_t) n * (size_t) im.g.n_embd;
+        if (out)
+            for (size_t i = 0; i < cnt; ++i) out[i] += r.h_out[i];
+        if (out_dev) {
+            Gpu& gp = *im.gpu;
+            if (n > r.g_add_tok) {
+                if (r.g_add) cudaFree(r.g_add);
+                ck(cudaMalloc(&r.g_add, cnt * 4), "remote: g_add");
+                r.g_add_tok = n;
+            }
+            ck(cudaMemcpyAsync(r.g_add, r.h_out, cnt * 4, cudaMemcpyHostToDevice, gp.s), "remote: rows h2d");
+            ds41_add_f32((float*) out_dev, (const float*) r.g_add, cnt, gp.s);
+            ck(cudaStreamSynchronize(gp.s), "remote: add sync");
+        }
+    }
+};
+#else
+bool remote_build(Ds41MoeImpl&, const std::vector<std::pair<int32_t, int32_t>>&, std::string&) { return true; }
+struct RemoteScope {
+    RemoteScope(Ds41MoeImpl&, int64_t, int, const int32_t*&, const float*&, const float*, const void*, float*, void*) {}
+};
+#endif
 
 
 // ---- the one place a blob's address is decided: the arena first, the blob source second ----------------
@@ -1632,7 +2040,9 @@ std::vector<std::pair<int32_t, int32_t>> warm_first(Ds41MoeImpl& im, const std::
 
 bool Ds41MoeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
     if (im_->cfg.cpu_only) return true;
-    return build_arena(arena_order(*im_, drop_excluded(*im_, ranked_all)), err);
+    const std::vector<std::pair<int32_t, int32_t>> ranked = drop_excluded(*im_, ranked_all);
+    if (!remote_build(*im_, ranked, err)) return false;
+    return build_arena(arena_order(*im_, drop_remote(*im_, ranked)), err);
 }
 
 void Ds41MoeTier::set_slot_gib(double gib) { im_->cfg.slot_gib = gib; }
@@ -1651,7 +2061,8 @@ void Ds41MoeTier::set_cache_enabled(bool on) {
 
 bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
     if (im_->cfg.cpu_only) return true;   // a CPU-only tier has neither a cache nor an arena to seed
-    const std::vector<std::pair<int32_t, int32_t>> ranked = drop_excluded(*im_, ranked_all);
+    if (!remote_build(*im_, drop_excluded(*im_, ranked_all), err)) return false;
+    const std::vector<std::pair<int32_t, int32_t>> ranked = drop_remote(*im_, drop_excluded(*im_, ranked_all));
     if (!build_arena(arena_order(*im_, ranked), err)) return false;
 #if !defined(DS4_MOE_CUDA)
     (void) ranked;
@@ -4586,6 +4997,7 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
 bool Ds41MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids6 || !w6 || !x || !out) return false;
+    RemoteScope rs(*im_, layer, 1, ids6, w6, x, nullptr, out, nullptr);
     rebal_count(*im_, layer, ids6, im_->g.top_k);
     if (!im_->g.routed(layer)) return false;
     if (im_->cfg.cpu_only) return cpu_run(*im_, layer, ids6, w6, x, out);
@@ -4599,6 +5011,7 @@ bool Ds41MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const
 bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids6 || !w6 || !x || !out_dev) return false;
+    RemoteScope rs(*im_, layer, 1, ids6, w6, x, nullptr, nullptr, out_dev);
     rebal_count(*im_, layer, ids6, im_->g.top_k);
     if (!im_->g.routed(layer) || im_->cfg.cpu_only) return false;
 #if defined(DS4_MOE_CUDA)
@@ -4611,6 +5024,7 @@ bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6
 bool Ds41MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids || !w || !x || !out || nt < 1 || nt > kMaxTok) return false;
+    RemoteScope rs(*im_, layer, nt, ids, w, x, nullptr, out, nullptr);
     rebal_count(*im_, layer, ids, (int64_t) nt * im_->g.top_k);
     if (!im_->g.routed(layer)) return false;
     if (im_->cfg.cpu_only) {   // the CPU tier: token by token (no sharing; it is not the verify path)
@@ -4644,6 +5058,7 @@ void Ds41MoeTier::profiler(bool on) {
 bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids || !w || !x || !out_dev || nt < 1 || nt > kMaxTok) return false;
+    RemoteScope rs(*im_, layer, nt, ids, w, x, nullptr, nullptr, out_dev);
     rebal_count(*im_, layer, ids, (int64_t) nt * im_->g.top_k);
     if (!im_->g.routed(layer)) return false;
     if (std::getenv("DS41_DBG_X")) std::fprintf(stderr, "[dbg_x] ENTER run_multi_to_dev layer=%lld nt=%d\n", (long long) layer, nt);
@@ -4951,6 +5366,7 @@ void Ds41MoeTier::release_chunk() {
 bool Ds41MoeTier::run_chunk(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out) {
     if (!im_->inited || !ids || !w || !x || !out || n < 1) return false;
     if (!im_->g.routed(layer)) return false;
+    RemoteScope rs(*im_, layer, n, ids, w, x, nullptr, out, nullptr);
 #if defined(DS4_MOE_CUDA)
     if (im_->gpu && !im_->cfg.cpu_only) return chunk_classes(*im_, layer, n, ids, w, x, out, nullptr);
 #endif
@@ -4964,6 +5380,7 @@ bool Ds41MoeTier::run_chunk(int64_t layer, int n, const int32_t* ids, const floa
 bool Ds41MoeTier::run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev) {
     if (!im_->inited || !ids || !w || !x || !out_dev || n < 1) return false;
     if (!im_->g.routed(layer)) return false;
+    RemoteScope rs(*im_, layer, n, ids, w, x, nullptr, nullptr, out_dev);
 #if defined(DS4_MOE_CUDA)
     if (im_->gpu && !im_->cfg.cpu_only) return chunk_classes(*im_, layer, n, ids, w, x, nullptr, out_dev);
 #endif
@@ -4973,6 +5390,7 @@ bool Ds41MoeTier::run_chunk_dev(int64_t layer, int n, const int32_t* ids, const 
 bool Ds41MoeTier::run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out) {
     if (!im_->inited) return false;
     if (!ids6 || !w6 || !x_dev || !out) return false;
+    RemoteScope rs(*im_, layer, 1, ids6, w6, nullptr, x_dev, out, nullptr);
     rebal_count(*im_, layer, ids6, im_->g.top_k);
     if (!im_->g.routed(layer)) return false;
     if (im_->cfg.cpu_only) return false;   // there is no device input without a device tier
@@ -5317,6 +5735,16 @@ void Ds41MoeTier::close() {
 #if defined(DS4_MOE_CUDA)
     chunk_stage_close(*im_);   // join the prefetch readers, free the pinned slabs
 #endif
+    if (im_->remote) {
+#if defined(DS4_MOE_CUDA)
+        const RemoteTier& r = *im_->remote;
+        if (r.calls > 0)
+            std::fprintf(stderr, "remote tier: %lld calls, %lld entries, %.3f ms/call waiting for the card\n",
+                         (long long) r.calls, (long long) r.entries, r.wait_ms / (double) r.calls);
+#endif
+        im_->remote->close();
+        im_->remote.reset();
+    }
     if (im_->gpu) im_->gpu->close();
     im_->gpu.reset();
     im_->pool.reset();
@@ -5362,7 +5790,26 @@ int64_t Ds41MoeTier::arena_experts() const {
 #endif
 }
 
+bool Ds41MoeTier::in_remote(int64_t layer, int64_t expert) const {
+    return im_ && im_->remote && im_->remote->held(layer, expert, im_->g.n_experts);
+}
+
+int64_t Ds41MoeTier::remote_experts() const {
+#if defined(DS4_MOE_CUDA)
+    if (im_ && im_->remote) return im_->remote->n;
+#endif
+    return 0;
+}
+
+double Ds41MoeTier::remote_gib() const {
+#if defined(DS4_MOE_CUDA)
+    if (im_ && im_->remote) return (double) im_->remote->used / 1073741824.0;
+#endif
+    return 0.0;
+}
+
 bool Ds41MoeTier::in_arena(int64_t layer, int64_t expert) const {
+    if (in_remote(layer, expert)) return true;   // not the file tier: the route-bias penalty and the readers skip it
 #if defined(DS4_MOE_CUDA)
     if (im_ && im_->gpu) return im_->gpu->arena.ptr(layer, expert) != nullptr;
 #endif

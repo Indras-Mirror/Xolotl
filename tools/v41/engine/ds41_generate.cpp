@@ -5,7 +5,7 @@
 //
 //   ds41_generate -m V41-GSQ.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu] [--experts gpu|cpu]
 //                 [--engram DIR:DIR:DIR] [--engram-hot hot.bin] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
-//                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--tier-batch-pcie 1.0] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
+//                 [--vram-lru] [--arena-adapt] [--arena-skip-resident] [--remote-device N [--remote-gib G]] [--pcie 0.25] [--tier-batch-pcie 1.0] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--kv-fp4] [--serve] [--quiet]
 //                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F]
 // --enc-skip (layer-major batches only; DEFAULT for one-shot runs, --no-enc-skip = full path): prompt tokens before the last --enc-replay (default 2560 = 128 * 20) stop
@@ -95,6 +95,9 @@ struct Args {
     // defaults = the measured best decode config on the 4090 (2026-10-11): --pcie 0.75 --pf-b 1.43 --vram-lru
     double vram_margin_gib = 1.0, pcie = 0.75, arena_gib = 60.0, pf_b = 1.43;
     double tier_batch_pcie = -1.0;   // < 0 = STRATA_TIER_BATCH_PCIE / 1.0
+    int remote_device = -1;          // --remote-device N: a second card holds the experts ranked after the VRAM head and computes them
+    double remote_gib = 0.0, remote_reserve_gib = 1.5;   // --remote-gib G (0 = its free memory less --remote-reserve-gib)
+    bool arena_skip_resident = false;   // --arena-skip-resident: the VRAM head stays out of the RAM arena
     int threads = 0, prefill_chunk = 0, prompt_batch = 8192;   // prompt_batch: layer-major batch B (0 = the chunk path)
     int64_t ctx = 0;
     float temp = 0.0f;
@@ -208,6 +211,10 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--vram-lru") a.vram_lru = true;
         else if (k == "--no-vram-lru") a.vram_lru = false;
         else if (k == "--arena-adapt") a.arena_adapt = true;
+        else if (k == "--arena-skip-resident") a.arena_skip_resident = true;
+        else if (k == "--remote-device") a.remote_device = std::atoi(next().c_str());
+        else if (k == "--remote-gib") a.remote_gib = std::atof(next().c_str());
+        else if (k == "--remote-reserve-gib") a.remote_reserve_gib = std::atof(next().c_str());
         else if (k == "--pcie") a.pcie = std::atof(next().c_str());
         else if (k == "--tier-batch-pcie") a.tier_batch_pcie = std::atof(next().c_str());
         else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
@@ -521,6 +528,10 @@ int main(int argc, char ** argv) {
     mc.max_arena_gib = a.arena_gib;
     mc.vram_lru = a.vram_lru;
     mc.arena_adapt = a.arena_adapt;
+    mc.arena_skip_resident = a.arena_skip_resident;
+    mc.remote_device = a.remote_device;
+    mc.remote_gib = a.remote_gib;
+    mc.remote_reserve_gib = a.remote_reserve_gib;
     mc.chunk_mmq = a.chunk_mmq;
     mc.chunk_prefetch = a.chunk_prefetch;
     mc.chunk_prefetch_gib = a.chunk_prefetch_gib;
@@ -566,8 +577,10 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "ds41_generate: seed: %s\n", err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "tier: %lld experts in VRAM, %lld in the RAM arena (%.1f GiB), %lld file tier; seeded in %.1f s\n",
-                     (long long) tier.resident(), (long long) tier.arena_experts(), tier.arena_gib(), (long long) tier.file_tier(),
+        std::fprintf(stderr, "tier: %lld experts in VRAM, %lld on the remote card (%.1f GiB), %lld in the RAM arena (%.1f GiB), "
+                     "%lld file tier; seeded in %.1f s\n",
+                     (long long) tier.resident(), (long long) tier.remote_experts(), tier.remote_gib(),
+                     (long long) tier.arena_experts(), tier.arena_gib(), (long long) tier.file_tier(),
                      (now_ms() - t0) / 1000.0);
     }
     // the selection-only bias per layer: the prune penalty / mask, + route_bias on the experts resident in VRAM now

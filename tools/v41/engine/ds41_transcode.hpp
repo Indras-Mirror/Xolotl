@@ -12,3 +12,5 @@ void ds41_ptq1_to_q2_0(const void* src, void* dst, size_t ptq1_bytes, void* stre
 /// (bytes) - one launch for a run of staged experts.
 void ds41_ptq1_to_q2_0_strided(const void* src, size_t src_stride, void* dst, size_t dst_stride, size_t ptq1_bytes,
                                int count, void* stream);
+/// dst[i] += src[i] for i < n (device floats) on `stream` - the remote tier's rows added to an out_dev call.
+void ds41_add_f32(float* dst, const float* src, size_t n, void* stream);

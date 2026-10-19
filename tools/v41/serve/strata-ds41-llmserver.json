@@ -1,0 +1,30 @@
+{
+  "exe": "/root/xolotl/tools/v41/serve/ds41-engine-llmserver.sh",
+  "args": [
+    "-m", "/root/models/V41-GSQ/V41-GSQ.gguf",
+    "--backend", "cuda",
+    "--experts", "gpu",
+    "--engram", "/root/models/V41-Engram/a:/root/models/V41-Engram/b",
+    "--rank", "/root/models/V41-GSQ/rank.bin",
+    "--ctx", "131072",
+    "--stop", "1",
+    "--arena-adapt",
+    "--kv-fp4",
+    "--route-bias", "0.5",
+    "--route-bias-file", "0.3",
+    "--arena-gib", "42",
+    "--arena-skip-resident",
+    "--remote-device", "1",
+    "--prompt-batch", "12288"
+  ],
+  "cwd": "/root/xolotl",
+  "tokenizer": "/root/models/V41-GSQ/tokenizer",
+  "model_name": "deepseek-v4.1-flash-gsq-uncensored",
+  "log": "/tmp/strata-ds41.log",
+  "port": 8150,
+  "env": {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "1,0"},
+  "allowed_hosts": "*",
+  "sampling": {"temperature": 1, "top_p": 0.95},
+  "api_monitor": true,
+  "reasoning_budget_tokens": 32768
+}
