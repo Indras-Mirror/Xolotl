@@ -4741,6 +4741,9 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
         return -1;
     }
     if (!im_->shrunk.empty()) { err = "still shrunk from the last batch (regrow_cache did not run)"; return -1; }
+    if (im_->cfg.cuda_device >= 0 && cudaSetDevice(im_->cfg.cuda_device) != cudaSuccess) {
+        err = "shrink_cache_for: cudaSetDevice failed"; return -1;
+    }
     strata::core::ExpertCache& c = *im_->gpu->cache;
     if (cudaDeviceSynchronize() != cudaSuccess) { err = "shrink_cache_for: device failed"; return -1; }
     size_t fr = 0, tot = 0;
@@ -4782,10 +4785,24 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
 int64_t Ds41MoeTier::regrow_cache(std::string& err) {
 #if defined(DS4_MOE_CUDA)
     if (im_->shrunk.empty() || !im_->gpu || !im_->gpu->cache) { im_->shrunk.clear(); return 0; }
+    if (im_->cfg.cuda_device >= 0 && cudaSetDevice(im_->cfg.cuda_device) != cudaSuccess) {
+        err = "regrow_cache: cudaSetDevice failed"; im_->shrunk.clear(); return -1;
+    }
     strata::core::ExpertCache& c = *im_->gpu->cache;
     const double t0 = now_ms();
     std::string ge;
-    if (!c.grow(c.full_bytes(), ge)) { err = "regrow_cache: grow: " + ge; im_->shrunk.clear(); return -1; }
+    // After a layer-major batch the driver often cannot map another VMM segment (fragmentation).
+    // Prefer keeping the hot shrunk cache over wiping both GPUs and PCIe-reseeding.
+    if (!c.grow(c.full_bytes(), ge)) {
+        (void) cudaDeviceSynchronize();
+        if (!c.grow(c.full_bytes(), ge)) {
+            std::fprintf(stderr, "serve: keep-cache regrow soft-fail (%s) - keeping %lld resident experts\n",
+                         ge.c_str(), (long long) im_->admitted);
+            im_->shrunk.clear();
+            err.clear();
+            return 0;   // soft OK: decode stays warm on the retained head
+        }
+    }
     std::vector<std::array<int64_t, 3>> fjobs;   // slot, layer, expert (not in the arena: read from the file)
     int64_t added = 0;
     for (const auto& j : im_->shrunk) {
