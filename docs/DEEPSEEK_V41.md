@@ -128,6 +128,8 @@ How each number was reached, step by step: [docs/ds4/V41_PROGRESS.md](ds4/V41_PR
 
 ### Running the V4.1 engine
 
+Windows (native, MSVC + CUDA): see [WINDOWS.md](WINDOWS.md) for the build, downloads, configs and measured numbers.
+
 ```bash
 cmake -S . -B build-ds4-gpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON \
       -DSTRATA_MMQ_KQUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp
