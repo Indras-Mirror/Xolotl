@@ -42,6 +42,9 @@
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 #include <cuda_profiler_api.h>
 #if defined(DS4_MOE_MMQ)
 #include "strata/prefill/moe_mmq.hpp"
@@ -127,6 +130,9 @@ struct Arena {
     bool built = false;
     std::string backing;
     std::unique_ptr<strata::core::PinnedArena> owner;
+    void* own_map = nullptr;        ///< STRATA_ARENA_PIN_AFTER: the mapping build_arena made (munmap in close)
+    uint64_t own_bytes = 0;
+    bool own_reg = false;           ///< ... and it is cudaHostRegister'ed
     std::vector<int32_t> slot_of;   ///< (layer, expert) -> arena index, or -1
     std::vector<uint64_t> off;      ///< arena index -> byte offset (blobs differ in size per layer; used + 1 entries)
     int64_t used = 0, blob = 0, file_tier = 0;
@@ -141,6 +147,15 @@ struct Arena {
     }
     void close() {
         owner.reset();
+#ifndef _WIN32
+        if (own_map) {
+            if (own_reg) cudaHostUnregister(own_map);
+            munmap(own_map, (size_t) own_bytes);
+        }
+#endif
+        own_map = nullptr;
+        own_bytes = 0;
+        own_reg = false;
         base = nullptr;
         bytes = 0;
         built = false;
@@ -1980,7 +1995,26 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
         gp.arena.close();
         return false;
     }
-    if (im_->cfg.pin) {
+    // STRATA_ARENA_PIN_AFTER=1 (llm-server): fill first, register after.  PinnedArena registers the untouched mapping
+    // and the kernel then faults and zeroes every page inside cudaHostRegister on one thread (72 GiB: 23.8 s at load,
+    // ~3 GB/s); filled first, the faults are spread over the readers below and overlap the disk, and the registration
+    // of resident pages is ~20 GB/s (pinbench, 16 GiB: register-then-fill 5.73 s, fill-then-register 2.58 s)
+    bool pin_after = false;
+#ifndef _WIN32
+    if (im_->cfg.pin && std::getenv("STRATA_ARENA_PIN_AFTER") && std::getenv("STRATA_ARENA_PIN_AFTER")[0] == '1') {
+        void* m = mmap(nullptr, (size_t) gp.arena.bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m != MAP_FAILED) {
+            madvise(m, (size_t) gp.arena.bytes, MADV_NOHUGEPAGE);   // THP pins at ~0.16 GB/s (ds41-engine.sh's note)
+            gp.arena.own_map = m;
+            gp.arena.own_bytes = gp.arena.bytes;
+            gp.arena.base = m;
+            pin_after = true;
+        }
+    }
+#endif
+    if (pin_after) {
+        // registered after the fill below
+    } else if (im_->cfg.pin) {
         gp.arena.owner.reset(new strata::core::PinnedArena(gp.arena.bytes));
         if (!gp.arena.owner->valid()) {
             err = "pinned arena allocation of " + std::to_string(gib) + " GiB failed";
@@ -2016,6 +2050,20 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
             }
         });
     for (auto& t : th) t.join();
+    if (pin_after) {
+        const double tr = now_ms();
+        if (cudaHostRegister(gp.arena.base, (size_t) gp.arena.bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) ==
+            cudaSuccess) {
+            gp.arena.own_reg = true;
+            gp.arena.pinned = true;
+            gp.arena.backing = "pinned after the fill (STRATA_ARENA_PIN_AFTER, 4 KB pages)";
+        } else {
+            (void) cudaGetLastError();
+            gp.arena.backing = "anonymous (cudaHostRegister after the fill FAILED: the PCIe DMAs stage through the driver)";
+        }
+        std::fprintf(stderr, "arena: %s, filled in %.1f s, registered in %.1f s\n", gp.arena.backing.c_str(),
+                     (tr - t0) / 1000.0, (now_ms() - tr) / 1000.0);
+    }
     gp.arena.seconds = (now_ms() - t0) / 1000.0;
     return true;
 #endif

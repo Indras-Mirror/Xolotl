@@ -8,6 +8,7 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -165,6 +166,34 @@ bool Ds41DSpark::Impl::load(std::string & e) {
     }
     wbuf = ggml_backend_alloc_ctx_tensors_from_buft(wctx, ggml_backend_get_default_buffer_type(be));
     if (!wbuf) { e = "cannot allocate the DSpark weights on the backend"; return false; }
+    // STRATA_DSPARK_PREFAULT=1 (llm-server): the loop below reads every source through the mmap, one page fault at a
+    // time.  With the sidecar out of the page cache (a 72 GiB arena; STRATA_SERVE_DSPARK_EVICT re-creates DSpark for
+    // every long prompt) that is ~0.35 GB/s from ZFS: 8.4 s a prompt vs 1.9 s cached.  Touch the pages on 16 threads
+    // first, 64 MiB at a time, so the faults overlap.
+    if (const char * pf = std::getenv("STRATA_DSPARK_PREFAULT"); pf && pf[0] == '1') {
+        std::vector<std::pair<const uint8_t *, size_t>> spans;
+        for (auto & s : src) {
+            size_t sh = 0;
+            s.first->find(s.second->name, &sh);
+            const auto * d = (const uint8_t *) s.first->shard(sh).tensor_data(*s.second);
+            size_t n = (size_t) ggml_type_size((ggml_type) s.second->type);
+            int64_t el = 1;
+            for (auto x : s.second->shape) el *= (int64_t) x;
+            n = (size_t) (el / ggml_blck_size((ggml_type) s.second->type)) * n;
+            for (size_t o = 0; o < n; o += (size_t) 64 << 20) spans.emplace_back(d + o, std::min(n - o, (size_t) 64 << 20));
+        }
+        std::atomic<size_t> next { 0 };
+        std::atomic<uint64_t> sink { 0 };
+        std::vector<std::thread> th;
+        for (int i = 0; i < 16; ++i)
+            th.emplace_back([&]() {
+                uint64_t acc = 0;
+                for (size_t k; (k = next.fetch_add(1)) < spans.size();)
+                    for (size_t o = 0; o < spans[k].second; o += 4096) acc += spans[k].first[o];
+                sink.fetch_add(acc);
+            });
+        for (auto & x : th) x.join();
+    }
     for (auto & s : src) {
         const GgufModel & m = *s.first;
         size_t sh = 0;

@@ -21,6 +21,7 @@
 #include <map>
 #include <set>
 #include <thread>
+#include <sys/stat.h>
 
 #ifdef _WIN32
 #include <string.h>
@@ -438,11 +439,56 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(w.ctx, ggml_backend_get_default_buffer_type(im.backend));
         if (!buf) { err = "cannot allocate the dense weights on the backend"; return false; }
         w.bufs.push_back(buf);
+        // STRATA_DENSE_REQUANT_CACHE=<dir> (llm-server): the conversions below cost ~25 s a load (q6_K's reference
+        // quantizer is CPU-bound; the reads are not the cost - measured with the source in the page cache).  Their
+        // output is written once to <dir>/<model>.<key>.dense-rq, in the order this loop converts, and read back on
+        // later loads.  The key: the model file's size and mtime, the requant / prediction types and the head switch;
+        // a cache of the wrong total size is ignored (and rewritten).
+        std::FILE * rq_in = nullptr;
+        std::FILE * rq_out = nullptr;
+        std::string rq_path, rq_tmp;
+        if (const char * cd = std::getenv("STRATA_DENSE_REQUANT_CACHE"); cd && *cd && (rq != GGML_TYPE_COUNT || pq != GGML_TYPE_COUNT)) {
+            size_t want = 0;
+            for (size_t s = 0; s < model.size(); ++s)
+                for (const auto & ti : model.shard(s).tensors()) {
+                    if (skip(ti.name)) continue;
+                    if (const std::string pn = pred_name(ti); !pn.empty()) want += ggml_nbytes(w.t[pn]);
+                    if ((int) w.t[ti.name]->type != (int) ti.type) want += ggml_nbytes(w.t[ti.name]);
+                }
+            struct stat st {};
+            const std::string mp = model.shard(0).path();
+            if (want > 0 && ::stat(mp.c_str(), &st) == 0) {
+                const size_t sl = mp.find_last_of('/');
+                char key[160];
+                std::snprintf(key, sizeof key, ".%llx.%llx.%s.%s.h%d.dense-rq", (unsigned long long) st.st_size,
+                              (unsigned long long) st.st_mtime, rq != GGML_TYPE_COUNT ? ggml_type_name(rq) : "none",
+                              pq != GGML_TYPE_COUNT ? ggml_type_name(pq) : "none", rq_head ? 1 : 0);
+                rq_path = std::string(cd) + "/" + (sl == std::string::npos ? mp : mp.substr(sl + 1)) + key;
+                struct stat cs {};
+                if (::stat(rq_path.c_str(), &cs) == 0 && (size_t) cs.st_size == want) {
+                    rq_in = std::fopen(rq_path.c_str(), "rb");
+                } else {
+                    rq_tmp = rq_path + ".tmp";
+                    rq_out = std::fopen(rq_tmp.c_str(), "wb");
+                    if (!rq_out) std::fprintf(stderr, "dense requant cache: cannot write %s\n", rq_tmp.c_str());
+                }
+            }
+        }
         // rows of the file's tensor `ti` (bytes `src`) converted to t->type and uploaded; returns the bytes uploaded
         auto convert_upload = [&](ggml_tensor * t, const TensorInfo & ti, const uint8_t * src) -> size_t {
             const int64_t n0 = t->ne[0], nr = ggml_nrows(t);
             const size_t src_row = ggml_row_size((ggml_type) ti.type, n0), dst_row = ggml_row_size(t->type, n0);
             std::vector<uint8_t> dst((size_t) nr * dst_row);
+            if (rq_in) {
+                if (std::fread(dst.data(), 1, dst.size(), rq_in) == dst.size()) {
+                    ggml_backend_tensor_set(t, dst.data(), 0, dst.size());
+                    return dst.size();
+                }
+                std::fprintf(stderr, "dense requant cache: short read in %s - converting\n", rq_path.c_str());
+                std::fclose(rq_in);
+                rq_in = nullptr;
+                // (a later tensor of this load is converted too: nothing below reads rq_in again)
+            }
             const int nth = (int) std::max(1u, std::thread::hardware_concurrency());
             std::vector<std::thread> th;
             for (int k = 0; k < nth; ++k)
@@ -455,6 +501,11 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                     }
                 });
             for (auto & x : th) x.join();
+            if (rq_out && std::fwrite(dst.data(), 1, dst.size(), rq_out) != dst.size()) {
+                std::fclose(rq_out);
+                rq_out = nullptr;
+                std::remove(rq_tmp.c_str());
+            }
             ggml_backend_tensor_set(t, dst.data(), 0, dst.size());
             return dst.size();
         };
@@ -475,8 +526,13 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                 ++rq_n;
                 rq_from += (size_t) ggml_nrows(t) * ggml_row_size((ggml_type) ti.type, t->ne[0]);
             }
-        if (rq_n) std::fprintf(stderr, "dense requant: %zu Q8_0 matrices -> %s, %.2f -> %.2f GB\n", rq_n, ggml_type_name(rq),
-                               rq_from / 1e9, rq_to / 1e9);
+        if (rq_n) std::fprintf(stderr, "dense requant: %zu Q8_0 matrices -> %s, %.2f -> %.2f GB%s\n", rq_n, ggml_type_name(rq),
+                               rq_from / 1e9, rq_to / 1e9, rq_in ? " (from the cache)" : rq_out ? " (cache written)" : "");
+        if (rq_in) std::fclose(rq_in);
+        if (rq_out) {
+            const bool ok = std::fclose(rq_out) == 0 && std::rename(rq_tmp.c_str(), rq_path.c_str()) == 0;
+            if (!ok) std::remove(rq_tmp.c_str());
+        }
         if (pq_n) std::fprintf(stderr, "prediction routers: %zu F32 copies as %s\n", pq_n, ggml_type_name(pq));
     }
     size_t si = 0;
