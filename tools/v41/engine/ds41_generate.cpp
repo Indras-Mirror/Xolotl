@@ -164,7 +164,12 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "-n" || k == "--n-predict") a.n_predict = std::atoi(next().c_str());
         else if (k == "--backend") a.backend = next();
         else if (k == "--experts") a.experts = next();
+#ifdef _WIN32
+        // the Windows path-list separator: a drive letter's ':' must not split "D:\a;E:\b"
+        else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ';')) a.engram.push_back(d); }
+#else
         else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ':')) a.engram.push_back(d); }
+#endif
         else if (k == "--slots") { const std::string v = next(); a.slots = v == "auto" ? 0 : std::atoll(v.c_str()); }
         else if (k == "--vram-margin") a.vram_margin_gib = std::atof(next().c_str());
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
@@ -310,8 +315,8 @@ int main(int argc, char ** argv) {
     if (!a.build_mirror.empty()) {   // the second-drive blob mirror (STRATA_BLOB_MIRROR): coldest experts first
         std::string err;
         if (a.mirror_gib < 0) {   // --check-mirror F: open it with every blob compared against the model file
-            setenv("STRATA_BLOB_MIRROR", a.build_mirror.c_str(), 1);
-            setenv("STRATA_BLOB_MIRROR_CHECK", "0", 1);
+            ds41_sys::setenv("STRATA_BLOB_MIRROR", a.build_mirror.c_str(), 1);
+            ds41_sys::setenv("STRATA_BLOB_MIRROR_CHECK", "0", 1);
             Ds41FileBlobs chk(a.model);
             if (!chk.open(err)) { std::fprintf(stderr, "ds41_generate: experts: %s\n", err.c_str()); return 1; }
             return chk.mirrored() > 0 ? 0 : 1;

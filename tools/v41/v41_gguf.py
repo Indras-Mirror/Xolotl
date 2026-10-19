@@ -54,7 +54,7 @@ import v41_gguf_meta as MD  # noqa: E402
 
 # V41_SRC="dir1:dir2:..." = another checkpoint (see v41_calib.py); V41_SRC_NAME / V41_SRC_URL = its GGUF metadata name
 # and HF page.  Unset = the dealignai FP8.
-_SRC = [d for d in os.environ.get("V41_SRC", "").split(":") if d]
+_SRC = [d for d in os.environ.get("V41_SRC", "").split(os.pathsep) if d]
 MAIN = _SRC[0] if _SRC else "/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"
 DIRS = _SRC or [MAIN, "/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",
                 "/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"]          # ~ v41_calib.DIRS
@@ -74,6 +74,18 @@ def log(*a):
 
 
 # ================================================================== source shards
+if hasattr(os, "pread"):
+    _pread = os.pread
+else:   # Windows has no os.pread: seek + read under a lock (callers may read from threads)
+    import threading
+    _pread_lock = threading.Lock()
+
+    def _pread(fd, n, off):
+        with _pread_lock:
+            os.lseek(fd, off, os.SEEK_SET)
+            return os.read(fd, n)
+
+
 class Source:
     """The HF checkpoint: header lookups and pread()s by tensor name, FP8 / FP4 dequantization."""
 
@@ -93,7 +105,7 @@ class Source:
                 h = json.loads(f.read(n))
             h.pop("__metadata__", None)
             self.hdr[shard] = (h, 8 + n)
-            self.fds[shard] = os.open(path, os.O_RDONLY)
+            self.fds[shard] = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
         return self.hdr[shard]
 
     def info(self, name):
@@ -110,7 +122,7 @@ class Source:
         fd = self.fds[self.wm[name]]
         out, got = bytearray(n), 0
         while got < n:
-            b = os.pread(fd, min(n - got, 1 << 28), off + start + got)
+            b = _pread(fd, min(n - got, 1 << 28), off + start + got)
             if not b:
                 raise OSError(f"{name}: short read")
             out[got:got + len(b)] = b
@@ -119,8 +131,15 @@ class Source:
 
     def fp8_lut(self):
         if self._fp8 is None:
-            import torch
-            v = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).float().numpy()
+            try:
+                import torch
+                v = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).float().numpy()
+            except ImportError:   # the same 256 values without torch (checked equal to torch's, NaNs included)
+                b = np.arange(256, dtype=np.int32)
+                s, e, m = (b >> 7) & 1, (b >> 3) & 0xF, b & 7
+                v = np.where(e == 0, (m / 8.0) * 2.0 ** -6, (1.0 + m / 8.0) * np.exp2(e.astype(np.float64) - 7.0))
+                v = np.where(s == 1, -v, v).astype(np.float32)
+                v[(e == 15) & (m == 7)] = np.nan
             self._fp8 = v
         return self._fp8
 
@@ -326,14 +345,14 @@ class ExpertDir:
             p = os.path.join(self.path, f"L{L:02d}.bin")
             if os.path.getsize(p) != o:
                 raise ValueError(f"{p}: {os.path.getsize(p)} bytes, the types say {o}")
-            self._idx[L] = (offs, os.open(p, os.O_RDONLY))
+            self._idx[L] = (offs, os.open(p, os.O_RDONLY | getattr(os, "O_BINARY", 0)))
         return self._idx[L]
 
     def get(self, L, e, role, src=None):
         offs, fd = self._layer(L)
         og, ou, od, g, dd = offs[e]
         o, n = {"gate": (og, g), "up": (ou, g), "down": (od, dd)}[role]
-        return os.pread(fd, n, o)
+        return _pread(fd, n, o)
 
 
 class ExpertRTN:

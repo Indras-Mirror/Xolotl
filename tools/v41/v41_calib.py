@@ -35,7 +35,7 @@ import v41_gptq as G  # noqa: E402
 
 # V41_SRC="dir1:dir2:..." = another checkpoint (e.g. the 1017): dir1 = MAIN (config, index, tokenizer), every dir is
 # searched for <shard>.ok.  Unset = the dealignai FP8 below.  Read by v41_calib, calib_layers.sh, v41_gguf, v41_sidecar.
-_SRC = [d for d in os.environ.get("V41_SRC", "").split(":") if d]
+_SRC = [d for d in os.environ.get("V41_SRC", "").split(os.pathsep) if d]
 MAIN = _SRC[0] if _SRC else "/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"
 DIRS = _SRC or [MAIN, "/media/mal/NVME1TB/Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",   # shard 48 (Engram L14) copied here 2026-10-11: NVMe, not Team CX2
                 "/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",

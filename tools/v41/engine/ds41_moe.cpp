@@ -30,9 +30,7 @@
 #include <thread>
 #include <utility>
 
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
+#include "ds41_sys.hpp"
 
 #include "strata/artifact/ds4_geometry.hpp"
 #include "ds41_geometry.hpp"
@@ -76,14 +74,8 @@ constexpr int kBatch = 512;    ///< a `ds4routes.bin` ubatch, in tokens (what ro
 }
 
 [[maybe_unused]] int64_t mem_available_gib() {
-    std::FILE* f = std::fopen("/proc/meminfo", "r");
-    if (!f) return -1;
-    char line[256];
-    long kb = -1;
-    while (std::fgets(line, sizeof line, f))
-        if (std::sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
-    std::fclose(f);
-    return kb < 0 ? -1 : (int64_t) (kb / (1024 * 1024));
+    const uint64_t b = ds41_sys::mem_available_bytes();   // Linux: /proc/meminfo MemAvailable; Windows: ullAvailPhys
+    return b == 0 ? -1 : (int64_t) (b >> 30);
 }
 
 /// One metadata integer.  The `deepseek4.*` geometry keys are one-element arrays in the converter's output, but a
@@ -754,7 +746,7 @@ void chunk_stage_run(Ds41MoeImpl& im, int s) {
         for (int k = 0; k < nth; ++k)
             rd.emplace_back([&, k] {
                 void* q = nullptr;
-                uint8_t* scratch = posix_memalign(&q, 4096, sc) == 0 ? (uint8_t*) q : nullptr;
+                uint8_t* scratch = ds41_sys::posix_memalign(&q, 4096, sc) == 0 ? (uint8_t*) q : nullptr;
                 for (int64_t i; (i = next.fetch_add(1)) < n;) {
                     if (c.cancel[s].load(std::memory_order_relaxed)) break;
                     uint8_t* dst = c.slab[s] + c.off[s][(size_t) i];
@@ -763,7 +755,7 @@ void chunk_stage_run(Ds41MoeImpl& im, int s) {
                     got.fetch_add((int64_t) c.len[s][(size_t) i], std::memory_order_relaxed);
                     c.done[s].fetch_add(1, std::memory_order_release);
                 }
-                std::free(scratch);
+                ds41_sys::aligned_free(scratch);
             });
         for (auto& t : rd) t.join();
         c.bytes[s] = got.load();
@@ -1088,7 +1080,7 @@ struct Ds41GgufBlobs::Impl {
     std::unique_ptr<GgufModel> model;
     std::vector<const uint8_t*> src[3];   // per role, per layer (null: no routed experts)
     std::vector<size_t> stride[3];        // per role, per layer: bytes of one expert's slice
-    // pread() path: per role, per layer, the shard's fd and the slice array's file offset.  A cold mmap memcpy
+    // ds41_sys::pread() path: per role, per layer, the shard's fd and the slice array's file offset.  A cold mmap memcpy
     // faults page by page (MiMo on ntfs3: ~1.1 GB/s even with 8 readers, FINDINGS s10); pread asks for each slice
     // in one request.  Same bytes.  STRATA_BLOB_MMAP=1 keeps the memcpy path.
     std::vector<int> fd[3];
@@ -1099,8 +1091,8 @@ struct Ds41GgufBlobs::Impl {
     std::vector<int> dfds;
     std::vector<int> dfd[3];
     ~Impl() {
-        for (int f : fds) if (f >= 0) ::close(f);
-        for (int f : dfds) if (f >= 0) ::close(f);
+        for (int f : fds) if (f >= 0) ds41_sys::close(f);
+        for (int f : dfds) if (f >= 0) ds41_sys::close(f);
     }
 };
 
@@ -1143,14 +1135,14 @@ bool Ds41GgufBlobs::open(std::string& err) {
                 if (!std::getenv("STRATA_BLOB_MMAP")) {
                     if (im_->fds.size() < im_->model->size()) im_->fds.assign(im_->model->size(), -1);
                     int& fdv = im_->fds[at];
-                    if (fdv < 0) fdv = ::open(im_->model->shard(at).path().c_str(), O_RDONLY | O_CLOEXEC);
+                    if (fdv < 0) fdv = ds41_sys::open(im_->model->shard(at).path().c_str(), O_RDONLY | O_CLOEXEC);
                     if (im_->fd[r].empty()) { im_->fd[r].assign((size_t) g_.n_layers, -1); im_->foff[r].assign((size_t) g_.n_layers, 0); }
                     im_->fd[r][(size_t) l] = fdv;
                     const char* dv = std::getenv("STRATA_BLOB_DIRECT");
                     if (!(dv && dv[0] == '0')) {
                         if (im_->dfds.size() < im_->model->size()) im_->dfds.assign(im_->model->size(), -2);
                         int& dfv = im_->dfds[at];
-                        if (dfv == -2) dfv = ::open(im_->model->shard(at).path().c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+                        if (dfv == -2) dfv = ds41_sys::open(im_->model->shard(at).path().c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
                         if (im_->dfd[r].empty()) im_->dfd[r].assign((size_t) g_.n_layers, -1);
                         im_->dfd[r][(size_t) l] = dfv;
                     }
@@ -1181,19 +1173,19 @@ void Ds41GgufBlobs::read_span(int r, int64_t layer, int64_t expert, size_t lo, s
     if (dfv >= 0) {   // O_DIRECT: the aligned span around the range, then the range out of it
         constexpr uint64_t A = 4096;
         const uint64_t a0 = off & ~(A - 1), a1 = (off + n + A - 1) & ~(A - 1);
-        struct Bounce { uint8_t* p = nullptr; size_t n = 0; ~Bounce() { std::free(p); } };
+        struct Bounce { uint8_t* p = nullptr; size_t n = 0; ~Bounce() { ds41_sys::aligned_free(p); } };
         thread_local Bounce bb;
         if (bb.n < a1 - a0) {
-            std::free(bb.p);
+            ds41_sys::aligned_free(bb.p);
             bb.p = nullptr;
             bb.n = 0;
             void* q = nullptr;
-            if (posix_memalign(&q, A, (size_t) (a1 - a0)) == 0) { bb.p = (uint8_t*) q; bb.n = (size_t) (a1 - a0); }
+            if (ds41_sys::posix_memalign(&q, A, (size_t) (a1 - a0)) == 0) { bb.p = (uint8_t*) q; bb.n = (size_t) (a1 - a0); }
         }
         if (bb.p) {
             size_t got = 0;
             while (got < a1 - a0) {
-                const ssize_t k = ::pread(dfv, bb.p + got, (size_t) (a1 - a0 - got), (off_t) (a0 + got));
+                const ssize_t k = ds41_sys::pread(dfv, bb.p + got, (size_t) (a1 - a0 - got), (int64_t) (a0 + got));
                 if (k <= 0) break;
                 got += (size_t) k;
             }
@@ -1206,7 +1198,7 @@ void Ds41GgufBlobs::read_span(int r, int64_t layer, int64_t expert, size_t lo, s
     if (fdv >= 0) {   // pread the range; fall back to the mmap on any short read / error
         size_t got = 0;
         while (got < n) {
-            const ssize_t k = ::pread(fdv, dst + got, n - got, (off_t) (off + got));
+            const ssize_t k = ds41_sys::pread(fdv, dst + got, n - got, (int64_t) (off + got));
             if (k <= 0) break;
             got += (size_t) k;
         }
@@ -1541,7 +1533,7 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
         std::fprintf(stderr, "arena: %s\n", gp.arena.backing.c_str());
     } else {
         void* p = nullptr;
-        if (posix_memalign(&p, 4096, gp.arena.bytes) != 0 || !p) {
+        if (ds41_sys::posix_memalign(&p, 4096, gp.arena.bytes) != 0 || !p) {
             err = "anonymous arena allocation failed";
             gp.arena.close();
             return false;
@@ -5367,10 +5359,10 @@ void Ds41MoeStats::add(const Ds41MoeStats& o) {
 
 Ds41FileBlobs::Ds41FileBlobs(std::string gguf) : path_(std::move(gguf)) {}
 Ds41FileBlobs::~Ds41FileBlobs() {
-    if (fd_ >= 0) ::close(fd_);
-    if (dfd_ >= 0) ::close(dfd_);
-    if (mfd_ >= 0) ::close(mfd_);
-    for (uint8_t* p : ball_) std::free(p);
+    if (fd_ >= 0) ds41_sys::close(fd_);
+    if (dfd_ >= 0) ds41_sys::close(dfd_);
+    if (mfd_ >= 0) ds41_sys::close(mfd_);
+    for (uint8_t* p : ball_) ds41_sys::aligned_free(p);
 }
 
 uint8_t* Ds41FileBlobs::take_bounce() const {
@@ -5380,7 +5372,7 @@ uint8_t* Ds41FileBlobs::take_bounce() const {
         bfree_.pop_back();
         return p;
     }
-    uint8_t* p = (uint8_t*) std::aligned_alloc(4096, (scratch_ + 4095) & ~(size_t) 4095);
+    uint8_t* p = (uint8_t*) ds41_sys::aligned_alloc(4096, (scratch_ + 4095) & ~(size_t) 4095);
     if (p) ball_.push_back(p);
     return p;
 }
@@ -5452,13 +5444,13 @@ bool Ds41FileBlobs::open(std::string& err) {
     }
     for (size_t c = 0; c < g_.cls_gu.size(); ++c)
         max_ = std::max<size_t>(max_, (size_t) (2 * (uint64_t) gu_rb_[c] * (uint64_t) FF + (uint64_t) d_rb_[c] * (uint64_t) D));
-    fd_ = ::open(path_.c_str(), O_RDONLY);
+    fd_ = ds41_sys::open(path_.c_str(), O_RDONLY);
     if (fd_ < 0) { err = "cannot open " + path_; return false; }
-    ::posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
+    ds41_sys::posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
     // The chunk-prefetch reader pool's O_DIRECT twin (measured 2.25 -> 4.65 GB/s on the scattered expert pattern).
     // STRATA_BLOB_DIRECT=0 keeps the buffered path; a filesystem that refuses O_DIRECT just leaves dfd_ = -1.
     const char* dv = std::getenv("STRATA_BLOB_DIRECT");
-    if (!(dv && dv[0] == '0')) dfd_ = ::open(path_.c_str(), O_RDONLY | O_DIRECT);
+    if (!(dv && dv[0] == '0')) dfd_ = ds41_sys::open(path_.c_str(), O_RDONLY | O_DIRECT);
     // decode misses (read_part) through it too: random 6.75 MB blobs 1.43 vs 1.99 ms cold (rdbench, SSD NVME), and no
     // page-cache churn inside the 84 GiB cgroup that also holds the pinned arena
     const char* pd = std::getenv("STRATA_DECODE_DIRECT");
@@ -5485,14 +5477,14 @@ struct MirrorEnt { int32_t l, e; uint64_t off; };
 }
 
 bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
-    const int fd = ::open(path, O_RDONLY | O_DIRECT);
+    const int fd = ds41_sys::open(path, O_RDONLY | O_DIRECT);
     if (fd < 0) { err = std::string("cannot open ") + path + " O_DIRECT"; return false; }
-    auto fail = [&](const std::string& m) { ::close(fd); err = m; return false; };
-    struct stat st{}, ss{};
-    if (::fstat(fd, &st) != 0 || ::fstat(fd_, &ss) != 0) return fail("fstat");
-    uint8_t* h = (uint8_t*) std::aligned_alloc(4096, 4096);
-    std::unique_ptr<uint8_t, void (*)(void*)> hg(h, std::free);
-    if (::pread(fd, h, 4096, 0) != 4096) return fail("short header");
+    auto fail = [&](const std::string& m) { ds41_sys::close(fd); err = m; return false; };
+    ds41_sys::Stat st{}, ss{};
+    if (ds41_sys::fstat(fd, &st) != 0 || ds41_sys::fstat(fd_, &ss) != 0) return fail("fstat");
+    uint8_t* h = (uint8_t*) ds41_sys::aligned_alloc(4096, 4096);
+    std::unique_ptr<uint8_t, void (*)(void*)> hg(h, ds41_sys::aligned_free);
+    if (ds41_sys::pread(fd, h, 4096, 0) != 4096) return fail("short header");
     MirrorHead H;
     std::memcpy(&H, h, sizeof H);
     if (std::memcmp(H.magic, "S41MIRR1", 8) != 0) return fail("bad magic");
@@ -5500,10 +5492,10 @@ bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
     const uint64_t NE = (uint64_t) (g_.n_layers * g_.n_experts);
     if (H.n == 0 || H.n > NE || H.data < sizeof H + H.n * sizeof(MirrorEnt) || (H.data & 4095)) return fail("bad header");
     const size_t tb = (size_t) H.data;
-    uint8_t* t = (uint8_t*) std::aligned_alloc(4096, tb);
-    std::unique_ptr<uint8_t, void (*)(void*)> tg(t, std::free);
+    uint8_t* t = (uint8_t*) ds41_sys::aligned_alloc(4096, tb);
+    std::unique_ptr<uint8_t, void (*)(void*)> tg(t, ds41_sys::aligned_free);
     for (size_t got = 0; got < tb;) {
-        const ssize_t k = ::pread(fd, t + got, tb - got, (off_t) got);
+        const ssize_t k = ds41_sys::pread(fd, t + got, tb - got, (int64_t) got);
         if (k <= 0) return fail("short index");
         got += (size_t) k;
     }
@@ -5529,11 +5521,11 @@ bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
         const size_t n = expert_bytes(x.l, x.e);
         read(x.l, x.e, a.data());
         const size_t span = (n + 4095) & ~(size_t) 4095;
-        uint8_t* m = (uint8_t*) std::aligned_alloc(4096, span);
-        std::unique_ptr<uint8_t, void (*)(void*)> mg(m, std::free);
+        uint8_t* m = (uint8_t*) ds41_sys::aligned_alloc(4096, span);
+        std::unique_ptr<uint8_t, void (*)(void*)> mg(m, ds41_sys::aligned_free);
         size_t got = 0;
         while (got < span) {
-            const ssize_t r = ::pread(fd, m + got, span - got, (off_t) (x.off + got));
+            const ssize_t r = ds41_sys::pread(fd, m + got, span - got, (int64_t) (x.off + got));
             if (r <= 0) break;
             got += (size_t) r;
         }
@@ -5553,8 +5545,8 @@ bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
 bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::pair<int32_t, int32_t>>& order,
                                  uint64_t budget, std::string& err) const {
     if (fd_ < 0) { err = "source not open"; return false; }
-    struct stat ss{};
-    ::fstat(fd_, &ss);
+    ds41_sys::Stat ss{};
+    ds41_sys::fstat(fd_, &ss);
     std::vector<MirrorEnt> ent;
     std::vector<uint8_t> seen((size_t) (g_.n_layers * g_.n_experts), 0);
     uint64_t bytes = 0;
@@ -5574,11 +5566,11 @@ bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::
         x.off = at;
         at += (expert_bytes(x.l, x.e) + 4095) & ~(uint64_t) 4095;
     }
-    const int fd = ::open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+    const int fd = ds41_sys::open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
     if (fd < 0) { err = "cannot create " + out + " (O_DIRECT)"; return false; }
     auto wr = [&](const uint8_t* p, uint64_t n, uint64_t off) {
         while (n) {
-            const ssize_t k = ::pwrite(fd, p, (size_t) std::min<uint64_t>(n, 1u << 30), (off_t) off);
+            const ssize_t k = ds41_sys::pwrite(fd, p, (size_t) std::min<uint64_t>(n, 1u << 30), (int64_t) off);
             if (k <= 0) return false;
             p += k;
             off += (uint64_t) k;
@@ -5587,7 +5579,7 @@ bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::
         return true;
     };
     {   // header + index
-        uint8_t* h = (uint8_t*) std::aligned_alloc(4096, (size_t) data);
+        uint8_t* h = (uint8_t*) ds41_sys::aligned_alloc(4096, (size_t) data);
         std::memset(h, 0, (size_t) data);
         MirrorHead H;
         std::memcpy(H.magic, "S41MIRR1", 8);
@@ -5597,13 +5589,13 @@ bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::
         std::memcpy(h, &H, sizeof H);
         std::memcpy(h + sizeof H, ent.data(), ent.size() * sizeof(MirrorEnt));
         const bool ok = wr(h, data, 0);
-        std::free(h);
-        if (!ok) { ::close(fd); err = "header write failed"; return false; }
+        ds41_sys::aligned_free(h);
+        if (!ok) { ds41_sys::close(fd); err = "header write failed"; return false; }
     }
     // batches of kB blobs: 16 threads read the next batch (read_part, O_DIRECT) while this thread writes the last
     constexpr size_t kB = 48;
     const size_t stride = (max_ + 4095) & ~(size_t) 4095;
-    uint8_t* buf[2] = {(uint8_t*) std::aligned_alloc(4096, kB * stride), (uint8_t*) std::aligned_alloc(4096, kB * stride)};
+    uint8_t* buf[2] = {(uint8_t*) ds41_sys::aligned_alloc(4096, kB * stride), (uint8_t*) ds41_sys::aligned_alloc(4096, kB * stride)};
     auto fill = [&](size_t b0, uint8_t* dst) {
         const size_t n = std::min(kB, ent.size() - b0);
         constexpr int P = 8;
@@ -5637,10 +5629,10 @@ bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::
                          (double) (ent[b0 + n - 1].off + expert_bytes(ent[b0 + n - 1].l, ent[b0 + n - 1].e) - data) /
                              ((now_ms() - t0) * 1e6));
     }
-    std::free(buf[0]);
-    std::free(buf[1]);
-    if (ok) ok = ::fsync(fd) == 0;
-    ::close(fd);
+    ds41_sys::aligned_free(buf[0]);
+    ds41_sys::aligned_free(buf[1]);
+    if (ok) ok = ds41_sys::fsync(fd) == 0;
+    ds41_sys::close(fd);
     if (!ok) { err = "write failed (disk full?)"; return false; }
     std::fprintf(stderr, "\nbuild-mirror: %s - %zu experts, %.2f GiB in %.1f s\n", out.c_str(), ent.size(),
                  (double) (at - data) / 1073741824.0, (now_ms() - t0) / 1000.0);
@@ -5656,7 +5648,7 @@ bool Ds41FileBlobs::read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* s
     if (span > scratch_bytes) return false;
     size_t got = 0;
     while (got < span) {
-        const ssize_t k = ::pread(fd, scratch + got, span - got, (off_t) (a0 + got));
+        const ssize_t k = ds41_sys::pread(fd, scratch + got, span - got, (int64_t) (a0 + got));
         if (k <= 0) return false;
         got += (size_t) k;
     }
@@ -5686,7 +5678,7 @@ void Ds41FileBlobs::advise(int64_t layer, int64_t expert) const {
     Span s[3];
     spans(layer, expert, s);
     for (const Span& x : s)
-        if (x.bytes) ::posix_fadvise(fd_, (off_t) x.off, (off_t) x.bytes, POSIX_FADV_WILLNEED);
+        if (x.bytes) ds41_sys::posix_fadvise(fd_, (int64_t) x.off, (int64_t) x.bytes, POSIX_FADV_WILLNEED);
 }
 
 size_t Ds41FileBlobs::expert_bytes(int64_t l, int64_t e) const {
@@ -5712,7 +5704,7 @@ void Ds41FileBlobs::spans(int64_t l, int64_t e, Span s[3]) const {
 // bytes [lo, hi) of the blob [gate | up | down] into dst + lo
 static void pread_all(int fd, uint8_t* dst, uint64_t off, uint64_t n) {
     while (n) {
-        const ssize_t r = ::pread(fd, dst, (size_t) std::min<uint64_t>(n, 1u << 30), (off_t) off);
+        const ssize_t r = ds41_sys::pread(fd, dst, (size_t) std::min<uint64_t>(n, 1u << 30), (int64_t) off);
         if (r <= 0) {
             std::fprintf(stderr, "Ds41FileBlobs: pread failed at %llu\n", (unsigned long long) off);
             std::abort();

@@ -13,7 +13,7 @@ serialize (~13K reads/s measured on NVME1TB) - ~5-10 ms per token; on the ntfs3 
 Checks free space first, streams with 64 MiB buffers, verifies every tensor's size and (with --verify N) N random
 rows against the source.  Safe to re-run: writes DST_DIR/engram.safetensors.partial and renames when complete.
 """
-import json, os, random, struct, sys, time
+import json, os, random, shutil, struct, sys, time
 
 def st_header(path):
     with open(path, 'rb') as f:
@@ -75,7 +75,7 @@ def main():
 def write_one(dst, fname, plan, verify):
     total = sum(p[3] for p in plan)
     os.makedirs(dst, exist_ok=True)
-    free = os.statvfs(dst).f_bavail * os.statvfs(dst).f_frsize
+    free = shutil.disk_usage(dst).free   # portable (os.statvfs is POSIX-only)
     print(f'{len(plan)} tensors, {total/1e9:.1f} GB -> {dst} (free {free/1e9:.1f} GB)')
     for p in plan: print(f'  {p[0]:40s} {p[4]:8s} {p[3]/1e9:7.2f} GB  from {os.path.basename(p[1])}')
     if free < total + (1 << 30): sys.exit(f'not enough free space: need {total/1e9:.1f} GB + 1 GB headroom')

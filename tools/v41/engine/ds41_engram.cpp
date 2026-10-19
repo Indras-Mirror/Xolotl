@@ -4,18 +4,19 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <random>
+#ifndef _WIN32
 #include <linux/fiemap.h>
 #include <linux/fs.h>
-#include <random>
 #include <sys/ioctl.h>
 #include <sys/sysmacros.h>
+#endif
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
+#include "ds41_sys.hpp"
+#include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace strata::v41 {
 
@@ -29,7 +30,7 @@ std::string slurp(const std::string & p) {
     return ss.str();
 }
 
-bool exists(const std::string & p) { struct stat st; return ::stat(p.c_str(), &st) == 0; }
+bool exists(const std::string & p) { std::error_code ec; return std::filesystem::exists(p, ec); }
 
 // "key": "value" in a JSON text (the HF index's weight_map; names are unique)
 std::string json_str(const std::string & js, const std::string & key) {
@@ -43,16 +44,16 @@ std::string json_str(const std::string & js, const std::string & key) {
 
 // a safetensors tensor's absolute byte offset (8 + header length + data_offsets[0]) and its byte size
 bool st_tensor(const std::string & path, const std::string & name, uint64_t & off, uint64_t & bytes, std::string & dtype) {
-    const int fd = ::open(path.c_str(), O_RDONLY);
+    const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
     if (fd < 0) return false;
     uint64_t hl = 0;
-    bool ok = ::pread(fd, &hl, 8, 0) == 8 && hl < (1ull << 30);
+    bool ok = ds41_sys::pread(fd, &hl, 8, 0) == 8 && hl < (1ull << 30);
     std::string h;
     if (ok) {
         h.resize(hl);
-        ok = ::pread(fd, h.data(), hl, 8) == (ssize_t) hl;
+        ok = ds41_sys::pread(fd, h.data(), hl, 8) == (ssize_t) hl;
     }
-    ::close(fd);
+    ds41_sys::close(fd);
     if (!ok) return false;
     const size_t p = h.find("\"" + name + "\"");
     if (p == std::string::npos) return false;
@@ -92,7 +93,7 @@ float fp8_e4m3(uint8_t b) {
 struct Ds41Engram::RawMap {
     int dev = -1;
     std::vector<uint64_t> log, phys, len;
-    ~RawMap() { if (dev >= 0) ::close(dev); }
+    ~RawMap() { if (dev >= 0) ds41_sys::close(dev); }
     ssize_t read(void * buf, size_t n, uint64_t off) const {
         size_t done = 0;
         while (done < n) {
@@ -102,7 +103,7 @@ struct Ds41Engram::RawMap {
             const size_t i = (size_t) (it - log.begin()) - 1;
             if (o >= log[i] + len[i]) return -1;
             const size_t k = (size_t) std::min<uint64_t>(n - done, log[i] + len[i] - o);
-            const ssize_t r = ::pread(dev, (uint8_t *) buf + done, k, (off_t) (phys[i] + (o - log[i])));
+            const ssize_t r = ds41_sys::pread(dev, (uint8_t *) buf + done, k, (int64_t) (phys[i] + (o - log[i])));
             if (r <= 0) return -1;
             done += (size_t) r;
         }
@@ -111,6 +112,13 @@ struct Ds41Engram::RawMap {
 };
 
 static std::shared_ptr<Ds41Engram::RawMap> raw_map(const std::string & path, int fd) {
+#ifdef _WIN32
+    // FIEMAP + reading the partition's block device is Linux-only; Windows reads the table through NTFS, whose
+    // random reads into a fragmented file are not the ntfs3 problem this works around.
+    (void) path;
+    (void) fd;
+    return nullptr;
+#else
     const char * env = std::getenv("STRATA_ENGRAM_RAWDEV");
     if (env && env[0] == '0') return nullptr;
     auto m = std::make_shared<Ds41Engram::RawMap>();
@@ -139,15 +147,15 @@ static std::shared_ptr<Ds41Engram::RawMap> raw_map(const std::string & path, int
     }
     const bool force = env && env[0] == '1';
     if (m->log.empty() || (!force && m->log.size() < 1024)) return nullptr;
-    struct stat st;
-    if (::fstat(fd, &st) != 0) return nullptr;
+    ds41_sys::Stat st;
+    if (ds41_sys::fstat(fd, &st) != 0) return nullptr;
     char sys[96];
     std::snprintf(sys, sizeof sys, "/sys/dev/block/%u:%u/uevent", major(st.st_dev), minor(st.st_dev));
     std::ifstream ue(sys);
     std::string line, devname;
     while (std::getline(ue, line)) if (line.rfind("DEVNAME=", 0) == 0) devname = line.substr(8);
     if (devname.empty()) return nullptr;
-    m->dev = ::open(("/dev/" + devname).c_str(), O_RDONLY | O_CLOEXEC);
+    m->dev = ds41_sys::open(("/dev/" + devname).c_str(), O_RDONLY | O_CLOEXEC);
     if (m->dev < 0) { std::fprintf(stderr, "engram: %s: %zu extents, /dev/%s not readable - filesystem reads\n",
                                    path.c_str(), m->log.size(), devname.c_str()); return nullptr; }
     std::mt19937_64 rng(7);
@@ -155,7 +163,7 @@ static std::shared_ptr<Ds41Engram::RawMap> raw_map(const std::string & path, int
     const uint64_t size = (uint64_t) st.st_size;
     for (int k = 0; k < 256; ++k) {
         const uint64_t o = (rng() % (size > 4096 ? size - 4096 : 1)) & ~(uint64_t) 255;
-        if (::pread(fd, a, sizeof a, (off_t) o) != (ssize_t) sizeof a || m->read(b, sizeof b, o) != (ssize_t) sizeof b ||
+        if (ds41_sys::pread(fd, a, sizeof a, (int64_t) o) != (ssize_t) sizeof a || m->read(b, sizeof b, o) != (ssize_t) sizeof b ||
             std::memcmp(a, b, sizeof a) != 0) {
             std::fprintf(stderr, "engram: %s: raw device check FAILED at %llu - filesystem reads\n", path.c_str(),
                          (unsigned long long) o);
@@ -165,10 +173,11 @@ static std::shared_ptr<Ds41Engram::RawMap> raw_map(const std::string & path, int
     std::fprintf(stderr, "engram: %s: %zu extents -> raw reads via /dev/%s (256 spans verified)\n", path.c_str(),
                  m->log.size(), devname.c_str());
     return m;
+#endif
 }
 
 static inline ssize_t tread(int fd, const std::shared_ptr<Ds41Engram::RawMap> & m, void * buf, size_t n, uint64_t off) {
-    return m ? m->read(buf, n, off) : ::pread(fd, buf, n, (off_t) off);
+    return m ? m->read(buf, n, off) : ds41_sys::pread(fd, buf, n, (int64_t) off);
 }
 
 Ds41Engram::~Ds41Engram() {
@@ -179,8 +188,8 @@ Ds41Engram::~Ds41Engram() {
     cv_.notify_all();
     for (auto & t : workers_) t.join();
     for (auto & t : tables_) {
-        if (t.fd_w >= 0) ::close(t.fd_w);
-        if (t.fd_s >= 0) ::close(t.fd_s);
+        if (t.fd_w >= 0) ds41_sys::close(t.fd_w);
+        if (t.fd_s >= 0) ds41_sys::close(t.fd_s);
     }
 }
 
@@ -222,9 +231,9 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
                 err = "engram: " + name + " has an unexpected dtype/size";
                 return false;
             }
-            const int fd = ::open(path.c_str(), O_RDONLY);
+            const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
             if (fd < 0) { err = "engram: cannot open " + path; return false; }
-            ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+            ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
             (k ? t.fd_s : t.fd_w) = fd;
             (k ? t.off_s : t.off_w) = off;
             (k ? t.rm_s : t.rm_w) = raw_map(path, fd);
@@ -304,8 +313,8 @@ bool Ds41Engram::rows_reference(int64_t pos0, int n, std::vector<std::vector<flo
             const Table & T = tables_[(size_t) e];
             const int64_t r = ids[(size_t) j];
             if (r < 0 || r >= T.rows ||
-                ::pread(T.fd_w, w, (size_t) dim_, (off_t) (T.off_w + (uint64_t) r * (uint64_t) dim_)) != (ssize_t) dim_ ||
-                ::pread(T.fd_s, s, (size_t) (dim_ / 32), (off_t) (T.off_s + (uint64_t) r * (uint64_t) (dim_ / 32))) != (ssize_t) (dim_ / 32)) {
+                ds41_sys::pread(T.fd_w, w, (size_t) dim_, (int64_t) (T.off_w + (uint64_t) r * (uint64_t) dim_)) != (ssize_t) dim_ ||
+                ds41_sys::pread(T.fd_s, s, (size_t) (dim_ / 32), (int64_t) (T.off_s + (uint64_t) r * (uint64_t) (dim_ / 32))) != (ssize_t) (dim_ / 32)) {
                 bad.fetch_add(1);
                 continue;
             }
@@ -350,15 +359,15 @@ void Ds41Engram::drop_cache() {
     // makes the next reads pathologically slow (measured 40K reads/s vs 158K/s after windowed eviction), so windows it is.
     for (const Table & t : tables_) {
         const int fd = t.fd_w >= 0 ? t.fd_w : t.fd_s;
-        struct stat st;
-        if (fd < 0 || ::fstat(fd, &st) != 0) continue;
+        ds41_sys::Stat st;
+        if (fd < 0 || ds41_sys::fstat(fd, &st) != 0) continue;
         const uint64_t win = 4ull << 30;
         for (uint64_t o = 0; o < (uint64_t) st.st_size; o += win)
-            ::posix_fadvise(fd, (off_t) o, (off_t) win, POSIX_FADV_DONTNEED);
-        struct stat s2;
-        if (t.fd_s >= 0 && ::fstat(t.fd_s, &s2) == 0 && s2.st_ino != st.st_ino)   // scale in another shard
+            ds41_sys::posix_fadvise(fd, (int64_t) o, (int64_t) win, POSIX_FADV_DONTNEED);
+        ds41_sys::Stat s2;
+        if (t.fd_s >= 0 && ds41_sys::fstat(t.fd_s, &s2) == 0 && s2.st_ino != st.st_ino)   // scale in another shard
             for (uint64_t o = 0; o < (uint64_t) s2.st_size; o += win)
-                ::posix_fadvise(t.fd_s, (off_t) o, (off_t) win, POSIX_FADV_DONTNEED);
+                ds41_sys::posix_fadvise(t.fd_s, (int64_t) o, (int64_t) win, POSIX_FADV_DONTNEED);
     }
 }
 

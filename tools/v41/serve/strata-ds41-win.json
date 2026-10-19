@@ -1,0 +1,60 @@
+{
+ "_comment": "Windows: strata-ds41.json with the engine run directly (ds41-engine.sh's settings moved into env; no flock/systemd-run). Paths: D:\\models\\dsv41-gsq (the HF repo's files as downloaded, joined V41-GSQ.gguf; vocab/merges/token_type are the tokenizer dir) and D:\\models\\dsv41-engram-src (the HF checkpoint's two Engram shards + index, read in place on NTFS). --engram takes ';' between folders on Windows. Tuned on an RTX 3090 + Ryzen 7 5800X + 128 GB DDR4 (3 greedy reps x prose/code/agent, quiet disk): --arena-gib 72 (+15%; 80 no better) and STRATA_TIER_BATCH_PCIE 0.75 (+2%, code +6%); DSpark kept at depth 4 / conf 0.6 (off = prose +12%, code -14%). Edit the paths for your machine (docs/WINDOWS.md).",
+ "exe": "D:\\src\\Xolotl\\build-win\\ds41_generate.exe",
+ "args": [
+  "-m",
+  "D:\\models\\dsv41-gsq\\V41-GSQ.gguf",
+  "--backend",
+  "cuda",
+  "--experts",
+  "gpu",
+  "--engram",
+  "D:\\models\\dsv41-engram-src",
+  "--rank",
+  "D:\\models\\dsv41-gsq\\rank.bin",
+  "--ctx",
+  "262144",
+  "--stop",
+  "1",
+  "--arena-adapt",
+  "--kv-fp4",
+  "--route-bias",
+  "0.5",
+  "--route-bias-file",
+  "0.3",
+  "--arena-gib",
+  "72",
+  "--prompt-batch",
+  "12288"
+ ],
+ "env": {
+  "GGML_NO_BACKTRACE": "1",
+  "STRATA_NO_LARGEPAGES": "1",
+  "STRATA_SERVE_STEP_MAX": "96",
+  "STRATA_SERVE_PASS_BIAS": "0",
+  "STRATA_SERVE_DSPARK": "D:\\models\\dsv41-gsq\\V41-MTP-Vision.Q2_K.gguf",
+  "STRATA_DSPARK_KEEP": "D:\\src\\Xolotl\\tools\\v41\\serve\\dspark_expert_counts.txt:64",
+  "STRATA_DSPARK_DEPTH": "4",
+  "STRATA_DSPARK_CONF": "0.6",
+  "STRATA_SERVE_LOOKUP": "14",
+  "STRATA_SERVE_DSPARK_EVICT": "4096",
+  "STRATA_DENSE_REQUANT": "q6_K",
+  "STRATA_PRESTAGE_GIB": "1.5",
+  "STRATA_TIER_BATCH_PCIE": "0.75"
+ },
+ "lib_dirs": [
+  "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8\\bin"
+ ],
+ "cwd": "D:\\src\\Xolotl",
+ "tokenizer": "D:\\models\\dsv41-gsq",
+ "model_name": "deepseek-v4.1-flash-xolotl",
+ "log": "D:\\models\\strata-ds41.log",
+ "port": 8150,
+ "host": "127.0.0.1",
+ "gpu": 0,
+ "sampling": {
+  "temperature": 1,
+  "top_p": 0.95
+ },
+ "reasoning_budget_tokens": 32768
+}
