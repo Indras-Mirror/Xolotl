@@ -23,7 +23,7 @@
   "port": 8150,
   "env": {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "1,0"},
   "allowed_hosts": "*",
-  "sampling": {"temperature": 1, "top_p": 0.95},
+  "sampling": {"temperature": 1, "top_p": 1.0},
   "api_monitor": true,
   "reasoning_budget_tokens": 32768
 }
