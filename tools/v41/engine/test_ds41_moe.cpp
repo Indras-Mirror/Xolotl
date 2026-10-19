@@ -11,6 +11,8 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -77,6 +79,7 @@ int main(int argc, char ** argv) {
     bool gpu = false, chunk_mmq = false;
     int remote = -1, nmulti = 0;   // --remote N [--remote-gib G]: a second card holds experts after the VRAM head;
     double remote_gib = 2.0;       // --multi N: N tokens at once through run_multi (the serve / verify path)
+    bool noref = false;            // --no-ref: the chunk pass is only timed (3 runs), not checked
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--layers" && i + 1 < argc) {
@@ -91,6 +94,7 @@ int main(int argc, char ** argv) {
         else if (a == "--remote" && i + 1 < argc) remote = std::atoi(argv[++i]);
         else if (a == "--remote-gib" && i + 1 < argc) remote_gib = std::atof(argv[++i]);
         else if (a == "--multi" && i + 1 < argc) nmulti = std::atoi(argv[++i]);
+        else if (a == "--no-ref") noref = true;
     }
     Ds41FileBlobs src(path);
     std::string err;
@@ -210,6 +214,17 @@ int main(int argc, char ** argv) {
                 IDS[(size_t) t * K + k] = e;
                 W[(size_t) t * K + k] = 0.1f + 0.4f * (float) (rng() % 1000) / 1000.0f;
             }
+        if (noref) {
+            for (int rep = 0; rep < 3; ++rep) {
+                const auto c0 = std::chrono::steady_clock::now();
+                if (!tier.run_chunk(l, nchunk, IDS.data(), W.data(), X.data(), OUT.data())) { std::fprintf(stderr, "run_chunk failed\n"); return 1; }
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+                int nrem = 0;
+                for (int32_t e : IDS) nrem += tier.in_remote(l, e);
+                std::printf("time L%d chunk %d tokens (%d remote entries): %.1f ms\n", l, nchunk, nrem, ms);
+            }
+            continue;
+        }
         if (!tier.run_chunk(l, nchunk, IDS.data(), W.data(), X.data(), OUT.data())) { std::fprintf(stderr, "run_chunk failed\n"); return 1; }
         int cf = 0, nan_rows = 0;
         double cw = 0;
