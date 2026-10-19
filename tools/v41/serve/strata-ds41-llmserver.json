@@ -4,7 +4,7 @@
     "-m", "/root/models/V41-GSQ/V41-GSQ.gguf",
     "--backend", "cuda",
     "--experts", "gpu",
-    "--engram", "/root/models/V41-Engram/a:/root/models/V41-Engram/b",
+    "--engram", "/root/models/FP8-engram",
     "--rank", "/root/models/V41-GSQ/rank.bin",
     "--ctx", "131072",
     "--stop", "1",
