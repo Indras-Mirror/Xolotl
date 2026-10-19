@@ -20,6 +20,7 @@
 <body>
 <header class="st-header">
   <span class="st-header__brand">Strata</span>
+  <span class="st-header__model" id="hdr-model" hidden></span>
   <nav class="st-tabs" role="tablist" aria-label="Views">
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>
@@ -100,6 +101,7 @@
       <div class="st-card state-card">
         <div class="state-card__head">
           <span class="card-title">Model state</span>
+          <span class="state-card__model" id="state-model" hidden></span>
           <span class="badges" id="state-badges">
             <span class="st-badge" data-s="idle">Idle</span>
             <span class="st-badge st-badge--reading" data-s="reading">Reading</span>

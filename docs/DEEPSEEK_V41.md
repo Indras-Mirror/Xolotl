@@ -69,6 +69,9 @@ DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221
   `route_pool=`) and each request logs `routing vs exact: X% of expert picks swapped, Y% of router weight kept`.
   Measured on an RTX 3090 (Windows, 1017 dsx 2-bit, medians of 6 requests on one server): exact 9.7 tok/s; 0.5 / 0.3
   21.7 tok/s, 37.1% swapped; 0.25 / 0.15 19.1 tok/s, 26.1%; protect 2 + pool 12 at 1.0 / 0.6 17.5 tok/s, 18.6%.
+- **The dashboard says what is running.** The top bar and the Monitor's Model state card show the config's optional
+  `"display_name"` (else the model id) and the current routing mode, e.g. `DeepSeek-V4.1-Flash-1017 · dsx 2-bit · light
+  routing (0.25 / 0.15)`; the mode follows each request (`-exact`, `-fast`, `strata_tune`).
 - ggml upstream fixes applied (#30103 flash-attn race, #29953 MMQ OOB reads); prefill logits unchanged bit for bit.
 
 ## DeepSeek-V4.1-Flash
