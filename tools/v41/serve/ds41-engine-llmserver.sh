@@ -30,5 +30,8 @@ GDB=()
 [ "${DS41_GDB:-0}" = 1 ] && GDB=(gdb -q -batch -nx -ex "set pagination off" -ex "set logging file /tmp/ds41-gdb.log"
     -ex "set logging redirect on" -ex "set logging enabled on" -ex "set print thread-events off" -ex run -ex bt
     -ex "thread apply all bt 12" --args)
+# DS41_NSYS=<report path>: the engine under nsys (CUDA API + kernels + copies, graphs as one range)
+[ -n "${DS41_NSYS:-}" ] && GDB=(/usr/local/bin/nsys profile -t cuda,nvtx --sample=none --cpuctxsw=none
+    --cuda-memory-usage=false --cuda-graph-trace=graph --kill=none -f true -o "$DS41_NSYS")
 exec systemd-run --scope -q --unit="ds41-serve-$$" -p MemoryMax="${DS41_MEMORY_MAX:-57G}" -p MemorySwapMax=0 \
     "${GDB[@]}" "$BUILD_DIR/ds41_generate" "$@"
