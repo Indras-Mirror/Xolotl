@@ -1547,6 +1547,16 @@ if(STRATA_NATIVE_EXPERTS)
     if(MSVC)
       target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
+    # An engine that also links ggml's CUDA backend (ds41_generate: the dense half) holds two copies of llama.cpp's
+    # MMQ host code, ggml-cuda's and ours, and both take a ggml_backend_cuda_context whose layout depends on
+    # GGML_CUDA_USE_GRAPHS (ggml-cuda gets it from its own directory's add_compile_definitions).  MSVC's linker takes
+    # a template instance (mul_mat_q_case<T>) from the FIRST library on the line that has it - ggml-cuda.lib - so our
+    # smaller context reached code compiled for the larger one: heap corruption on the first prompt batch
+    # (0xC0000374).  GNU ld searches forward only and keeps our own copy.  Same define, same layout, either copy.
+    if(GGML_CUDA_GRAPHS)
+      target_compile_definitions(strata_mmq PRIVATE GGML_CUDA_USE_GRAPHS)
+      target_compile_definitions(strata_mmq_w4a4 PRIVATE GGML_CUDA_USE_GRAPHS)
+    endif()
     # GGML's CUDA error reporting calls cuGetErrorString from the driver API.
     target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
     if(TARGET CUDA::cuda_driver)   # not in the HIP (gfx906) build, whose CUDA::cudart is a stand-in
