@@ -308,7 +308,16 @@ def _note_ds41(self, n, evs, st=None, rate=None):
     return _svc_note(self, n, evs, st, rate)
 
 
+EXACT_SUFFIX = "-exact"   # a model name ending in it (a config alias) = exact routing for that request: no decode biases
+
+
 def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # **kw: the server's newer keywords (0.1.44: force=)
+    model = sampling.get("model") if isinstance(sampling, dict) else None
+    if isinstance(model, str) and model.endswith(EXACT_SUFFIX):
+        tune = dict(sampling.get("strata_tune") or {}) if isinstance(sampling.get("strata_tune"), dict) else {}
+        tune.setdefault("route_bias", 0.0)
+        tune.setdefault("route_bias_file", 0.0)
+        sampling = {**sampling, "strata_tune": tune}
     t0 = _time.time()
     _text_state["kind"] = None
     _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request: prompt {len(ids):,} tokens, max {max_new}, "

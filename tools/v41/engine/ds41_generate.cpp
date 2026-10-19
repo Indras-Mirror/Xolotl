@@ -1100,6 +1100,11 @@ int main(int argc, char ** argv) {
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
+        // per-request decode biases (GEN keys route_bias= / route_bias_file=, from the server's "strata_tune"): a request
+        // that names neither gets the --route-bias / --route-bias-file the engine started with, so one server can answer
+        // exact-routing requests (both 0) beside the fast default without a restart.  apply_bias() writes zeros over a
+        // bias it set earlier, so an exact request never inherits the previous one's.
+        const float cfg_route_bias = a.route_bias, cfg_route_bias_file = a.route_bias_file;
         std::string line;
         while (next_line(line)) {
             if (line == "QUIT") break;
@@ -1109,6 +1114,7 @@ int main(int argc, char ** argv) {
             std::string w, csv;
             int max_new = 0, tk = 0;
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
+            float req_rb = cfg_route_bias, req_rbf = cfg_route_bias_file;
             ss >> w >> max_new;
             while (ss >> w) {
                 const size_t eq = w.find('=');
@@ -1119,6 +1125,14 @@ int main(int argc, char ** argv) {
                 else if (k == "top_k") tk = std::atoi(v.c_str());
                 else if (k == "min_p") min_p = (float) std::atof(v.c_str());
                 else if (k == "seed") rng.seed((uint64_t) std::atoll(v.c_str()));
+                else if (k == "route_bias") req_rb = std::max(0.0f, (float) std::atof(v.c_str()));
+                else if (k == "route_bias_file") req_rbf = std::max(0.0f, (float) std::atof(v.c_str()));
+            }
+            if (req_rb != a.route_bias || req_rbf != a.route_bias_file) {
+                a.route_bias = req_rb;
+                a.route_bias_file = req_rbf;
+                std::fprintf(stderr, "serve: decode route bias %.2f, file penalty %.2f%s\n", req_rb, req_rbf,
+                             (req_rb == 0.0f && req_rbf == 0.0f) ? " (exact routing)" : "");
             }
             std::vector<int> ids = csv.empty() ? std::vector<int>() : parse_csv(csv);
             if (ids.empty()) { std::printf("ERR empty prompt\n"); std::fflush(stdout); continue; }

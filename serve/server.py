@@ -1241,6 +1241,11 @@ class StrataEngine:
             ac = tune.get("aux_cpus")
             if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
                 keys += f" aux_cpus={int(ac)}"
+            # the DeepSeek-V4.1 engine's decode biases for this request (0 and 0 = exact routing); other engines ignore them
+            for k in ("route_bias", "route_bias_file"):
+                v = tune.get(k)
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 8.0:
+                    keys += f" {k}={float(v)!r}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
