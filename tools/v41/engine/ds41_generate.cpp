@@ -2450,6 +2450,11 @@ int main(int argc, char ** argv) {
             // ---- DSpark speculative sampling (as the one-shot loop: P = last fed position, t = the token for P+1,
             // sp_ids = drafts for P+2..; each verify row's distribution is sample_p's, spec_accept keeps it exact)
             long rq_pass = 0, rq_acc = 0;
+            // serve pass split (ms summed over this request's passes): verify = pass_v (its own split from pv_ms),
+            // sample = sample_dist/spec_accept/sample_p over the verify rows, draft = DSpark step; the rest of the
+            // decode wall (emit, lookup, rebalance_tick) is reported as "other"
+            double sq_ms[3] = {0, 0, 0};
+            const double pv0[4] = {pv_ms[0], pv_ms[1], pv_ms[2], pv_ms[3]};
             if (sp_t >= 0) {
                 int P = total - 1, t = sp_t, prev = ids.back();
                 bool dirty = false;
@@ -2529,13 +2534,16 @@ int main(int argc, char ** argv) {
                     vt.push_back(t);
                     for (int i = 0; i < k; ++i) vt.push_back(dr[i]);
                     const int r0 = refeed ? 1 : 0, p0 = refeed ? P : P + 1;
+                    const double tq0 = now_ms();
                     if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
+                    const double tq1 = now_ms();
                     int acc = 0, tn = -1;
                     for (; acc < k; ++acc) {
                         sample_dist(vlog.data() + (size_t) (r0 + acc) * nv, nv, temp, tk, top_p, min_p, dist);
                         if (!spec_accept(dist, dr[acc], rng, tn)) break;
                     }
                     if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, temp, tk, top_p, min_p, rng);
+                    const double tq2 = now_ms();
                     ++rq_pass; rq_acc += acc;
                     if (is_lk) {
                         ++lk_pass; lk_dr += k; lk_acc += acc;
@@ -2549,6 +2557,7 @@ int main(int argc, char ** argv) {
                     if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, sp_ids, sp_conf)) {
                         ferr = "DSpark step: " + dsp->last_error(); finish = "error"; break;
                     }
+                    sq_ms[0] += tq1 - tq0; sq_ms[1] += tq2 - tq1; sq_ms[2] += now_ms() - tq2;
                     hist.push_back(t);
                     bool more = true;
                     for (int i = 0; i < acc && more; ++i) { hist.push_back(drafts[i]); more = emit(drafts[i]); }
@@ -2621,6 +2630,13 @@ int main(int argc, char ** argv) {
             if (rq_pass > 0)
                 std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", rq_pass,
                              1.0 + (double) rq_acc / rq_pass, 1.0 + (double) sv_acc / std::max(1L, sv_pass));
+            if (rq_pass > 0) {
+                const double n = (double) rq_pass;
+                std::fprintf(stderr, "serve: pass split %.2f ms/pass = verify %.2f (dense %.2f, tier %.2f, taps %.2f, logits %.2f) "
+                             "+ sample %.2f + draft %.2f + other %.2f\n", dec_ms / n, sq_ms[0] / n, (pv_ms[0] - pv0[0]) / n,
+                             (pv_ms[1] - pv0[1]) / n, (pv_ms[2] - pv0[2]) / n, (pv_ms[3] - pv0[3]) / n, sq_ms[1] / n,
+                             sq_ms[2] / n, (dec_ms - sq_ms[0] - sq_ms[1] - sq_ms[2]) / n);
+            }
 #endif
             tier.rebalance_tick(true);   // the gap until the next request: retire a large batch for the reader
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
