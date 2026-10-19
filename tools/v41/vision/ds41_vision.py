@@ -33,8 +33,8 @@ ADAPTED (documented deviations from strata_vision.cpp)
   * Weights: the C++ reads an mtmd mmproj; here the same tensors live in the V4.1 sidecar GGUF.
   * Grid: DeepSeek's span is n_llm_h rows of (n_llm_w+1) plus the 2 delimiters, so nx*ny == n cannot
     be the reading-order rectangle (that would need n = n_llm_h*(n_llm_w+1) = n-2).  We emit the flat
-    reading order nx = n, ny = 1 unless (n_llm_w+1)*n_llm_h happens to equal n.  See the report for
-    slice 2: derive DeepSeek M-RoPE from n and the delimiter count, not from nx/ny.
+    reading order nx = n, ny = 1. V4.1 uses sequential 1-D text positions for the whole span;
+    nx/ny do not change the engine's RoPE positions.
   * No mtmd flash-attn / min-tokens knobs (accepted and ignored); no GPU warm-up.
   * The server already caches by image hash (server.py:1363-1388), so this process keeps no cache.
 """

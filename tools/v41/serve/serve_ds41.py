@@ -117,7 +117,14 @@ def to_encoder_messages(messages, tools):
     out = []
     for m in messages:
         m = dict(m)
-        m["content"] = _text(m.get("content"))
+        content = m.get("content")
+        if isinstance(content, list) and any(p.get("type") in ("image", "image_url", "input_image")
+                                              for p in content if isinstance(p, dict)):
+            m["content"] = [{**p, "type": "image_url" if p.get("type") == "input_image" else
+                            "text" if p.get("type") == "input_text" else p.get("type")}
+                            for p in content if isinstance(p, dict)]
+        else:
+            m["content"] = _text(content)
         if m.get("tool_calls"):
             calls = []
             for c in m["tool_calls"]:
@@ -184,9 +191,49 @@ def _svc_init_ds41(self, engine, tokenizer, template, *a, **k):
     assert len(eos) == 1, eos
     self.stop_ids = set(eos)
     self.effort_end = False      # #458's tail-turn trick is Qwen text; V4.1's effort lives in the first system turn
+    self.literals = {**self.literals, E.IMAGE_PLACEHOLDER: "\U000f0e20"}
 
 
 S.Service.__init__ = _svc_init_ds41
+
+
+def _expand_images_ds41(self, ids, encoded):
+    marker = self.tok.encode(E.IMAGE_PLACEHOLDER, parse_special=True)
+    if len(marker) != 1:
+        raise ValueError("the tokenizer must encode the image marker as one token")
+    out, k = [], 0
+    for token in ids:
+        if token == marker[0]:
+            if k == len(encoded):
+                raise ValueError("the prompt and its images do not match")
+            out.extend([token] * encoded[k][1])
+            k += 1
+        else:
+            out.append(token)
+    if k != len(encoded):
+        raise ValueError("the prompt and its images do not match")
+    return out
+
+
+S.Service.expand_image_tokens = _expand_images_ds41
+_Vision = S.Vision
+
+
+class Ds41Vision(_Vision):
+    """Run the reference-based encoder with the server's existing cache and ENC protocol."""
+
+    def __init__(self, cfg, log=None, env=None, lazy=False):
+        super().__init__(cfg, log=log, env=env, lazy=True)
+        args, log, env = self.spawn
+        args = [cfg.get("python") or sys.executable, str(V41 / "vision" / "ds41_vision.py"), *args[1:]]
+        if cfg.get("reference_dir"):
+            args += ["--reference-dir", os.path.abspath(cfg["reference_dir"])]
+        self.spawn = (args, log, env)
+        if not lazy and not self.lazy_vision and not self.elastic:
+            self._start()
+
+
+S.Vision = Ds41Vision
 
 # ---- tool calls: DSML
 CALLS_OPEN = f"<{E.dsml_token}{E.tool_calls_block_name}>"           # <｜DSML｜ calls>

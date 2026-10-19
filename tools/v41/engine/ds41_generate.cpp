@@ -13,6 +13,7 @@
 //
 // --serve speaks Strata's engine line protocol (~/AI/Strata/serve/server.py StrataEngine, as glm_generate):
 //   in:  GEN <max_new> [temperature=.. top_p=.. top_k=.. min_p=.. seed=..] <ids csv> | STOP | QUIT
+//        GENI <max_new> [k=v ..] <image embeddings file> <ids csv>   (GEN with vision; see --image-token)
 //   out: READY <ctx> stop, RESUME <reused>, PP <read> <total> <ms> <tok/s>, T <id>, DONE ..., ERR <text>
 // Conversation reuse: a request that extends what the state has seen continues; one that shares the last prompt
 // restores the snapshot taken at its end (Ds41Dense::snapshot: every other cache is position-indexed); the same prompt
@@ -86,6 +87,8 @@ struct Args {
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
     float skip_miss = 0.0f, skip_file = 0.0f;
     double chunk_prefetch_gib = 0.0;
+    int image_token = 129264;     // --image-token N: the model's <|image|> id (each image is one run of it in the prompt)
+    bool vision = false;
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -94,6 +97,61 @@ std::vector<int> parse_csv(const std::string & s) {
     std::string x;
     while (std::getline(ss, x, ',')) if (!x.empty()) v.push_back(std::atoi(x.c_str()));
     return v;
+}
+
+// The image-embedding file of a GENI line: one or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then
+// n * n_embd float32) in prompt order (serve/server.py combined_embeddings_path; generate.cpp reads the same).
+static bool read_sve1(const std::string & path, std::vector<std::vector<float>> & rows, std::vector<int64_t> & counts,
+                      int64_t n_embd, int64_t max_rows, std::string & err) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err = "cannot open the embeddings file"; return false; }
+    int32_t hdr[5];
+    int64_t total = 0;
+    for (;;) {
+        f.read(reinterpret_cast<char *>(hdr), sizeof(hdr));
+        if (f.gcount() == 0 && f.eof()) break;
+        if (f.gcount() != sizeof(hdr)) { err = "short embeddings header"; return false; }
+        if (hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 || hdr[4] != (int32_t) n_embd
+            || (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[1] > max_rows - total) {
+            err = "bad embeddings file (expected strata-vision records of width " + std::to_string(n_embd) + ")";
+            return false;
+        }
+        const int64_t n = hdr[1];
+        total += n;
+        std::vector<float> r((size_t) (n * n_embd));
+        if (f.read(reinterpret_cast<char *>(r.data()), (std::streamsize) (r.size() * 4)).gcount()
+                != (std::streamsize) (r.size() * 4)) { err = "short embeddings file"; return false; }
+        rows.push_back(std::move(r));
+        counts.push_back(n);
+    }
+    if (rows.empty()) { err = "the embeddings file has no records"; return false; }
+    return true;
+}
+
+// Map records onto image-token runs, using the row counts to split adjacent images within the same run.
+static bool map_vision(const std::vector<int> & ids, int image_token, const std::vector<std::vector<float>> & rows,
+                       const std::vector<int64_t> & counts, std::vector<float> & vis_rows,
+                       std::vector<int64_t> & vis_pos, std::string & err) {
+    size_t k = 0;
+    for (size_t i = 0; i < ids.size(); ) {
+        if (ids[i] != image_token) { ++i; continue; }
+        size_t j = i;
+        while (j < ids.size() && ids[j] == image_token) ++j;
+        const int64_t run = (int64_t) (j - i);
+        if (k >= rows.size()) { err = "the prompt has more images than the embeddings file"; return false; }
+        int64_t matched = 0;
+        while (matched < run && k < rows.size()) {
+            if (counts[k] > run - matched) { err = "an image span does not match its embeddings"; return false; }
+            matched += counts[k];
+            vis_rows.insert(vis_rows.end(), rows[k].begin(), rows[k].end());
+            ++k;
+        }
+        if (matched != run) { err = "an image span is missing embeddings"; return false; }
+        for (size_t t = i; t < j; ++t) vis_pos.push_back((int64_t) t);
+        i = j;
+    }
+    if (k != rows.size()) { err = "the embeddings file has more images than the prompt"; return false; }
+    return true;
 }
 
 bool parse(int argc, char ** argv, Args & a) {
@@ -151,6 +209,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--enc-skip") a.enc_skip = 1;
         else if (k == "--no-enc-skip") a.enc_skip = 0;
         else if (k == "--enc-replay") a.enc_replay = std::atoi(next().c_str());
+        else if (k == "--image-token") a.image_token = std::atoi(next().c_str());
+        else if (k == "--vision") a.vision = true;
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty());
@@ -317,6 +377,7 @@ int main(int argc, char ** argv) {
     if (enc_skip && PB <= 1) { std::fprintf(stderr, "ds41_generate: --enc-skip needs the layer-major prompt path (--prompt-batch >= 2)\n"); return 2; }
     int64_t ER = enc_skip ? (int64_t) a.enc_replay : 0;
     dc.engram_dirs = a.engram;
+    dc.vision = a.vision;
     dc.act_quant = a.act_quant;
     // --kv-fp4 / STRATA_KV_FP4=1: the compressed KV + indexer keys packed to their exact FP4 grids (Ds41DenseConfig::kv_fp4)
     dc.kv_fp4 = a.kv_fp4 || (std::getenv("STRATA_KV_FP4") && std::getenv("STRATA_KV_FP4")[0] == '1');
@@ -1096,18 +1157,31 @@ int main(int argc, char ** argv) {
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
         std::string line;
+        bool previous_vision = false;
         while (next_line(line)) {
             if (line == "QUIT") break;
             if (line == "STOP" || line.empty()) continue;
-            if (line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
+            dense.clear_vision();
+            if (previous_vision) {
+                hist.clear();
+                snap_len = -1;
+                previous_vision = false;
+            }
+            // GENI = GEN with an image-embedding file: GENI <max_new> [k=v ..] <embeddings file> <ids csv> (the file
+            // holds one strata-vision record per image, in prompt order; the engine lands them on the image_token runs).
+            const bool geni = line.rfind("GENI ", 0) == 0;
+            if (!geni && line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
             std::istringstream ss(line);
-            std::string w, csv;
+            std::string w, csv, emb_file;
             int max_new = 0, tk = 0;
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
             ss >> w >> max_new;
             while (ss >> w) {
                 const size_t eq = w.find('=');
-                if (eq == std::string::npos) { csv = w; continue; }
+                if (eq == std::string::npos) {   // the two positionals: GENI's embeddings file then the csv (GEN: just the csv)
+                    if (geni && emb_file.empty()) emb_file = w; else csv = w;
+                    continue;
+                }
                 const std::string k = w.substr(0, eq), v = w.substr(eq + 1);
                 if (k == "temperature") temp = (float) std::atof(v.c_str());
                 else if (k == "top_p") top_p = (float) std::atof(v.c_str());
@@ -1121,6 +1195,32 @@ int main(int argc, char ** argv) {
                 std::printf("ERR prompt (%zu) + max tokens (%d) exceed the context (%d)\n", ids.size(), max_new, ctxv);
                 std::fflush(stdout);
                 continue;
+            }
+            // vision: resolve this request's image rows onto its image_token runs and hand them to the dense layers
+            std::vector<float> vis_rows;
+            std::vector<int64_t> vis_pos;
+            const bool is_vision = geni;
+            if (is_vision) {
+                if (!dense.vision()) { std::printf("ERR image input requires --vision\n"); std::fflush(stdout); continue; }
+                std::string verr;
+                std::vector<std::vector<float>> recs;
+                std::vector<int64_t> counts;
+                const int64_t ne = dense.geom().n_embd;
+                if (!read_sve1(emb_file, recs, counts, ne, (int64_t) ids.size(), verr)
+                    || !map_vision(ids, a.image_token, recs, counts, vis_rows, vis_pos, verr)) {
+                    std::printf("ERR %s\n", verr.c_str()); std::fflush(stdout); continue;
+                }
+                if (vis_rows.empty()) { std::printf("ERR GENI prompt has no image tokens\n"); std::fflush(stdout); continue; }
+                // an image prompt prefills fresh: every image span is the same run of image_token, so a token-only reuse
+                // test would "continue" a different image (same ids, different embeddings).  Empty hist / no snapshot / no park.
+                dense.drop_park();
+                park_hist.clear();
+                hist.clear();
+                snap_len = -1;
+                dense.set_vision(vis_rows.data(), vis_pos.data(), (int) vis_pos.size());
+                previous_vision = true;
+            } else {
+                dense.clear_vision();
             }
             size_t lcp = 0;
             while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
@@ -1462,7 +1562,8 @@ int main(int argc, char ** argv) {
                 continue;
             }
             hist = ids;
-            if (total > reused && dense.snapshot(total)) {
+            // no snapshot for an image prompt: a text request with the same ids (all image_token) would restore its embeddings
+            if (total > reused && !is_vision && dense.snapshot(total)) {
                 snap_len = total;
                 snap_logits = last_logits;
                 snap_seed.swap(cur_seed);   // this prompt's DSpark tail rows (0 rows when DSpark is off / no tail ran)

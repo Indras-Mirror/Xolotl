@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import time
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -138,6 +139,42 @@ def t_tokenizer(tok_dir):
     import serve.server as S
     svc = S.Service(S.MockEngine(tok, "x"), tok, D.Ds41Template())
     check("stop ids = <｜end▁of▁sentence｜> only", svc.stop_ids == set(tok.encode(E.eos_token, parse_special=True)), svc.stop_ids)
+    t_image_prompt(svc)
+
+
+def t_image_prompt(svc):
+    from types import SimpleNamespace
+    marker = E.IMAGE_PLACEHOLDER
+    image_id = svc.tok.encode(marker, parse_special=True)[0]
+    with tempfile.TemporaryDirectory() as directory:
+        paths = [Path(directory) / "first.sve", Path(directory) / "second.sve"]
+        for path, data in zip(paths, (b"first", b"second")):
+            path.write_bytes(data)
+        encoded = [(paths[0], 3), (paths[1], 5)]
+        seen = []
+
+        def encode_all(sources, cancel):
+            seen.extend(sources)
+            return encoded
+
+        svc.vision = SimpleNamespace(dir=Path(directory), encode_all=encode_all)
+        messages = [{"role": "user", "content": [{"type": "text", "text": "quote " + marker},
+                    {"type": "image", "source": "first"}, {"type": "image", "source": "second"},
+                    {"type": "text", "text": "compare"}]}]
+        kwargs = {"enable_thinking": False}
+        before = svc.encode_prompt(messages, None, kwargs)
+        ids, thinking, maximum = svc.prepare(messages, None, kwargs, max_new=20)
+        check("vision: only actual image blocks become markers", before.count(image_id) == 2)
+        check("vision: adjacent images expand to all encoder rows", ids.count(image_id) == 8 and len(ids) == len(before) + 6)
+        check("vision: source order and sampling room preserved", seen == ["first", "second"] and not thinking and maximum == 20)
+        check("vision: combined records keep prompt order", Path(svc.embeddings.path).read_bytes() == b"firstsecond")
+        svc.drop_embeddings()
+        try:
+            svc.expand_image_tokens(before, encoded[:1])
+            check("vision: rejects image-count mismatch", False)
+        except ValueError:
+            check("vision: rejects image-count mismatch", True)
+        svc.vision = None
 
 
 def free_port():
@@ -153,7 +190,7 @@ def post(port, path, body):
 def t_http(tok_dir):
     port = free_port()
     script = "need the file" + E.thinking_end_token + dsml([("read_file", {"path": "a.txt", "lines": 3})])
-    py = str(Path.home() / "AI/Strata/.venv/bin/python")
+    py = sys.executable
     proc = subprocess.Popen([py, str(HERE / "serve_ds41.py"), "--engine", "mock", "--port", str(port),
                              "--tokenizer", str(tok_dir), "--script", script, "--script", script, "--script", "done" + E.thinking_end_token + "The file says AAA."],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)

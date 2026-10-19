@@ -37,6 +37,9 @@ public:
     int64_t row_dim() const { return dim_; }                    ///< 256
     /// Record token `tid` at position `pos` (history for the hashes; positions may be rewritten).
     void set_token(int64_t pos, int tid);
+    /// Record position `pos` as a DEAD token (an image span): it takes no part in any n-gram and stops the look-back,
+    /// so a text n-gram never spans an image (model.py NgramHashState.DEAD).
+    void set_dead(int64_t pos);
     /// Hash ids of the n-grams ending at `pos` for Engram slot `e` (0 = layer 1, 1 = layer 14): out[cols].
     void hash(int64_t pos, int e, int64_t * out) const;
     /// Rows for tokens at positions pos0..pos0+n-1, every Engram slot: out[e] = n * cols * dim floats (token-major).
