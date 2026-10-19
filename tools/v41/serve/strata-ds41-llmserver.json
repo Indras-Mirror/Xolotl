@@ -13,7 +13,6 @@
     "--route-bias", "0.5",
     "--route-bias-file", "0.3",
     "--arena-gib", "42",
-    "--arena-skip-resident",
     "--remote-device", "1",
     "--prompt-batch", "12288"
   ],
