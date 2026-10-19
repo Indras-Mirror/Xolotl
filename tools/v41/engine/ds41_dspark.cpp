@@ -60,7 +60,9 @@ struct Ds41DSpark::Impl {
     std::pair<int, bool> last_key { -1, false };   ///< the graph ga was last planned for
     double ms = 0;
 
+    std::thread stash_th;              ///< STRATA_DSPARK_STASH: the first load's copy to the host (joined before wbuf goes)
     ~Impl() {
+        if (stash_th.joinable()) stash_th.join();
         if (const char * cf = std::getenv("STRATA_DSPARK_COUNT"); cf && !counts.empty()) {
             if (FILE * f = std::fopen(cf, "w")) {
                 for (auto & r : counts) { for (size_t i = 0; i < r.size(); ++i) std::fprintf(f, "%s%lld", i ? " " : "", (long long) r[i]); std::fputc('\n', f); }
@@ -166,11 +168,36 @@ bool Ds41DSpark::Impl::load(std::string & e) {
     }
     wbuf = ggml_backend_alloc_ctx_tensors_from_buft(wctx, ggml_backend_get_default_buffer_type(be));
     if (!wbuf) { e = "cannot allocate the DSpark weights on the backend"; return false; }
+    // STRATA_DSPARK_STASH=1 (llm-server): STRATA_SERVE_DSPARK_EVICT frees the drafter for every long prompt and the
+    // next open_cache() loads it again - re-reading the 5.7 GB sidecar and converting (3.9 s with the prefault, 8.4 s
+    // without).  The loaded buffer is kept in host memory (~2.9 GB) once; a re-created drafter with the same sources
+    // and settings copies it back.  Same bytes as a load.
+    struct Stash { std::string key; std::vector<uint8_t> bytes; };
+    static Stash stash;
+    const bool use_stash = std::getenv("STRATA_DSPARK_STASH") && std::getenv("STRATA_DSPARK_STASH")[0] == '1';
+    const uint8_t * wbase = (const uint8_t *) ggml_backend_buffer_get_base(wbuf);
+    const size_t wsize = ggml_backend_buffer_get_size(wbuf);
+    std::string skey;
+    if (use_stash) {
+        skey = side->shard(0).path() + "|" + main->shard(0).path() + "|" + std::to_string(wsize);
+        for (const char * k : { "STRATA_DSPARK_KEEP", "STRATA_DSPARK_EXP_TYPE", "STRATA_DSPARK_OWN_HEAD" })
+            skey += std::string("|") + (std::getenv(k) ? std::getenv(k) : "");
+    }
+    bool restored = false;
+    if (use_stash && stash.key == skey && stash.bytes.size() == wsize) {
+        for (auto & s : src) {
+            ggml_tensor * t = w[s.second->name];
+            const size_t off = (size_t) ((const uint8_t *) t->data - wbase);
+            ggml_backend_tensor_set(t, stash.bytes.data() + off, 0, ggml_nbytes(t));
+            wbytes += ggml_nbytes(t);
+        }
+        restored = true;
+    }
     // STRATA_DSPARK_PREFAULT=1 (llm-server): the loop below reads every source through the mmap, one page fault at a
     // time.  With the sidecar out of the page cache (a 72 GiB arena; STRATA_SERVE_DSPARK_EVICT re-creates DSpark for
     // every long prompt) that is ~0.35 GB/s from ZFS: 8.4 s a prompt vs 1.9 s cached.  Touch the pages on 16 threads
     // first, 64 MiB at a time, so the faults overlap.
-    if (const char * pf = std::getenv("STRATA_DSPARK_PREFAULT"); pf && pf[0] == '1') {
+    if (const char * pf = std::getenv("STRATA_DSPARK_PREFAULT"); !restored && pf && pf[0] == '1') {
         std::vector<std::pair<const uint8_t *, size_t>> spans;
         for (auto & s : src) {
             size_t sh = 0;
@@ -194,7 +221,7 @@ bool Ds41DSpark::Impl::load(std::string & e) {
             });
         for (auto & x : th) x.join();
     }
-    for (auto & s : src) {
+    for (auto & s : (restored ? decltype(src) {} : src)) {
         const GgufModel & m = *s.first;
         size_t sh = 0;
         m.find(s.second->name, &sh);
@@ -240,6 +267,23 @@ bool Ds41DSpark::Impl::load(std::string & e) {
             ggml_backend_tensor_set(t, out.data(), 0, out.size());
         }
         wbytes += ggml_nbytes(t);
+    }
+    if (use_stash && !restored) {
+        // the first load: keep its bytes for the next re-creation.  On a thread: the 2.9 GB copy into fresh host pages
+        // took 3.7 s on the first prompt's critical path.  A re-creation only follows this drafter's destruction, which
+        // joins the thread, so the stash is complete whenever it is read.
+        std::vector<std::pair<ggml_tensor *, size_t>> ts;
+        for (auto & s : src) {
+            ggml_tensor * t = w[s.second->name];
+            ts.emplace_back(t, (size_t) ((const uint8_t *) t->data - wbase));
+        }
+        stash.key.clear();
+        stash_th = std::thread([ts = std::move(ts), skey, wsize]() {
+            std::vector<uint8_t> b(wsize);
+            for (const auto & x : ts) ggml_backend_tensor_get(x.first, b.data() + x.second, 0, ggml_nbytes(x.first));
+            stash.bytes = std::move(b);
+            stash.key = skey;
+        });
     }
     if (cfg.shared_head) {
         const ggml_tensor * h = cfg.shared_head;
