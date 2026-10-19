@@ -6922,8 +6922,12 @@ def main() -> int:
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
+    if not (tpath / "vocab.json").exists() and (tpath / "tokenizer" / "vocab.json").exists():
+        tpath = tpath / "tokenizer"    # the HF repos ship the files in tokenizer/ (Xolotl #14): point there, not one up
+        print(f"tokenizer: using {tpath}", file=sys.stderr)
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
-        ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
+        ap.error(f"the model's tokenizer is missing: {tpath} must directly hold vocab.json, merges.txt and "
+                 f"token_type.json (point the config's \"tokenizer\" at the folder that has them); run setup again")
     if (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
         vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))

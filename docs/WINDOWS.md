@@ -6,7 +6,17 @@ Tested on one machine:
 - RTX 3090 24 GB, Ryzen 7 5800X, 128 GB DDR4-3200, Samsung 990 EVO Plus NVMe
 - Windows 11 Pro, driver 616.92, CUDA 12.8, Visual Studio 2022 Build Tools
 
-Other cards should work with `CUDA_ARCH` set (89 = RTX 40, 120 = RTX 50) but are untested. Reports are welcome.
+Other cards should work with `CUDA_ARCH` set (89 = RTX 40). Reports are welcome.
+
+**RTX 50 (sm_120), from a community build on an RTX 5090 D v2 ([#14](https://github.com/Indras-Mirror/Xolotl/issues/14)):**
+- CUDA 12.8 cannot build sm_120 here: ptxas rejects the MXFP4 kernel's block-scale mma (`.kind::mxf4 not supported on
+  .target 'sm_120'`). Use **CUDA 13.1** with `-DCMAKE_CUDA_ARCHITECTURES=120a`; plain `120` fails the same way, the `a`
+  suffix is required.
+- If a newer Visual Studio (e.g. "18" Build Tools) is installed, `vswhere -latest` picks it and nvcc refuses it as the
+  host compiler (`C1189: unsupported Microsoft Visual Studio version`). Point VCVARS at the **VS 2022** Build Tools
+  `vcvars64.bat`.
+- The config's `"tokenizer"` must be the folder that directly holds `vocab.json`, `merges.txt` and `token_type.json`.
+  Serve now also accepts the model folder when the files sit in its `tokenizer/` subfolder (the HF repos' layout).
 
 ## What you need
 
@@ -15,7 +25,7 @@ Other cards should work with `CUDA_ARCH` set (89 = RTX 40, 120 = RTX 50) but are
 | GPU | NVIDIA, 24 GB, driver new enough for CUDA 12.8 |
 | RAM | 128 GB recommended for the 72 GiB arena in the example configs; lower `--arena-gib` on smaller machines |
 | Disk | ~370 GB on an NVMe (NTFS): the model (148-163 GB) + the official Engram shards (203 GB), plus room for the parts while joining |
-| Tools | Visual Studio 2022 (Desktop development with C++), CUDA Toolkit 12.8+, Git for Windows (Git Bash), Python 3.12 |
+| Tools | Visual Studio 2022 (Desktop development with C++), CUDA Toolkit 12.8+ (13.1+ for RTX 50), Git for Windows (Git Bash), Python 3.12 |
 
 ## 1. Code and llama.cpp
 
