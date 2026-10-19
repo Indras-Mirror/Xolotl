@@ -40,7 +40,8 @@
   "STRATA_PRESTAGE_GIB": "1.5",
   "STRATA_TIER_BATCH_PCIE": "0.75",
   "STRATA_SERVE_DSPARK": "D:/models/dsv41-gsq/V41-MTP-Vision.Q2_K.gguf",
-  "STRATA_DSPARK_KEEP": "D:/src/Xolotl/tools/v41/serve/dspark_expert_counts.txt:64"
+  "STRATA_DSPARK_KEEP": "D:/src/Xolotl/tools/v41/serve/dspark_expert_counts.txt:64",
+  "STRATA_TEXT_LOG": "0"
  },
  "lib_dirs": [
   "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8\\bin"

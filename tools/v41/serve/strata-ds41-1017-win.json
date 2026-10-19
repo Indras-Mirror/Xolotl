@@ -40,7 +40,8 @@
   "STRATA_SERVE_DSPARK_EVICT": "4096",
   "STRATA_DENSE_REQUANT": "q6_K",
   "STRATA_PRESTAGE_GIB": "1.5",
-  "STRATA_TIER_BATCH_PCIE": "0.75"
+  "STRATA_TIER_BATCH_PCIE": "0.75",
+  "STRATA_TEXT_LOG": "0"
  },
  "lib_dirs": [
   "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8\\bin"
