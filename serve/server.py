@@ -1246,6 +1246,10 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 8.0:
                     keys += f" {k}={float(v)!r}"
+            for k in ("route_protect", "route_pool"):   # the smart router's ranks (0 = off)
+                v = tune.get(k)
+                if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 32:
+                    keys += f" {k}={v}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:

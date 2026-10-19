@@ -118,6 +118,14 @@ public:
     /// Selection-only routing bias for layer il (n_expert floats): added to the top-k score, not to the mixing weights.
     /// Soft pruning (-penalty on cold experts) / cache-aware routing (+bonus on VRAM-resident ones).  Default 0.
     void set_route_bias(int il, const float * bias);
+    /// Smart router ranks (built when STRATA_RB_SMART=1 or STRATA_RB_PROTECT / STRATA_RB_POOL is set): the exact
+    /// top-`protect` experts are always kept, and the bias only moves selections inside the exact top-`pool` (colibri's
+    /// CACHE_ROUTE window).  0 = off; both 0 = the flat bias.  False when this engine has no smart router.
+    bool set_route_select(int protect, int pool);
+    /// Route meter (smart router only): since the last reset, the routed slots, how many of them differ from exact
+    /// routing, and the share of the exact top-k's router weight the chosen experts kept (mean over tokens).
+    struct RouteMeter { long long slots = 0, swaps = 0; double weight_kept = 1.0; bool on = false; };
+    RouteMeter route_meter(bool reset);
     /// Layer il of the current pass: Engram (layers 1/14), attention, hc, ffn_norm, router, shared expert.
     /// ids / wts: n * n_used (token-major); *fn_host: n * n_embd floats (the routed experts' input, valid until the
     /// next call).  `fn_dev` (optional): the same activations on the backend.
