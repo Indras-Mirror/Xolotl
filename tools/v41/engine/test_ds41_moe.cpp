@@ -108,6 +108,7 @@ int main(int argc, char ** argv) {
     cfg.arena_gib = 4.0;
     cfg.max_arena_gib = 4.0;
     cfg.pcie_frac = 0.5;
+    cfg.tier_batch_pcie = 0.5;   // run_multi too: half the arena misses go to the CPU pool
     cfg.pf_b = 0;
     cfg.remote_device = remote;
     cfg.remote_gib = remote_gib;

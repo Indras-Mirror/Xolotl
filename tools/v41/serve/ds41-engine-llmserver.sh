@@ -22,5 +22,10 @@ export STRATA_ENGRAM_RAWDEV="${STRATA_ENGRAM_RAWDEV:-0}"
 [ -n "${STRATA_PROMPT_BATCH:-}" ] && set -- "$@" --prompt-batch "$STRATA_PROMPT_BATCH"
 [ -z "$STRATA_SERVE_DSPARK" ] && unset STRATA_SERVE_DSPARK
 BUILD_DIR="${STRATA_BUILD_DIR:-$PWD/build-xolotl}"
+# DS41_GDB=1: the engine under gdb, its output (and a backtrace on a crash) in /tmp/ds41-gdb.log - stdout stays the protocol
+GDB=()
+[ "${DS41_GDB:-0}" = 1 ] && GDB=(gdb -q -batch -nx -ex "set pagination off" -ex "set logging file /tmp/ds41-gdb.log"
+    -ex "set logging redirect on" -ex "set logging enabled on" -ex "set print thread-events off" -ex run -ex bt
+    -ex "thread apply all bt 12" --args)
 exec systemd-run --scope -q --unit="ds41-serve-$$" -p MemoryMax="${DS41_MEMORY_MAX:-57G}" -p MemorySwapMax=0 \
-    "$BUILD_DIR/ds41_generate" "$@"
+    "${GDB[@]}" "$BUILD_DIR/ds41_generate" "$@"

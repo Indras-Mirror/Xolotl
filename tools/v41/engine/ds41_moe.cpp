@@ -473,7 +473,8 @@ struct RemoteTier {
     uint8_t* base = nullptr;             ///< the experts, on `dev`
     size_t cap = 0, used = 0;
     std::vector<int64_t> off;            ///< (layer * n_experts + e) -> byte offset in base; -1 = not held
-    std::vector<int32_t> proxy;          ///< per layer: the non-remote expert a token whose top-k is all remote points at
+    static constexpr int kProxy = 8;
+    std::vector<int32_t> proxy;          ///< per layer, kProxy: the best-ranked non-remote experts (substitutes of last resort)
     int64_t n = 0;
     cudaStream_t s = nullptr;
     void *d_x = nullptr, *d_xq = nullptr, *d_parts = nullptr, *d_scratch = nullptr, *d_meta = nullptr, *d_w = nullptr,
@@ -852,15 +853,20 @@ bool remote_build(Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>
         jobs.push_back({le.first, le.second, r.off[at]});
     }
     r.n = (int64_t) jobs.size();
-    // a token whose whole top-k is remote points its entries at the layer's best-ranked other expert (weight 0)
-    r.proxy.assign((size_t) NL, -1);
+    // substitutes of last resort: per layer the kProxy best-ranked experts the card does not hold (then any)
+    const int KP = RemoteTier::kProxy;
+    r.proxy.assign((size_t) (NL * KP), -1);
+    std::vector<int> np((size_t) NL, 0);
+    auto add_proxy = [&](int64_t l, int64_t e) {
+        if (np[(size_t) l] >= KP || r.off[(size_t) (l * NX + e)] >= 0) return;
+        for (int i = 0; i < np[(size_t) l]; ++i)
+            if (r.proxy[(size_t) (l * KP + i)] == e) return;
+        r.proxy[(size_t) (l * KP + np[(size_t) l]++)] = (int32_t) e;
+    };
     for (const auto& le : ranked)
-        if (le.first >= 0 && le.first < NL && le.second >= 0 && le.second < NX && r.proxy[(size_t) le.first] < 0 &&
-            r.off[(size_t) (le.first * NX + le.second)] < 0)
-            r.proxy[(size_t) le.first] = le.second;
+        if (le.first >= 0 && le.first < NL && le.second >= 0 && le.second < NX) add_proxy(le.first, le.second);
     for (int64_t l = 0; l < NL; ++l)
-        for (int64_t e = 0; e < NX && r.proxy[(size_t) l] < 0; ++e)
-            if (r.off[(size_t) (l * NX + e)] < 0) r.proxy[(size_t) l] = (int32_t) e;
+        for (int64_t e = 0; e < NX; ++e) add_proxy(l, e);
     // upload: 8 readers, each with its own pinned bounce
     std::atomic<size_t> nx{0};
     std::atomic<bool> bad{false};
@@ -891,8 +897,9 @@ bool remote_build(Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>
     return true;
 }
 
-/// A tier call's remote share: the remote entries leave `ids`/`w` (pointed at a non-remote expert of the same token,
-/// or the layer's proxy, with weight 0 - the call computes a row nobody adds) and run on the card meanwhile; the
+/// A tier call's remote share: the remote entries leave `ids`/`w` (pointed, with weight 0, at a non-remote expert the
+/// TOKEN does not route to - one the call already uses, else a layer proxy - so the call computes a row nobody adds
+/// and no (token, expert) pair repeats: the CPU pool's jobs hold at most MAXT tokens) and run on the card meanwhile; the
 /// destructor waits and adds their summed rows to `out` (host) or `out_dev` (the main card).
 struct RemoteScope {
     Ds41MoeImpl& im;
@@ -914,14 +921,30 @@ struct RemoteScope {
         if (cnt == 0) return;
         ids.assign(ids_io, ids_io + NE);
         w.assign(w_io, w_io + NE);
+        // candidates: the call's own non-remote experts (no extra blob), first seen first, then the layer's proxies
+        std::vector<int32_t> cand;
+        std::vector<char> seen((size_t) NX, 0);
+        for (int64_t j = 0; j < NE; ++j) {
+            const int32_t e = ids_io[j];
+            if (e >= 0 && e < NX && !seen[(size_t) e] && !r.held(layer, e, NX)) { seen[(size_t) e] = 1; cand.push_back(e); }
+        }
+        for (int i = 0; i < RemoteTier::kProxy; ++i) {
+            const int32_t e = r.proxy[(size_t) (layer * RemoteTier::kProxy + i)];
+            if (e >= 0 && !seen[(size_t) e]) { seen[(size_t) e] = 1; cand.push_back(e); }
+        }
         for (int64_t t = 0; t < n; ++t)
             for (int64_t k = 0; k < K; ++k) {
                 const int64_t j = t * K + k;
                 if (ids[(size_t) j] < 0 || ids[(size_t) j] >= NX || !r.held(layer, ids[(size_t) j], NX)) continue;
-                int32_t sub = r.proxy[(size_t) layer];
-                for (int64_t k2 = 0; k2 < K; ++k2) {
-                    const int32_t e2 = ids_io[t * K + k2];
-                    if (e2 >= 0 && e2 < NX && !r.held(layer, e2, NX)) { sub = e2; break; }
+                int32_t sub = -1;
+                for (int32_t c : cand) {   // the first candidate this token does not route to (K <= kProxy: one exists)
+                    bool used = false;
+                    for (int64_t k2 = 0; k2 < K && !used; ++k2) used = ids[(size_t) (t * K + k2)] == c;
+                    if (!used) { sub = c; break; }
+                }
+                if (sub < 0) {
+                    std::fprintf(stderr, "ds41_moe: remote: no substitute for layer %lld\n", (long long) layer);
+                    std::abort();
                 }
                 ids[(size_t) j] = sub;
                 w[(size_t) j] = 0.0f;
