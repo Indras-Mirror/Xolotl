@@ -4796,11 +4796,22 @@ int64_t Ds41MoeTier::regrow_cache(std::string& err) {
     if (!c.grow(c.full_bytes(), ge)) {
         (void) cudaDeviceSynchronize();
         if (!c.grow(c.full_bytes(), ge)) {
-            std::fprintf(stderr, "serve: keep-cache regrow soft-fail (%s) - keeping %lld resident experts\n",
-                         ge.c_str(), (long long) im_->admitted);
+            size_t fr = 0, tot = 0;
+            (void) cudaMemGetInfo(&fr, &tot);
+            // Keeping a maxed-out shrunk cache leaves no room for the next pass graph (seen: 38 MiB OOM
+            // on CUDA1 with ~275 MiB "free" but fragmented). Only soft-keep when there is real headroom.
+            if (fr >= (size_t) (1.5 * 1073741824.0)) {
+                std::fprintf(stderr, "serve: keep-cache regrow soft-fail (%s) - keeping %lld resident (%.2f GiB free)\n",
+                             ge.c_str(), (long long) im_->admitted, fr / 1073741824.0);
+                im_->shrunk.clear();
+                err.clear();
+                return 0;
+            }
+            std::fprintf(stderr, "serve: keep-cache regrow fail (%s, %.2f GiB free) - re-seed needed\n",
+                         ge.c_str(), fr / 1073741824.0);
             im_->shrunk.clear();
-            err.clear();
-            return 0;   // soft OK: decode stays warm on the retained head
+            err = "regrow_cache: grow: " + ge;
+            return -1;
         }
     }
     std::vector<std::array<int64_t, 3>> fjobs;   // slot, layer, expert (not in the arena: read from the file)
