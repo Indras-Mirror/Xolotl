@@ -122,3 +122,8 @@ peasantsmith, ukisai, d0xin and gcsa-abliterix.
 
 *Xolotl* is Quetzalcoatl's dark twin, who carries the dead up from the underworld - as the engine carries experts up
 from RAM and NVMe. Research code from one developer, measured on one PC; reports from other hardware welcome. MIT.
+
+## Support
+
+If Xolotl's been useful to you and you want to help support what I do, you can shout me a coffee on
+[Ko-fi](https://ko-fi.com/indrasmirror). Every bit helps keep this going :)
