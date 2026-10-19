@@ -517,7 +517,7 @@ def _note_ds41(self, n, evs, st=None, rate=None):
 # a model name ending in one of these (a config alias) = that routing for the request, for the strata_tune keys the
 # request doesn't name: -exact = no decode biases (quality mode), -fast = the stronger 0.5 / 0.3 nudge (speed mode); the
 # plain name gets the config's --route-bias / --route-bias-file
-ROUTE_SUFFIXES = {"-exact": {"route_bias": 0.0, "route_bias_file": 0.0},
+ROUTE_SUFFIXES = {"-exact": {"route_bias": 0.0, "route_bias_file": 0.0, "route_bias_remote": 0.0},
                   "-fast": {"route_bias": 0.5, "route_bias_file": 0.3}}
 
 

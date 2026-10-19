@@ -1242,7 +1242,7 @@ class StrataEngine:
             if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
                 keys += f" aux_cpus={int(ac)}"
             # the DeepSeek-V4.1 engine's decode biases for this request (0 and 0 = exact routing); other engines ignore them
-            for k in ("route_bias", "route_bias_file"):
+            for k in ("route_bias", "route_bias_file", "route_bias_remote"):
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 8.0:
                     keys += f" {k}={float(v)!r}"

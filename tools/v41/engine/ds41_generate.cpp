@@ -85,6 +85,8 @@ struct Args {
                                      // DEFAULT 0.6 (Mal: max decode w/o too much loss): 21.1 vs 15.1 tok/s, code ppl 2.67->2.87, agentic 6.88->6.39
     int   bias_prompt = 0;          // --bias-prompt N: quality proxy - apply route bias during the prompt, treating the first N
                                     // ranked experts as VRAM-resident (what the deferred seed will cache)
+    float route_bias_remote = 0.0f;  // --route-bias-remote X: selection bonus +X on the experts the remote card (--remote-device)
+                                     // holds - computed there beside the main card, off the decode's critical path (0 = as before)
     float route_bias = 1.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed (DEFAULT 1.0, Mal 2026-10-11:
                                   // ~4x decode; 4096-tok ppl code 2.38 -> 2.67, agentic 15.1 -> 6.9; --route-bias 0 = exact routing)
     std::vector<std::string> engram;
@@ -249,6 +251,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--route-bias") a.route_bias = (float) std::atof(next().c_str());
         else if (k == "--bias-prompt") a.bias_prompt = std::atoi(next().c_str());
         else if (k == "--route-bias-file") a.route_bias_file = (float) std::atof(next().c_str());
+        else if (k == "--route-bias-remote") a.route_bias_remote = (float) std::atof(next().c_str());
         else if (k == "--quiet") a.quiet = true;
         else if (k == "--dump-logits") a.dump_logits = next();
         else if (k == "--dump-last") a.dump_last = next();
@@ -602,7 +605,7 @@ int main(int argc, char ** argv) {
     bool bias_now = a.bias_prompt > 0 || !defer_vram;
     bool bias_set = false;   // a nonzero bias is in the dense half now (--serve turns it off again for the next prompt)
     auto apply_bias = [&]() {
-        const bool want = n_pruned > 0 || (bias_now && (a.route_bias != 0.0f || a.route_bias_file != 0.0f));
+        const bool want = n_pruned > 0 || (bias_now && (a.route_bias != 0.0f || a.route_bias_file != 0.0f || a.route_bias_remote != 0.0f));
         if (!want && !bias_set) return;
         bias_set = want;
         std::vector<float> rb((size_t) TG.n_experts);
@@ -610,6 +613,7 @@ int main(int argc, char ** argv) {
             for (int64_t e = 0; e < TG.n_experts; ++e)
                 rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
                                : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
+                               : (bias_now && a.route_bias_remote != 0.0f && tier.in_remote(l, e)) ? a.route_bias_remote
                                : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
             dense.set_route_bias((int) l, rb.data());
         }
@@ -1363,7 +1367,7 @@ int main(int argc, char ** argv) {
         // that names neither gets the --route-bias / --route-bias-file the engine started with, so one server can answer
         // exact-routing requests (both 0) beside the fast default without a restart.  apply_bias() writes zeros over a
         // bias it set earlier, so an exact request never inherits the previous one's.
-        const float cfg_route_bias = a.route_bias, cfg_route_bias_file = a.route_bias_file;
+        const float cfg_route_bias = a.route_bias, cfg_route_bias_file = a.route_bias_file, cfg_route_bias_remote = a.route_bias_remote;
         // the smart router's ranks (route_protect= / route_pool=, engines built with STRATA_RB_SMART / _PROTECT / _POOL):
         // a request that names neither gets the env's
         auto env_rank = [](const char * k) { const char * e = std::getenv(k); return e ? std::max(0, std::atoi(e)) : 0; };
@@ -1756,7 +1760,7 @@ int main(int argc, char ** argv) {
             std::string w, csv, emb_file;
             int max_new = 0, tk = 0;
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
-            float req_rb = cfg_route_bias, req_rbf = cfg_route_bias_file;
+            float req_rb = cfg_route_bias, req_rbf = cfg_route_bias_file, req_rbr = cfg_route_bias_remote;
             int req_rprot = cfg_rprot, req_rpool = cfg_rpool;
             std::vector<uint64_t> req_img_keys;   // img_keys=<hex>,<hex>.. (GENI): the server's key per picture, in prompt order
             ss >> w >> max_new;
@@ -1774,6 +1778,7 @@ int main(int argc, char ** argv) {
                 else if (k == "seed") rng.seed((uint64_t) std::atoll(v.c_str()));
                 else if (k == "route_bias") req_rb = std::max(0.0f, (float) std::atof(v.c_str()));
                 else if (k == "route_bias_file") req_rbf = std::max(0.0f, (float) std::atof(v.c_str()));
+                else if (k == "route_bias_remote") req_rbr = std::max(0.0f, (float) std::atof(v.c_str()));
                 else if (k == "route_protect") req_rprot = std::max(0, std::atoi(v.c_str()));
                 else if (k == "route_pool") req_rpool = std::max(0, std::atoi(v.c_str()));
                 else if (k == "img_keys") {
@@ -1790,12 +1795,13 @@ int main(int argc, char ** argv) {
             // a changed bias is applied again just before the decode: a repeated prompt (regenerate) runs no prompt pass,
             // and the passes are what turn the decode bias on - without this it decoded with the previous request's
             bool bias_changed = false;
-            if (req_rb != a.route_bias || req_rbf != a.route_bias_file) {
+            if (req_rb != a.route_bias || req_rbf != a.route_bias_file || req_rbr != a.route_bias_remote) {
                 a.route_bias = req_rb;
                 a.route_bias_file = req_rbf;
+                a.route_bias_remote = req_rbr;
                 bias_changed = true;
-                std::fprintf(stderr, "serve: decode route bias %.2f, file penalty %.2f%s\n", req_rb, req_rbf,
-                             (req_rb == 0.0f && req_rbf == 0.0f) ? " (exact routing)" : "");
+                std::fprintf(stderr, "serve: decode route bias %.2f, remote %.2f, file penalty %.2f%s\n", req_rb, req_rbr, req_rbf,
+                             (req_rb == 0.0f && req_rbf == 0.0f && req_rbr == 0.0f) ? " (exact routing)" : "");
             }
             if ((req_rprot != cur_rprot || req_rpool != cur_rpool) && dense.set_route_select(req_rprot, req_rpool)) {
                 cur_rprot = req_rprot;
