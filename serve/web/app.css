@@ -82,6 +82,9 @@ main { flex: 1; min-height: 0; display: flex; }
                    gap: var(--st-s-5); }
 .state-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
 .state-card__head { display: flex; align-items: center; gap: var(--st-s-4); flex-wrap: wrap; }
+.state-card__model { color: var(--st-ink-muted); font-weight: 600; }
+.st-header__model { color: var(--st-ink-muted); font-weight: 600; margin-left: var(--st-s-3); white-space: nowrap;
+                    overflow: hidden; text-overflow: ellipsis; max-width: 42vw; }
 .badges { display: flex; gap: var(--st-s-2); flex-wrap: wrap; }
 .badges .st-badge { opacity: .38; transition: opacity var(--st-dur); }
 .badges .st-badge.on { opacity: 1; }

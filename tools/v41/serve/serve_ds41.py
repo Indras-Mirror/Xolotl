@@ -197,6 +197,53 @@ def _svc_init_ds41(self, engine, tokenizer, template, *a, **k):
 S.Service.__init__ = _svc_init_ds41
 
 
+# ---- the dashboard's routing note (Service.mode_note): the config's decode biases until a request names its own
+def _config_routing():
+    """(route_bias, route_bias_file, protect, pool) from the --config the server was started with; the engine's
+    defaults (1.0 / 0.6, no smart router) for what it doesn't set."""
+    try:
+        cfg = json.load(open(sys.argv[sys.argv.index("--config") + 1], encoding="utf-8"))
+    except (ValueError, IndexError, OSError):
+        return 1.0, 0.6, 0, 0
+    args, env = [str(x) for x in cfg.get("args", [])], cfg.get("env") or {}
+    def flag(name, dflt):
+        try:
+            return float(args[args.index(name) + 1])
+        except (ValueError, IndexError):
+            return dflt
+    def rank(name):
+        try:
+            return max(0, int(env.get(name, 0)))
+        except (TypeError, ValueError):
+            return 0
+    return flag("--route-bias", 1.0), flag("--route-bias-file", 0.6), rank("STRATA_RB_PROTECT"), rank("STRATA_RB_POOL")
+
+
+_ROUTING = _config_routing()
+
+
+def _routing_note(rb, rbf, protect, pool):
+    if protect or pool:
+        return f"smart routing (top {protect}, pool {pool}, {rb:g} / {rbf:g})"
+    if rb == 0 and rbf == 0:
+        return "exact routing"
+    for name, (a, b) in (("light", (0.25, 0.15)), ("fast", (0.5, 0.3))):
+        if abs(rb - a) < 1e-9 and abs(rbf - b) < 1e-9:
+            return f"{name} routing ({rb:g} / {rbf:g})"
+    return f"route bias {rb:g} / {rbf:g}"
+
+
+_svc_init_routing = S.Service.__init__
+
+
+def _svc_init_note(self, *a, **k):
+    _svc_init_routing(self, *a, **k)
+    self.mode_note = _routing_note(*_ROUTING)
+
+
+S.Service.__init__ = _svc_init_note
+
+
 def _expand_images_ds41(self, ids, encoded):
     marker = self.tok.encode(E.IMAGE_PLACEHOLDER, parse_special=True)
     if len(marker) != 1:
@@ -370,6 +417,12 @@ def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # 
         for k, v in ROUTE_SUFFIXES[suffix].items():
             tune.setdefault(k, v)
         sampling = {**sampling, "strata_tune": tune}
+    tune = sampling.get("strata_tune") if isinstance(sampling, dict) and isinstance(sampling.get("strata_tune"), dict) else {}
+    def num(k, dflt):
+        v = tune.get(k)
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else dflt
+    self.mode_note = _routing_note(num("route_bias", _ROUTING[0]), num("route_bias_file", _ROUTING[1]),
+                                   int(num("route_protect", _ROUTING[2])), int(num("route_pool", _ROUTING[3])))
     t0 = _time.time()
     _text_state["kind"] = None
     _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request: prompt {len(ids):,} tokens, max {max_new}, "

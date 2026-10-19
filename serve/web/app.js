@@ -180,8 +180,22 @@ function setPill(state, text) {
   $("pill-text").textContent = text;
 }
 
+// the loaded model in the top bar and on the Model state card, so every screenshot says what is running: the
+// config's "display_name" (else the model id) and the engine adapter's mode note (DeepSeek-V4.1: the routing)
+function renderModelLabel(eng) {
+  const text = [eng.display_name || eng.model, eng.mode].filter(Boolean).join(" · ");
+  for (const id of ["hdr-model", "state-model"]) {
+    const el = $(id);
+    if (!el) continue;
+    el.textContent = text;
+    el.title = text;
+    el.hidden = !text;
+  }
+}
+
 function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
+  renderModelLabel(eng);
   const last = (m.requests || [])[0];
   // the header pill
   if (live.state === "reading") {
