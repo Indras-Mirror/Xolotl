@@ -1,5 +1,5 @@
 {
- "_comment": "Windows, DeepSeek-V4.1-Flash-1017 via lxe's dsx 2-bit build (lxe/DeepSeek-V4.1-Flash-1017-dsx-2bit, base 1017, its 4 GGUF shards merged into one file with tools/xolotl/gguf_merge_shards.py (the expert tier reads a single-file GGUF)), its expert-rank.json converted to rank-dsx.bin, the official 1017 Engram shards read in place, the 1017 tokenizer files. DSpark: the September V4.1 Q2_K draft until a 1017 draft exists (verified exactly by the 1017 trunk, so the output is unchanged; measured 2026-10-18, 3 greedy reps: code 14.0 -> 18.6 tok/s at 3.7 tokens/pass, agent 13.5 -> 15.4, prose 13.3 -> 12.3). Tuned settings as the other Windows configs (72 GiB arena, tier-batch PCIe 0.75). Edit the paths for your machine (docs/WINDOWS.md).",
+ "_comment": "Windows, DeepSeek-V4.1-Flash-1017 via lxe's dsx 2-bit build (lxe/DeepSeek-V4.1-Flash-1017-dsx-2bit, base 1017, its 4 GGUF shards merged into one file with tools/xolotl/gguf_merge_shards.py (the expert tier reads a single-file GGUF)), its expert-rank.json converted to rank-dsx.bin, the official 1017 Engram shards read in place, the 1017 tokenizer files. DSpark: the 1017 checkpoint's own draft (mtp.0-2), built on Windows with tools/v41/v41_sidecar.py and v41_sidecar_requant (Q2_K, 5.66 GB); acceptance on the round-5 prompts matches the September draft's (code 3.67 vs 3.70, agent 2.96 vs 2.78, prose 1.67 vs 1.71 tokens/pass). Tuned settings as the other Windows configs (72 GiB arena, tier-batch PCIe 0.75). Routing: the plain model name decodes with the light nudge (--route-bias 0.25 / --route-bias-file 0.15, 19.1 tok/s avg on the 3090, 26% of expert picks differ from exact routing); -fast = 0.5 / 0.3 (21.7 tok/s, 37%); -exact = no nudge (9.7 tok/s). Measured 2026-10-18, local-ai/dsv41/bench/abba-smart.json. STRATA_RB_SMART=1 builds the smart router: the per-request route_protect / route_pool keys and the route meter line per request; with both keys 0 it selects exactly as the flat bias.",
  "exe": "D:\\src\\Xolotl\\build-win\\ds41_generate.exe",
  "args": [
   "-m",
@@ -19,9 +19,9 @@
   "--arena-adapt",
   "--kv-fp4",
   "--route-bias",
-  "0.5",
+  "0.25",
   "--route-bias-file",
-  "0.3",
+  "0.15",
   "--arena-gib",
   "72",
   "--prompt-batch",
@@ -39,9 +39,10 @@
   "STRATA_DENSE_REQUANT": "q6_K",
   "STRATA_PRESTAGE_GIB": "1.5",
   "STRATA_TIER_BATCH_PCIE": "0.75",
-  "STRATA_SERVE_DSPARK": "D:/models/dsv41-gsq/V41-MTP-Vision.Q2_K.gguf",
+  "STRATA_SERVE_DSPARK": "D:/models/dsv41-1017-src/V41-MTP-Vision-1017.Q2_K.gguf",
   "STRATA_DSPARK_KEEP": "D:/src/Xolotl/tools/v41/serve/dspark_expert_counts.txt:64",
-  "STRATA_TEXT_LOG": "0"
+  "STRATA_TEXT_LOG": "0",
+  "STRATA_RB_SMART": "1"
  },
  "lib_dirs": [
   "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8\\bin"
@@ -59,6 +60,7 @@
  },
  "reasoning_budget_tokens": 32768,
  "aliases": [
-  "deepseek-v4.1-flash-xolotl-exact"
+  "deepseek-v4.1-flash-xolotl-exact",
+  "deepseek-v4.1-flash-xolotl-fast"
  ]
 }
