@@ -22,7 +22,12 @@
 #include <set>
 #include <thread>
 
+#ifdef _WIN32
+#include <string.h>
+#define strcasecmp _stricmp
+#else
 #include <strings.h>
+#endif
 
 using namespace strata;
 using namespace strata::v41;

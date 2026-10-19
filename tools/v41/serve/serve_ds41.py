@@ -274,7 +274,7 @@ S.OutputParser = F.OutputParser
 import threading as _th
 import time as _time
 
-_TEXT_LOG = os.environ.get("STRATA_TEXT_LOG", "/tmp/strata-ds41-text.log")
+_TEXT_LOG = os.environ.get("STRATA_TEXT_LOG", os.path.join(__import__("tempfile").gettempdir(), "strata-ds41-text.log"))
 _text_lock = _th.Lock()
 _text_state = {"kind": None}
 _KIND_LABEL = {"reasoning": "thinking", "content": "answer", "tool_start": "tool call", "tool_call": "tool call"}

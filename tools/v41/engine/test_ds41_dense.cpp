@@ -17,7 +17,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
-#include <sys/stat.h>
+#include "ds41_sys.hpp"
 #include <thread>
 #include <vector>
 
