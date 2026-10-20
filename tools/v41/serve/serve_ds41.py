@@ -414,6 +414,44 @@ F.OutputParser.feed = _op_feed_ds41
 F.OutputParser.finish = _op_finish_ds41
 S.OutputParser = F.OutputParser
 
+# ---- "parallel": N (#465's batch slots) on the DeepSeek-V4.1 engine.  ds41_generate --serve runs Strata's slot protocol
+# itself (BGEN / BADM / BT / BDONE / BSTOP / BYIELD: the server's generate_batched, unchanged) when started with
+# --batch N (= its --batch-slots N): INFO batch_slots=N.  The server's own parallel_args is Strata's: it skips the flag
+# whenever the args hold "--slots" - for ds41 that is the VRAM EXPERT cache, not batch slots - and caps at 8, where a
+# ds41 window takes 16 rows (one per slot).  When the engine cannot run the slots (no conversation pool, a build
+# without them) it says why in its log and the server says "N asked, the engine runs one at a time".
+DS41_PARALLEL_MAX = 16
+
+
+def ds41_parallel_args(cfg: dict, args: list[str]) -> list[str]:
+    if "--batch" in args or "--batch-slots" in args:
+        return []
+    n = cfg.get("parallel")
+    if n is None or n is False:
+        return []
+    if isinstance(n, bool) or not isinstance(n, int):
+        print(f'[strata] "parallel" must be a whole number of requests (2..{DS41_PARALLEL_MAX}), not {n!r}: ignored',
+              flush=True)
+        return []
+    if n <= 1:
+        return []
+    if os.environ.get("STRATA_DS41_PARALLEL", "1") == "0":
+        print(f'[strata] "parallel": {n} ignored: the DeepSeek-V4.1 engine\'s batch slots are turned off '
+              "(STRATA_DS41_PARALLEL=0); one request at a time", flush=True)
+        return []
+    if "--conversation-cache-mib" in args and args[args.index("--conversation-cache-mib") + 1:][:1] == ["0"]:
+        print(f'[strata] "parallel": {n} ignored: the DeepSeek-V4.1 engine\'s batch slots need its conversation pool '
+              "(--conversation-cache-mib 0 turns it off); one request at a time", flush=True)
+        return []
+    if n > DS41_PARALLEL_MAX:
+        print(f'[strata] "parallel": {n} - the DeepSeek-V4.1 engine runs at most {DS41_PARALLEL_MAX} requests together '
+              f"(a batch window is {DS41_PARALLEL_MAX} rows); it will use {DS41_PARALLEL_MAX}", flush=True)
+        n = DS41_PARALLEL_MAX
+    return ["--batch", str(n)]
+
+
+S.parallel_args = ds41_parallel_args
+
 # ---- full text log (llama.cpp-style): every request's thinking / answer / tool calls as they are generated, so a run
 # can be watched (`tail -f`) and checked afterwards (loops, what it was thinking).  STRATA_TEXT_LOG=<path> (default
 # /tmp/strata-ds41-text.log), STRATA_TEXT_LOG=0 = off.
