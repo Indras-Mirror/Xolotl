@@ -460,7 +460,8 @@ import time as _time
 
 _TEXT_LOG = os.environ.get("STRATA_TEXT_LOG", os.path.join(__import__("tempfile").gettempdir(), "strata-ds41-text.log"))
 _text_lock = _th.Lock()
-_text_state = {"kind": None}
+_text_state = {"kind": None, "who": None, "n": 0}
+_text_req = _th.local()   # "parallel": requests write at once - each chunk says whose it is when the writer changes
 _KIND_LABEL = {"reasoning": "thinking", "content": "answer", "tool_start": "tool call", "tool_call": "tool call"}
 
 
@@ -483,9 +484,10 @@ def _note_ds41(self, n, evs, st=None, rate=None):
         if not ev.text:
             continue
         label = _KIND_LABEL.get(ev.kind, ev.kind)
-        if label != _text_state["kind"]:
-            _text_state["kind"] = label
-            out.append(f"\n--- {label} ---\n")
+        who = getattr(_text_req, "n", None)
+        if label != _text_state["kind"] or who != _text_state["who"]:
+            _text_state["kind"], _text_state["who"] = label, who
+            out.append(f"\n--- {label} ---\n" if who is None or not getattr(self.engine, "batch", 0) else f"\n--- [#{who}] {label} ---\n")
         out.append(ev.text)
     if out:
         _text_write("".join(out))
@@ -515,7 +517,10 @@ def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # 
                                    int(num("route_protect", _ROUTING[2])), int(num("route_pool", _ROUTING[3])))
     t0 = _time.time()
     _text_state["kind"] = None
-    _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request: prompt {len(ids):,} tokens, max {max_new}, "
+    with _text_lock:
+        _text_state["n"] += 1
+        _text_req.n = _text_state["n"]
+    _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request #{_text_req.n}: prompt {len(ids):,} tokens, max {max_new}, "
                 f"thinking {'on' if thinking else 'off'}, tools {len(tools or [])} =====\n")
     end = "(stream closed)"
     try:
@@ -525,7 +530,7 @@ def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # 
                 end = f"finish {d.get('finish')}, {d.get('completion_tokens')} tokens"
             yield item
     finally:
-        _text_write(f"\n===== end: {end}, {_time.time() - t0:.1f} s =====\n")
+        _text_write(f"\n===== end #{_text_req.n}: {end}, {_time.time() - t0:.1f} s =====\n")
 
 
 S.Service._note = _note_ds41
