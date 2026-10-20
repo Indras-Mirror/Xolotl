@@ -1,5 +1,6 @@
 // bench_ds41_conv_pool <model.gguf> [--ctx 262144] [--budget-mib 8192] [--sizes 2048,8192,32768,65536,131072]
-//                      [--reps 5] [--no-fp4] [--fill 32768 (0 = skip E)] [--sys 8192] [--slab-kib 2048]
+//                      [--reps 5] [--no-fp4] [--fill 32768 (0 = skip E)] [--sys 8192] [--slab-kib 2048] [--prealloc]
+//                      (--sizes 0 skips A/B/C)
 //
 // The conversation pool on the card, with the model's real state shapes (geometry from the GGUF: kv source layers,
 // ratios, d_head / idx_dim, the window ring; --kv-fp4 row sizes NVFP4 288 B / MXFP4 68 B).  No weights are loaded: the
@@ -58,7 +59,7 @@ int main(int argc, char ** argv) {
     int64_t ctx = 262144, fill_n = 32768, sys_n = 8192;
     size_t budget_mib = 8192, slab_kib = 2048;
     int reps = 5;
-    bool fp4 = true;
+    bool fp4 = true, prealloc = false;
     std::vector<int64_t> sizes = { 2048, 8192, 32768, 65536, 131072 };
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -68,6 +69,7 @@ int main(int argc, char ** argv) {
         else if (a == "--reps") reps = std::max(2, std::atoi(nx().c_str()));
         else if (a == "--slab-kib") slab_kib = (size_t) std::atoll(nx().c_str());
         else if (a == "--no-fp4") fp4 = false;
+        else if (a == "--prealloc") prealloc = true;
         else if (a == "--fill") fill_n = std::atoll(nx().c_str());
         else if (a == "--sys") sys_n = std::atoll(nx().c_str());
         else if (a == "--sizes") {
@@ -163,12 +165,13 @@ int main(int argc, char ** argv) {
     Ds41PoolConfig cfg;
     cfg.budget_bytes = budget_mib << 20;
     cfg.slab_bytes = slab_kib << 10;
+    cfg.prealloc = prealloc;
     cfg.device = dev;
     Ds41ConvPool pool;
     auto t0 = clk::now();
     if (!pool.init(lay, cfg, err)) { std::fprintf(stderr, "pool init: %s\n", err.c_str()); return 1; }
-    std::printf("# pool: slab %zu KiB, chunk %zu positions, init %.1f ms (lazy extents of %zu MiB)\n", cfg.slab_bytes >> 10,
-                pool.chunk_positions(), ms_since(t0), cfg.extent_bytes >> 20);
+    std::printf("# pool: slab %zu KiB, chunk %zu positions, init %.1f ms (%s extents of %zu MiB)\n", cfg.slab_bytes >> 10,
+                pool.chunk_positions(), ms_since(t0), prealloc ? "the whole budget in" : "lazy", cfg.extent_bytes >> 20);
     {   // pinned allocation speed: one 256 MiB extent
         void * p = nullptr;
         t0 = clk::now();
@@ -189,7 +192,7 @@ int main(int argc, char ** argv) {
                 "restore_enqueue_ms\trestore_dev_ms\trestore_wall_ms\trestore_GBps\tincr_save_MiB\tincr_save_ms\t"
                 "partial_restore_ms\texact\n");
     for (int64_t n : sizes) {
-        if (n > ctx) continue;
+        if (n < 1 || n > ctx) continue;
         const size_t kv = pos_bytes(n), tot = kv + lay.region_bytes();
         // A. baseline: main's park (ggml_backend_tensor_get = synchronous cudaMemcpy into pageable vectors) + unpark
         double park = 1e30, unpark = 1e30;
@@ -316,6 +319,7 @@ int main(int argc, char ** argv) {
             std::vector<Ds41PoolId> ids;
             double save_ms = 0;
             int k = 0;
+            const uint64_t ev0 = pool.stats().evictions;   // cumulative: count this run's only
             for (;; ++k) {
                 for (auto & x : t) x = (int32_t) (g() % 129280);
                 if (shared) for (int64_t i = 0; i < std::min(sys_n, fill_n); ++i) t[(size_t) i] = (int32_t) (i * 7 + 3);
@@ -323,7 +327,7 @@ int main(int argc, char ** argv) {
                 const Ds41PoolId id = pool.save(D.t, t.data(), nullptr, fill_n, logits.data(), logits.size(), err);
                 save_ms += ms_since(t0);
                 if (!id) { std::fprintf(stderr, "fill save: %s\n", err.c_str()); break; }
-                if (pool.stats().evictions) break;
+                if (pool.stats().evictions != ev0) break;
                 ids.push_back(id);
                 if (k > 20000) break;
             }
