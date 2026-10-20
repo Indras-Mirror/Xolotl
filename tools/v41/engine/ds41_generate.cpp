@@ -2604,13 +2604,19 @@ int main(int argc, char ** argv) {
                 std::printf("BADM %d %d\n", admit, cont ? 1 : 0);
                 std::fflush(stdout);
                 ++batch_epoch;
+                if (!cont) save_live("turn end");   // (a slot that decodes on goes to the pool at its BDONE)
             }
+            // batch slots: every turn's boundary into the pool at once (an async copy of the new tail).  With one live
+            // state the pool got it when the next request overwrote it; with slots a side request takes another slot,
+            // nothing is overwritten, and an earlier boundary of this conversation (an edited turn's resume point) would
+            // be gone with the slot's next snapshot (20.10 card: c3edit read 8185 tokens again instead of resuming at 8081)
+            else if (my_slot >= 0) {
+                save_live("turn end");
 #if defined(DS41_HAVE_DSPARK)
-            else if (my_slot >= 0) {   // a solo request: DSpark's window is this slot's conversation now
-                dsp_slot = my_slot;
+                dsp_slot = my_slot;         // a solo request: DSpark's window is this slot's conversation now
                 dsp_epoch = batch_epoch;
-            }
 #endif
+            }
         }
         tier.close();
         // the stdin reader thread (detached) sits in getline holding cin's lock: a normal exit's stream teardown waits

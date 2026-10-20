@@ -18,6 +18,7 @@ Scenarios (each prints a JSON line; SUMMARY at the end):
   promote    a solo GEN STOPped, then BGEN with prompt + output into another slot: the conversation moves (swap), = ref
   yield      BYIELD during a slot's long read: YIELDED + DONE cancel + BADM 0, the read goes on from there, = reference
   yieldsolo  the same for a solo read (into a free slot the "server" names)
+  edit       solo turns: a side request in another slot, the next turn, then an edit of it: resumes from the pool
   mix        a short BGEN prompt read in the windows beside a decoding slot (its rows mixed in): the decoder = reference
              exactly, the mixed read's first-token logits vs the reference's (KL, top-1)
 """
@@ -225,7 +226,7 @@ def main():
     Y, Y2 = BOS + T[0][400:499], BOS + T[1][600:699]     # 100 tokens: four layer-major batches of 32
     D = BOS + T[2][200:239]
     want = a.scenario.split(",") if a.scenario != "all" else ["order", "cancel", "classes", "solo", "promote", "yield",
-                                                              "yieldsolo", "mix"]
+                                                              "yieldsolo", "edit", "mix"]
     res = []
 
     def report(d):
@@ -253,7 +254,7 @@ def main():
         env = dict(env_b, **(extra_env or {}))
         return Engine(a.bin, common + ["--batch-slots", str(slots)], env, out, name)
 
-    if any(s in want for s in ("order", "cancel", "classes", "solo", "promote", "yield", "yieldsolo")):
+    if any(s in want for s in ("order", "cancel", "classes", "solo", "promote", "yield", "yieldsolo", "edit")):
         E = engine("slots", {"STRATA_BATCH_MIX_MAX": "0"})
         if E.info.get("batch_slots") != "3":
             report({"scenario": "start", "ok": False, "info": E.info})
@@ -358,6 +359,20 @@ def main():
             yq = (g.get("yielded") or [None, None])[1]
             d["ok"] = (g.get("yielded") or [None])[0] == 2 and yq in (32, 64) and g["done"][5] == "cancel" and r2["resume"] == yq \
                 and d["tokens"]["equal"]
+            report(d)
+        if "edit" in want:
+            # solo turns only: a conversation, a side request (another slot), its next turn (continues the live state
+            # in its slot), then an EDIT of that turn (shares only the first turn's prompt): it must resume from the
+            # first turn's boundary in the pool, not read everything again (20.10 card: c3edit read 8185 tokens)
+            P1 = BOS + T[2][400:439]
+            g1 = E.gen(P1, 4)
+            E.gen(B, 2)
+            P2 = P1 + g1["tokens"] + T[2][500:510]
+            E.gen(P2, 2)
+            P3 = P1 + T[2][600:612]
+            g3 = E.gen(P3, 2)
+            d = {"scenario": "edit", "resume": g3["resume"], "expect_resume": len(P1)}
+            d["ok"] = g3["resume"] == len(P1)
             report(d)
         E.close()
     if "mix" in want:
