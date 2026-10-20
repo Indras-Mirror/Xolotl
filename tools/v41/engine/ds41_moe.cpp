@@ -6081,8 +6081,16 @@ bool Ds41FileBlobs::open(std::string& err) {
         smax = std::max<uint64_t>(smax, (uint64_t) d_rb_[c] * (uint64_t) g_.n_embd);
     }
     scratch_ = (size_t) smax + 8192;   // the largest role span + the 4096-rounding a pread adds on both ends
+    // The mirror is read O_DIRECT whatever the model file uses: on Windows the model file is best read buffered
+    // (STRATA_BLOB_DIRECT=0: it is also memory-mapped, and NO_BUFFERING reads of a mapped file serialize), while the
+    // mirror is a second, unmapped file.
+#ifdef _WIN32
+    const bool mirror_ok = true;
+#else
+    const bool mirror_ok = dfd_ >= 0;
+#endif
     const char* mp = std::getenv("STRATA_BLOB_MIRROR");
-    if (mp && mp[0] && part_direct_ && dfd_ >= 0) {
+    if (mp && mp[0] && part_direct_ && mirror_ok) {
         std::string merr;
         if (!open_mirror(mp, merr)) std::fprintf(stderr, "blob mirror: NOT used (%s)\n", merr.c_str());
     }
@@ -6154,11 +6162,16 @@ bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
     }
     const char* sh = std::getenv("STRATA_BLOB_MIRROR_SHARE");
     if (sh && sh[0]) mshare_ = std::max(0, std::min(1000, (int) std::lround(std::atof(sh) * 1000.0)));
+    // STRATA_BLOB_MIRROR_PART_SHARE: read_part's own share (decode misses: one blob split over both drives waits on the
+    // slower one); default = STRATA_BLOB_MIRROR_SHARE.  The prompt prefetch (read_staged, whole blobs) uses the latter.
+    const char* ps = std::getenv("STRATA_BLOB_MIRROR_PART_SHARE");
+    mpshare_ = ps && ps[0] ? std::max(0, std::min(1000, (int) std::lround(std::atof(ps) * 1000.0))) : mshare_;
     moff_.swap(mo);
     mirrored_ = (int64_t) H.n;
     mfd_ = fd;
-    std::fprintf(stderr, "blob mirror: %s - %lld experts (%.1f GiB), share %.3f of each mirrored blob's parts\n", path,
-                 (long long) H.n, (double) (end - H.data) / 1073741824.0, mshare_ / 1000.0);
+    std::fprintf(stderr, "blob mirror: %s - %lld experts (%.1f GiB), share %.3f of each mirrored blob's parts (%.3f for "
+                 "decode reads)\n", path, (long long) H.n, (double) (end - H.data) / 1073741824.0, mshare_ / 1000.0,
+                 mpshare_ / 1000.0);
     return true;
 }
 
@@ -6276,7 +6289,24 @@ bool Ds41FileBlobs::read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* s
     return true;
 }
 
+bool Ds41FileBlobs::mirror_pick(int64_t layer, int64_t expert) const {
+    // whole-blob reads: a fixed hash of (layer, expert) sends mshare_ per mille of the mirrored blobs to the mirror
+    const uint32_t h = (uint32_t) (((uint64_t) (layer * g_.n_experts + expert) * 2654435761ull) >> 7);
+    return (int) (h % 1000u) < mshare_;
+}
+
 void Ds41FileBlobs::read_staged(int64_t layer, int64_t expert, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes) const {
+    if (mfd_ >= 0 && scratch && scratch_bytes >= scratch_ && mirror_pick(layer, expert)) {
+        const uint64_t mo = moff_[(size_t) (layer * g_.n_experts + expert)];
+        if (mo != ~0ull) {   // the mirror blob is contiguous: [0, n) in steps the bounce holds
+            const uint64_t n = expert_bytes(layer, expert);
+            const uint64_t step = (uint64_t) (scratch_bytes - 8192) & ~(uint64_t) 4095;
+            bool ok = true;
+            for (uint64_t a = 0; a < n && ok; a += step)
+                ok = read_direct(mo + a, (size_t) std::min<uint64_t>(step, n - a), dst + a, scratch, scratch_bytes, mfd_);
+            if (ok) return;
+        }
+    }
     if (dfd_ < 0 || scratch_bytes < scratch_) {
         read(layer, expert, dst);
         return;
@@ -6354,10 +6384,10 @@ void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int npart
     if (part + 1 < nparts) hi &= ~(uint64_t) 4095;
     else hi = total;
     uint64_t at = 0;
-    uint8_t* bb = part_direct_ && dfd_ >= 0 ? take_bounce() : nullptr;
+    uint8_t* bb = part_direct_ && (dfd_ >= 0 || mfd_ >= 0) ? take_bounce() : nullptr;
     // the mirror's share of the parts: part p goes there when floor((p+1)*share) > floor(p*share) - spread evenly,
     // and a 1-part read stays on the model file.  The mirror blob is contiguous: [lo, hi) is one aligned span there.
-    if (mfd_ >= 0 && bb && nparts > 1 && ((part + 1) * mshare_) / 1000 != (part * mshare_) / 1000) {
+    if (mfd_ >= 0 && bb && nparts > 1 && ((part + 1) * mpshare_) / 1000 != (part * mpshare_) / 1000) {
         const uint64_t mo = moff_[(size_t) (layer * g_.n_experts + expert)];
         if (mo != ~0ull) {
             const uint64_t step = (uint64_t) (scratch_ - 8192) & ~(uint64_t) 4095;

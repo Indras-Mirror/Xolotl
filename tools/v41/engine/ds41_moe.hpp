@@ -244,10 +244,13 @@ private:
     /// there is no twin fd or the bounce is too small (the caller then falls back to the buffered `read`).
     bool read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes, int fd = -1) const;
     bool open_mirror(const char* path, std::string& err);
+    /// read_staged (whole blobs): does this mirrored blob come from the mirror?  mshare_ per mille, by a fixed hash.
+    bool mirror_pick(int64_t layer, int64_t expert) const;
     int mfd_ = -1;                        ///< the mirror (O_DIRECT), -1 = none
     std::vector<uint64_t> moff_;          ///< per (layer, expert): the blob's offset in the mirror, ~0 = not mirrored
     int64_t mirrored_ = 0;
     int mshare_ = 280;                    ///< per mille of a mirrored blob's parts read from the mirror
+    int mpshare_ = 280;                   ///< the same for read_part (decode misses) only
     /// read_part's aligned bounces (one per concurrent part, kept for the next call)
     uint8_t* take_bounce() const;
     void give_bounce(uint8_t* p) const;
