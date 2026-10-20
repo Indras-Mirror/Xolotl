@@ -46,6 +46,17 @@ DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts
 - **Fast where it counts.** The Qwen models run at 100-130 tok/s; an agent's small follow-up turn on DeepSeek-V4.1
   costs ~8 s on a 6K-16K context, and the engine learns the conversation's experts between turns.
 
+## Recently added
+
+- **DeepSeek-V4.1-Flash-1017 builds** of the October checkpoint:
+  [IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored)
+  (V2 142 GiB; V3 152 GiB, recalibrated on a code + agentic heavy mix). A V4 is in the works.
+- **Native Windows** for the DeepSeek-V4.1 engine (MSVC + CUDA, RTX 50 notes from #14): [docs/WINDOWS.md](docs/WINDOWS.md).
+- **Vision** input for DeepSeek-V4.1 (#8), per-request routing options (#11), a 16-row tier call (#9) and a uniform
+  VRAM expert cache under the auto slot budget (#15).
+- Engine: a VRAM breakdown in the decode trace (dense weights, DSpark draft, free memory) and per-GPU one-time setup
+  in the dense kernels.
+
 ## Quick start
 
 Linux, an NVIDIA GPU with 24 GB, CUDA 12.x/13.x, and RAM for the arena (90 GB was used above).
@@ -60,7 +71,8 @@ ninja -C build-xolotl      # strata, strata-dense, glm_generate, ds41_generate, 
 ```
 
 Get a model: DeepSeek-V4.1-Flash is **[IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)**
-(152 GiB, our GSQ mixed ternary / 2-bit / 3-bit quant - the card has the download and Engram steps). Then serve it
+(152 GiB, our GSQ mixed ternary / 2-bit / 3-bit quant - the card has the download and Engram steps), or the newer
+**[1017 builds](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored)** of the October checkpoint. Then serve it
 (edit the model paths in its config first):
 
 ```bash
@@ -76,9 +88,8 @@ Then point any OpenAI- or Anthropic-compatible client at `http://127.0.0.1:<port
 
 What I've measured is one setup: **RTX 4090 (24 GB), 90 GB DDR4, Linux, NVMe**. Beyond that:
 
-- **OS:** Linux only for the DeepSeek engine for now (the launcher and the expert/Engram disk reads are Linux-specific).
-  The Strata core runs on Windows, but the DeepSeek side doesn't yet. WSL2 might work but is untested; keep the model
-  files inside WSL's own filesystem, not on a Windows drive.
+- **OS:** Linux, or Windows 11 natively (MSVC + CUDA; build and serve steps in [docs/WINDOWS.md](docs/WINDOWS.md)).
+  Everything measured here is on Linux.
 - **GPU:** NVIDIA, compute capability 7.5 or newer (RTX 20/30/40/50). Build with your card's architecture:
   `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 30, `89` for RTX 40, `120` for RTX 50 (use CUDA 13.x for RTX 50; 12.8 builds
   had prompt-path crashes).
@@ -106,6 +117,7 @@ pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up
 | [How Xolotl works](docs/xolotl/HOW_IT_WORKS.md) | the three memory tiers, per-model engines, the server, the agent-loop work |
 | [Benchmarks](docs/xolotl/BENCHMARKS.md) | every measured number, exactness checks, how to measure your own PC |
 | [DeepSeek-V4.1-Flash engine](docs/DEEPSEEK_V41.md) | GSQ quantisation, DSpark, the fp4 KV cache, Engram |
+| [DeepSeek-V4.1 on Windows](docs/WINDOWS.md) | native MSVC + CUDA build, configs, RTX 50 notes |
 | [GLM-5.3-Flash engine](docs/glm) | KDA + MLA attention, the LoRA on routed experts, soft pruning |
 | [Qwen3.8 / upstream Strata](README.strata.md) | the Strata engine this grew from |
 | [Brand kit](docs/brand/XOLOTL_BRAND.md) | logo, banner, palette |
