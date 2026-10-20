@@ -1148,6 +1148,11 @@ int main(int argc, char ** argv) {
         std::vector<float> park_logits;
         int64_t park_rows = 0;            // positions saved: a request writing past this invalidates the park
         bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
+        // STRATA_SERVE_DSPARK leaves the live state DIRTY when its last verify pass rejected drafts: the ratio-2
+        // compressor state ring then holds the rejected positions' states, so a request that continues the live
+        // history at an odd position (its group's first half is the last accepted token) must re-feed that token -
+        // the same rule as the in-request refeed (`dirty && (P + 1) & 1`).
+        bool live_dirty = false;
 #if defined(DS41_HAVE_DSPARK)
         // STRATA_SERVE_DSPARK: DSpark's window (main_hidden of the last <= 128 positions) is seeded by running a
         // request's last min(128, new) prompt tokens through pass_v instead of the passes / batch (no extra work), and
@@ -1324,7 +1329,14 @@ int main(int argc, char ** argv) {
             int reused = 0;
             bool regen = false;   // the snapshot's own prompt again: nothing new to feed
             if (reuse_override >= 0) reused = reuse_override;   // a partial unpark: positions [0, lp) are the parked one's
-            else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
+            else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) {
+                reused = (int) lcp;
+                if (live_dirty && (reused & 1)) {   // re-feed the last accepted token (its group's ratio-2 state)
+                    --reused;
+                    hist.resize((size_t) reused);
+                    std::fprintf(stderr, "serve: the live state is dirty (DSpark) at an odd position: resuming at %d\n", reused);
+                }
+            }
             else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);   // the same prompt again (regenerate): its end state + saved logits
                 reused = snap_len;
@@ -1346,6 +1358,7 @@ int main(int argc, char ** argv) {
                 hist.clear();
                 snap_len = -1;
             }
+            live_dirty = false;
             std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
                          park_hist.size(), lp_show, hist.size(), snap_len, ids.size(), reused);
             if (reused > 0) {
@@ -1786,6 +1799,7 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "serve: lookup %ld/%ld drafts accepted in %ld passes\n", lk_acc, lk_dr, lk_pass);
                 dsp_next = P + 1;   // the ring holds every position <= P (the last emitted token is not fed)
                 if (std::strcmp(finish, "error") == 0) dsp_next = -1;
+                live_dirty = dirty;   // the last pass rejected drafts: the ratio-2 state ring holds rejected positions
                 sv_pass += rq_pass; sv_acc += rq_acc;
             }
 #endif
