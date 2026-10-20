@@ -9,6 +9,7 @@ line protocol, same output-file format.
 PROTOCOL (strata_vision.cpp:12-16, 184-233)
   argv   : --mmproj <sidecar.gguf> --model <text model .gguf> [--gpu] [--threads N] [--max-tokens N]
            [--min-tokens N] [--flash-attn on|off|auto]        (server.py:1268 builds exactly this)
+           [--vision-weights <tower.safetensors | checkpoint dir | mmproj.gguf>]   (serve_ds41.py adds it)
   stdout : "READY <n_embd>\\n" once (server.py:1297), then per stdin line
              "ENC <image path> <output path>"  ->  "OK <n> <nx> <ny> <ms>"  or  "ERR <message>"
              "QUIT"                            ->  exit 0
@@ -31,6 +32,12 @@ image_processor.py:132-137):
 
 ADAPTED (documented deviations from strata_vision.cpp)
   * Weights: the C++ reads an mtmd mmproj; here the same tensors live in the V4.1 sidecar GGUF.
+  * --vision-weights (serve config: vision "weights"): the sidecar keeps the tower in Q8_0, and Q8_0 of the
+    checkpoint's BF16 alone moves some rows to cosine 0.996 against the reference (test_ds41_vision.py, 300x1200).
+    The full-precision tower - a safetensors file with the checkpoint's vision.* / aligner.* / image_* bytes,
+    the checkpoint directory itself, or an mmproj GGUF (clip / deepseek41v, names mapped back) - replaces the
+    sidecar's tensors; the sidecar still gives the vision config (cross-checked).  Same memory and speed: the
+    encoder dequantizes to --dtype at load either way.
   * Grid: DeepSeek's span is n_llm_h rows of (n_llm_w+1) plus the 2 delimiters, so nx*ny == n cannot
     be the reading-order rectangle (that would need n = n_llm_h*(n_llm_w+1) = n-2).  We emit the flat
     reading order nx = n, ny = 1. V4.1 uses sequential 1-D text positions for the whole span;
@@ -38,7 +45,7 @@ ADAPTED (documented deviations from strata_vision.cpp)
   * No mtmd flash-attn / min-tokens knobs (accepted and ignored).
   * The server already caches by image hash (server.py:1363-1388), so this process keeps no cache.
 
-ON THE GPU (--device cuda / --gpu; aiserver 20.10, RTX 5090)
+ON THE GPU (--device cuda / --gpu; measured on an RTX 5090)
   * The server starts the encoder BEFORE the engine and waits for READY (server.py `vision = Vision(...)` ahead of
     "loading the model"); the ds41 engine sizes its VRAM expert cache from the card's free memory at every re-seed
     (ds41_generate.cpp:419, :855 - free minus --vram-margin).  So everything the encoder will ever hold must be on the
@@ -176,6 +183,214 @@ class SidecarWeights:
     def torch(self, name, tp, dtype):
         return tp.from_numpy(np.ascontiguousarray(self.get(name))).to(dtype)
 
+    @property
+    def vision_config(self):
+        return json.loads(self.kv["deepseek41.sidecar.vision_config"])
+
+    @property
+    def image_token_id(self):
+        return self.kv.get("deepseek41.sidecar.image_token_id")
+
+    def describe(self):
+        types = sorted({_GGML_NAMES.get(t, str(t)) for _, t, _ in self.tensors.values()})
+        return f"sidecar GGUF {os.path.basename(self.path)} ({len(self.tensors)} tensors, {'/'.join(types)})"
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+_GGML_NAMES = {F32: "F32", F16: "F16", Q8_0: "Q8_0", BF16: "BF16"}
+_ST_TYPES = {"F32": (F32, 4), "F16": (F16, 2), "BF16": (BF16, 2)}
+
+
+def _pread(fd, nbytes, off, name):
+    raw = bytearray()
+    while len(raw) < nbytes:
+        b = os.pread(fd, nbytes - len(raw), off + len(raw))
+        if not b:
+            raise OSError(f"{name}: short read")
+        raw += b
+    return bytes(raw)
+
+
+class SafetensorsWeights:
+    """The full-precision tower from safetensors: ONE file (e.g. the tower extracted from the checkpoint, whose
+    __metadata__ carries vision_config / image_token_id) or a checkpoint DIRECTORY (model.safetensors.index.json:
+    only the shards holding vision.* / aligner.* / image_* are opened, only those byte ranges are read; the config
+    comes from its config.json).  BF16 / F16 / F32 tensors (the DeepSeek-V4.1 checkpoints ship the tower in BF16)."""
+
+    def __init__(self, path):
+        self.path = path
+        self.meta, cfg = {}, None
+        if os.path.isdir(path):
+            idx = os.path.join(path, "model.safetensors.index.json")
+            if os.path.exists(idx):
+                wm = json.load(open(idx))["weight_map"]
+                files = sorted({s for n, s in wm.items() if n.startswith(VISION_PREFIXES)})
+            else:
+                files = sorted(f for f in os.listdir(path) if f.endswith(".safetensors"))
+            files = [os.path.join(path, f) for f in files]
+            if os.path.exists(os.path.join(path, "config.json")):
+                cfg = json.load(open(os.path.join(path, "config.json")))
+        else:
+            files = [path]
+        self.fds, self.tensors = [], {}
+        for f in files:
+            with open(f, "rb") as fh:
+                (n,) = struct.unpack("<Q", fh.read(8))
+                hdr = json.loads(fh.read(n))
+            self.meta.update(hdr.pop("__metadata__", None) or {})
+            fd = os.open(f, os.O_RDONLY)
+            self.fds.append(fd)
+            for name, e in hdr.items():
+                if not name.startswith(VISION_PREFIXES):
+                    continue
+                if e["dtype"] not in _ST_TYPES:
+                    raise ValueError(f"{f}: {name} is {e['dtype']} (expected BF16 / F16 / F32)")
+                b0, b1 = e["data_offsets"]
+                self.tensors[name] = (fd, 8 + n + b0, b1 - b0, _ST_TYPES[e["dtype"]][0], tuple(e["shape"]), e["dtype"])
+        if not self.tensors:
+            raise ValueError(f"{path}: no vision.* / aligner.* / image_* tensors")
+        self._cfg = cfg
+
+    def names(self):
+        return sorted(self.tensors)
+
+    def get(self, name):
+        fd, off, nb, ty, shape, _ = self.tensors[name]
+        return dequantize(_pread(fd, nb, off, name), ty).reshape(shape).astype(np.float32)
+
+    def torch(self, name, tp, dtype):
+        return tp.from_numpy(np.ascontiguousarray(self.get(name))).to(dtype)
+
+    @property
+    def vision_config(self):
+        if self._cfg is not None and "vision_config" in self._cfg:
+            return dict(self._cfg["vision_config"])
+        return json.loads(self.meta["vision_config"]) if "vision_config" in self.meta else None
+
+    @property
+    def image_token_id(self):
+        if self._cfg is not None and "image_token_id" in self._cfg:
+            return self._cfg["image_token_id"]
+        v = self.meta.get("image_token_id")
+        return int(v) if v not in (None, "") else None
+
+    def describe(self):
+        types = sorted({e[5] for e in self.tensors.values()})
+        return f"safetensors {self.path} ({len(self.tensors)} tensors, {'/'.join(types)})"
+
+    def close(self):
+        for fd in self.fds:
+            os.close(fd)
+        self.fds = []
+
+
+class MmprojWeights:
+    """The tower from an llama.cpp mmproj GGUF (general.architecture "clip", clip.projector_type "deepseek41v", e.g.
+    Unsloth's mmproj-BF16.gguf), its names mapped back to the checkpoint's:
+      v.patch_embd.{weight [1024,3,14,14] -> [1024,588], bias}   -> vision.patch_embed.proj.*
+      v.blk.N.attn_qkv / attn_out                                  -> vision.blocks.N.attn.wqkv / wo
+      v.blk.N.ffn_gate ++ ffn_up (rows: gate first, as mlp.forward's chunk(2)) -> vision.blocks.N.mlp.w1.weight
+      v.blk.N.ffn_down / ln1 / ln2                                 -> mlp.w2 / norm1 / norm2
+      v.post_ln -> vision.norm;  mm.1 / mm.2 -> aligner.w1 / w2;  v.token_embd.img_start / img_end, v.image_newline
+    The clip header has no rope_theta / max_image_tokens: vision_config fills V4.1's 10000 / 1024 (the sidecar's
+    config, when one is given too, wins and is cross-checked)."""
+
+    _SIMPLE = {"v.post_ln.weight": "vision.norm.weight", "v.patch_embd.bias": "vision.patch_embed.proj.bias",
+               "mm.1.weight": "aligner.w1.weight", "mm.1.bias": "aligner.w1.bias",
+               "mm.2.weight": "aligner.w2.weight", "mm.2.bias": "aligner.w2.bias",
+               "v.token_embd.img_start": "image_start", "v.token_embd.img_end": "image_end",
+               "v.image_newline": "image_newline"}
+    _BLOCK = {"attn_qkv.weight": "attn.wqkv.weight", "attn_qkv.bias": "attn.wqkv.bias",
+              "attn_out.weight": "attn.wo.weight", "attn_out.bias": "attn.wo.bias",
+              "ffn_down.weight": "mlp.w2.weight", "ln1.weight": "norm1.weight", "ln2.weight": "norm2.weight"}
+
+    def __init__(self, path):
+        self.kv, tensors, self.data_start = read_gguf_header(path)
+        self.path = path
+        if self.kv.get("clip.projector_type") != "deepseek41v":
+            raise ValueError(f"{path}: clip.projector_type {self.kv.get('clip.projector_type')!r}, expected deepseek41v")
+        self.src = {n: (s, t, o) for n, s, t, o in tensors}
+        self.fd = os.open(path, os.O_RDONLY)
+        self.map = {}                                  # checkpoint name -> list of mmproj names (concatenated on dim 0)
+        for n in self.src:
+            if n in self._SIMPLE:
+                self.map[self._SIMPLE[n]] = [n]
+            elif n == "v.patch_embd.weight":
+                self.map["vision.patch_embed.proj.weight"] = [n]
+            elif n.startswith("v.blk."):
+                i, rest = n[len("v.blk."):].split(".", 1)
+                if rest in self._BLOCK:
+                    self.map[f"vision.blocks.{i}.{self._BLOCK[rest]}"] = [n]
+                elif rest == "ffn_gate.weight":
+                    self.map[f"vision.blocks.{i}.mlp.w1.weight"] = [n, f"v.blk.{i}.ffn_up.weight"]
+                elif rest != "ffn_up.weight":
+                    raise ValueError(f"{path}: unmapped tensor {n}")
+            else:
+                raise ValueError(f"{path}: unmapped tensor {n}")
+
+    def names(self):
+        return sorted(self.map)
+
+    def _one(self, n):
+        shape, ty, off = self.src[n]
+        return dequantize(_pread(self.fd, ggml_nbytes(shape, ty), self.data_start + off, n), ty).reshape(shape[::-1])
+
+    def get(self, name):
+        parts = [self._one(n) for n in self.map[name]]
+        a = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+        if name == "vision.patch_embed.proj.weight":
+            a = a.reshape(a.shape[0], -1)              # [1024, 3, p, p] conv -> the reference Linear's [1024, 3*p*p]
+        return a.astype(np.float32)
+
+    def torch(self, name, tp, dtype):
+        return tp.from_numpy(np.ascontiguousarray(self.get(name))).to(dtype)
+
+    @property
+    def vision_config(self):
+        k = self.kv
+        return {"model_type": "deepseek_v41_vision", "num_hidden_layers": int(k["clip.vision.block_count"]),
+                "hidden_size": int(k["clip.vision.embedding_length"]),
+                "num_attention_heads": int(k["clip.vision.attention.head_count"]),
+                "intermediate_size": int(k["clip.vision.feed_forward_length"]),
+                "patch_size": int(k["clip.vision.patch_size"]), "rope_theta": 10000,
+                "downsample_ratio": int(k["clip.vision.projector.scale_factor"]), "max_image_tokens": 1024,
+                "min_pixels": int(k["clip.vision.image_min_pixels"]), "max_wh_ratio": None}
+
+    @property
+    def image_token_id(self):
+        return None
+
+    def describe(self):
+        types = sorted({_GGML_NAMES.get(t, str(t)) for _, t, _ in self.src.values()})
+        return f"mmproj GGUF {os.path.basename(self.path)} ({len(self.src)} tensors -> {len(self.map)}, {'/'.join(types)})"
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def open_weights(path):
+    """--vision-weights: a safetensors file or checkpoint directory, an mmproj GGUF (clip / deepseek41v), or another
+    V4.1 sidecar GGUF (vision.* names)."""
+    if os.path.isdir(path) or path.endswith(".safetensors"):
+        return SafetensorsWeights(path)
+    with open(path, "rb") as f:
+        magic = f.read(4)
+    if magic == b"GGUF":
+        kv, _, _ = read_gguf_header(path)
+        return MmprojWeights(path) if kv.get("general.architecture") == "clip" else SidecarWeights(path)
+    return SafetensorsWeights(path)
+
+
+# keys a weights source's vision_config must agree on with the sidecar's (when both are given)
+_CFG_KEYS = ("num_hidden_layers", "hidden_size", "num_attention_heads", "intermediate_size", "patch_size",
+             "downsample_ratio", "min_pixels")
+
 
 # --------------------------------------------------------------------- model
 class VisionArgs:
@@ -283,7 +498,10 @@ def build_span(embeds, n_llm_h, n_llm_w, image_start, image_newline, image_end):
 
 class Encoder:
     def __init__(self, sidecar, reference_dir=DEFAULT_REFERENCE, device="cpu", threads=0, dtype="f32",
-                 max_n_token=None, fast_attention=True, offload=False, tf32=False):
+                 max_n_token=None, fast_attention=True, offload=False, tf32=False, weights=None):
+        """sidecar: the V4.1 sidecar GGUF (vision config + its own Q8_0 tower), may be None when `weights` carries a
+        config.  weights: optional full-precision tower (open_weights: safetensors file / checkpoint dir / mmproj
+        GGUF) that REPLACES the sidecar's tensors; the sidecar's vision_config then stays the config, cross-checked."""
         if threads and threads > 0:
             torch.set_num_threads(int(threads))
         if device != "cuda":
@@ -294,12 +512,23 @@ class Encoder:
         ViT, Aligner, load_image, _ = _load_reference(reference_dir)
         self.load_image, self.Aligner, self.ViT = load_image, Aligner, ViT
 
-        w = SidecarWeights(sidecar)
-        cfg = json.loads(w.kv["deepseek41.sidecar.vision_config"])
+        side = SidecarWeights(sidecar) if sidecar else None
+        w = open_weights(weights) if weights else side
+        if w is None:
+            raise ValueError("no vision weights: give the sidecar (--mmproj) and/or --vision-weights")
+        cfg = side.vision_config if side is not None else w.vision_config
+        if cfg is None:
+            raise ValueError(f"{w.describe()}: no vision_config; pass the sidecar (--mmproj) as well")
+        if side is not None and w is not side and w.vision_config is not None:
+            bad = {k: (cfg.get(k), w.vision_config.get(k)) for k in _CFG_KEYS if cfg.get(k) != w.vision_config.get(k)}
+            if bad:
+                raise ValueError(f"--vision-weights {w.path} is not this sidecar's tower: config differs {bad}")
+        self.weights_desc = w.describe()
         tile = w.get("image_start")
         self.args = VisionArgs(cfg, dim=int(tile.shape[0]), max_n_token=max_n_token)
         self.n_embd = self.args.dim
-        self.image_token_id = int(w.kv.get("deepseek41.sidecar.image_token_id", 0))
+        tid = side.image_token_id if side is not None else w.image_token_id
+        self.image_token_id = int(tid or 0)
 
         self.vit = ViT(self.args).eval()
         if fast_attention:
@@ -317,6 +546,8 @@ class Encoder:
                 al_sd[name[len("aligner."):]] = w.torch(name, torch, self.dtype)
         self.vit.load_state_dict(vit_sd, strict=True)
         self.aligner.load_state_dict(al_sd, strict=True)
+        for src in {id(x): x for x in (side, w) if x is not None}.values():
+            src.close()
         # load_state_dict copies INTO the float32 parameters: the modules themselves must take the dtype (bf16 / f16
         # patches on f32 weights fail in the first Linear; on the CPU "bf16" was f32 compute on bf16-rounded weights)
         self.vit, self.aligner = self.vit.to(self.dtype), self.aligner.to(self.dtype)
@@ -466,6 +697,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], add_help=True)
     ap.add_argument("--mmproj", help="the vision sidecar GGUF (strata-vision's mmproj)")
     ap.add_argument("--sidecar", help="alias of --mmproj")
+    ap.add_argument("--vision-weights", default=None,
+                    help="full-precision tower replacing the sidecar's Q8_0 one: a safetensors file (the tower "
+                         "extracted from the checkpoint), a checkpoint directory (model.safetensors.index.json), or "
+                         "an mmproj GGUF (clip / deepseek41v); the sidecar still gives the config")
     ap.add_argument("--model", help="the text model (accepted for argv compatibility; not read)")
     ap.add_argument("--gpu", action="store_true", help="use the GPU (accepted; --device cuda)")
     ap.add_argument("--device", choices=["cpu", "cuda"], default=None)
@@ -485,13 +720,14 @@ def main(argv=None):
     ap.add_argument("--no-warmup", action="store_true", help="cuda: no warm-up before READY")
     a = ap.parse_args(argv)
 
-    sidecar = a.sidecar or a.mmproj or DEFAULT_SIDECAR
+    sidecar = a.sidecar or a.mmproj or (None if a.vision_weights else DEFAULT_SIDECAR)
     device = a.device or ("cuda" if a.gpu else "cpu")
     enc = Encoder(sidecar, reference_dir=a.reference_dir, device=device, threads=a.threads,
                   dtype=a.dtype, max_n_token=a.max_tokens or None, fast_attention=not a.ref_attention,
-                  offload=a.offload, tf32=a.tf32)
+                  offload=a.offload, tf32=a.tf32, weights=a.vision_weights)
     log(f"ds41-vision: {len(enc.vit.blocks)} vit layers, n_embd {enc.n_embd}, image_token_id "
-        f"{enc.image_token_id}, dtype {a.dtype}, device {device}, threads {enc.torch.get_num_threads()}")
+        f"{enc.image_token_id}, dtype {a.dtype}, device {device}, threads {enc.torch.get_num_threads()}; "
+        f"weights: {enc.weights_desc}")
     serve(enc, a)
 
 

@@ -275,6 +275,10 @@ class Ds41Vision(_Vision):
         args = [cfg.get("python") or sys.executable, str(V41 / "vision" / "ds41_vision.py"), *args[1:]]
         if cfg.get("reference_dir"):
             args += ["--reference-dir", os.path.abspath(cfg["reference_dir"])]
+        # "weights": the full-precision tower in place of the sidecar's Q8_0 copy (a safetensors file with the
+        # checkpoint's vision.* / aligner.* / image_*, the checkpoint folder, or an mmproj GGUF); "mmproj" stays the config
+        if cfg.get("weights"):
+            args += ["--vision-weights", os.path.abspath(os.path.expanduser(str(cfg["weights"])))]
         # the encoder's numerics / placement (ds41_vision.py): "dtype" f32 (default) | bf16 | f16, "device" cpu | cuda
         # (the server's own "gpu": true already passes --gpu = cuda); on the card "offload": true keeps the weights in
         # pinned RAM between images, "tf32": true, "warmup_tokens": N (the warm-up grid; default max_tokens / 1024)
