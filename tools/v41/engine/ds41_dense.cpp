@@ -53,6 +53,7 @@ bool env_on(const char * k, bool dflt) {
 struct Allo {
     ggml_gallocr_t a = nullptr;
     uint64_t epoch = 0;
+    bool failed = false;   // the last alloc failed: the gallocr holds a plan without a buffer (see alloc)
     std::map<const ggml_cgraph *, uint64_t> graph_epoch;
     std::set<const void *> compute_bufs;
     ~Allo() { if (a) ggml_gallocr_free(a); }
@@ -72,7 +73,14 @@ struct Allo {
             for (int i = 0; i < g->n_leafs; ++i) unbind(g->leafs[i]);
         }
         const size_t before = ggml_gallocr_get_buffer_size(a, 0);
-        if (!ggml_gallocr_alloc_graph(a, g)) return false;
+        // A failed allocation leaves the gallocr PLANNED for that graph with NO buffer (ggml_gallocr_reserve_n frees
+        // the old buffer, then the larger one does not fit).  The next alloc_graph of the same graph then finds the plan
+        // current, skips the reserve and places the tensors in the null buffer - a segfault (2026-10-20: the oom_hook
+        // retry on a 768K prompt).  So after a failure re-plan explicitly; the freed buffer also makes every graph
+        // allocated before it stale (the epoch).
+        if (failed && !ggml_gallocr_reserve(a, g)) { ++epoch; return false; }
+        if (!ggml_gallocr_alloc_graph(a, g)) { failed = true; ++epoch; return false; }
+        failed = false;
         if (ggml_gallocr_get_buffer_size(a, 0) != before && before != 0) ++epoch;
         auto note = [&](const ggml_tensor * t) {
             if (!t || !t->buffer) return;
@@ -228,6 +236,16 @@ struct Ds41Dense::Impl {
     int64_t S = 1, batch = 0, col0 = 0;
     int batch_pos0 = 0;                             // the batch's first position
     std::vector<std::array<int64_t, 3>> span_cap;   // [sub-batch][ratio] pass_cap
+    // A sub-batch whose graph does not fit is run as narrower spans (attn_router_span): span_max is the width that
+    // fitted, kept for the rest of the prompt (release_pass resets it); 0 = the full sub-batch.  alloc_failed: the last
+    // compute() failed in the graph allocation (not in the compute) - the only failure a narrower span can cure.
+    int64_t span_max = 0;
+    bool alloc_failed = false;
+    // The indexer's selection over a long context (build_attn): its [visible compressed rows x queries] score / mask
+    // tensors are built for at most idx_tile elements at a time (query chunks); 0 = one piece.  Default 2^28 = a 512K
+    // context's 512-query sub-batch, so every context up to 512K builds the very same graph as before.
+    int64_t idx_tile = 0;
+    std::map<std::array<int64_t, 3>, size_t> graph_bytes_memo;   // span_graph_bytes: (cap 1, cap 2, n) -> bytes
     std::vector<float> host_fn, host_wts, host_logits, host_emb;
     std::vector<int32_t> host_ids;
     std::vector<int32_t> host_xids;       // route meter: o_xids / o_xwts readbacks, and the counters since route_meter(true)
@@ -493,6 +511,7 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
         std::fprintf(stderr, "ds41_dense: graph buffer did not fit - freed the tier's prestage region, retrying\n");
         ok_alloc = a.alloc(gf, false);
     }
+    alloc_failed = !ok_alloc;
     if (!ok_alloc) { err = "graph allocation failed"; return false; }
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { err = "graph compute failed"; return false; }
     if (g_dprof_on && g_dprof_slot >= 0) { g_dprof[1] += tq1 - tq0; g_dprof[2] += dprof_now() - tq1; }
@@ -646,45 +665,69 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                 ggml_tensor * iw = ggml_mul_mat(gc, im.BL(il, "indexer.proj.weight"), xn);
                 iw = ggml_scale(gc, iw, 1.0f / std::sqrt((float) (im.ID * im.IH)));         // softmax_scale * heads^-0.5
                 ggml_tensor * ksrc = ggml_view_3d(gc, idxk, im.ID, 1, cap, idxk->nb[1], idxk->nb[1], 0);
-                // visibility: row i visible to query t iff i < nvis_t  -> 0 / -inf
-                ggml_tensor * nvs = ggml_reshape_2d(gc, b.v1(im.i_nvis[r], n, (size_t) col0 * 4), 1, n);
-                ggml_tensor * ramp = ggml_view_2d(gc, im.neg_ramp, cap, 1, (size_t) cap * 4, 0);
-                ggml_tensor * vis = ggml_log(gc, ggml_step(gc, ggml_add(gc, ggml_repeat(gc, ramp, ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, n)), nvs)));
-                ggml_tensor * sc = ggml_lightning_indexer(gc, iq, ksrc, iw, ggml_cast(gc, vis, GGML_TYPE_F16));   // [cap, n]
-                sc = ggml_reshape_2d(gc, sc, cap, n);
-                if (L.uses_cand) {   // rank only inside cand_layer's candidate blocks
-                    const int64_t nblk = (cap + im.CBS - 1) / im.CBS, ncb = std::min<int64_t>(im.CB, nblk);
-                    ggml_tensor * m = ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, im.CBS, nblk, n), NEG_INF);
-                    ggml_tensor * z = ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, im.CBS, ncb, n), 0.0f);
-                    m = ggml_set_rows(gc, m, z, ggml_cont(gc, ggml_view_2d(gc, im.cand, ncb, n, im.cand->nb[1], (size_t) col0 * im.cand->nb[1])));
-                    m = ggml_view_2d(gc, m, cap, n, m->nb[2], 0);
-                    sc = ggml_add(gc, sc, m);
+                // The selection of queries [q0, q0 + nq) of this span.  Its score / mask tensors are [cap, nq]: with
+                // cap = the visible compressed rows (a power of two) they grow with the context - a 1M context's
+                // ratio-1 layers hold ~18 bytes x 2^20 rows x 512 queries = a 9.3 GB graph buffer (2026-10-20: the
+                // 768K / 1M prompts' last batch, the first to run layers 21-39 past 2^19 rows, OOM'd on it).  Every
+                // op here is per query (the indexer kernel's grid is [kv blocks, queries], top-k / argsort / get_rows
+                // are per column), so the span's queries are taken in chunks of at most idx_tile score elements, each
+                // chunk's tensors dying before the next is built.  Up to idx_tile (default: a 512K context) the span
+                // is ONE chunk and the graph is the very one it always was.
+                auto select = [&](int64_t q0, int64_t nq, ggml_tensor ** sel_out, ggml_tensor ** selm_out) {
+                    const bool whole = q0 == 0 && nq == n;
+                    const size_t c0q = (size_t) (col0 + q0);
+                    ggml_tensor * iq_c = whole ? iq : ggml_view_3d(gc, iq, im.ID, im.IH, nq, iq->nb[1], iq->nb[2], (size_t) q0 * iq->nb[2]);
+                    ggml_tensor * iw_c = whole ? iw : ggml_view_2d(gc, iw, im.IH, nq, iw->nb[1], (size_t) q0 * iw->nb[1]);
+                    // visibility: row i visible to query t iff i < nvis_t  -> 0 / -inf
+                    ggml_tensor * nvs = ggml_reshape_2d(gc, b.v1(im.i_nvis[r], nq, c0q * 4), 1, nq);
+                    ggml_tensor * ramp = ggml_view_2d(gc, im.neg_ramp, cap, 1, (size_t) cap * 4, 0);
+                    ggml_tensor * vis = ggml_log(gc, ggml_step(gc, ggml_add(gc, ggml_repeat(gc, ramp, ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, nq)), nvs)));
+                    ggml_tensor * sc = ggml_lightning_indexer(gc, iq_c, ksrc, iw_c, ggml_cast(gc, vis, GGML_TYPE_F16));   // [cap, nq]
+                    sc = ggml_reshape_2d(gc, sc, cap, nq);
+                    if (L.uses_cand) {   // rank only inside cand_layer's candidate blocks
+                        const int64_t nblk = (cap + im.CBS - 1) / im.CBS, ncb = std::min<int64_t>(im.CB, nblk);
+                        ggml_tensor * m = ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, im.CBS, nblk, nq), NEG_INF);
+                        ggml_tensor * z = ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, im.CBS, ncb, nq), 0.0f);
+                        m = ggml_set_rows(gc, m, z, ggml_cont(gc, ggml_view_2d(gc, im.cand, ncb, nq, im.cand->nb[1], c0q * im.cand->nb[1])));
+                        m = ggml_view_2d(gc, m, cap, nq, m->nb[2], 0);
+                        sc = ggml_add(gc, sc, m);
+                    }
+                    if (L.cand_src) {   // model.py select_candidate_blocks: block score = max, newest block pinned
+                        const int64_t nblk = (cap + im.CBS - 1) / im.CBS, ncb = std::min<int64_t>(im.CB, nblk);
+                        GGML_ASSERT(cap % im.CBS == 0);
+                        ggml_tensor * bm = ggml_pool_2d(gc, sc, GGML_OP_POOL_MAX, (int) im.CBS, 1, (int) im.CBS, 1, 0, 0);   // [nblk, nq]
+                        // pin: + 1e30 at block (nvis - 1) / CBS of each query
+                        ggml_tensor * br = ggml_view_2d(gc, im.blk_ramp, nblk, 1, (size_t) nblk * 4, 0);
+                        ggml_tensor * lb = ggml_reshape_2d(gc, b.v1(im.i_lastblk, nq, c0q * 4), 1, nq);
+                        ggml_tensor * eq = ggml_step(gc, ggml_scale_bias(gc, ggml_abs(gc, ggml_sub(gc, ggml_repeat(gc, br, bm), lb)), -1.0f, 0.5f));
+                        bm = ggml_add(gc, bm, ggml_scale(gc, eq, 1e30f));
+                        ggml_tensor * cb = ggml_cont(gc, ggml_top_k(gc, bm, (int) ncb));                     // I32 [ncb, nq]
+                        outs.push_back(ggml_cpy(gc, cb, ggml_view_2d(gc, im.cand, ncb, nq, im.cand->nb[1], c0q * im.cand->nb[1])));
+                    }
+                    ggml_tensor * s1 = ggml_cont(gc, ggml_top_k(gc, sc, (int) K));                          // I32 [K, nq]
+                    // Canonicalise the top-k order.  ggml_cuda_op_top_k asks CUB's DeviceTopK for
+                    // output_ordering::unsorted, and CUB hands the k ids back in an order its atomically assigned
+                    // output slots produce - run-to-run unstable, while the SET is stable (measured: order-only on
+                    // every differing row).  The ids drive the gather of the compressed rows, so that order is the
+                    // flash-attn's accumulation order; left alone the whole run stops being reproducible from the
+                    // first query whose compressed rows are attended (the SWA window's 128).  Sort ascending.
+                    s1 = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, s1, 1, K, nq),
+                                                           ggml_argsort(gc, ggml_cast(gc, s1, GGML_TYPE_F32),
+                                                                        GGML_SORT_ORDER_ASC)), K, nq);
+                    ggml_tensor * m1 = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, vis, 1, cap, nq), s1), K, nq);   // vis at sel
+                    // the chunk's writes go to outs now, so the graph runs (and frees) this chunk before the next
+                    outs.push_back(ggml_cpy(gc, s1, ggml_view_2d(gc, L.sel, K, nq, L.sel->nb[1], c0q * L.sel->nb[1])));
+                    outs.push_back(ggml_cpy(gc, m1, ggml_view_2d(gc, L.selm, K, nq, L.selm->nb[1], c0q * L.selm->nb[1])));
+                    *sel_out = s1;
+                    *selm_out = m1;
+                };
+                const int64_t qc = im.idx_tile > 0 && cap * n > im.idx_tile ? std::max<int64_t>(1, im.idx_tile / cap) : n;
+                for (int64_t q0 = 0; q0 < n; q0 += qc) {
+                    ggml_tensor * s1 = nullptr, * m1 = nullptr;
+                    select(q0, std::min(qc, n - q0), &s1, &m1);
+                    sel = sel ? ggml_concat(gc, sel, s1, 1) : s1;      // [K, n] for the gather below
+                    selm = selm ? ggml_concat(gc, selm, m1, 1) : m1;
                 }
-                if (L.cand_src) {   // model.py select_candidate_blocks: block score = max, newest block pinned
-                    const int64_t nblk = (cap + im.CBS - 1) / im.CBS, ncb = std::min<int64_t>(im.CB, nblk);
-                    GGML_ASSERT(cap % im.CBS == 0);
-                    ggml_tensor * bm = ggml_pool_2d(gc, sc, GGML_OP_POOL_MAX, (int) im.CBS, 1, (int) im.CBS, 1, 0, 0);   // [nblk, n]
-                    // pin: + 1e30 at block (nvis - 1) / CBS of each query
-                    ggml_tensor * br = ggml_view_2d(gc, im.blk_ramp, nblk, 1, (size_t) nblk * 4, 0);
-                    ggml_tensor * lb = ggml_reshape_2d(gc, b.v1(im.i_lastblk, n, (size_t) col0 * 4), 1, n);
-                    ggml_tensor * eq = ggml_step(gc, ggml_scale_bias(gc, ggml_abs(gc, ggml_sub(gc, ggml_repeat(gc, br, bm), lb)), -1.0f, 0.5f));
-                    bm = ggml_add(gc, bm, ggml_scale(gc, eq, 1e30f));
-                    ggml_tensor * cb = ggml_cont(gc, ggml_top_k(gc, bm, (int) ncb));                     // I32 [ncb, n]
-                    outs.push_back(ggml_cpy(gc, cb, ggml_view_2d(gc, im.cand, ncb, n, im.cand->nb[1], (size_t) col0 * im.cand->nb[1])));
-                }
-                sel = ggml_cont(gc, ggml_top_k(gc, sc, (int) K));                                     // I32 [K, n]
-                // Canonicalise the top-k order.  ggml_cuda_op_top_k asks CUB's DeviceTopK for
-                // output_ordering::unsorted, and CUB hands the k ids back in an order its atomically assigned
-                // output slots produce - run-to-run unstable, while the SET is stable (measured: order-only on
-                // every differing row).  The ids drive the gather of the compressed rows, so that order is the
-                // flash-attn's accumulation order; left alone the whole run stops being reproducible from the
-                // first query whose compressed rows are attended (the SWA window's 128).  Sort ascending.
-                sel = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sel, 1, K, n),
-                                                        ggml_argsort(gc, ggml_cast(gc, sel, GGML_TYPE_F32),
-                                                                     GGML_SORT_ORDER_ASC)), K, n);
-                selm = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, vis, 1, cap, n), sel), K, n);   // vis at sel
-                outs.push_back(ggml_cpy(gc, sel, ggml_view_2d(gc, L.sel, K, n, L.sel->nb[1], (size_t) col0 * L.sel->nb[1])));
-                outs.push_back(ggml_cpy(gc, selm, ggml_view_2d(gc, L.selm, K, n, L.selm->nb[1], (size_t) col0 * L.selm->nb[1])));
             } else {
                 const L_t & IS = im.ly[(size_t) L.idxl];
                 sel = ggml_view_2d(gc, IS.sel, K, n, IS.sel->nb[1], (size_t) col0 * IS.sel->nb[1]);
@@ -1112,6 +1155,7 @@ bool Ds41Dense::set_columns(int nc) {
         al->a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
         al->graph_epoch.clear();
         al->compute_bufs.clear();
+        al->failed = false;
         ++al->epoch;
     }
     if (im.gctx) ggml_free(im.gctx);
@@ -1147,6 +1191,9 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     if (const char * e = std::getenv("DS41_TEST_TOPK")) im.ITOP = std::atoi(e);
     if (const char * e = std::getenv("DS41_TEST_CAND_BLOCKS")) im.CB = std::atoi(e);
     im.S = std::max(1, cfg.max_pass);                       // the dense sub-batch size of the layer-major walk
+    // STRATA_INDEXER_TILE=<elements>: the indexer selection's per-graph piece (see build_attn); 0 = never split
+    im.idx_tile = std::getenv("STRATA_INDEXER_TILE") ? std::max<long long>(0, std::atoll(std::getenv("STRATA_INDEXER_TILE")))
+                                                     : (int64_t) 1 << 28;
     im.NCmax = std::max<int64_t>(im.S, std::max(1, cfg.prompt_batch));   // state columns: the whole prompt batch, or the pass
     im.NC = cfg.elastic_cols ? im.S : im.NCmax;                           // elastic: S until a batch asks for more
     // the window ring: every row is gathered BY POSITION (slot = pos % RAW), so its size never changes results.  DSpark
@@ -1320,6 +1367,8 @@ Ds41Dense::RouteMeter Ds41Dense::route_meter(bool reset) {
 
 void Ds41Dense::set_oom_hook(std::function<bool()> hook) { p_->oom_hook = std::move(hook); }
 
+void Ds41Dense::reset_span_width() { p_->span_max = 0; }
+
 void Ds41Dense::release_pass() {
     Impl & im = *p_;
     if (!im.allo_pass.a) return;
@@ -1327,7 +1376,9 @@ void Ds41Dense::release_pass() {
     im.allo_pass.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     im.allo_pass.graph_epoch.clear();
     im.allo_pass.compute_bufs.clear();
+    im.allo_pass.failed = false;
     ++im.allo_pass.epoch;
+    im.span_max = 0;   // the next prompt starts at full sub-batch width again (see attn_router_span)
 }
 
 // pass_cap (per ratio) of a pass of n tokens ending at pos0+n: the visible compressed rows it ranks over.
@@ -1337,6 +1388,40 @@ static void span_pass_caps(const Ds41Dense::Impl & im, int pos0, int n, int64_t 
         const int64_t nvis_last = (pos0 + n) / r;
         out[r] = nvis_last == 0 ? 0 : std::min<int64_t>(next_pow2(std::max<int64_t>(nvis_last, im.CBS)), im.cmax[r]);
     }
+}
+
+size_t Ds41Dense::span_graph_bytes(int pos_end, int n) {
+    Impl & im = *p_;
+    n = (int) std::max<int64_t>(1, std::min<int64_t>(n, im.S));
+    pos_end = (int) std::max<int64_t>(n, std::min<int64_t>(pos_end, im.cfg.ctx_max));
+    int64_t caps[3];
+    span_pass_caps(im, pos_end - n, n, caps);
+    const std::array<int64_t, 3> key { caps[1], caps[2], n };
+    auto it = im.graph_bytes_memo.find(key);
+    if (it != im.graph_bytes_memo.end()) return it->second;
+    // build every layer KIND's span graph (they differ in ratio, kv / index / candidate source, Engram) and let a
+    // throwaway allocator plan it: ggml_gallocr_reserve_n_size sizes the buffer without allocating anything
+    int64_t saved[3] = { im.pass_cap[0], im.pass_cap[1], im.pass_cap[2] };
+    for (int r = 0; r < 3; ++r) im.pass_cap[r] = caps[r];
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
+    std::vector<uint8_t> meta(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
+    std::set<std::array<int64_t, 6>> kinds;
+    size_t mx = 0;
+    for (int64_t l = 0; l < im.nl; ++l) {
+        const Impl::Layer & L = im.ly[(size_t) l];
+        if (!kinds.insert({ L.ratio, L.kv_src, L.idx_src, L.cand_src, L.uses_cand, L.eslot >= 0 }).second) continue;
+        ggml_init_params p = { meta.size(), meta.data(), true };
+        ggml_context * gc = ggml_init(p);
+        ggml_cgraph * gf = build_attn(im, gc, (int) l, n, 0);
+        size_t sz = 0;
+        ggml_gallocr_reserve_n_size(ga, gf, nullptr, nullptr, &sz);
+        mx = std::max(mx, sz);
+        ggml_free(gc);
+    }
+    ggml_gallocr_free(ga);
+    for (int r = 0; r < 3; ++r) im.pass_cap[r] = saved[r];
+    im.graph_bytes_memo[key] = mx;
+    return mx;
 }
 
 // Wait for the pass's Engram reads (started by upload_inputs) and push the rows into the state tensor's columns.  A
@@ -1526,13 +1611,19 @@ bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
 // PASS-LOCAL row maps (the pass's own rows / states sit at the end of the [ring | pass rows] they index, so they are
 // recomputed from the sub-batch's own position - upload_inputs laid them out for the whole batch, correct only at
 // col0 = 0).  Shared by attn_router_span and attn_router_span_kv.
+// A span is a whole sub-batch (col0 % S == 0) or, when a sub-batch's graph did not fit, a narrower piece of one
+// (attn_router_span): a piece at an unaligned column gets the pass_cap of its own end position.
 static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
-    if (col0 < 0 || n < 1 || im.S < 1 || col0 % im.S != 0 || (int64_t) col0 + n > im.batch) { im.err = "bad span"; return false; }
-    const size_t si = (size_t) (col0 / im.S);
-    if (si >= im.span_cap.size()) { im.err = "bad span"; return false; }
-    im.pass_cap[0] = im.span_cap[si][0];
-    im.pass_cap[1] = im.span_cap[si][1];
-    im.pass_cap[2] = im.span_cap[si][2];
+    if (col0 < 0 || n < 1 || im.S < 1 || (int64_t) col0 + n > im.batch) { im.err = "bad span"; return false; }
+    if (col0 % im.S == 0) {
+        const size_t si = (size_t) (col0 / im.S);
+        if (si >= im.span_cap.size()) { im.err = "bad span"; return false; }
+        im.pass_cap[0] = im.span_cap[si][0];
+        im.pass_cap[1] = im.span_cap[si][1];
+        im.pass_cap[2] = im.span_cap[si][2];
+    } else {
+        span_pass_caps(im, im.batch_pos0 + col0, n, im.pass_cap);
+    }
     const int64_t pbase = (int64_t) im.batch_pos0 + col0;
     static const bool memo_on = !(std::getenv("STRATA_SPAN_MEMO") && std::getenv("STRATA_SPAN_MEMO")[0] == '0');
     if (memo_on && im.span_memo_pos0 == (int64_t) im.batch_pos0 && im.span_memo_col0 == col0 && im.span_memo_n == n) return true;
@@ -1575,8 +1666,38 @@ static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
     return true;
 }
 
+// attn_router_span / attn_router_span_kv run their span as pieces of at most span_max columns (the whole span until a
+// graph does not fit).  A piece whose GRAPH ALLOCATION fails - nothing has run, the state is untouched - is retried as
+// halves down to kMinSpan columns, and span_max keeps the width that fitted for the rest of the prompt, so a tight
+// card (a long context's graph, another process taking VRAM mid-prompt) makes the prompt a little slower instead of
+// failing it.  The pieces walk the columns in order, as the sub-batches do, so every position-indexed state (window
+// ring, compressor state, compressed rows, candidate blocks) advances exactly as before; the per-query arithmetic is
+// the same, but the dense matmuls see fewer columns, so a split prompt is not bit-identical to an unsplit one (it only
+// happens where the unsplit one would have failed).
+static constexpr int kMinSpan = 16;
+static bool span_kv_one(Ds41Dense::Impl & im, int il, int col0, int n);
+static bool span_attn_one(Ds41Dense::Impl & im, int il, int col0, int n);
+static bool run_spans(Ds41Dense::Impl & im, int il, int col0, int n, const std::function<bool(int, int)> & one) {
+    int64_t w = im.span_max > 0 ? std::min<int64_t>(im.span_max, n) : n;
+    for (int c = col0; c < col0 + n; ) {
+        const int m = (int) std::min<int64_t>(w, (int64_t) col0 + n - c);
+        im.alloc_failed = false;
+        if (one(c, m)) { c += m; continue; }
+        if (!im.alloc_failed || m <= kMinSpan) return false;
+        w = std::max(kMinSpan, m / 2);
+        im.span_max = w;
+        std::fprintf(stderr, "ds41_dense: layer %d: the graph of a %d-column span did not fit - %lld-column spans for the rest "
+                     "of this prompt\n", il, m, (long long) w);
+    }
+    return true;
+}
+
 bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
     Impl & im = *p_;
+    return run_spans(im, il, col0, n, [&](int c, int m) { return span_kv_one(im, il, c, m); });
+}
+
+static bool span_kv_one(Ds41Dense::Impl & im, int il, int col0, int n) {
     if (!upload_span(im, col0, n)) return false;
     if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;   // the Engram add feeds this layer's K/V
     im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
@@ -1606,6 +1727,10 @@ static void meter_add(Ds41Dense::Impl & im, int64_t col0, int64_t n) {
 
 bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     Impl & im = *p_;
+    return run_spans(im, il, col0, n, [&](int c, int m) { return span_attn_one(im, il, c, m); });
+}
+
+static bool span_attn_one(Ds41Dense::Impl & im, int il, int col0, int n) {
     double tp = g_dprof_on ? dprof_now() : 0;
     auto lap = [&](int i) { if (g_dprof_on) { const double t = dprof_now(); g_dprof[i] += t - tp; tp = t; } };
     if (!upload_span(im, col0, n)) return false;

@@ -126,6 +126,13 @@ public:
     /// Called when a graph's buffer cannot be allocated; return true if it freed device memory (the allocation is
     /// then retried once).  E.g. the expert tier's prestage region.
     void set_oom_hook(std::function<bool()> hook);
+    /// The pass-graph buffer (bytes) the widest span graph of a layer-major batch needs when its sub-batch of n columns
+    /// ends at position pos_end: every layer kind's attention graph planned by a throwaway allocator (nothing is
+    /// allocated), memoized on the visible compressed rows.  It grows with the context (the indexer's rows x queries).
+    size_t span_graph_bytes(int pos_end, int n);
+    /// Forget a narrowed span width: after a sub-batch's graph did not fit, attn_router_span keeps running narrower
+    /// spans for the rest of the prompt; release_pass() or this resets it (the serve loop calls it per prompt).
+    void reset_span_width();
     /// Selection-only routing bias for layer il (n_expert floats): added to the top-k score, not to the mixing weights.
     /// Soft pruning (-penalty on cold experts) / cache-aware routing (+bonus on VRAM-resident ones).  Default 0.
     void set_route_bias(int il, const float * bias);
