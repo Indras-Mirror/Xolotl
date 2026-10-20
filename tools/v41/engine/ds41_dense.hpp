@@ -180,6 +180,19 @@ public:
     bool unpark();
     void drop_park();
     bool parked() const;
+    /// Conversation pool (ds41_conv_pool, ds41_conv_pool_dense.hpp): where a conversation's device state at a turn
+    /// boundary lives.  `streams`: the position-indexed caches (compressed KV + indexer keys of every kv source layer;
+    /// row r holds positions [r * ratio, (r + 1) * ratio), `rows` = cmax, the spare row excluded).  `regions`: the window
+    /// rings and the ratio-2 compressor states - the *_snap copies (snap = true: what snapshot() / park() keep) or the
+    /// live ones.  Pointers into the state buffer (device memory on CUDA); the sizes never change after init.
+    struct PoolRegion {
+        std::string name;
+        void * data = nullptr;
+        size_t row_bytes = 0, bytes = 0;
+        int64_t rows = 0;
+        int ratio = 0;
+    };
+    void pool_regions(bool snap, std::vector<PoolRegion> & streams, std::vector<PoolRegion> & regions) const;
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns
