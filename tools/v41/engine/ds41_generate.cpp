@@ -1286,13 +1286,21 @@ int main(int argc, char ** argv) {
                 // at the longest common prefix even when it is below the snapshot").
                 static const bool park_partial = !(std::getenv("STRATA_SERVE_PARK_PARTIAL") && std::getenv("STRATA_SERVE_PARK_PARTIAL")[0] == '0');
                 const size_t lp_min = (size_t) std::max<int64_t>(park_min, (int64_t) park_hist.size() * 3 / 4);
-                if (park_partial && lp < park_hist.size() && lp >= lp_min && lp > lcp && dense.unpark()) {
-                    std::fprintf(stderr, "serve: unparked the %zu-token conversation at lcp %zu (partial: re-feeds from there)\n",
-                                 park_hist.size(), lp);
+                // ...but NOT every cache is positional: the window ring at the park's end P holds positions [P - RAW, P)
+                // (RAW = SWA + 16) and the ratio-2 compressor state P - 2, P - 1.  A resume at s < P reads the window
+                // [s - SWA + 1, s) from the ring and, at an odd s, the state of s - 1: exact only for an even s with
+                // P - s <= RAW - SWA = 16 - and only after restore() (the live rings are the side request's).  The
+                // old path resumed at any lp with the side request's rings (tools/v41/engine/check_conv_reuse.py
+                // park_partial, CPU: 20 back -> KL 2.1 against a fresh prefill, top-1 wrong).
+                const size_t ps = lp & ~(size_t) 1;
+                if (park_partial && lp < park_hist.size() && lp >= lp_min && ps > lcp && park_hist.size() - ps <= 16
+                    && dense.unpark() && dense.restore()) {
+                    std::fprintf(stderr, "serve: unparked the %zu-token conversation at %zu (lcp %zu; partial: re-feeds from there)\n",
+                                 park_hist.size(), ps, lp);
                     hist = park_hist;
                     snap_len = -1;        // the tail under the park's end is re-fed, so no snapshot survives this
-                    reuse_override = (int) lp;
-                    lcp = lp;
+                    reuse_override = (int) ps;
+                    lcp = ps;
                     unparked = true;
 #if defined(DS41_HAVE_DSPARK)
                     dsp_next = -1;        // DSpark's window holds the side request's states
@@ -1340,7 +1348,15 @@ int main(int argc, char ** argv) {
             }
             std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
                          park_hist.size(), lp_show, hist.size(), snap_len, ids.size(), reused);
-            if (reused > 0) { std::printf("RESUME %d\n", reused); std::fflush(stdout); }
+            if (reused > 0) {
+                // the Engram hashes of the first new positions read the 3 tokens before `reused` from the history, which
+                // is kept by position: an unrelated request since (a parked conversation's side request) wrote its own
+                // tokens there.  The reused prefix is this prompt's own, so write it back (a no-op when unchanged).
+                const int h0 = std::max(0, reused - 3);
+                dense.set_engram_history(h0, reused - h0, ids.data() + h0, nullptr);
+                std::printf("RESUME %d\n", reused);
+                std::fflush(stdout);
+            }
             const int total = (int) ids.size();
             // a long prompt runs layer-major without the VRAM cache (its pass / chunk buffers need that VRAM) and with
             // the prompt's routing (no decode bias).  A short one (<= step_max new tokens: a chat / agent turn's tool
