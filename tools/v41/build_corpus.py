@@ -361,8 +361,9 @@ def render_session(msgs, calls, tok, max_tokens):
 
 
 def build_sessions(a, tok):
-    roots = [os.path.expanduser(p) for p in ("~/.claude/projects", "~/.quetza-data", "~/.claude-data",
-                                            "~/.pi/agent/sessions")]   # pi-agent sessions (turin fleet workloads)
+    roots = [os.path.expanduser(p) for p in ("~/.claude/projects", "~/.quetza-data", "~/.claude-data")]
+    # private agent logs (e.g. ~/.pi/agent/sessions) enter a corpus only when named with --session-root
+    roots += [os.path.expanduser(p) for p in a.session_root]
     files = []
     for r in roots:
         for f in glob.glob(os.path.join(r, "**", "*.jsonl"), recursive=True):
@@ -520,6 +521,9 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=8191)
     ap.add_argument("--sessions", type=int, default=40)
     ap.add_argument("--exclude-session", action="append", default=[])
+    ap.add_argument("--session-root", action="append", default=[],
+                    help="extra session dir to scan (repeatable; e.g. ~/.pi/agent/sessions). Off by default: "
+                         "private agent logs enter a corpus only when named here")
     ap.add_argument("--extra-sessions", action="append", default=[],
                     help="OpenAI-style SWE trajectory JSONL (one {messages,tools,src,instance_id,resolved} per line)")
     a = ap.parse_args()
