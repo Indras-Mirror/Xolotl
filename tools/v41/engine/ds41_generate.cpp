@@ -1170,7 +1170,14 @@ int main(int argc, char ** argv) {
         // reuse like text.  STRATA_SERVE_PARK_MIN is the smallest conversation worth a record.  KV with --kv-fp4 is
         // ~890 bytes a position (+ ~6 MB of rings a record): 8 GiB holds ~9M positions, i.e. ~150 agents at 60K.
         const bool pool_on = park_on && a.conv_mib > 0;
-        Ds41ConvStoreHost pool(pool_on ? (size_t) a.conv_mib << 20 : 0, (size_t) a.conv_slots);
+        Ds41ConvStore pool;
+        if (pool_on) {
+            std::string perr;
+            if (!pool.init(dense, ctx, (size_t) a.conv_mib << 20, (size_t) a.conv_slots, !ggml_backend_is_cpu(be), perr)) {
+                std::fprintf(stderr, "ds41_generate: conversation pool: %s\n", perr.c_str());
+                return 1;
+            }
+        }
         std::vector<uint64_t> live_id;   // hist's position identities (its prompt part; past it: text = 0)
         // the live conversation's turn boundary into the pool (logged as serve/server.py ConvCacheLog reads it)
         auto save_live = [&](const char * why) {
@@ -1205,6 +1212,7 @@ int main(int argc, char ** argv) {
         std::printf("\n");
         if (pool_on) std::fprintf(stderr, "serve: conversation pool %d MiB, %d slots, records >= %d tokens\n", a.conv_mib,
                                   a.conv_slots, std::max(1, park_min));
+        if (pool_on) std::fprintf(stderr, "serve: conversation pool store: %s\n", pool.kind());
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
@@ -1361,13 +1369,14 @@ int main(int argc, char ** argv) {
                     ConvRestore rs;
                     std::string perr;
                     const double t0 = now_ms();
-                    if (pool.restore(dense, m.rec, (int64_t) std::min<size_t>(lcp, (size_t) pr), rs, perr)) {
+                    if (pool.restore(dense, m, (int64_t) std::min<size_t>(lcp, (size_t) pr), rs, perr)) {
                         dense.rearm((int) rs.pos);
                         dense.restore();
-                        hist = rs.tokens;
-                        live_id = rs.ident;
+                        // positions [0, pr) are this prompt's own (the match is strict on token + identity)
+                        hist.assign(ids.begin(), ids.begin() + pr);
+                        live_id.assign(rid.begin(), rid.begin() + std::min<size_t>(rid.size(), (size_t) pr));
                         if (pr == rs.pos) { snap_len = (int) rs.pos; snap_logits = rs.logits; }
-                        else { snap_len = -1; hist.resize((size_t) pr); if (live_id.size() > (size_t) pr) live_id.resize((size_t) pr); }
+                        else snap_len = -1;
                         snap_seed_n = 0;   // no DSpark seed rows in a record: a repeat decodes its first tokens draftless
                         live_dirty = false;
                         reuse_override = (int) pr;
@@ -1474,6 +1483,10 @@ int main(int argc, char ** argv) {
                 snap_len = -1;
             }
             live_dirty = false;
+            if (pool_on) {   // a save queued above reads positions this request is about to overwrite
+                std::string ferr2;
+                if (!pool.fence(&ferr2)) std::fprintf(stderr, "strata serve: conversation cache: fence: %s\n", ferr2.c_str());
+            }
             if (pool_on) std::fprintf(stderr, "serve: reuse lcp=%zu pool=%zu lp=%zu hist=%zu snap=%d prompt=%zu images=%zu -> reused=%d\n",
                                       lcp, pool.size(), lp_show, hist.size(), snap_len, ids.size(), vis_pos.size(), reused);
             else

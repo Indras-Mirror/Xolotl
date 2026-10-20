@@ -16,13 +16,19 @@
 #include "ds41_dense.hpp"
 
 #include "ggml-backend.h"
+#if defined(DS41_POOL_CUDA)
+#include "ds41_conv_pool.hpp"
+#include "ds41_conv_pool_dense.hpp"
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -68,6 +74,7 @@ inline int64_t conv_partial_resume(int64_t lcp, int64_t boundary) {
 
 struct ConvMatch {
     int64_t rec = 0;            ///< 0 = no match
+    int boundary = -1, next_boundary_idx = -1;   ///< the store's boundary indices for pos / next_boundary
     int64_t pos = 0;            ///< the boundary when it is a prefix of the prompt (<= lcp, <= n); 0 = none
     int64_t lcp = 0;            ///< common prefix of the record and the prompt
     int64_t next_boundary = -1; ///< the record's boundary above lcp (for conv_partial_resume), -1 = none
@@ -163,8 +170,9 @@ public:
 
     /// Write record `rec`'s boundary state into the device (the snapshot tensors + the position caches).  `from`:
     /// positions [0, from) already hold the same rows (skipped).  The caller then does rearm(pos) + restore().
-    bool restore(Ds41Dense & dense, int64_t rec, int64_t from, ConvRestore & out, std::string & err) {
+    bool restore(Ds41Dense & dense, const ConvMatch & m, int64_t from, ConvRestore & out, std::string & err) {
         out = ConvRestore();
+        const int64_t rec = m.rec;
         auto it = std::find_if(recs_.begin(), recs_.end(), [&](const Rec & r) { return r.id == rec; });
         if (it == recs_.end()) { err = "no such record"; return false; }
         (void) from;   // the host store copies whole regions (a region is one tensor's rows [0, n])
@@ -189,6 +197,11 @@ public:
     size_t evictions() const { return evictions_; }
     size_t superseded() const { return superseded_; }
     size_t clear() { const size_t n = recs_.size(); recs_.clear(); bytes_ = 0; return n; }
+    bool fence(std::string * = nullptr) { return true; }
+    std::string stats_line() const {
+        return "host store: " + std::to_string(recs_.size()) + " records, " + std::to_string(bytes_ >> 20) + " MiB, " +
+               std::to_string(evictions_) + " evicted, " + std::to_string(superseded_) + " superseded";
+    }
 
 private:
     struct Rec {
@@ -205,6 +218,134 @@ private:
     std::deque<Rec> recs_;   // least recently used first
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0, restores_ = 0;
     int64_t next_id_ = 0;
+};
+
+#if defined(DS41_POOL_CUDA)
+/// The pinned pool (ds41_conv_pool: pinned slabs, shared prefix chunks, up to 4 boundaries a record,
+/// async copies on its own stream) behind the same calls.  cuda = false on the CPU backend (the tensors are host memory).
+class Ds41ConvStorePinned {
+public:
+    bool init(const Ds41Dense & d, int64_t ctx, size_t budget, bool cuda, std::string & err) {
+        Ds41PoolLayout lay;
+        if (!ds41_pool_from_dense(d, ctx, lay, snap_, live_)) { err = "pool layout from the dense half failed"; return false; }
+        Ds41PoolConfig c;
+        c.budget_bytes = budget;
+        c.cuda = cuda;
+        return pool_.init(lay, c, err);
+    }
+    int64_t save(Ds41Dense & dense, const int * tokens, const uint64_t * ident, size_t ident_n, int64_t n,
+                 const float * logits, size_t n_logits, std::string & err) {
+        const uint64_t * ids = pad(ident, ident_n, n);
+        ggml_backend_synchronize(dense.backend());   // the device data is final (the save reads it on the pool's stream)
+        static_assert(sizeof(int) == sizeof(int32_t), "token ids are int32");
+        return (int64_t) pool_.save(snap_, reinterpret_cast<const int32_t *>(tokens), ids, n, logits, n_logits, err);
+    }
+    ConvMatch best_prefix(const int * tokens, const uint64_t * ident, size_t ident_n, int64_t n) {
+        const uint64_t * ids = pad(ident, ident_n, n);
+        const Ds41PoolMatch pm = pool_.best_prefix(reinterpret_cast<const int32_t *>(tokens), ids, n);
+        ConvMatch m;
+        m.rec = (int64_t) pm.rec;
+        m.pos = pm.pos;
+        m.lcp = pm.lcp;
+        m.boundary = pm.boundary;
+        m.has_logits = pm.has_logits;
+        m.next_boundary = pm.next_pos;
+        m.next_boundary_idx = pm.next_boundary;
+        if (m.pos > 0 && m.next_boundary > 0 && conv_partial_resume(m.lcp, m.next_boundary) <= m.pos) m.next_boundary = -1;
+        if (m.pos == 0 && !ids) {
+            // a record with no boundary under the common prefix: best_prefix skips it, but a boundary within 16 above
+            // the prefix resumes too (conv_partial_resume).  Text prompts only (records() carries no identities).
+            for (const auto & r : pool_.records()) {
+                const std::vector<int32_t> t = pool_.tokens(r.id);
+                const int64_t l = (int64_t) conv_common_prefix(t.data(), nullptr, 0, t.size(), tokens, nullptr, 0, (size_t) n);
+                for (size_t b = 0; b < r.boundaries.size(); ++b) {
+                    const int64_t s = r.boundaries[b].pos > l ? conv_partial_resume(l, r.boundaries[b].pos) : 0;
+                    if (s > m.resume()) {
+                        m = ConvMatch();
+                        m.rec = (int64_t) r.id; m.lcp = l; m.next_boundary = r.boundaries[b].pos; m.next_boundary_idx = (int) b;
+                    }
+                }
+            }
+        }
+        return m;
+    }
+    bool restore(Ds41Dense &, const ConvMatch & m, int64_t from, ConvRestore & out, std::string & err) {
+        out = ConvRestore();
+        const bool at_pos = m.pos > 0 && m.resume() == m.pos;
+        const int b = at_pos ? m.boundary : m.next_boundary_idx;
+        const int64_t bpos = at_pos ? m.pos : m.next_boundary;
+        Ds41PoolRestore rr;
+        if (!pool_.restore((Ds41PoolId) m.rec, b, std::min(from, bpos), snap_, rr, err)) { out.live_clobbered = rr.live_clobbered; return false; }
+        if (!pool_.wait(rr, &err)) { out.live_clobbered = true; return false; }
+        out.pos = rr.pos;
+        out.logits = std::move(rr.logits);
+        return true;
+    }
+    bool fence(std::string * err = nullptr) { return pool_.fence(err); }
+    size_t size() const { return pool_.stats().records; }
+    size_t bytes() const { return pool_.stats().used_bytes; }
+    size_t evictions() const { return pool_.stats().evictions; }
+    std::string stats_line() const { return pool_.stats_line(); }
+
+private:
+    const uint64_t * pad(const uint64_t * ident, size_t ident_n, int64_t n) {
+        bool any = false;
+        for (size_t i = 0; i < ident_n && (int64_t) i < n; ++i) any |= ident[i] != 0;
+        if (!any) return nullptr;
+        idbuf_.assign(ident, ident + std::min<size_t>(ident_n, (size_t) n));
+        idbuf_.resize((size_t) n, 0);
+        return idbuf_.data();
+    }
+    Ds41ConvPool pool_;
+    Ds41PoolTargets snap_, live_;
+    std::vector<uint64_t> idbuf_;
+};
+#endif
+
+/// The serve loop's store: the pinned pool when built with it (STRATA_CONV_POOL=host: the synchronous host store).
+class Ds41ConvStore {
+public:
+    bool init(const Ds41Dense & d, int64_t ctx, size_t budget, size_t slots, bool cuda, std::string & err) {
+        if (budget == 0) return true;
+        const char * e = std::getenv("STRATA_CONV_POOL");
+#if defined(DS41_POOL_CUDA)
+        if (!(e && std::strcmp(e, "host") == 0)) {
+            pin_ = std::make_unique<Ds41ConvStorePinned>();
+            if (pin_->init(d, ctx, budget, cuda, err)) { kind_ = "pinned"; return true; }
+            pin_.reset();
+            return false;
+        }
+#endif
+        (void) d; (void) ctx; (void) cuda; (void) e;
+        host_ = std::make_unique<Ds41ConvStoreHost>(budget, slots);
+        kind_ = "host";
+        return true;
+    }
+    const char * kind() const { return kind_; }
+#if defined(DS41_POOL_CUDA)
+#define DS41_STORE_CALL(x) (pin_ ? pin_->x : host_->x)
+#else
+#define DS41_STORE_CALL(x) (host_->x)
+#endif
+    int64_t save(Ds41Dense & d, const int * t, const uint64_t * id, size_t idn, int64_t n, const float * lg, size_t nl, std::string & err) {
+        return DS41_STORE_CALL(save(d, t, id, idn, n, lg, nl, err));
+    }
+    ConvMatch best_prefix(const int * t, const uint64_t * id, size_t idn, int64_t n) { return DS41_STORE_CALL(best_prefix(t, id, idn, n)); }
+    bool restore(Ds41Dense & d, const ConvMatch & m, int64_t from, ConvRestore & out, std::string & err) {
+        return DS41_STORE_CALL(restore(d, m, from, out, err));
+    }
+    bool fence(std::string * err = nullptr) { return DS41_STORE_CALL(fence(err)); }
+    size_t size() const { return DS41_STORE_CALL(size()); }
+    size_t bytes() const { return DS41_STORE_CALL(bytes()); }
+    size_t evictions() const { return DS41_STORE_CALL(evictions()); }
+    std::string stats_line() const { return DS41_STORE_CALL(stats_line()); }
+#undef DS41_STORE_CALL
+private:
+    std::unique_ptr<Ds41ConvStoreHost> host_;
+#if defined(DS41_POOL_CUDA)
+    std::unique_ptr<Ds41ConvStorePinned> pin_;
+#endif
+    const char * kind_ = "off";
 };
 
 }  // namespace strata::v41
