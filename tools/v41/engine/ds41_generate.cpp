@@ -4,7 +4,7 @@
 // the server's job: tools/v41/serve/serve_ds41.py).
 //
 //   ds41_generate -m V41-GSQ.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu] [--experts gpu|cpu]
-//                 [--engram DIR:DIR:DIR] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
+//                 [--engram DIR:DIR:DIR] [--engram-hot hot.bin] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
 //                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--tier-batch-pcie 1.0] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--kv-fp4] [--serve] [--quiet]
 //                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F]
@@ -70,6 +70,7 @@ struct Args {
     float route_bias = 1.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed (DEFAULT 1.0, Mal 2026-10-11:
                                   // ~4x decode; 4096-tok ppl code 2.38 -> 2.67, agentic 15.1 -> 6.9; --route-bias 0 = exact routing)
     std::vector<std::string> engram;
+    std::string engram_hot;
     int n_predict = 64;
     std::string backend = "cuda", experts = "gpu";
     int64_t slots = 0;            // 0 = auto (free VRAM after the dense half, minus --vram-margin)
@@ -164,6 +165,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "-n" || k == "--n-predict") a.n_predict = std::atoi(next().c_str());
         else if (k == "--backend") a.backend = next();
         else if (k == "--experts") a.experts = next();
+        else if (k == "--engram-hot") a.engram_hot = next();
 #ifdef _WIN32
         // the Windows path-list separator: a drive letter's ':' must not split "D:\a;E:\b"
         else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ';')) a.engram.push_back(d); }
@@ -383,6 +385,7 @@ int main(int argc, char ** argv) {
     int64_t ER = enc_skip ? (int64_t) a.enc_replay : 0;
     dc.engram_dirs = a.engram;
     dc.vision = a.vision;
+    dc.engram_hot = a.engram_hot;
     dc.act_quant = a.act_quant;
     // --kv-fp4 / STRATA_KV_FP4=1: the compressed KV + indexer keys packed to their exact FP4 grids (Ds41DenseConfig::kv_fp4)
     dc.kv_fp4 = a.kv_fp4 || (std::getenv("STRATA_KV_FP4") && std::getenv("STRATA_KV_FP4")[0] == '1');
@@ -1797,6 +1800,16 @@ int main(int argc, char ** argv) {
             if (const Ds41Dense::RouteMeter rm = dense.route_meter(false); rm.on && rm.slots > 0)
                 std::fprintf(stderr, "serve: routing vs exact: %.2f%% of expert picks swapped, %.2f%% of router weight kept (%lld slots)\n",
                              100.0 * (double) rm.swaps / (double) rm.slots, 100.0 * rm.weight_kept, rm.slots);
+            if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
+                size_t tf = 0, tt = 0;
+                ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
+                double dsp_gib = 0.0;
+#if defined(DS41_HAVE_DSPARK)
+                if (dsp) dsp_gib = (double) dsp->weight_bytes() / 1073741824.0;
+#endif
+                std::fprintf(stderr, "vram ledger: %s; DSpark weights %.2f GiB; free %.2f of %.2f GiB\n",
+                             dense.vram_ledger().c_str(), dsp_gib, tf / 1073741824.0, tt / 1073741824.0);
+            }
 #if defined(DS41_HAVE_DSPARK)
             if (rq_pass > 0)
                 std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", rq_pass,

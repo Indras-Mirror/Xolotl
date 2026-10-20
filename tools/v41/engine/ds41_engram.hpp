@@ -30,8 +30,17 @@ class Ds41Engram {
 public:
     struct RawMap;   ///< a fragmented table file read straight from its block device (see ds41_engram.cpp)
     ~Ds41Engram();
-    /// dirs: where the shards are (the index json is looked up in each, the shard files too).
+    /// dirs: where the shards are (the index json is looked up in each, the shard files too).  Loads the hot set too when
+    /// one is given (set_hot_path, else STRATA_ENGRAM_HOT); a hot set that fails its checks is skipped with a warning.
     bool open(const Ds41Geometry & g, const std::vector<std::string> & dirs, int threads, std::string & err);
+    /// The hash state only (no tables, no threads): enough for hash() - used by the offline hot-set tool.
+    void setup_hash(const Ds41Geometry & g);
+    /// Hot-set pack to load at open() (overrides STRATA_ENGRAM_HOT; "" = env / none).
+    void set_hot_path(const std::string & p) { hot_path_ = p; }
+    /// Raw bytes of one row (dim weight bytes then dim/32 scale bytes) straight from the tables (offline tool).
+    bool read_raw(int e, uint32_t row, uint8_t * dst) const;
+    /// Fingerprint of the hash geometry (rows, primes, multipliers, token map): a hot set is only valid for the same one.
+    uint64_t geometry_fingerprint() const;
     bool enabled() const { return !tables_.empty(); }
     int64_t n_cols() const { return cols_; }                    ///< hash columns per token per layer (24)
     int64_t row_dim() const { return dim_; }                    ///< 256
@@ -62,6 +71,8 @@ public:
     uint64_t row_reads() const { return reads_; }
     uint64_t cache_hits() const { return cache_hits_; }   ///< unique rows served from the row cache
     uint64_t cache_misses() const { return cache_miss_; }
+    uint64_t hot_hits() const { return hot_hits_; }       ///< unique rows served from the hot set
+    size_t hot_rows() const { return hot_keys_.size(); }
 
 private:
     struct Table { int fd_w = -1, fd_s = -1; uint64_t off_w = 0, off_s = 0; int64_t rows = 0;
@@ -78,6 +89,15 @@ private:
     size_t cache_cap_ = 0, cache_used_ = 0;
     uint64_t cache_hits_ = 0, cache_miss_ = 0;
     std::mutex cache_mu_;
+    // Hot set: rows that many documents use (ranked offline over a corpus by tools/v41/engine/ds41_engram_hot.cpp),
+    // pinned in RAM for the process lifetime.  hot_keys_ is sorted (slot << 32 | row) and immutable after open(), so the
+    // lookup is lock-free; hot_pool_ holds the raw rows in key order.  See ds41_engram.cpp (load_hot) for the file format.
+    std::string hot_path_;
+    std::vector<uint64_t> hot_keys_;
+    std::vector<uint8_t> hot_pool_;
+    std::vector<size_t> hot_begin_;   // [slot + 1]: slot e's keys are hot_keys_[hot_begin_[e] .. hot_begin_[e + 1])
+    uint64_t hot_hits_ = 0;
+    bool load_hot(const std::string & path, std::string & err);
     std::vector<int64_t> hist_;      // compressed ids by position
     std::vector<int64_t> offsets_;   // [slot * cols + col] bucket range start
     int64_t cols_ = 0, dim_ = 0;

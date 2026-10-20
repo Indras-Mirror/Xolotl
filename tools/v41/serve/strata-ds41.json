@@ -2,15 +2,15 @@
   "exe": "/home/mal/AI/Xolotl/tools/v41/serve/ds41-engine.sh",
   "args": [
     "-m",
-    "/media/mal/SSD NVME/AI/V41-GSQ-v2/V41-GSQ-v2.gguf",
+    "/media/mal/SSD NVME/AI/V41-GSQ-1017/V41-GSQ-1017.gguf",
     "--backend",
     "cuda",
     "--experts",
     "gpu",
     "--engram",
-    "/media/Crucial1TB/V41-Engram:/media/mal/SSD NVME/AI/V41-Engram",
+    "/media/Crucial1TB/V41-1017-Engram:/media/mal/SSD NVME/AI/V41-1017-Engram",
     "--rank",
-    "/media/mal/SSD NVME/AI/V41-GSQ-v2/rank.bin",
+    "/media/mal/SSD NVME/AI/V41-GSQ-1017/rank-1017-085.bin",
     "--ctx",
     "524288",
     "--stop",
@@ -37,5 +37,9 @@
     "top_p": 0.95
   },
   "api_monitor": true,
-  "reasoning_budget_tokens": 32768
+  "reasoning_budget_tokens": 32768,
+  "env": {
+    "STRATA_SERVE_DSPARK": "/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision-1017.Q2_K.gguf",
+    "STRATA_ATTN_F16_GATHER": "1"
+  }
 }

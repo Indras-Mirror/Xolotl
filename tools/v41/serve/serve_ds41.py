@@ -336,6 +336,36 @@ def _op_init_ds41(self, *a, **k):
     _op_init(self, *a, **k)
     self.stream_tools = False          # the streaming scanner reads Qwen's <function=...> body
     self.dsml_hold = ""
+    self.echo_check, self.echo_hold = True, ""
+
+
+# 2026-10-19: after the server closes a thinking budget with REASONING_WRAP_UP, the 1017 sometimes repeats that sentence
+# as the first line of its answer (seen in the probe runs: the sentence correctly in the thinking AND again in the
+# answer).  Drop an exact repeat at the very start of the answer; anything else passes through unchanged.
+WRAP_SENTENCE = S.REASONING_WRAP_UP.split("</think>")[0].strip()
+
+
+def _drop_wrap_echo(self, evs):
+    out = []
+    for ev in evs:
+        if not self.echo_check or ev.kind != "content":
+            if self.echo_check and self.echo_hold and ev.kind != "reasoning":   # flush a held prefix before anything else
+                out.append(F.Event("content", self.echo_hold)); self.echo_hold = ""; self.echo_check = False
+            out.append(ev)
+            continue
+        self.echo_hold += ev.text
+        head = self.echo_hold.lstrip()
+        if not head or WRAP_SENTENCE.startswith(head):
+            continue                                   # still could be the echo: hold it
+        self.echo_check = False
+        if head.startswith(WRAP_SENTENCE):
+            rest = head[len(WRAP_SENTENCE):].lstrip("\n")
+            if rest:
+                out.append(F.Event("content", rest))
+        else:
+            out.append(F.Event("content", self.echo_hold))
+        self.echo_hold = ""
+    return out
 
 
 def _strip_wrappers(self, delta: str, final: bool) -> str:
@@ -349,12 +379,17 @@ def _strip_wrappers(self, delta: str, final: bool) -> str:
 
 
 def _op_feed_ds41(self, delta: str):
-    return _op_feed(self, _strip_wrappers(self, delta, False))
+    return _drop_wrap_echo(self, _op_feed(self, _strip_wrappers(self, delta, False)))
 
 
 def _op_finish_ds41(self, *a, **k):   # *a/**k: the 0.1.44 server's finish(reason=...)
     out = _op_feed(self, _strip_wrappers(self, "", True)) if self.dsml_hold else []
-    return out + _op_finish(self, *a, **k)
+    out = _drop_wrap_echo(self, out + _op_finish(self, *a, **k))
+    if self.echo_hold:                 # ended while matching: the whole sentence = the echo, a part of it = real text
+        if self.echo_hold.strip() != WRAP_SENTENCE:
+            out.append(F.Event("content", self.echo_hold))
+        self.echo_hold = ""
+    return out
 
 
 F.OutputParser.__init__ = _op_init_ds41

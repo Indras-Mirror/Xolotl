@@ -212,6 +212,14 @@ struct Ds41Dense::Impl {
     ggml_tensor * i_eng[2] = {};          // F32 [EC * ED, NC]  Engram rows
     ggml_tensor * neg_ramp = nullptr;     // F32 [cmax1]  -i     (constant)
     ggml_tensor * blk_ramp = nullptr;     // F32 [cmax1 / CBS + 1]  i (constant)
+    ggml_tensor * zpad16 = nullptr;       // F16 [DH, 1] zeros: the flash-attn key padding (STRATA_ATTN_F16_GATHER)
+    ggml_tensor * zidx = nullptr;         // I32 [kZidx] zeros: gathers that zero row once per pad slot
+    // STRATA_ATTN_F16_GATHER=1 (CUDA): the attention's key rows are gathered straight into F16 and concatenated /
+    // padded in F16, instead of gathered F32 -> concat F32 -> pad F32 -> cast F16.  Same values bit for bit (the
+    // gather dequantizes in float and rounds with the same __float2half as the cast; concat and pad only move bits),
+    // but the 512-query sub-batch's key tensors peak at ~0.74 GB instead of ~1.48 GB (the "1424 MiB" pass-graph
+    // buffer of V41_START_HERE run20/21).
+    bool f16_gather = false;
 
     // ---- the pass
     int pos0 = 0, n = 0;
@@ -497,6 +505,19 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
 // -DSTRATA_DSV41_FQ_OP=ON on a llama.cpp tree patched with tools/v41/ggml/dsv41-fake-quant.patch - the fused
 // GGML_OP_DSV41_FAKE_QUANT, one kernel per call (bit-identical on CUDA and CPU: test_ds41_fq; ~3,000 fewer tiny
 // kernels per decode token).  STRATA_FQ_COMPOSITE=1 in such a build: the composite.
+// get_rows whose result is F16 (f16) or the usual F32.  ggml_get_rows always declares F32; the CUDA kernel writes any
+// of F32 / F16 / BF16, dequantizing in float and rounding with the same conversion a later cast would use, so retyping
+// the (not yet allocated) result is the gather + cast in one step without the F32 intermediate.  CUDA only.
+static ggml_tensor * rows_as(ggml_context * gc, ggml_tensor * a, ggml_tensor * idx, bool f16) {
+    ggml_tensor * t = ggml_get_rows(gc, a, idx);
+    if (f16 && t->type == GGML_TYPE_F32) {
+        t->type = GGML_TYPE_F16;
+        t->nb[0] = ggml_type_size(GGML_TYPE_F16);
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) t->nb[i] = t->nb[i - 1] * t->ne[i - 1];
+    }
+    return t;
+}
+
 static ggml_tensor * fake_quant(ggml_context * gc, ggml_tensor * x, Ds41Quant mode) {
 #if defined(STRATA_DSV41_FQ_OP)
     static const bool composite = std::getenv("STRATA_FQ_COMPOSITE") != nullptr;
@@ -560,7 +581,9 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * kv2 = ggml_reshape_2d(gc, kv, DH, n);
     if (im.cfg.act_quant) kv2 = fake_quant(gc, ggml_cont(gc, kv2), Ds41Quant::FP8_POW2_32);   // model.py _window_kv
     ggml_tensor * wsrc = ggml_concat(gc, L.raw->type == GGML_TYPE_F32 ? L.raw : ggml_cast(gc, L.raw, GGML_TYPE_F32), kv2, 1);     // [DH, RAW + n]
-    ggml_tensor * Kw = ggml_reshape_3d(gc, ggml_get_rows(gc, wsrc, b.v1(im.i_widx, SWA * n, (size_t) col0 * SWA * 4)), DH, SWA, n);
+    // F16 key path for this graph only when the zero index covers its padding (255 pad rows x n queries at most)
+    const bool f16 = im.f16_gather && 255 * n <= im.zidx->ne[0];
+    ggml_tensor * Kw = ggml_reshape_3d(gc, rows_as(gc, wsrc, b.v1(im.i_widx, SWA * n, (size_t) col0 * SWA * 4), f16), DH, SWA, n);
     ggml_tensor * Mw = b.cols2(im.i_wmask, SWA, n, col0);
     {
         const int64_t k = std::min<int64_t>(n, RAW);
@@ -667,7 +690,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                 sel = ggml_view_2d(gc, IS.sel, K, n, IS.sel->nb[1], (size_t) col0 * IS.sel->nb[1]);
                 selm = ggml_view_2d(gc, IS.selm, K, n, IS.selm->nb[1], (size_t) col0 * IS.selm->nb[1]);
             }
-            Kc = ggml_reshape_3d(gc, ggml_get_rows(gc, comp, ggml_cont(gc, ggml_reshape_1d(gc, ggml_cont(gc, sel), K * n))), DH, K, n);
+            Kc = ggml_reshape_3d(gc, rows_as(gc, comp, ggml_cont(gc, ggml_reshape_1d(gc, ggml_cont(gc, sel), K * n)), f16), DH, K, n);
             Mc = ggml_cont(gc, selm);
             // the source's rows must be read AFTER this pass wrote its own (a kv source attends to its new row)
         }
@@ -679,11 +702,15 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     int64_t M = Kall->ne[1];
     if (!im.cpu && M % 256) {   // ggml-cuda's flash-attn for d 512 wants the key count a multiple of 256
         const int64_t pad = 256 - M % 256;
-        Kall = ggml_pad(gc, Kall, 0, (int) pad, 0, 0);
+        // F16 has no CUDA pad: concat zeros gathered from the one zero row (F16 -> F16, exact) - the same zeros
+        Kall = f16 ? ggml_concat(gc, Kall, ggml_reshape_3d(gc, rows_as(gc, im.zpad16, ggml_view_1d(gc, im.zidx, pad * n, 0), true),
+                                                           DH, pad, n), 1)
+             : ggml_pad(gc, Kall, 0, (int) pad, 0, 0);
         Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, n), NEG_INF), 0);
         M += pad;
     }
-    ggml_tensor * k4 = ggml_cast(gc, ggml_reshape_4d(gc, Kall, DH, M, 1, n), GGML_TYPE_F16);
+    ggml_tensor * k4 = Kall->type == GGML_TYPE_F16 ? ggml_reshape_4d(gc, Kall, DH, M, 1, n)
+                                                   : ggml_cast(gc, ggml_reshape_4d(gc, Kall, DH, M, 1, n), GGML_TYPE_F16);
     ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, q, DH, NH, 1, n), 0, 2, 1, 3);    // [DH, 1, NH, n]
     ggml_tensor * m4 = ggml_cast(gc, ggml_reshape_4d(gc, Mall, M, 1, 1, n), GGML_TYPE_F16);
     ggml_tensor * o = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
@@ -1146,6 +1173,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
             }
         }
     }
+    im.engram.set_hot_path(cfg.engram_hot);
     if (!cfg.engram_dirs.empty() && !im.engram.open(G, cfg.engram_dirs, cfg.engram_threads, err)) return false;
 
     // layers
@@ -1212,6 +1240,11 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     auto I = [&](ggml_type t, int64_t a, int64_t b2 = 1) { return b2 == 1 ? ggml_new_tensor_1d(im.ictx, t, a) : ggml_new_tensor_2d(im.ictx, t, a, b2); };
     im.neg_ramp = I(GGML_TYPE_F32, im.cmax[1] + 1);
     im.blk_ramp = I(GGML_TYPE_F32, im.cmax[1] / im.CBS + 2);
+    // default ON (CUDA) since 2026-10-18: 1017 8K prompt 239.8 -> 255.2 tok/s, +1.06 GiB min free VRAM, logits + tokens
+    // identical (verify/s7/vram-f16.sh GATE A).  STRATA_ATTN_F16_GATHER=0 restores the F32 gather.
+    im.f16_gather = !im.cpu && !(std::getenv("STRATA_ATTN_F16_GATHER") && std::getenv("STRATA_ATTN_F16_GATHER")[0] == '0');
+    im.zidx = I(GGML_TYPE_I32, im.f16_gather ? 255 * 2048 : 1);   // ibuf is cleared to 0 below: all zeros
+    if (im.f16_gather) im.zpad16 = I(GGML_TYPE_F16, im.DH, 1);
     im.ibuf = ggml_backend_alloc_ctx_tensors(im.ictx, im.backend);
     if (!im.ibuf) { err = "cannot allocate the inputs"; return false; }
     ggml_backend_buffer_clear(im.ibuf, 0);
@@ -1830,6 +1863,21 @@ bool Ds41Dense::read_state_cols(int c0, int n, std::vector<float> & x) {
     x.resize((size_t) (im.D * im.HC * n));
     ggml_backend_tensor_get(im.x_state, x.data(), (size_t) c0 * col, (size_t) n * col);
     return true;
+}
+
+std::string Ds41Dense::vram_ledger() const {
+    const Impl & im = *p_;
+    auto gib = [](size_t b) { return (double) b / 1073741824.0; };
+    auto dev = [](ggml_backend_buffer_t b) { return b && !ggml_backend_buffer_is_host(b) ? ggml_backend_buffer_get_size(b) : (size_t) 0; };
+    size_t w = 0;
+    for (auto b : im.w.bufs) w += dev(b);
+    const size_t gd = im.allo_dec.a ? ggml_gallocr_get_buffer_size(im.allo_dec.a, 0) : 0;
+    const size_t gp = im.allo_pass.a ? ggml_gallocr_get_buffer_size(im.allo_pass.a, 0) : 0;
+    char line[320];
+    std::snprintf(line, sizeof line, "dense weights %.2f, KV state %.2f, columns %.2f (NC %lld), inputs %.2f, graphs dec %.2f + "
+                  "pass %.2f = %.2f GiB", gib(w), gib(dev(im.sbuf)), gib(dev(im.nbuf)), (long long) im.NC, gib(dev(im.ibuf)),
+                  gib(gd), gib(gp), gib(w + dev(im.sbuf) + dev(im.nbuf) + dev(im.ibuf) + gd + gp));
+    return line;
 }
 
 bool Ds41Dense::snapshot(int pos) {

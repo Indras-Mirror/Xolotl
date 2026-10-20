@@ -1,0 +1,21 @@
+THIS IS A PLACEHOLDER - the real file is NOT in this repository.
+
+model-00048-of-00048.safetensors  (101.5 GB)  =  one of the two ENGRAM table shards
+(Engram n-gram memory, FP8 rows, read from disk at run time; the engine needs BOTH shards 47 and 48)
+
+It is unchanged from the original checkpoint, so download it from:
+  https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017     (the checkpoint this quant was made from)
+
+Download both shards + the index (~203 GB):
+  hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+     model-00047-of-00048.safetensors model-00048-of-00048.safetensors \
+     model.safetensors.index.json config.json --local-dir FP8-engram
+
+Then extract the tables to fast drives with Strata-DSV4.1 (https://github.com/Indras-Mirror/Strata-DSV4.1):
+  python3 tools/v41/extract_engram.py FP8-engram --to layers.1=/fast/a --to layers.14=/fast/b
+and run the engine with  --engram "/fast/a:/fast/b"
+
+The extracted Engram tables will follow in this repository later as 10 GiB parts; until then use the official
+shards above.
+
+See README.md -> "Quick start (4 steps)" for the full steps.

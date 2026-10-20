@@ -54,7 +54,7 @@ main() {
   else
     echo "This copy of Strata was not made with git, so it cannot fetch new files itself. Download the newest one:"
     echo "  https://github.com/Niko1221/Strata/archive/refs/heads/main.zip"
-    echo "unzip it anywhere and run ./setup.sh (or ./update.sh) in it: it finds the model files in Strata-data and"
+    echo "unzip it anywhere and run ./setup.sh (or ./update.sh) in it: it finds the model files in Xolotl-data and"
     echo "sets itself up the same way - nothing big is downloaded again."
     echo "Checking this copy's engine and settings meanwhile ..."
   fi

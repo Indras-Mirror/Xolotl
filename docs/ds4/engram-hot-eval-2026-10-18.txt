@@ -1,0 +1,10 @@
+eval: 1461 held-out docs, 1041477 prefill + 347896 decode tokens, 48 lookups/token, row cache 2000000 rows (persistent, fill-until-full), prefill chunk 4096
+  hot GiB   hot rows decode reads/tok   prefill reads/1K   decode hot % decode cache %
+     0.00          0            38.55            30269.7           0.0%          19.7%
+     0.50    1973790            31.32            25560.7          31.7%           3.1%
+     1.00    3947580            29.37            24179.1          36.7%           2.1%
+     2.00    7895160            27.29            22639.1          41.7%           1.5%
+     4.00   15790320            25.25            21064.9          46.3%           1.1%
+     8.00   31580641            23.17            19444.1          50.8%           0.9%
+    16.00   63161283            20.92            17576.9          55.6%           0.8%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:10.31

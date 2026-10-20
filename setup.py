@@ -4238,17 +4238,39 @@ def ram_ctx(model, ram, low_ram=False) -> int:
     return max(c for c in CONTEXTS if c <= 131072 or (c != 204800 and (ctx_ram_need(model, c, low_ram) or 0) <= ram))
 
 
-def settings_path() -> Path:
+# Xolotl #6: its own per-user settings and its own default data folder (Xolotl-data), so it can sit beside an original
+# Strata install (e.g. both in C:\portable) without sharing that install's settings or moving its model files.  An
+# Xolotl folder that ran before this change (its settings were in the shared Strata file) keeps its data folder: the
+# old file is read once, and only when it lists this very folder.
+APP_NAME = "Xolotl"
+DATA_NAME = "Xolotl-data"
+
+
+def settings_path(app: str = APP_NAME) -> Path:
     if WIN:
-        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "Strata" / "settings.json"
-    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "strata" / "settings.json"
+        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / app / "settings.json"
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / app.lower() / "settings.json"
+
+
+def is_xolotl(folder: Path) -> bool:
+    """An Xolotl folder (not an original Strata one): it carries the DeepSeek tools."""
+    return (folder / "setup.py").is_file() and (folder / "tools" / "v41").is_dir()
 
 
 def load_settings() -> dict:
     try:
         return json.loads(settings_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        pass
+    try:                                                # #6: an Xolotl folder set up before its own settings existed
+        old = json.loads(settings_path("Strata").read_text(encoding="utf-8"))
+        here = os.path.normcase(str(ROOT.resolve()))
+        if any(os.path.normcase(str(Path(p).resolve())) == here for p in old.get("installs", [])):
+            old["installs"] = [p for p in old.get("installs", []) if is_xolotl(Path(p))]
+            return old
+    except (OSError, ValueError):
+        pass
+    return {}
 
 
 def save_settings(s: dict) -> None:
@@ -4270,22 +4292,23 @@ def has_data(folder: Path) -> bool:
 
 
 def other_installs(settings: dict) -> list:
-    """Strata folders besides this one that may hold model files: the ones this user ran before, and Strata* folders
-    next to this one (a zip unpacked again lands in e.g. `Strata-main (1)\\Strata-main`)."""
+    """Xolotl folders besides this one that may hold model files: the ones this user ran before, and Xolotl / Strata*
+    folders next to this one (a zip unpacked again lands in e.g. `Xolotl-main (1)\\Xolotl-main`).  #6: an original
+    Strata folder is never one of them, so its model files stay where they are."""
     cands = [Path(p) for p in settings.get("installs", [])]
     for base in dict.fromkeys((ROOT.parent, ROOT.parent.parent)):
         try:
             for d in base.iterdir():
-                if d.is_dir() and d.name.lower().startswith("strata"):
+                if d.is_dir() and d.name.lower().startswith(("strata", "xolotl")):
                     cands.append(d)
-                    cands += [c for c in d.iterdir() if c.is_dir() and c.name.lower().startswith("strata")]
+                    cands += [c for c in d.iterdir() if c.is_dir() and c.name.lower().startswith(("strata", "xolotl"))]
         except OSError:
             pass
     found = []
     for d in cands:
         try:
             d = d.resolve()
-            if d != ROOT and d not in found and (d / "setup.py").is_file():
+            if d != ROOT and d not in found and is_xolotl(d):
                 found.append(d)
         except OSError:
             pass
@@ -4353,7 +4376,7 @@ def data_folder(requested: str | None) -> tuple:
     and of earlier Strata folders on the same drive into the data folder, and points their configs there."""
     settings = load_settings()
     dest = Path(requested).expanduser().resolve() if requested else \
-        Path(settings["data_dir"]) if settings.get("data_dir") else ROOT.parent / "Strata-data"
+        Path(settings["data_dir"]) if settings.get("data_dir") else ROOT.parent / DATA_NAME
     try:
         dest.mkdir(parents=True, exist_ok=True)
     except OSError as e:                                # e.g. no write access next to the Strata folder
@@ -4365,7 +4388,7 @@ def data_folder(requested: str | None) -> tuple:
     sources = [ROOT, *other_installs(settings)]
     if settings.get("data_dir") and Path(settings["data_dir"]) != dest:
         sources.append(Path(settings["data_dir"]))
-    sources += [f / "Strata-data" for f in list(sources) if (f / "Strata-data") != dest]
+    sources += [f / n for f in list(sources) for n in (DATA_NAME, "Strata-data") if (f / n) != dest]
     seen = set()
     for folder in sources:
         key = os.path.normcase(str(folder))
@@ -5761,7 +5784,7 @@ def main() -> int:
                          "that uses the API; remembered for this model, also in run-<model>.bat/.sh)")
     ap.add_argument("--browser", dest="browser", action="store_true",
                     help="open the chat page again when the model is ready (the default; undoes --no-browser)")
-    ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default Strata-data next to this folder, "
+    ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default Xolotl-data next to this folder, "
                                        "remembered for every Strata folder on this PC")
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with every shard: "

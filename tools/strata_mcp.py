@@ -450,18 +450,25 @@ class Strata:
                       key=lambda m: bool(models[m].get("experimental")))
 
     # ---- paths
-    def settings_path(self) -> Path:
+    def settings_path(self, app: str = "Xolotl") -> Path:     # Xolotl #6: its own settings (setup.py settings_path)
         if WIN:
-            return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "Strata" / "settings.json"
-        return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "strata" / "settings.json"
+            return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / app / "settings.json"
+        return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / app.lower() / "settings.json"
 
     def data_dir(self) -> Path:
+        s = {}
         try:
             s = json.loads(self.settings_path().read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            s = {}
+            try:                    # #6: the shared Strata settings, only when they list this folder (as setup.py)
+                old = json.loads(self.settings_path("Strata").read_text(encoding="utf-8"))
+                here = os.path.normcase(str(self.root.resolve()))
+                if any(os.path.normcase(str(Path(p).resolve())) == here for p in old.get("installs", [])):
+                    s = old
+            except (OSError, ValueError):
+                pass
         d = s.get("data_dir") if isinstance(s, dict) else None
-        return Path(d) if d else self.root.parent / "Strata-data"
+        return Path(d) if d else self.root.parent / "Xolotl-data"
 
     def allowed_roots(self) -> list[Path]:
         return [norm(self.root), norm(self.data_dir())]
@@ -1004,10 +1011,10 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
                          "description": "setup's low-RAM mode (default auto)"},
              "port": {**port, "description": "the port the model will listen on (default 8080)"},
              "data_dir": {"type": "string", "maxLength": 260,
-                          "description": "where the model files go (default: the Strata-data folder next to the "
+                          "description": "where the model files go (default: the Xolotl-data folder next to the "
                                          "Strata folder). Only the current data folder, a folder inside the Strata "
                                          "folder, or a new absolute path whose last folder is named Strata... "
-                                         "(e.g. D:\\Strata-data) outside system folders"},
+                                         "(e.g. D:\\Xolotl-data) outside system folders"},
              "confirm": {"type": "boolean", "description": "true = really start the install (after the user agreed "
                                                            "to the plan and the download size)"},
              "cancel": {"type": "boolean", "description": "true = stop the install in progress"}}},
@@ -1156,17 +1163,17 @@ class Tools:
             raise ToolError("data_dir: network (UNC) paths are not allowed; use a local drive")
         p = Path(os.path.expandvars(raw)).expanduser()
         if not p.is_absolute():
-            raise ToolError("data_dir must be an absolute path (e.g. D:\\Strata-data or /mnt/big/Strata-data)")
+            raise ToolError("data_dir must be an absolute path (e.g. D:\\Xolotl-data or /mnt/big/Xolotl-data)")
         if ".." in p.parts:
             raise ToolError("data_dir must not contain '..'")
         n = norm(p)
         current = norm(s.data_dir())
-        if n == current or is_inside(n, norm(s.root)) or n == norm(s.root.parent / "Strata-data"):
+        if n == current or is_inside(n, norm(s.root)) or n == norm(s.root.parent / "Xolotl-data"):
             pass
         else:
             if not p.name.lower().startswith("strata"):
                 raise ToolError(f"data_dir {raw!r}: a new data folder must be named Strata... (e.g. "
-                                f"{Path(p.anchor or '/') / 'Strata-data'}), so that no other folder is filled with "
+                                f"{Path(p.anchor or '/') / 'Xolotl-data'}), so that no other folder is filled with "
                                 "model files")
             if not p.parent.is_dir():
                 raise ToolError(f"data_dir {raw!r}: its parent folder {p.parent} does not exist")
@@ -1278,7 +1285,7 @@ class Tools:
         short = None
         if free is not None and free < need:
             short = (f"not enough free disk space for {model}: about {need:.0f} GB needed at {target}, "
-                     f"{free:.0f} GB free; free some space or choose data_dir on a bigger drive (e.g. D:\\Strata-data)")
+                     f"{free:.0f} GB free; free some space or choose data_dir on a bigger drive (e.g. D:\\Xolotl-data)")
         args = ["--yes", "--no-start", "--family", family, "--model", model, "--context", str(context),
                 "--vision", vision or "no"]
         if family in ("qwen", "coder"):
