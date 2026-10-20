@@ -153,6 +153,13 @@ def dequantize(raw, ty):
     raise ValueError(f"unsupported GGML type {ty}")
 
 
+def _pread(fd, n, off):
+    if hasattr(os, "pread"):
+        return os.pread(fd, n, off)
+    os.lseek(fd, off, os.SEEK_SET)   # Windows has no os.pread; one reader per process, so seek + read is safe
+    return os.read(fd, n)
+
+
 class SidecarWeights:
     """Reads only the vision.* / aligner.* / image_* tensors of the sidecar GGUF, by offset."""
 
@@ -162,7 +169,7 @@ class SidecarWeights:
         self.tensors = {n: (s, t, o) for n, s, t, o in tensors if n.startswith(VISION_PREFIXES)}
         if not self.tensors:
             raise ValueError(f"{path}: no vision.* / aligner.* / image_* tensors")
-        self.fd = os.open(path, os.O_RDONLY)
+        self.fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))   # O_BINARY: Windows opens text otherwise
 
     def names(self):
         return sorted(self.tensors)
@@ -174,7 +181,7 @@ class SidecarWeights:
         nbytes = ggml_nbytes(shape, ty)
         raw = bytearray()
         while len(raw) < nbytes:
-            b = os.pread(self.fd, nbytes - len(raw), self.data_start + off + len(raw))
+            b = _pread(self.fd, nbytes - len(raw), self.data_start + off + len(raw))
             if not b:
                 raise OSError(f"{name}: short read")
             raw += b
