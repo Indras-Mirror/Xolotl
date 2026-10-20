@@ -352,8 +352,13 @@ int main(int argc, char ** argv) {
                      ", \"c_fed_decode\": " + c_feed_dec.json() + ", \"bind\": " + a_bind.json() + ", \"pool\": " + a_pool.json() + ", \"noise\": " + a_noise.json() + "}";
     std::printf("RESULT %s\n", js.c_str());
     if (!json_out.empty()) { std::ofstream o(json_out); o << js << "\n"; }
-    const bool ok = b_ref.exact == b_ref.n && a_bind.exact == a_bind.n && a_pool.exact == a_pool.n && b_bat.top1 == b_bat.n &&
-                    c_feed_last.top1 == c_feed_last.n;
+    // the CPU backend: a window's rows are the solo rows bit for bit; a GPU's dense kernels round by column count, so
+    // there the batched rows must stay within the solo path's own noise (its multi-row pass against one-row steps)
+    const bool cpu_be = ggml_backend_is_cpu(be);
+    const bool batch_ok = cpu_be ? b_bat.exact == b_bat.n && c_dec.exact == c_dec.n && c_feed_last.exact == c_feed_last.n
+                                 : b_bat.kl_sum / std::max(1L, b_bat.n) <= 2.0 * a_noise.kl_sum / std::max(1L, a_noise.n) &&
+                                   b_bat.top1 >= a_noise.top1 * b_bat.n / std::max(1L, a_noise.n) - 1;
+    const bool ok = b_ref.exact == b_ref.n && a_bind.exact == a_bind.n && a_pool.exact == a_pool.n && batch_ok;
     std::fprintf(stderr, "%s\n", ok ? "PASS" : "FAIL (see RESULT)");
     tier.close();
     std::fflush(stdout);
