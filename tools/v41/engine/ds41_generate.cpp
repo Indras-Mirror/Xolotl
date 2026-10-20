@@ -94,6 +94,9 @@ struct Args {
     // --serve's conversation pool: --conversation-cache-mib N (default 8192; 0 = the single park of STRATA_SERVE_PARK)
     // of host memory for conversations saved at their turn boundary, at most --conversation-cache-slots of them
     int conv_mib = 8192, conv_slots = 64;
+    // --batch-slots N | auto (--batch N: the server's "parallel": N): conversation states held at once for the batch
+    // windows (ds41_batch.hpp); 1 = the single-sequence engine as before, 0 = auto (Ds41DenseConfig::n_slots)
+    int batch_slots = 1;
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -224,6 +227,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--vision") a.vision = true;
         else if (k == "--conversation-cache-mib") a.conv_mib = std::max(0, std::atoi(next().c_str()));
         else if (k == "--conversation-cache-slots") a.conv_slots = std::max(1, std::atoi(next().c_str()));
+        else if (k == "--batch-slots" || k == "--batch") { const std::string v = next(); a.batch_slots = v == "auto" ? 0 : std::max(1, std::atoi(v.c_str())); }
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty());
@@ -392,6 +396,7 @@ int main(int argc, char ** argv) {
     dc.engram_dirs = a.engram;
     dc.engram_hot = a.engram_hot;
     dc.vision = a.vision;
+    dc.n_slots = a.batch_slots;
     dc.engram_hot = a.engram_hot;
     dc.act_quant = a.act_quant;
     // --kv-fp4 / STRATA_KV_FP4=1: the compressed KV + indexer keys packed to their exact FP4 grids (Ds41DenseConfig::kv_fp4)
@@ -403,6 +408,11 @@ int main(int argc, char ** argv) {
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds41_generate: dense init: %s\n", err.c_str()); return 1; }
     const Ds41Geometry & G = dense.geom();
     const int n_layer = (int) dense.n_layer(), n_embd = (int) G.n_embd, top_k = (int) G.n_used, nv = (int) G.vocab;
+    // gate tap: the single-sequence paths on another batch slot (they must not care which one)
+    if (const char * e = std::getenv("DS41_TEST_SOLO_SLOT"); e && !dense.bind_slot(std::atoi(e))) {
+        std::fprintf(stderr, "ds41_generate: DS41_TEST_SOLO_SLOT: %s\n", dense.last_error().c_str());
+        return 2;
+    }
     // enc-skip's layer 20: the LAST kv source (every compressed-KV / index-key write is owned by a kv source, and the
     // layers above it only read that owner's state, so the cut belongs there).  Also the window reach R = swa *
     // (n_layer - cut_layer) is what --enc-replay defaults to.

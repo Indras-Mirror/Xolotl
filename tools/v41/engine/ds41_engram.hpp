@@ -49,6 +49,18 @@ public:
     /// Record position `pos` as a DEAD token (an image span): it takes no part in any n-gram and stops the look-back,
     /// so a text n-gram never spans an image (model.py NgramHashState.DEAD).
     void set_dead(int64_t pos);
+    /// Batch slots: one history per conversation.  select_history(s) makes slot s's history the one set_token /
+    /// set_dead / hash / rows / start use (O(1): the vectors are swapped, not copied); 0 at start.
+    void select_history(int s);
+    int history_slot() const { return hist_cur_; }
+    /// Exchange two slots' histories (Ds41Dense::swap_slots).
+    void swap_histories(int a, int b);
+    /// set_token / set_dead on slot s's history (any slot, the selected one unchanged).
+    void set_token_in(int s, int64_t pos, int tid);
+    void set_dead_in(int s, int64_t pos);
+    /// rows() for n rows of several histories: row t = position pos[t] of slot slot[t]'s history (token-major out, as
+    /// rows()); the reads of all rows are one batch (dedup / sort / coalesce over the union).
+    bool rows_at(const int * slot, const int64_t * pos, int n, std::vector<std::vector<float>> & out, std::string & err);
     /// Hash ids of the n-grams ending at `pos` for Engram slot `e` (0 = layer 1, 1 = layer 14): out[cols].
     void hash(int64_t pos, int e, int64_t * out) const;
     /// Rows for tokens at positions pos0..pos0+n-1, every Engram slot: out[e] = n * cols * dim floats (token-major).
@@ -98,7 +110,12 @@ private:
     std::vector<size_t> hot_begin_;   // [slot + 1]: slot e's keys are hot_keys_[hot_begin_[e] .. hot_begin_[e + 1])
     uint64_t hot_hits_ = 0;
     bool load_hot(const std::string & path, std::string & err);
-    std::vector<int64_t> hist_;      // compressed ids by position
+    std::vector<int64_t> hist_;      // compressed ids by position (the selected slot's history)
+    std::vector<std::vector<int64_t>> hist_store_;   // the other slots' histories ([hist_cur_] is an empty placeholder)
+    int hist_cur_ = 0;
+    std::vector<int64_t> & hist_of(int s);
+    void hash_in(const std::vector<int64_t> & h, int64_t pos, int e, int64_t * out) const;
+    std::shared_ptr<Batch> start_ids(std::vector<int64_t> & ids, int n, std::vector<std::vector<float>> & out, std::string & err);
     std::vector<int64_t> offsets_;   // [slot * cols + col] bucket range start
     int64_t cols_ = 0, dim_ = 0;
     uint64_t bytes_ = 0, reads_ = 0;

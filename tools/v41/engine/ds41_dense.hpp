@@ -58,6 +58,12 @@ struct Ds41DenseConfig {
     /// them back after it (the prompt_batch columns are ~2.6 GiB at 8192 - expert slots while decoding).
     bool    elastic_cols = false;
     bool    vision = false;            ///< opt-in image embeddings, VL routing and Engram masking
+
+    /// Batch slots (--batch-slots N): conversation states held at once, each of the full ctx_max - its window rings,
+    /// ratio-2 compressor states, compressed KV + indexer keys, snapshot, park and Engram history.  Slot 0 is the one
+    /// a single-slot engine has always had (n_slots = 1 = the engine as before, byte for byte).  Every single-sequence
+    /// call works on the BOUND slot (bind_slot); begin_rows() runs rows of several slots in one pass.
+    int     n_slots = 1;
 };
 
 class Ds41Dense {
@@ -86,6 +92,33 @@ public:
     /// Start a pass: tokens tids[0..n) at positions pos0.., n <= max_pass.  Embeddings + Engram rows (the hash
     /// needs the 3 tokens before pos0: the history is kept by position, so a re-decoded position overwrites it).
     bool begin(const int * tids, int n, int pos0);
+
+    // ---- batch slots (see Ds41DenseConfig::n_slots and docs/BATCHING.md)
+    int n_slots() const;
+    /// The bound slot: begin / begin_batch / spans / snapshot / restore / park / unpark / rearm / state_regions /
+    /// pool_regions / set_engram_history all act on its state.  0 at init.
+    int slot() const;
+    /// Bind slot s (0 <= s < n_slots).  O(1): pointers only, no device work; the decode graphs of every slot stay
+    /// cached (keyed by slot).  Call between passes, never inside one.
+    bool bind_slot(int s);
+    /// Exchange two slots' whole state (device tensors, snapshot, park, Engram history) - O(1), no copy: a
+    /// conversation moves to another slot id.  The bound slot id stays bound (it now holds the other state).
+    bool swap_slots(int a, int b);
+    /// Device bytes one slot's state takes (rings + snapshot rings + compressor states + compressed KV + indexer keys).
+    size_t slot_bytes() const;
+    /// One row of a batch pass: token `tid` at position `pos` of slot `slot`'s conversation.
+    struct Row { int slot = 0; int pos = 0; int tid = 0; };
+    /// The most rows a batch pass takes (= Ds41MoeTier::kMaxMulti: one tier call per layer).
+    static constexpr int kMaxRows = 16;
+    /// Start a batch pass over rows of several slots: rows are grouped by slot (a slot's rows contiguous, at
+    /// consecutive ascending positions; one slot per group), n <= kMaxRows and n <= the state columns.  A slot may
+    /// carry one row (a decode step) or several (a piece of its prompt, or a verify).  Text only (no image rows).
+    /// Then attn_router / predict_multi / finish / logits / read_state run as for a pass of n tokens: row i is pass
+    /// column i.  Every slot's own window ring / compressor state / compressed rows / Engram history advance exactly
+    /// as a solo pass of its rows would advance them; the numbers differ from a solo pass only by the row-batched
+    /// matmuls (the same model, not the same bits).  The bound slot does not change.
+    bool begin_rows(const Row * rows, int n);
+
     /// Layer-major prompt batch (cfg.prompt_batch > 0): the whole batch's inputs are prepared once - embeddings,
     /// positions, window / compressed / indexer index maps, Engram rows and the initial x/pre state - into the state
     /// tensors' columns 0..B-1; then attn_router_span / finish_span walk layer il's sub-batches in order.  B <=

@@ -99,9 +99,14 @@ endif()
 if(TARGET ds41_dense AND TARGET ds41_moe_cuda)
     add_executable(ds41_generate ${_v41_dir}/ds41_generate.cpp)
     target_link_libraries(ds41_generate PRIVATE ds41_dense ds41_moe_cuda)
+    # the batch-slot gates (ds41_batch.hpp) on the CPU backend with the real model
+    add_executable(test_ds41_batch ${_v41_dir}/test_ds41_batch.cpp)
+    target_link_libraries(test_ds41_batch PRIVATE ds41_dense ds41_moe_cuda)
 elseif(TARGET ds41_dense AND TARGET ds41_moe_cpu)
     add_executable(ds41_generate ${_v41_dir}/ds41_generate.cpp)
     target_link_libraries(ds41_generate PRIVATE ds41_dense ds41_moe_cpu)
+    add_executable(test_ds41_batch ${_v41_dir}/test_ds41_batch.cpp)
+    target_link_libraries(test_ds41_batch PRIVATE ds41_dense ds41_moe_cpu)
 endif()
 # Windows threads (main and std::thread alike) take the executable's stack reserve, 1 MiB by default; Linux gives 8 MiB.
 # The engine's alloca scratch is sized for Linux, so reserve the same 8 MiB (address space only; committed as used).
