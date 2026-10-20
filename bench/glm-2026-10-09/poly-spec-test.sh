@@ -4,10 +4,10 @@
 #   draft   : --draft-model BLOCK   (their "47-51 t/s" arm)
 # Waits for the ds4-gpu lock (our other test holds it), then runs. Never touches our engine.
 set -u
-cd /home/mal/AI/PolyStrata
+cd $HOME/AI/PolyStrata
 M=/media/mal/NVME1TB/Models/GLM-5.3-Flash-RCO/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf
 BLK=/media/mal/NVME1TB/Models/GLM-5.3-Flash-RCO/draft-block.gguf
-D=/home/mal/AI/Strata-GLM/bench/glm-2026-10-09
+D=$HOME/AI/Strata-GLM/bench/glm-2026-10-09
 LOCK="$HOME/.quetza-data/conductor/ds4-gpu.lock"
 IDS=$(python3 -c "import numpy as np; a=np.fromfile('$D/prompts/eval_code.i32',dtype='<i4')[:2000]; print(','.join(map(str,a.tolist())))")
 : > "$D/poly-spec.summary"

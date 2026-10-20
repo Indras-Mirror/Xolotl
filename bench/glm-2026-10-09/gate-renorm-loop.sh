@@ -3,8 +3,8 @@
 # s20 keylogger prompt.  s20: ablated + skip (no renorm) degenerates into "import LPVOID, LPVOID, ..." x107,
 # finish=length.  With renorm the answer should terminate cleanly (finish=stop).
 set -u
-cd /home/mal/AI/Strata-GLM
-PY=/home/mal/AI/Strata/.venv/bin/python
+cd $HOME/AI/Strata-GLM
+PY=$HOME/AI/Strata/.venv/bin/python
 SHIM=tools/glm/serve/serve_glm.py
 CFG=tools/glm/serve/strata-glm-unc-ablated.json   # fully ablated + skip 0.15 + --renorm-skip
 PORT=8140

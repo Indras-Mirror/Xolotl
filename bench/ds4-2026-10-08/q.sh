@@ -1,7 +1,7 @@
 #!/bin/bash
 # queue one full-model run behind the shared GPU lock: wait for the lock AND 70 GiB available, then memguard
 # usage: q.sh <log> <extra ds4_generate args...>   (env vars pass through)
-cd /home/mal/AI/Strata-DS4
+cd $HOME/AI/Strata-DS4
 LOG=$1; shift
 L=~/.quetza-data/conductor/ds4-gpu.lock
 until flock -n "$L" true && [ "$(awk '/^MemAvailable:/{print int($2/1048576)}' /proc/meminfo)" -ge 70 ]; do sleep 30; done

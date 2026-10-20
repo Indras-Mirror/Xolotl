@@ -4,7 +4,7 @@
 # The packet forbids loading the 80 GB model before ~/.quetza-data/conductor/.done-p0-gpu-runs exists.
 # This waits for it and then runs p64 -> p600 -> p3000 through run_ref_gate.sh, logging everything.
 set -u
-REPO=/home/mal/AI/Xolotl
+REPO=$HOME/AI/Xolotl
 DONE=$HOME/.quetza-data/conductor/.done-p0-gpu-runs
 LOG=$REPO/bench/ds4-2026-10-05/ref/gate.log
 mkdir -p "$REPO/bench/ds4-2026-10-05/ref"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # batch 7: nsys of the MMQ chunk path (p3000, no ppl); speed on a 5996-token prompt (p3000 twice), chunk 4096, no ppl
-cd /home/mal/AI/Strata-DS4
+cd $HOME/AI/Strata-DS4
 B=bench/ds4-2026-10-08; BIN=$B/bin/ds4_generate.argsort
 L=~/.quetza-data/conductor/ds4-gpu.lock
 until flock -n "$L" true && [ "$(awk '/^MemAvailable:/{print int($2/1048576)}' /proc/meminfo)" -ge 70 ]; do sleep 30; done

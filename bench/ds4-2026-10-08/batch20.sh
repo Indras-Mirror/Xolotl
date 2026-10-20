@@ -2,7 +2,7 @@
 # b20: real-model A/B of the device-side visibility mask (DS4_VIS_DEV=1) against the host mask (DS4_VIS_DEV=0),
 # interleaved (single runs swing ~1 tok/s), p600 + 128 greedy, the recommended decode config.  Binary snapshotted,
 # so a rebuild cannot change a queued run.  The wakeword daemon is stopped for the measurements and restarted after.
-cd /home/mal/AI/Strata-DS4 || exit 1
+cd $HOME/AI/Strata-DS4 || exit 1
 B=bench/ds4-2026-10-08
 export DS4_BIN=$B/bin/ds4_generate.visdev
 F="--vram-lru --pf-b 0.7 --f16-q8 --arena-skip-resident --arena-gib 58"

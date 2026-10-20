@@ -384,6 +384,7 @@ int main(int argc, char ** argv) {
     if (enc_skip && PB <= 1) { std::fprintf(stderr, "ds41_generate: --enc-skip needs the layer-major prompt path (--prompt-batch >= 2)\n"); return 2; }
     int64_t ER = enc_skip ? (int64_t) a.enc_replay : 0;
     dc.engram_dirs = a.engram;
+    dc.engram_hot = a.engram_hot;
     dc.vision = a.vision;
     dc.engram_hot = a.engram_hot;
     dc.act_quant = a.act_quant;
@@ -1797,6 +1798,16 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file\n",
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
                          (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
+            if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
+                size_t tf = 0, tt = 0;
+                ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
+                double dsp_gib = 0.0;
+#if defined(DS41_HAVE_DSPARK)
+                if (dsp) dsp_gib = (double) dsp->weight_bytes() / 1073741824.0;
+#endif
+                std::fprintf(stderr, "vram ledger: %s; DSpark weights %.2f GiB; free %.2f of %.2f GiB\n",
+                             dense.vram_ledger().c_str(), dsp_gib, tf / 1073741824.0, tt / 1073741824.0);
+            }
             if (const Ds41Dense::RouteMeter rm = dense.route_meter(false); rm.on && rm.slots > 0)
                 std::fprintf(stderr, "serve: routing vs exact: %.2f%% of expert picks swapped, %.2f%% of router weight kept (%lld slots)\n",
                              100.0 * (double) rm.swaps / (double) rm.slots, 100.0 * rm.weight_kept, rm.slots);

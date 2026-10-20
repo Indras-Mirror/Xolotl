@@ -1,7 +1,7 @@
 #!/bin/bash
 # b32 (~9 min): soft pruning, bigger penalties + --arena-adapt (an NVMe-read expert replaces its layer's LRU arena
 # expert, so a conversation's pruned-but-needed experts migrate into RAM): 25% at 0.5 / 1.5, 40% at 1.5
-cd /home/mal/AI/Strata-DS4 || exit 1
+cd $HOME/AI/Strata-DS4 || exit 1
 R=bench/ds4-2026-10-09/reap; export DS4_BIN=bench/ds4-2026-10-08/bin/ds4_generate.reap3
 F="--vram-lru --pf-b 0.7 --f16-q8 --prefill-chunk 4096 --chunk-mmq --chunk-prestage --comp-type iq4_nl --icomp-q8 --arena-adapt"
 for x in "enzh25a05 enzh25 0.5" "enzh25a15 enzh25 1.5" "enzh40a15 enzh40 1.5"; do

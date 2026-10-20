@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run the remaining goldens one at a time (one model process at a time)
 set -uo pipefail
-cd /home/mal/AI/Strata-DS4
+cd $HOME/AI/Strata-DS4
 DUMP=tools/ds4/golden_dump
 MODEL=/media/mal/NVME1TB/Models/DeepSeek-V4-Flash-Q2-0731.gguf
 OUT=bench/ds4-2026-10-05/goldens

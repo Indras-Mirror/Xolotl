@@ -3,9 +3,9 @@
 # Same 4 prompts x 320 tokens as llamacpp-ab/bench.sh, plus the full timings
 # object (draft acceptance) per prompt. RAM watchdog as in bench.sh.
 L=$1; shift
-BIN=/home/mal/AI/llama.cpp-master-rebase/build/bin/llama-server
+BIN=$HOME/AI/llama.cpp-master-rebase/build/bin/llama-server
 M=/media/mal/NVME1TB/Models/DeepSeek-V4-Flash-Q2-0731.gguf
-OUT=/home/mal/AI/Strata-DS4/bench/ds4-2026-10-05/phase0
+OUT=$HOME/AI/Strata-DS4/bench/ds4-2026-10-05/phase0
 LOG=$OUT/$L.log
 PORT=${PORT:-8143}
 if [ "${BASE:-B}" = "A" ]; then

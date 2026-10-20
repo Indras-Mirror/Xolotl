@@ -1164,6 +1164,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     }
     im.cpu = ggml_backend_is_cpu(im.backend);
     if (!load_weights(im, err)) return false;
+    im.engram.set_hot_path(cfg.engram_hot);
     im.vision = cfg.vision;
     if (im.vision) {
         for (int64_t l = 0; l < im.nl; ++l) {

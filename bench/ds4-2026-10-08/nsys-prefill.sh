@@ -3,7 +3,7 @@
 # indexer's flop estimate) is the [cap,n,64] permute/cont copies or the small-K batched matmul.  This profiles a
 # 32K prefill - same cap-dependent work, 1/4 the wall time - and prints the top kernels by time.
 # Usage: bash bench/ds4-2026-10-08/nsys-prefill.sh [ctx_tokens]   (default 32768; use 131072 when there is time)
-cd /home/mal/AI/Strata-DS4 || exit 1
+cd $HOME/AI/Strata-DS4 || exit 1
 B=bench/ds4-2026-10-08; N=${1:-32768}
 case $N in 32768) C=36000;; 131072) C=135000;; *) C=$((N + 3000));; esac
 mkdir -p $B/nsys

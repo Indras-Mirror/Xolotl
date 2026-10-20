@@ -752,10 +752,13 @@ __global__ void __launch_bounds__(256) attn_chunk_tc_kernel(const float* __restr
 template <int KF, int VF>
 void launch_attn_chunk_tc(const float* q, const uint8_t* K, const uint8_t* V, float* out, int T, int n_head, int n_kv,
                           int pos0, int max_ctx, float scale, cudaStream_t st) {
-    static bool armed = false;                             // one flag per instantiation
-    if (!armed) {
+    static bool armed[64] = {};                            // one flag per GPU and instantiation
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return;
+    if (!armed[dev]) {
         cudaFuncSetAttribute(attn_chunk_tc_kernel<KF, VF>, cudaFuncAttributeMaxDynamicSharedMemorySize, kTcSmem);
-        armed = true;
+        armed[dev] = true;
     }
     attn_chunk_tc_kernel<KF, VF><<<dim3(n_kv, (T + 7) / 8), 256, kTcSmem, st>>>(q, K, V, out, T, n_head, pos0, max_ctx, scale);
 }

@@ -3,9 +3,9 @@
 # Uses llama-server + one raw /completion request, which is how the 16.34 tok/s bar was measured (s3) - and it
 # avoids this build's llama-cli, which spins in its interactive loop when stdin is EOF (234M "> " lines, 671 MB log,
 # 0% of the prefill done; s32).
-cd /home/mal/AI/Strata-DS4 || exit 1
+cd $HOME/AI/Strata-DS4 || exit 1
 B=bench/ds4-2026-10-08; LOG=$B/b22-llamacpp-ctx65536.log
-BIN=/home/mal/AI/llama.cpp-master-rebase/build-cu134/bin/llama-server
+BIN=$HOME/AI/llama.cpp-master-rebase/build-cu134/bin/llama-server
 M=/media/mal/NVME1TB/Models/DeepSeek-V4-Flash-Q2-0731.gguf
 L=~/.quetza-data/conductor/ds4-gpu.lock
 until flock -n "$L" true && [ "$(awk '/^MemAvailable:/{print int($2/1048576)}' /proc/meminfo)" -ge 70 ]; do sleep 30; done

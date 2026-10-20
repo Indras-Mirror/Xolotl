@@ -4,8 +4,8 @@
 # Cancel:  touch ~/AI/Strata-Backup/v41-dev/d2/queue.CANCEL      (also cancels the queue between its runs)
 # or:      kill "$(cat ~/AI/Strata-Backup/v41-dev/d2/whenfree.pid)"
 set -u
-DS=/home/mal/AI/Xolotl
-W=/home/mal/AI/Strata-Backup/v41-dev/d2; mkdir -p "$W"
+DS=$HOME/AI/Xolotl
+W=$HOME/AI/Strata-Backup/v41-dev/d2; mkdir -p "$W"
 IDLE_SECS=${D2_IDLE_SECS:-180}
 STEP=15
 LOG="$W/whenfree.log"

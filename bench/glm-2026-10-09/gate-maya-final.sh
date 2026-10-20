@@ -19,7 +19,7 @@ COMMON=(--backend cuda --experts gpu --arena-gib 72 --arena-skip-resident --chun
         --stop 154820,154827,154829 --lora "$A" --lora-exps --pcie auto)
 T=(--temp 0 --ids-file $D/prompts/chat_code6k.i32 -n 256)
 text() {
-  /home/mal/AI/Strata/.venv/bin/python - "$1" "$TOK" <<'EOF' 2>&1
+  $HOME/AI/Strata/.venv/bin/python - "$1" "$TOK" <<'EOF' 2>&1
 import sys, re
 sys.path.insert(0, "tools/glm/serve"); sys.path.insert(0, "/home/mal/AI/Strata/tools")
 import glm_tok

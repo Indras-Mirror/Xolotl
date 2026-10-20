@@ -77,3 +77,10 @@ out/
 
 # generated task data that must ship with the benchmark (the repo-wide *.log rule would drop it)
 !tools/gauntlet/tasks/*/workspace/*.log
+
+# Private notes and add-ons live in private/ (never tracked); stray root session notes are ignored too.
+/private/
+/HANDOFF-*.md
+/HANDOFF_*.md
+/RESUME_PROMPT_*.md
+/START_HERE*.md

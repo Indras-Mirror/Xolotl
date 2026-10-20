@@ -14,7 +14,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-BIN=${LLAMA_SERVER:-/home/mal/AI/llama.cpp-master-rebase/build/bin/llama-server}
+BIN=${LLAMA_SERVER:-$HOME/AI/llama.cpp-master-rebase/build/bin/llama-server}
 MODEL=${DS4_MODEL:-/media/mal/NVME1TB/Models/DeepSeek-V4-Flash-Q2-0731.gguf}
 OUT=${OUTDIR:-$ROOT/bench/ds4-2026-10-05/profile-decode}
 PORT=${PORT:-8142}

@@ -24,7 +24,7 @@ while pgrep -f "gate-ctx300k.s[h]" >/dev/null; do sleep 30; done   # do not inte
 while ! flock -n "$LOCK" true 2>/dev/null; do sleep 30; done
 
 text() {   # the generated ids (one per line in the log) -> text
-  /home/mal/AI/Strata/.venv/bin/python - "$1" "$TOK" <<'EOF' 2>&1 | head -c 1500
+  $HOME/AI/Strata/.venv/bin/python - "$1" "$TOK" <<'EOF' 2>&1 | head -c 1500
 import sys, re
 sys.path.insert(0, "tools/glm/serve"); sys.path.insert(0, "/home/mal/AI/Strata/tools")
 import glm_tok

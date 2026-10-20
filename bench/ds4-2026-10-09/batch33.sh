@@ -1,7 +1,7 @@
 #!/bin/bash
 # b33 (~10-12 min): long-context decode probes (--pos-offset, empty caches: attention cost real, hit rate optimistic)
 # 256K / 512K x unpruned / soft-pruned 25% (enzh, penalty 0.5, --arena-adapt); rotated iq4_nl KV + icomp q8
-cd /home/mal/AI/Strata-DS4 || exit 1
+cd $HOME/AI/Strata-DS4 || exit 1
 O=bench/ds4-2026-10-09/longctx; R=bench/ds4-2026-10-09/reap; B=bench/ds4-2026-10-08
 export DS4_BIN=$B/bin/ds4_generate.reap3 Q_PROMPT=$B/ctx/probe16.i32 Q_N=48 Q_PPL=
 F="--vram-lru --pf-b 0.7 --f16-q8 --arena-skip-resident --arena-gib 58 --vram-margin 2.0 --comp-type iq4_nl --icomp-q8"

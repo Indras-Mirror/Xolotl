@@ -1,7 +1,7 @@
 #!/bin/bash
 # b24b: the rest of b24, queued BEHIND strata-glm's build + baseline run (Mal: GLM gets priority).  Waits for the
 # marker GLM touches when it is done with the GPU, then the usual lock + MemAvailable gate in q.sh.
-cd /home/mal/AI/Strata-DS4 || exit 1
+cd $HOME/AI/Strata-DS4 || exit 1
 B=bench/ds4-2026-10-08
 M=~/.quetza-data/conductor/glm-gpu-done
 until [ -e "$M" ]; do sleep 30; done

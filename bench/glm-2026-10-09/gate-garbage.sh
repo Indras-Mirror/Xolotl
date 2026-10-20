@@ -12,7 +12,7 @@ for ctx in 307200 524288; do
      --ids-file $D/prompts/chat_pal.i32 -n 600 > $D/garbage-$ctx.log 2>&1
   echo "exit $?" | tee -a $S
   grep -hE "^decode :|out of memory|error" $D/garbage-$ctx.log | tee -a $S
-  /home/mal/AI/Strata/.venv/bin/python - $D/garbage-$ctx.log <<'PY' | tee -a $S
+  $HOME/AI/Strata/.venv/bin/python - $D/garbage-$ctx.log <<'PY' | tee -a $S
 import sys, re
 sys.path.insert(0, "tools/glm/serve"); sys.path.insert(0, "/home/mal/AI/Strata/tools")
 import glm_tok

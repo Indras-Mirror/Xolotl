@@ -6,9 +6,9 @@ set -u
 pf="$1"; label="$2"; shift 2
 VERB="${1:-}"
 
-BIN=/home/mal/AI/llama.cpp-ds4-prefetch/build/bin/llama-server
+BIN=$HOME/AI/llama.cpp-ds4-prefetch/build/bin/llama-server
 M=/media/mal/NVME1TB/Models/DeepSeek-V4-Flash-Q2-0731.gguf
-OUT=/home/mal/AI/Strata-DS4/bench/ds4-2026-10-06/prefetch
+OUT=$HOME/AI/Strata-DS4/bench/ds4-2026-10-06/prefetch
 PORT=8140
 LOG="$OUT/$label.log"
 

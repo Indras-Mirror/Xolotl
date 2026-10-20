@@ -4,7 +4,7 @@
 #  1. p600 + 128 decode, OLD (cq8 snapshot) vs NEW (dec1), --ppl - same config as b23
 #  2. --pos-offset probes (decode over empty caches at a deep position, no prefill): 128K fused-idx off/on,
 #     + --icomp-q8 --comp-type q8_0, then 256K with --icomp-q8 --comp-type q4_0
-cd /home/mal/AI/Strata-DS4 || exit 1
+cd $HOME/AI/Strata-DS4 || exit 1
 B=bench/ds4-2026-10-08; D=bench/ds4-2026-10-06/dense; L=~/.quetza-data/conductor/ds4-gpu.lock
 {
 for F in swa16:40 tame:63; do f=${F%:*}; t=${F#*:}

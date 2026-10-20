@@ -1,7 +1,7 @@
 #!/bin/bash
 # bench.sh <label> <extra llama-server args...>
 L=$1; shift
-BIN=/home/mal/AI/llama.cpp-master-rebase/build/bin/llama-server
+BIN=$HOME/AI/llama.cpp-master-rebase/build/bin/llama-server
 M=/media/mal/NVME1TB/Models/DeepSeek-V4-Flash-Q2-0731.gguf
 LOG=/tmp/claude-1000/dsab/$L.log
 $BIN -m $M --port 8140 -c 32768 -fa on -t 8 -np 1 --jinja -ctk q4_0 -ctv q4_0 --no-kv-offload --load-mode none "$@" > $LOG 2>&1 &

@@ -3,7 +3,7 @@
 # context; the ppl cost was settled at p600 in b23); (2) the llama.cpp 64K bar (never obtained, s32); (3) the first
 # 256K end-to-end run, with --comp-q8 and a 2048 prefill chunk (halves the [cap, n] score/mask intermediates,
 # 1 GiB each at cap 65536 and n 4096, which were never blocked).
-cd /home/mal/AI/Strata-DS4 || exit 1
+cd $HOME/AI/Strata-DS4 || exit 1
 B=bench/ds4-2026-10-08
 export DS4_BIN=$B/bin/ds4_generate.cq8
 F="--vram-lru --pf-b 0.7 --prefill-chunk 4096 --chunk-mmq --chunk-prestage --vram-margin 2.0"

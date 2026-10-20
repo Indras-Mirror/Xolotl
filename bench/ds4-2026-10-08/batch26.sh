@@ -1,6 +1,6 @@
 #!/bin/bash
 # b26 (~15 min): the KV ladder's real-model quality (p600 + 128, --ppl, same binary) and the pinned-RAM probe.
-cd /home/mal/AI/Strata-DS4 || exit 1
+cd $HOME/AI/Strata-DS4 || exit 1
 B=bench/ds4-2026-10-08; export DS4_BIN=$B/bin/ds4_generate.dec2
 F="--vram-lru --pf-b 0.7 --f16-q8 --arena-skip-resident --arena-gib 58"
 $B/q.sh $B/b26-f32.log    $F

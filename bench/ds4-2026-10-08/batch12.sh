@@ -1,6 +1,6 @@
 #!/bin/bash
 # batch 12: shared decode graph allocator (VRAM -> slots). p600 decode config w/ ppl; p6000 chunked prefill + decode
-cd /home/mal/AI/Strata-DS4
+cd $HOME/AI/Strata-DS4
 export DS4_BIN=bench/ds4-2026-10-08/bin/ds4_generate.shared
 B=bench/ds4-2026-10-08
 $B/q.sh $B/b12-p600.log --arena-skip-resident --arena-gib 58 --vram-lru --pf-b 0.7
