@@ -26,7 +26,7 @@
 namespace strata::v41 {
 
 namespace ty {
-constexpr uint32_t F32 = 0, F16 = 1, Q8_0 = 8, Q3_K = 11, I8 = 24, I32 = 26, Q2_0 = 42, PTQ1_0 = 143;
+constexpr uint32_t F32 = 0, F16 = 1, Q8_0 = 8, Q3_K = 11, I8 = 24, I32 = 26, MXFP4 = 39, Q2_0 = 42, PTQ1_0 = 143;
 }
 
 /// One layer's routed experts: the type of each expert's gate+up and of its down, and where each expert's rows are
@@ -419,7 +419,8 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
             std::map<int, int> count;
             for (uint64_t e = 0; e < NE; ++e) { tv[e] = mv[e]; sv[e] = count[mv[e]]++; }
             for (const auto & [t, n] : count) {
-                if (t != (int) ty::Q2_0 && t != (int) ty::Q3_K && t != (int) ty::PTQ1_0)
+                // MXFP4 = an expert kept exactly as trained (the checkpoint's own FP4 bytes)
+                if (t != (int) ty::Q2_0 && t != (int) ty::Q3_K && t != (int) ty::PTQ1_0 && t != (int) ty::MXFP4)
                     return mapn + ": type " + std::to_string(t) + " is not an expert tier";
                 std::string tn = ggml_type_name((uint32_t) t);
                 for (char & c : tn) c = (char) std::tolower((unsigned char) c);

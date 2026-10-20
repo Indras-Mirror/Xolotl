@@ -33,6 +33,7 @@ template<> struct Fmt<143> { static constexpr int qk = 128, ipb = 4, step = 1;
 // MXFP4 (39) on gate/up too: Qwen3.8-Flash-Next-MXFP4 (all three projections MXFP4); Fmt<39> and the plain
 // per-column kernel were already there for the MiMo down outliers, only the gate/up list did not name it, so
 // native_expert_supported refused the file ("layer 0's experts are MXFP4/MXFP4 ..., no GPU kernels for")
+// ... and DeepSeek-V4.1's native expert tier (the checkpoint's own E2M1+E8M0 bytes, lossless) - ds41_geometry.hpp
 #define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(39) X(143)
 #define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(18) X(22) X(39) X(143)
 #define STRATA_MMVQ_FMTS_FORK(X) X(10) X(143)
