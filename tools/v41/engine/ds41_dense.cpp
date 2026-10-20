@@ -2252,7 +2252,8 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     }
     im.routed = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
     im.cand = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.CB, NC);
-    for (int64_t l = 0; l < im.nl; ++l) {
+    for (int64_t l = 0; l < (int64_t) im.ly.size(); ++l) {
+        if (!im.active_layer(l)) continue;
         auto & L = im.ly[(size_t) l];
         if (!L.idx_src) continue;
         L.sel = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.ITOP, NC);
