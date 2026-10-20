@@ -45,7 +45,10 @@
 #ifndef _WIN32
 #include <sys/mman.h>
 #endif
+#if __has_include(<cuda_profiler_api.h>)   // a CUDA install without the profiler API (some Windows toolkits)
 #include <cuda_profiler_api.h>
+#define DS41_HAVE_PROFILER_API 1
+#endif
 #if defined(DS4_MOE_MMQ)
 #include "strata/prefill/moe_mmq.hpp"
 #endif
@@ -5166,7 +5169,7 @@ bool Ds41MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const flo
 }
 
 void Ds41MoeTier::profiler(bool on) {
-#if defined(DS4_MOE_CUDA)
+#if defined(DS4_MOE_CUDA) && defined(DS41_HAVE_PROFILER_API)
     if (on) cudaProfilerStart(); else cudaProfilerStop();
 #else
     (void) on;
