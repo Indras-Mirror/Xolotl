@@ -6673,6 +6673,43 @@ def clean_shared_defaults(d) -> dict:
     return out
 
 
+def split_joined_args(cfg: dict) -> None:
+    """#2267: an engine option written as ONE element of the config's "args" - "--ple-io mmap" or "--ple-io=mmap" - reaches
+    the engine as a single argument ("unknown argument: --ple-io mmap"; the usual form is two elements, "--ple-io",
+    "mmap").  Recommend, never force: such an element is split into the flag and its value, and said at startup.  Only an
+    element that starts with a flag name (--letters-digits-dashes) followed by a space or "=" is touched, and never one
+    that sits in the value place of the flag before it."""
+    args = cfg.get("args")
+    if not isinstance(args, list):
+        return
+    out, changed = [], []
+    for a in args:
+        m = re.match(r"^(--[A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|=)(\S.*)$", a) if isinstance(a, str) else None
+        prev = out[-1] if out else None
+        in_value_place = isinstance(prev, str) and re.match(r"^--[A-Za-z0-9][A-Za-z0-9-]*$", prev) is not None
+        if m is None or in_value_place:
+            out.append(a)
+            continue
+        out += [m.group(1), m.group(2).strip()]
+        changed.append(a)
+    if changed:
+        cfg["args"] = out
+        print("[strata] the config's args hold " + ", ".join(repr(c) for c in changed) + " as one element each: split into the "
+              'flag and its value (write them as two elements, e.g. "--ple-io", "mmap")', flush=True)
+
+
+def read_config(path) -> dict:
+    """The run config's JSON.  A mistake in it (a missing comma between two args, a trailing comma) is said with its
+    place in the file instead of a traceback (#2267: editing "args" by hand is where it happens)."""
+    text = Path(path).read_text(encoding="utf-8-sig")   # Notepad adds a BOM
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"[strata] {path} is not valid JSON: {e.msg} at line {e.lineno}, column {e.colno}. Check the commas "
+                         'between the entries of "args" (each option and each value is its own quoted entry, e.g. '
+                         '"--ple-io", "mmap",) and that no entry is followed by a comma at the end of a list.') from None
+
+
 def lift_reasoning_effort_arg(cfg: dict) -> None:
     """#1641: "--reasoning-effort high" in a config's "args" is meant for the thinking level, which is not an engine
     option (the engine stopped at the unknown flag).  It is the config's "reasoning_effort" (none, low, medium or high:
@@ -6907,7 +6944,8 @@ def main() -> int:
                          "each, requests spread over them (also \"replicas\" in the config: a number, or "
                          "[{\"gpus\": [0, 1]}, {\"gpus\": [2, 3]}])")
     a = ap.parse_args()
-    cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    cfg = read_config(a.config) if a.config else {}
+    split_joined_args(cfg)
     lift_reasoning_effort_arg(cfg)
     if a.replicas is not None:
         cfg["replicas"] = a.replicas

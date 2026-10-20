@@ -7,6 +7,9 @@
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#ifdef STRATA_ENABLE_CUDA
+#include <cuda_runtime.h>
+#endif
 #ifdef DS41_HAVE_CUDA
 #include "ggml-cuda.h"
 #endif   // ggml_cgraph::uid (graph reuse)
@@ -135,6 +138,7 @@ struct Ds41Dense::Impl {
     std::unique_ptr<GgufModel> model;
     std::vector<int64_t> layers;          // blocks in the file (0..nl-1)
     int64_t nl = 0;
+    int64_t layer_lo = 0, layer_hi = 0;   // [layer_lo, layer_hi) this instance runs and holds KV for
     ggml_backend_t backend = nullptr;
     bool own_backend = false, cpu = true;
     WStore w;
@@ -182,6 +186,16 @@ struct Ds41Dense::Impl {
     std::vector<ParkedRows> parked;     // park(): host copies of the snapshot rings + the cache rows an unrelated request overwrites
     int parked_pos = -1;
     std::vector<Layer> ly;
+    std::vector<int64_t> shadow_layers;
+
+    bool owns_layer(int64_t l) const {
+        return l >= layer_lo && l < layer_hi;
+    }
+    bool active_layer(int64_t l) const {
+        if (owns_layer(l)) return true;
+        for (int64_t s : shadow_layers) if (s == l) return true;
+        return false;
+    }
 
     // ---- per-pass inputs (ictx / ibuf), uploaded by begin()
     ggml_context * ictx = nullptr;
@@ -298,7 +312,21 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
         return t;
     };
     // routed experts never reach ggml (PTQ1_0 = 143 is past GGML_TYPE_COUNT); the I32 maps are read by the geometry
-    auto skip = [&](const std::string & n) { return is_routed(n) || n == "token_embd.weight"; };
+    auto blk_layer = [](const std::string & n) -> int64_t {
+        if (n.rfind("blk.", 0) != 0) return -1;
+        const size_t dot = n.find('.', 4);
+        if (dot == std::string::npos) return -1;
+        return std::atoll(n.substr(4, dot - 4).c_str());
+    };
+    auto in_dense_range = [&](const std::string & n) {
+        if (im.cfg.head_only) return n == "output.weight" || n == "output_norm.weight";
+        if (n == "token_embd.weight") return im.layer_lo == 0;
+        if (n == "output.weight" || n == "output_norm.weight") return im.layer_hi == im.nl && !im.cfg.omit_output_head;
+        const int64_t l = blk_layer(n);
+        if (l < 0) return true;
+        return l >= im.layer_lo && l < im.layer_hi;
+    };
+    auto skip = [&](const std::string & n) { return is_routed(n) || n == "token_embd.weight" || !in_dense_range(n); };
     if (im.cpu) {
         for (size_t s = 0; s < model.size(); ++s) {
             const GgufFile & sh = model.shard(s);
@@ -1060,8 +1088,12 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     }
     im.routed = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
     im.cand = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.CB, NC);
-    for (auto & L : im.ly)
-        if (L.idx_src) { L.sel = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.ITOP, NC); L.selm = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.ITOP, NC); }
+    for (int64_t l = 0; l < im.nl; ++l) {
+        auto & L = im.ly[(size_t) l];
+        if (!L.idx_src) continue;
+        L.sel = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.ITOP, NC);
+        L.selm = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.ITOP, NC);
+    }
     im.i_emb = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
     im.i_pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, NC);
     im.i_img = im.vision ? ggml_new_tensor_1d(c, GGML_TYPE_F32, NC) : nullptr;   // vision: the image-position mask
@@ -1137,6 +1169,14 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     for (size_t i = 0; i < im.layers.size(); ++i)
         if (im.layers[i] != (int64_t) i) { err = "the file's blocks must be 0..k"; return false; }
     im.nl = (int64_t) im.layers.size();
+    if (cfg.head_only) {
+        im.layer_lo = im.nl;
+        im.layer_hi = im.nl;
+    } else {
+        im.layer_lo = std::max<int64_t>(0, cfg.layer_lo);
+        im.layer_hi = cfg.layer_hi < 0 ? im.nl : std::min<int64_t>(cfg.layer_hi, im.nl);
+        if (im.layer_lo >= im.layer_hi) { err = "invalid layer range"; return false; }
+    }
     const Ds41Geometry & G = im.g;
     im.D = G.n_embd; im.HC = G.hc; im.DH = G.d_head; im.DHR = G.d_rope; im.NH = G.n_head; im.OG = G.o_groups;
     im.OL = G.o_lora; im.OGD = G.n_head * G.d_head / G.o_groups; im.RQ = G.r_q; im.SWA = G.n_swa;
@@ -1174,13 +1214,15 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         }
     }
     im.engram.set_hot_path(cfg.engram_hot);
-    if (!cfg.engram_dirs.empty() && !im.engram.open(G, cfg.engram_dirs, cfg.engram_threads, err)) return false;
+    if (!cfg.head_only && !cfg.engram_dirs.empty() && !im.engram.open(G, cfg.engram_dirs, cfg.engram_threads, err)) return false;
 
+    im.shadow_layers = cfg.shadow_layers;
     // layers
-    im.ly.resize((size_t) im.nl);
-    for (int64_t l = 0; l < im.nl; ++l) {
+    im.ly.resize(cfg.head_only ? 0 : (size_t) im.nl);
+    for (int64_t l = 0; !cfg.head_only && l < im.nl; ++l) {
         auto & L = im.ly[(size_t) l];
         L.ratio = G.ratio[(size_t) l];
+        if (!im.active_layer(l)) continue;
         L.kv_src = G.is_kv_source(l);
         L.idx_src = G.is_index_source(l);
         L.cand_src = l == G.cand_layer;
@@ -1189,102 +1231,104 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         L.idxl = G.idx_src(l);
         L.eslot = G.engram_slot(l);
     }
-    // persistent state
-    if (cfg.kv_fp4 && (!cfg.act_quant || im.cpu || im.DH % 64 || im.ID % 32)) {
-        err = "--kv-fp4 needs act_quant (the FP4 grids), the CUDA backend, d_head % 64 == 0 and idx_dim % 32 == 0";
-        return false;
-    }
-    const ggml_type kvt = cfg.kv_type >= 0 ? (ggml_type) cfg.kv_type : cfg.act_quant ? GGML_TYPE_BF16 : GGML_TYPE_F32;
-    ggml_init_params sp = { ggml_tensor_overhead() * 512, nullptr, true };
-    im.sctx = ggml_init(sp);
-    auto T = [&](ggml_type t, std::initializer_list<int64_t> ne) {
-        const int64_t * d = ne.begin();
-        switch (ne.size()) {
-            case 1: return ggml_new_tensor_1d(im.sctx, t, d[0]);
-            case 2: return ggml_new_tensor_2d(im.sctx, t, d[0], d[1]);
-            default: return ggml_new_tensor_3d(im.sctx, t, d[0], d[1], d[2]);
+    // persistent state (layer KV rings; skipped on head_only — only pass columns hold x/pre for logits)
+    if (!cfg.head_only) {
+        if (cfg.kv_fp4 && (!cfg.act_quant || im.cpu || im.DH % 64 || im.ID % 32)) {
+            err = "--kv-fp4 needs act_quant (the FP4 grids), the CUDA backend, d_head % 64 == 0 and idx_dim % 32 == 0";
+            return false;
         }
-    };
-    const int64_t D = im.D, NCM = im.NCmax;
-    for (int64_t l = 0; l < im.nl; ++l) {
-        auto & L = im.ly[(size_t) l];
-        L.raw = T(kvt, { im.DH, im.RAW });
-        L.raw_snap = T(kvt, { im.DH, im.RAW });
-        L.rbias = T(GGML_TYPE_F32, { im.NE });   // zeroed with the buffer
-        if (L.kv_src) {
-            // STRATA_KV_FP4_ONLY=comp|idx (bisect tap): pack only one of the two caches
-            static const char * only = std::getenv("STRATA_KV_FP4_ONLY");
-            const bool fc = cfg.kv_fp4 && !(only && std::string(only) == "idx");
-            const bool fi = cfg.kv_fp4 && !(only && std::string(only) == "comp");
-            L.comp = T(fc ? GGML_TYPE_NVFP4 : kvt, { im.DH, im.cmax[L.ratio] + 1 });
-            L.idxk = T(fi ? GGML_TYPE_MXFP4 : kvt, { im.ID, im.cmax[L.ratio] + 1 });
-            if (L.ratio == 2) {
-                L.st_kv = T(GGML_TYPE_F32, { im.DH, 2 });
-                L.st_sc = T(GGML_TYPE_F32, { im.DH, 2 });
-                L.st_kv_snap = T(GGML_TYPE_F32, { im.DH, 2 });
-                L.st_sc_snap = T(GGML_TYPE_F32, { im.DH, 2 });
+        const ggml_type kvt = cfg.kv_type >= 0 ? (ggml_type) cfg.kv_type : cfg.act_quant ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+        ggml_init_params sp = { ggml_tensor_overhead() * 512, nullptr, true };
+        im.sctx = ggml_init(sp);
+        auto T = [&](ggml_type t, std::initializer_list<int64_t> ne) {
+            const int64_t * d = ne.begin();
+            switch (ne.size()) {
+                case 1: return ggml_new_tensor_1d(im.sctx, t, d[0]);
+                case 2: return ggml_new_tensor_2d(im.sctx, t, d[0], d[1]);
+                default: return ggml_new_tensor_3d(im.sctx, t, d[0], d[1], d[2]);
+            }
+        };
+        for (int64_t l = 0; l < im.nl; ++l) {
+            if (!im.active_layer(l)) continue;
+            auto & L = im.ly[(size_t) l];
+            L.raw = T(kvt, { im.DH, im.RAW });
+            L.raw_snap = T(kvt, { im.DH, im.RAW });
+            L.rbias = T(GGML_TYPE_F32, { im.NE });   // zeroed with the buffer
+            if (L.kv_src) {
+                static const char * only = std::getenv("STRATA_KV_FP4_ONLY");
+                const bool fc = cfg.kv_fp4 && !(only && std::string(only) == "idx");
+                const bool fi = cfg.kv_fp4 && !(only && std::string(only) == "comp");
+                L.comp = T(fc ? GGML_TYPE_NVFP4 : kvt, { im.DH, im.cmax[L.ratio] + 1 });
+                L.idxk = T(fi ? GGML_TYPE_MXFP4 : kvt, { im.ID, im.cmax[L.ratio] + 1 });
+                if (L.ratio == 2) {
+                    L.st_kv = T(GGML_TYPE_F32, { im.DH, 2 });
+                    L.st_sc = T(GGML_TYPE_F32, { im.DH, 2 });
+                    L.st_kv_snap = T(GGML_TYPE_F32, { im.DH, 2 });
+                    L.st_sc_snap = T(GGML_TYPE_F32, { im.DH, 2 });
+                }
             }
         }
+        if (smart_router()) im.rknob = T(GGML_TYPE_F32, { kRK + 1, 2 });
+        im.sbuf = ggml_backend_alloc_ctx_tensors(im.sctx, im.backend);
+        if (!im.sbuf) { err = "cannot allocate the decode state"; return false; }
+        ggml_backend_buffer_clear(im.sbuf, 0);
+        for (auto & L : im.ly)
+            if (L.st_sc) { std::vector<float> v((size_t) (im.DH * 2), -1.0e30f); ggml_backend_tensor_set(L.st_sc, v.data(), 0, v.size() * 4); }
+        if (im.rknob) set_route_select(env_rank("STRATA_RB_PROTECT"), env_rank("STRATA_RB_POOL"));   // all-zero knobs would protect everything
     }
-    if (smart_router()) im.rknob = T(GGML_TYPE_F32, { kRK + 1, 2 });
-    im.sbuf = ggml_backend_alloc_ctx_tensors(im.sctx, im.backend);
-    if (!im.sbuf) { err = "cannot allocate the decode state"; return false; }
-    ggml_backend_buffer_clear(im.sbuf, 0);
-    // the ratio-2 state scores start at -1e30 (an unwritten state gets softmax weight 0); sel = 0 (a valid row)
-    for (auto & L : im.ly)
-        if (L.st_sc) { std::vector<float> v((size_t) (im.DH * 2), -1.0e30f); ggml_backend_tensor_set(L.st_sc, v.data(), 0, v.size() * 4); }
-    if (im.rknob) set_route_select(env_rank("STRATA_RB_PROTECT"), env_rank("STRATA_RB_POOL"));   // all-zero knobs would protect everything
-    // inputs
-    ggml_init_params ipp = { ggml_tensor_overhead() * 64, nullptr, true };
-    im.ictx = ggml_init(ipp);
-    auto I = [&](ggml_type t, int64_t a, int64_t b2 = 1) { return b2 == 1 ? ggml_new_tensor_1d(im.ictx, t, a) : ggml_new_tensor_2d(im.ictx, t, a, b2); };
-    im.neg_ramp = I(GGML_TYPE_F32, im.cmax[1] + 1);
-    im.blk_ramp = I(GGML_TYPE_F32, im.cmax[1] / im.CBS + 2);
-    // default ON (CUDA) since 2026-10-18: 1017 8K prompt 239.8 -> 255.2 tok/s, +1.06 GiB min free VRAM, logits + tokens
-    // identical (verify/s7/vram-f16.sh GATE A).  STRATA_ATTN_F16_GATHER=0 restores the F32 gather.
-    im.f16_gather = !im.cpu && !(std::getenv("STRATA_ATTN_F16_GATHER") && std::getenv("STRATA_ATTN_F16_GATHER")[0] == '0');
-    im.zidx = I(GGML_TYPE_I32, im.f16_gather ? 255 * 2048 : 1);   // ibuf is cleared to 0 below: all zeros
-    if (im.f16_gather) im.zpad16 = I(GGML_TYPE_F16, im.DH, 1);
-    im.ibuf = ggml_backend_alloc_ctx_tensors(im.ictx, im.backend);
-    if (!im.ibuf) { err = "cannot allocate the inputs"; return false; }
-    ggml_backend_buffer_clear(im.ibuf, 0);
-    {
-        std::vector<float> v((size_t) im.neg_ramp->ne[0]);
-        for (size_t i = 0; i < v.size(); ++i) v[i] = -(float) i;
-        ggml_backend_tensor_set(im.neg_ramp, v.data(), 0, v.size() * 4);
-        v.assign((size_t) im.blk_ramp->ne[0], 0);
-        for (size_t i = 0; i < v.size(); ++i) v[i] = (float) i;
-        ggml_backend_tensor_set(im.blk_ramp, v.data(), 0, v.size() * 4);
+    if (!cfg.head_only) {
+        ggml_init_params ipp = { ggml_tensor_overhead() * 64, nullptr, true };
+        im.ictx = ggml_init(ipp);
+        auto I = [&](ggml_type t, int64_t a, int64_t b2 = 1) { return b2 == 1 ? ggml_new_tensor_1d(im.ictx, t, a) : ggml_new_tensor_2d(im.ictx, t, a, b2); };
+        im.neg_ramp = I(GGML_TYPE_F32, im.cmax[1] + 1);
+        im.blk_ramp = I(GGML_TYPE_F32, im.cmax[1] / im.CBS + 2);
+        // default ON (CUDA) since 2026-10-18: 1017 8K prompt 239.8 -> 255.2 tok/s, +1.06 GiB min free VRAM, logits + tokens
+        // identical (verify/s7/vram-f16.sh GATE A).  STRATA_ATTN_F16_GATHER=0 restores the F32 gather.
+        im.f16_gather = !im.cpu && !(std::getenv("STRATA_ATTN_F16_GATHER") && std::getenv("STRATA_ATTN_F16_GATHER")[0] == '0');
+        im.zidx = I(GGML_TYPE_I32, im.f16_gather ? 255 * 2048 : 1);   // ibuf is cleared to 0 below: all zeros
+        if (im.f16_gather) im.zpad16 = I(GGML_TYPE_F16, im.DH, 1);
+        im.ibuf = ggml_backend_alloc_ctx_tensors(im.ictx, im.backend);
+        if (!im.ibuf) { err = "cannot allocate the inputs"; return false; }
+        ggml_backend_buffer_clear(im.ibuf, 0);
+        {
+            std::vector<float> v((size_t) im.neg_ramp->ne[0]);
+            for (size_t i = 0; i < v.size(); ++i) v[i] = -(float) i;
+            ggml_backend_tensor_set(im.neg_ramp, v.data(), 0, v.size() * 4);
+            v.assign((size_t) im.blk_ramp->ne[0], 0);
+            for (size_t i = 0; i < v.size(); ++i) v[i] = (float) i;
+            ggml_backend_tensor_set(im.blk_ramp, v.data(), 0, v.size() * 4);
+        }
     }
     ggml_init_params gp = { ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(8192, false) * 400, nullptr, true };
     im.gctx = ggml_init(gp);
     im.allo_dec.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     im.allo_pass.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     if (!alloc_cols(im, im.NC, err)) return false;
-    // the host mirrors are sized for the largest batch once (pinned registrations must not move)
-    im.host_fn.resize((size_t) (D * NCM));
+    if (!cfg.head_only) {
+        const int64_t D = im.D, NCM = im.NCmax;
+        im.host_fn.resize((size_t) (D * NCM));
 #ifdef DS41_HAVE_CUDA
-    // pinned: the fn rows go device -> host -> the tier's device input every layer (pageable copies ran at ~2 GB/s)
-    if (!im.cpu && !im.host_fn.empty()) ggml_backend_cuda_register_host_buffer(im.host_fn.data(), im.host_fn.size() * 4);
+        if (!im.cpu && !im.host_fn.empty()) ggml_backend_cuda_register_host_buffer(im.host_fn.data(), im.host_fn.size() * 4);
 #endif
-    im.host_ids.resize((size_t) (im.NU * NCM));
-    im.host_wts.resize((size_t) (im.NU * NCM));
-    if (smart_router()) {
-        im.host_xids.resize((size_t) (im.NU * NCM));
-        im.host_xwts.resize((size_t) (im.NU * NCM));
-    }
-#ifdef DS41_HAVE_CUDA
-    // pinned too: attn_router reads fn / ids / wts back with three async copies and one sync (truly async only from
-    // pinned memory)
-    if (!im.cpu) {
-        ggml_backend_cuda_register_host_buffer(im.host_ids.data(), im.host_ids.size() * 4);
-        ggml_backend_cuda_register_host_buffer(im.host_wts.data(), im.host_wts.size() * 4);
-        if (!im.host_xids.empty()) {
-            ggml_backend_cuda_register_host_buffer(im.host_xids.data(), im.host_xids.size() * 4);
-            ggml_backend_cuda_register_host_buffer(im.host_xwts.data(), im.host_xwts.size() * 4);
+        im.host_ids.resize((size_t) (im.NU * NCM));
+        im.host_wts.resize((size_t) (im.NU * NCM));
+        if (smart_router()) {
+            im.host_xids.resize((size_t) (im.NU * NCM));
+            im.host_xwts.resize((size_t) (im.NU * NCM));
         }
-    }
+#ifdef DS41_HAVE_CUDA
+        // pinned too: attn_router reads fn / ids / wts back with three async copies and one sync (truly async only from
+        // pinned memory)
+        if (!im.cpu) {
+            ggml_backend_cuda_register_host_buffer(im.host_ids.data(), im.host_ids.size() * 4);
+            ggml_backend_cuda_register_host_buffer(im.host_wts.data(), im.host_wts.size() * 4);
+            if (!im.host_xids.empty()) {
+                ggml_backend_cuda_register_host_buffer(im.host_xids.data(), im.host_xids.size() * 4);
+                ggml_backend_cuda_register_host_buffer(im.host_xwts.data(), im.host_xwts.size() * 4);
+            }
+        }
 #endif
+    }
     return true;
 }
 
@@ -1834,6 +1878,7 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
 }
 
 bool Ds41Dense::logits(int row0, int nrows, float * out) {
+    if (!owns_head()) { p_->err = "logits on a stage without the head"; return false; }
     Impl & im = *p_;
     if (row0 < 0 || nrows < 1 || row0 + nrows > im.n) { im.err = "bad logits rows"; return false; }
     std::vector<uint8_t> meta(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
@@ -1968,5 +2013,368 @@ bool Ds41Dense::read_sel(int il, std::vector<int> & sel, std::vector<float> & ma
             mask.push_back(m[(size_t) (t * im.ITOP + j)]);
         }
     *K = (int) k;
+    return true;
+}
+
+void Ds41Dense::set_layer_range(int64_t layer_lo, int64_t layer_hi) {
+    p_->layer_lo = layer_lo;
+    p_->layer_hi = layer_hi < 0 ? p_->nl : layer_hi;
+}
+
+int64_t Ds41Dense::layer_lo() const { return p_->layer_lo; }
+int64_t Ds41Dense::layer_hi() const { return p_->layer_hi; }
+bool Ds41Dense::owns_head() const {
+    const Impl & im = *p_;
+    if (im.cfg.head_only) return true;
+    return im.layer_hi == im.nl && !im.cfg.omit_output_head;
+}
+
+int Ds41Dense::pass_size() const { return p_->n; }
+int Ds41Dense::pass_pos0() const { return p_->pos0; }
+
+bool Ds41Dense::set_pass_layout(int n, int pos0) {
+    Impl & im = *p_;
+    if (n < 1 || n > im.NC || pos0 < 0 || pos0 + n > im.cfg.ctx_max) { im.err = "bad pass layout"; return false; }
+    im.n = n;
+    im.pos0 = pos0;
+    im.batch = n > 1 ? n : 0;
+    return true;
+}
+
+size_t Ds41Dense::handoff_bytes_per_column() const {
+    const Impl & im = *p_;
+    return (size_t) (im.D * im.HC + im.HC) * sizeof(float);
+}
+
+bool Ds41Dense::export_handoff(int col0, int n, float * dst) const {
+    const Impl & im = *p_;
+    if (!dst || col0 < 0 || n < 1 || col0 + n > im.NC) return false;
+    const size_t col_x = (size_t) (im.D * im.HC) * sizeof(float);
+    const size_t col_p = (size_t) im.HC * sizeof(float);
+    for (int c = 0; c < n; ++c) {
+        ggml_backend_tensor_get(im.x_state, dst, (size_t) (col0 + c) * col_x, col_x);
+        dst += (im.D * im.HC);
+        ggml_backend_tensor_get(im.pre_state, dst, (size_t) (col0 + c) * col_p, col_p);
+        dst += im.HC;
+    }
+    return true;
+}
+
+bool Ds41Dense::import_handoff(int col0, int n, const float * src) {
+    Impl & im = *p_;
+    if (!src || col0 < 0 || n < 1 || col0 + n > im.NC) return false;
+    const size_t col_x = (size_t) (im.D * im.HC) * sizeof(float);
+    const size_t col_p = (size_t) im.HC * sizeof(float);
+    for (int c = 0; c < n; ++c) {
+        ggml_backend_tensor_set(im.x_state, src, (size_t) (col0 + c) * col_x, col_x);
+        src += (im.D * im.HC);
+        ggml_backend_tensor_set(im.pre_state, src, (size_t) (col0 + c) * col_p, col_p);
+        src += im.HC;
+    }
+    ggml_backend_synchronize(im.backend);
+    return true;
+}
+
+static void copy_tensor_bytes(ggml_tensor * dst, const ggml_tensor * src, ggml_backend_t backend) {
+    if (!dst || !src || ggml_nbytes(dst) != ggml_nbytes(src)) return;
+    std::vector<uint8_t> buf(ggml_nbytes(src));
+    ggml_backend_tensor_get(src, buf.data(), 0, buf.size());
+    ggml_backend_tensor_set(dst, buf.data(), 0, buf.size());
+}
+
+static void copy_tensor_cols(ggml_tensor * dst, const ggml_tensor * src, int col0, int n, size_t col_bytes) {
+    if (!dst || !src || col_bytes == 0) return;
+    std::vector<uint8_t> buf(col_bytes);
+    for (int c = 0; c < n; ++c) {
+        const size_t off = (size_t) (col0 + c) * col_bytes;
+        ggml_backend_tensor_get(src, buf.data(), off, col_bytes);
+        ggml_backend_tensor_set(dst, buf.data(), off, col_bytes);
+    }
+}
+
+bool Ds41Dense::import_layer_cache_from(const Ds41Dense & src, int64_t global_layer, int col0, int n) {
+    Impl & im = *p_;
+    const Impl & sm = *src.p_;
+    if (global_layer < 0 || global_layer >= im.nl || col0 < 0 || n < 1 || col0 + n > im.NC) return false;
+    auto & L = im.ly[(size_t) global_layer];
+    const auto & SL = sm.ly[(size_t) global_layer];
+    ggml_backend_synchronize(sm.backend);
+    if (L.sel && SL.sel) {
+        const size_t col_bytes = (size_t) im.ITOP * 4;
+        copy_tensor_cols(L.sel, SL.sel, col0, n, col_bytes);
+        copy_tensor_cols(L.selm, SL.selm, col0, n, col_bytes);
+    }
+    if (L.comp && SL.comp) copy_tensor_bytes(L.comp, SL.comp, im.backend);
+    if (L.idxk && SL.idxk) copy_tensor_bytes(L.idxk, SL.idxk, im.backend);
+    if (L.raw && SL.raw) copy_tensor_bytes(L.raw, SL.raw, im.backend);
+    if (L.st_kv && SL.st_kv) copy_tensor_bytes(L.st_kv, SL.st_kv, im.backend);
+    if (L.st_sc && SL.st_sc) copy_tensor_bytes(L.st_sc, SL.st_sc, im.backend);
+    ggml_backend_synchronize(im.backend);
+    return true;
+}
+
+bool Ds41Dense::import_cand_from(const Ds41Dense & src, int col0, int n) {
+    Impl & im = *p_;
+    const Impl & sm = *src.p_;
+    if (!im.cand || !sm.cand || col0 < 0 || n < 1 || col0 + n > im.NC) return false;
+    ggml_backend_synchronize(sm.backend);
+    const size_t col_bytes = (size_t) im.CB * 4;
+    copy_tensor_cols(im.cand, sm.cand, col0, n, col_bytes);
+    ggml_backend_synchronize(im.backend);
+    return true;
+}
+
+namespace {
+enum Ds41HandoffMode { kHandoffSameDevice, kHandoffPeer, kHandoffPinnedHost };
+
+#ifdef STRATA_ENABLE_CUDA
+/// Same probe as Strata peer experts (#2666): peer access must move data both ways exactly.
+bool ds41_p2p_copies_data(int dev_a, int dev_b) {
+    constexpr size_t kN = 1 << 14;
+    std::vector<float> h(kN), back(kN);
+    for (size_t i = 0; i < kN; ++i) h[i] = 1.0f + (float) ((i * 2654435761u) % 4093u);
+    float* d[2] = {nullptr, nullptr};
+    const int dev[2] = {dev_a, dev_b};
+    bool ok = true, tested = true;
+    for (int k = 0; k < 2 && tested; ++k) {
+        cudaSetDevice(dev[k]);
+        if (cudaMalloc((void**) &d[k], kN * 4) != cudaSuccess) { cudaGetLastError(); tested = false; }
+    }
+    for (int dir = 0; dir < 2 && tested && ok; ++dir) {
+        const int from = dir == 0 ? 0 : 1, to = 1 - from;
+        cudaSetDevice(dev[from]);
+        if (cudaMemcpy(d[from], h.data(), kN * 4, cudaMemcpyHostToDevice) != cudaSuccess) { tested = false; break; }
+        cudaSetDevice(dev[to]);
+        if (cudaMemset(d[to], 0, kN * 4) != cudaSuccess) { tested = false; break; }
+        if (cudaMemcpyPeer(d[to], dev[to], d[from], dev[from], kN * 4) != cudaSuccess) { tested = false; break; }
+        cudaSetDevice(dev[to]);
+        if (cudaMemcpy(back.data(), d[to], kN * 4, cudaMemcpyDeviceToHost) != cudaSuccess) { tested = false; break; }
+        ok = std::memcmp(back.data(), h.data(), kN * 4) == 0;
+    }
+    for (int k = 0; k < 2; ++k)
+        if (d[k] != nullptr) { cudaSetDevice(dev[k]); cudaFree(d[k]); }
+    if (!tested) { cudaGetLastError(); return true; }
+    return ok;
+}
+
+Ds41HandoffMode ds41_handoff_mode(int src_dev, int dst_dev) {
+    if (src_dev < 0 || dst_dev < 0) return kHandoffPinnedHost;
+    if (src_dev == dst_dev) return kHandoffSameDevice;
+    int ab = 0, ba = 0;
+    cudaDeviceCanAccessPeer(&ab, src_dev, dst_dev);
+    cudaDeviceCanAccessPeer(&ba, dst_dev, src_dev);
+    if (!ab || !ba) return kHandoffPinnedHost;
+    cudaSetDevice(dst_dev);
+    cudaError_t e0 = cudaDeviceEnablePeerAccess(src_dev, 0);
+    if (e0 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e0 = cudaSuccess; }
+    cudaSetDevice(src_dev);
+    cudaError_t e1 = cudaDeviceEnablePeerAccess(dst_dev, 0);
+    if (e1 == cudaErrorPeerAccessAlreadyEnabled) { cudaGetLastError(); e1 = cudaSuccess; }
+    if (e0 != cudaSuccess || e1 != cudaSuccess) return kHandoffPinnedHost;
+    if (!ds41_p2p_copies_data(src_dev, dst_dev)) {
+        cudaSetDevice(dst_dev);
+        cudaDeviceDisablePeerAccess(src_dev);
+        cudaGetLastError();
+        cudaSetDevice(src_dev);
+        cudaDeviceDisablePeerAccess(dst_dev);
+        cudaGetLastError();
+        return kHandoffPinnedHost;
+    }
+    return kHandoffPeer;
+}
+
+const char * ds41_handoff_mode_name(Ds41HandoffMode m) {
+    switch (m) {
+        case kHandoffSameDevice: return "same-device";
+        case kHandoffPeer: return "peer";
+        case kHandoffPinnedHost: return "pinned-host";
+    }
+    return "?";
+}
+
+bool ds41_try_enable_peer(int dst_dev, int src_dev) {
+    cudaSetDevice(dst_dev);
+    const cudaError_t e = cudaDeviceEnablePeerAccess(src_dev, 0);
+    if (e == cudaSuccess || e == cudaErrorPeerAccessAlreadyEnabled) return true;
+    cudaGetLastError();
+    return false;
+}
+#endif
+}  // namespace
+
+bool Ds41Dense::import_handoff_from(const Ds41Dense & src, int src_cuda_device, int dst_cuda_device, int col0, int n,
+                                    void * cuda_stream, std::vector<float> & pinned_host) {
+    Impl & im = *p_;
+    const Impl & sm = *src.p_;
+    if (col0 < 0 || n < 1 || col0 + n > im.NC || col0 + n > sm.NC || !im.x_state || !sm.x_state) return false;
+    const size_t col_x = (size_t) (im.D * im.HC) * sizeof(float);
+    const size_t col_p = (size_t) im.HC * sizeof(float);
+    if (col_x != (size_t) (sm.D * sm.HC) * sizeof(float) || im.HC != sm.HC) return false;
+    const size_t col_floats = col_x / sizeof(float) + col_p / sizeof(float);
+    const size_t need = col_floats * (size_t) n;
+    if (pinned_host.size() < need) {
+        pinned_host.resize(need);
+#ifdef STRATA_ENABLE_CUDA
+        if (!pinned_host.empty()) ggml_backend_cuda_register_host_buffer(pinned_host.data(), pinned_host.size() * 4);
+#endif
+    }
+#ifdef STRATA_ENABLE_CUDA
+    if (src_cuda_device < 0) src_cuda_device = sm.cfg.cuda_device;
+    if (dst_cuda_device < 0) dst_cuda_device = im.cfg.cuda_device;
+    if (src_cuda_device < 0 || dst_cuda_device < 0) return false;
+    cudaSetDevice(src_cuda_device);
+    ggml_backend_synchronize(sm.backend);
+    const Ds41HandoffMode mode = ds41_handoff_mode(src_cuda_device, dst_cuda_device);
+    if (mode == kHandoffPinnedHost) {
+        if (!src.export_handoff(col0, n, pinned_host.data())) return false;
+        ggml_backend_synchronize(sm.backend);
+        cudaSetDevice(dst_cuda_device);
+        if (!import_handoff(col0, n, pinned_host.data())) return false;
+        ggml_backend_synchronize(im.backend);
+        if (cuda_stream) cudaStreamSynchronize((cudaStream_t) cuda_stream);
+        return true;
+    }
+    const size_t off_x = (size_t) col0 * col_x;
+    const size_t off_p = (size_t) col0 * col_p;
+    const size_t bytes_x = (size_t) n * col_x;
+    const size_t bytes_p = (size_t) n * col_p;
+    cudaStream_t stream = cuda_stream ? (cudaStream_t) cuda_stream : nullptr;
+    cudaSetDevice(dst_cuda_device);
+    ggml_backend_synchronize(im.backend);
+    if (mode == kHandoffPeer && !ds41_try_enable_peer(dst_cuda_device, src_cuda_device)) {
+        if (!src.export_handoff(col0, n, pinned_host.data())) return false;
+        ggml_backend_synchronize(sm.backend);
+        if (!import_handoff(col0, n, pinned_host.data())) return false;
+        ggml_backend_synchronize(im.backend);
+        return true;
+    }
+    if (mode == kHandoffSameDevice) {
+        if (cudaMemcpyAsync((uint8_t *) im.x_state->data + off_x, (uint8_t *) sm.x_state->data + off_x, bytes_x, cudaMemcpyDeviceToDevice,
+                            stream) != cudaSuccess)
+            return false;
+        if (cudaMemcpyAsync((uint8_t *) im.pre_state->data + off_p, (uint8_t *) sm.pre_state->data + off_p, bytes_p, cudaMemcpyDeviceToDevice,
+                            stream) != cudaSuccess)
+            return false;
+    } else {
+        if (cudaMemcpyPeerAsync((uint8_t *) im.x_state->data + off_x, dst_cuda_device, (uint8_t *) sm.x_state->data + off_x, src_cuda_device,
+                                bytes_x, stream) != cudaSuccess)
+            return false;
+        if (cudaMemcpyPeerAsync((uint8_t *) im.pre_state->data + off_p, dst_cuda_device, (uint8_t *) sm.pre_state->data + off_p,
+                                src_cuda_device, bytes_p, stream) != cudaSuccess)
+            return false;
+    }
+    if (stream) cudaStreamSynchronize(stream);
+    else cudaDeviceSynchronize();
+    return true;
+#else
+    if (!src.export_handoff(col0, n, pinned_host.data())) return false;
+    return import_handoff(col0, n, pinned_host.data());
+#endif
+}
+
+bool Ds41Dense::begin_continued(const int * tids, int n, int pos0) {
+    Impl & im = *p_;
+    if (n < 1 || n > im.NC || pos0 < 0 || pos0 + n > im.cfg.ctx_max) { im.err = "bad pass"; return false; }
+    im.pos0 = pos0;
+    im.n = n;
+    im.batch = 0;
+    im.span_cap.clear();
+    return im.upload_inputs(tids, n, pos0);
+}
+
+bool Ds41Dense::begin_batch_continued(const int * tids, int B, int pos0) {
+    Impl & im = *p_;
+    if (B < 1 || B > im.cfg.prompt_batch || B > im.NC || pos0 < 0 || pos0 + B > im.cfg.ctx_max) {
+        im.err = "bad batch";
+        return false;
+    }
+    if (!im.upload_inputs(tids, B, pos0)) return false;
+    im.pos0 = pos0;
+    im.batch_pos0 = pos0;
+    im.batch = B;
+    im.n = B;
+    im.col0 = 0;
+    const int64_t nb = (B + im.S - 1) / im.S;
+    im.span_cap.assign((size_t) nb, { 0, 0, 0 });
+    for (int64_t i = 0; i < nb; ++i)
+        span_pass_caps(im, pos0 + (int) (i * im.S), (int) std::min<int64_t>(im.S, (int64_t) B - i * im.S),
+                       im.span_cap[(size_t) i].data());
+    return true;
+}
+
+namespace {
+constexpr char kConvMagic[] = "DS41CONV1";
+void append_bytes(std::vector<uint8_t> & out, const void * p, size_t n) {
+    const auto * b = static_cast<const uint8_t *>(p);
+    out.insert(out.end(), b, b + n);
+}
+}  // namespace
+
+bool Ds41Dense::capture_conversation(int64_t positions, std::vector<uint8_t> & out) const {
+    Impl & im = *const_cast<Impl *>(p_.get());
+    if (positions < 1 || im.snap_pos < 0) return false;
+    ggml_backend_synchronize(im.backend);
+    out.clear();
+    append_bytes(out, kConvMagic, 8);
+    const int64_t lo = im.layer_lo, hi = im.layer_hi;
+    append_bytes(out, &lo, sizeof lo);
+    append_bytes(out, &hi, sizeof hi);
+    append_bytes(out, &positions, sizeof positions);
+    append_bytes(out, &im.snap_pos, sizeof im.snap_pos);
+    auto put_tensor = [&](ggml_tensor * t, size_t off, size_t n) {
+        if (!t || n == 0) return;
+        const size_t o = out.size();
+        out.resize(o + n);
+        ggml_backend_tensor_get(t, out.data() + o, off, n);
+    };
+    for (auto & L : im.ly) {
+        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
+            if (t) put_tensor(t, 0, ggml_nbytes(t));
+        for (ggml_tensor * t : { L.comp, L.idxk }) {
+            if (!t) continue;
+            const int64_t rows = t->ne[1];
+            const int64_t n = std::min<int64_t>(rows - 1, positions + 1);
+            put_tensor(t, 0, (size_t) n * t->nb[1]);
+            put_tensor(t, (size_t) (rows - 1) * t->nb[1], t->nb[1]);
+        }
+    }
+    return true;
+}
+
+bool Ds41Dense::restore_conversation(const std::vector<uint8_t> & in) {
+    if (in.size() < 8 + 4 * sizeof(int64_t) || std::memcmp(in.data(), kConvMagic, 8) != 0) return false;
+    Impl & im = *p_;
+    size_t o = 8;
+    int64_t lo = 0, hi = 0, positions = 0, snap = 0;
+    std::memcpy(&lo, in.data() + o, sizeof lo); o += sizeof lo;
+    std::memcpy(&hi, in.data() + o, sizeof hi); o += sizeof hi;
+    std::memcpy(&positions, in.data() + o, sizeof positions); o += sizeof positions;
+    std::memcpy(&snap, in.data() + o, sizeof snap); o += sizeof snap;
+    if (lo != im.layer_lo || hi != im.layer_hi) return false;
+    auto get_tensor = [&](ggml_tensor * t, size_t n) -> bool {
+        if (!t) return n == 0;
+        if (o + n > in.size()) return false;
+        ggml_backend_tensor_set(t, in.data() + o, 0, n);
+        o += n;
+        return true;
+    };
+    for (auto & L : im.ly) {
+        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
+            if (!get_tensor(t, t ? ggml_nbytes(t) : 0)) return false;
+        for (ggml_tensor * t : { L.comp, L.idxk }) {
+            if (!t) continue;
+            const int64_t rows = t->ne[1];
+            const int64_t n = std::min<int64_t>(rows - 1, positions + 1);
+            if (!get_tensor(t, (size_t) n * t->nb[1])) return false;
+            if (!get_tensor(t, t->nb[1])) return false;
+        }
+        if (L.raw_snap) ggml_backend_tensor_copy(L.raw_snap, L.raw);
+        if (L.st_kv_snap) {
+            ggml_backend_tensor_copy(L.st_kv_snap, L.st_kv);
+            ggml_backend_tensor_copy(L.st_sc_snap, L.st_sc);
+        }
+    }
+    im.snap_pos = (int) snap;
+    ggml_backend_synchronize(im.backend);
     return true;
 }

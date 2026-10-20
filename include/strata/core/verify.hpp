@@ -170,6 +170,14 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, const float* handoff_in, float* handoff_out) {
         lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
     }
+    /// STRATA_SPLIT_OVERLAP=1 (opt-in; stages on DIFFERENT devices only): the hand-off carries a ready flag (one
+    /// mapped word per hand-off buffer: host and device addresses).  The writing stage raises it from the GPU when
+    /// its hand-off is out (handoff_publish); the reading stage's window graph waits on it (wait_flag_ge) - so the
+    /// next stage's graph is launched while this stage is still running, and the host no longer syncs between the
+    /// stages.  Null (the default): the old order - sync, then launch the next stage.  Set before `init`.
+    void set_handoff_flags(uint32_t* in_host, uint32_t* in_dev, uint32_t* out_host, uint32_t* out_dev) {
+        hflag_in_h_ = in_host; hflag_in_d_ = in_dev; hflag_out_h_ = out_host; hflag_out_d_ = out_dev;
+    }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
@@ -414,6 +422,21 @@ private:
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
+    uint32_t* hflag_in_h_ = nullptr;     ///< set_handoff_flags: the incoming hand-off's ready word (host / device)
+    uint32_t* hflag_in_d_ = nullptr;
+    uint32_t* hflag_out_h_ = nullptr;    ///< ... and the outgoing one's
+    uint32_t* hflag_out_d_ = nullptr;
+    uint32_t* hcount_d_ = nullptr;       ///< handoff_publish's block counter (device memory)
+    uint32_t* herr_h_ = nullptr;         ///< the bounded hand-off wait gave up (mapped; the reading stage's)
+    uint32_t* herr_d_ = nullptr;
+    uint32_t* hdrop_h_ = nullptr;        ///< STRATA_TEST_HANDOFF_DROP: the writing stage withholds its flag (mapped)
+    uint32_t* hdrop_d_ = nullptr;
+    bool handoff_failed(std::string& err) const;   ///< the bounded hand-off wait timed out in the last window
+    int prelaunched_ = 0;                ///< prelaunch ran for a window of this size: run skips staging + launch
+    /// The overlapped split: stage this window's inputs and launch its graph now (the graph waits on the hand-off
+    /// flag); `run` then only serves the host side.  Called on a helper thread while the previous stage runs.
+    bool prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+    bool chain_overlap() const;          ///< this stage hands off through a flag to a next stage that waits on it
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs

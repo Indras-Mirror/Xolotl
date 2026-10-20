@@ -32,6 +32,7 @@ struct Ds41DSparkConfig {
     /// The trunk's output.weight already on `backend` (Ds41Dense::weight): shared instead of a second copy (-0.7 GB).
     /// Any type (a requantized dense head only moves acceptance - drafts are verified).  nullptr = load from main_gguf.
     ggml_tensor * shared_head = nullptr;
+    int cuda_device = -1;   ///< CUDA ordinal for cudaSetDevice around graph compute (layer-split head GPU)
 };
 
 class Ds41DSpark {

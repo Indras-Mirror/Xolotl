@@ -81,7 +81,8 @@ What I've measured is one setup: **RTX 4090 (24 GB), 90 GB DDR4, Linux, NVMe**. 
   files inside WSL's own filesystem, not on a Windows drive.
 - **GPU:** NVIDIA, compute capability 7.5 or newer (RTX 20/30/40/50). Build with your card's architecture:
   `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 30, `89` for RTX 40, `120` for RTX 50 (use CUDA 13.x for RTX 50; 12.8 builds
-  had prompt-path crashes).
+  had prompt-path crashes). **Tesla V100 (sm_70):** experimental DS41-on-Buster path only — see [BUSTER.md](BUSTER.md)
+  (`STRATA_EXPERIMENTAL_SM60=ON`, CUDA 12.x, no chunk-MMQ on Volta).
 - **VRAM:** 24 GB is what I run. 16 GB should load but is untested, and prompts get processed in smaller batches, so
   prefill will be slower. Below 16 GB won't work.
 - **RAM:** 90 GB here, with a 64 GB expert cache in RAM. Less RAM means a smaller cache, so more experts come off the

@@ -2822,6 +2822,46 @@ class ConfigReasoningEffort(unittest.TestCase):
         self.assertEqual(cfg, {"args": ["--ctx", "4096"]})
 
 
+class JoinedEngineArgs(unittest.TestCase):
+    """#2267: "--ple-io mmap" written as one element of the config's args reached the engine as one argument."""
+
+    def split(self, args):
+        from serve.server import split_joined_args
+        cfg = {"args": list(args)}
+        with mock.patch("builtins.print") as pr:
+            split_joined_args(cfg)
+        return cfg["args"], pr.called
+
+    def test_one_element_becomes_flag_and_value(self):
+        self.assertEqual(self.split(["--spec", "4", "--ple-io mmap"]), (["--spec", "4", "--ple-io", "mmap"], True))
+        self.assertEqual(self.split(["--ple-io=mmap", "--kv int8"]), (["--ple-io", "mmap", "--kv", "int8"], True))
+
+    def test_proper_args_are_untouched(self):
+        args = ["--ple-io", "mmap", "--native", "/data/My Models/a b.gguf", "--max-context", "131072", "--vision"]
+        self.assertEqual(self.split(args), (args, False))
+        # a value in a flag's value place stays whole, whatever it looks like
+        args = ["--system-prompt", "--be brief please"]
+        self.assertEqual(self.split(args), (args, False))
+
+    def test_no_args(self):
+        from serve.server import split_joined_args
+        cfg = {}
+        split_joined_args(cfg)
+        self.assertEqual(cfg, {})
+
+    def test_bad_json_names_the_place(self):
+        import tempfile
+        from serve.server import read_config
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "c.json"
+            p.write_text('{"args": ["--ple-io" "mmap"]}', encoding="utf-8")
+            with self.assertRaises(SystemExit) as cm:
+                read_config(p)
+            self.assertIn("line 1", str(cm.exception))
+            p.write_text('﻿{"args": ["--ple-io", "mmap"]}', encoding="utf-8")
+            self.assertEqual(read_config(p), {"args": ["--ple-io", "mmap"]})
+
+
 class SharedSettings(unittest.TestCase):
     """The web app's "Use for other apps too": POST /settings makes its Chat settings every client's defaults."""
 

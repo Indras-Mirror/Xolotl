@@ -199,6 +199,34 @@ that overlap instead of one, a 32K one four instead of two. Same tokens; 2x / 3x
 32K +18% / +21% / +29%, 64K +4% / +12% / +17%, 8K unchanged. `STRATA_SPLIT_CHUNK16K=1` keeps 16384.) Conversation checkpoints save and restore every card's state; the adaptive expert swaps copy
 into the card that owns the layer.
 
+## Overlapped hand-off (`STRATA_SPLIT_OVERLAP=1`, opt-in)
+
+By default each verify window runs the stages one after another: the host syncs stage 1, then stages and launches
+stage 2's graph, and so on. `STRATA_SPLIT_OVERLAP=1` (stages on different cards only) gives the hand-off a ready
+flag: the earlier stage's GPU writes the hand-off with volatile stores and raises the flag (`handoff_publish`), the
+next stage's graph is staged and launched on a helper thread while the earlier stage is still running and waits for
+the flag on its GPU (`wait_flag_ge`), and the host goes straight from serving one stage's layers to the next, syncing
+the earlier stage only once the chain is done. It takes one stream sync and one graph launch per window off the
+critical path. Batch windows (several conversations) keep the serial order.
+
+Measured on 2x RX 7900 XTX (gfx1100, ROCm, Linux), Ryzen 9 9900X, 52 GB RAM, Swift 1.5 IQ3_XXS, 128K context, 8-bit
+KV, layers 0-25 / 26-47; 512-token greedy answers, median of 8 runs:
+
+| | serial (default) | `STRATA_SPLIT_OVERLAP=1` | one card |
+|---|---|---|---|
+| decode, code prompt | 53 tok/s | 70.1 tok/s | ~70 tok/s |
+| decode, prose prompt | 45 tok/s | 55.9 tok/s | ~68 tok/s |
+
+Greedy output is byte-identical with the flag at 0 and 1; the quiz set scored the same (47/51). Not measured on
+NVIDIA yet, where a sync and a graph launch cost less.
+
+The reading stage's wait for the flag is bounded on the GPU: `STRATA_SPLIT_WAIT_MS` (default 30000, 0 = no bound).
+If the flag does not arrive in time, the wait marks an error word and returns, the window's graph completes, and the
+host fails that window with an error naming the setting (the server then restarts the engine) instead of using a
+stale hand-off. Normally the host's own per-layer wait (20 s, #267) ends a stalled window first and releases every
+GPU wait, the hand-off's included. Test hook: `STRATA_TEST_HANDOFF_DROP=N` withholds the flag in the first stage's
+N-th window, as if the publish were lost.
+
 ## Limits (for now)
 
 - **Works across cards** (bench/results/2026-09-29-layer-split-limits):
