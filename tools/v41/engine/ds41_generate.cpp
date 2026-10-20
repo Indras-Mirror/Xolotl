@@ -424,7 +424,13 @@ int main(int argc, char ** argv) {
     dc.engram_hot = a.engram_hot;
     dc.act_quant = a.act_quant;
     // --kv-fp4 / STRATA_KV_FP4=1: the compressed KV + indexer keys packed to their exact FP4 grids (Ds41DenseConfig::kv_fp4)
-    dc.kv_fp4 = a.kv_fp4 || (std::getenv("STRATA_KV_FP4") && std::getenv("STRATA_KV_FP4")[0] == '1');
+    const bool kv_fp4_env = std::getenv("STRATA_KV_FP4") && std::getenv("STRATA_KV_FP4")[0] == '1';
+    if ((a.kv_fp4 || kv_fp4_env) && a.kv_type >= 0) {
+        std::fprintf(stderr, "ds41_generate: --kv-fp4 and --kv-q8/--kv-type are mutually exclusive "
+                             "(FP4 packs the caches; --kv-type picks one ggml type for them)\n");
+        return 2;
+    }
+    dc.kv_fp4 = a.kv_fp4 || kv_fp4_env;
     if (dc.kv_fp4) std::fprintf(stderr, "kv: compressed KV NVFP4 + indexer keys MXFP4 (--kv-fp4, exact)\n");
     dc.kv_type = a.kv_type;
     if (a.kv_type >= 0) std::fprintf(stderr, "kv: compressed KV + indexer keys as %s (--kv-q8/--kv-type)\n",
