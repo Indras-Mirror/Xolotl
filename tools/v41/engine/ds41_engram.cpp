@@ -242,23 +242,23 @@ bool Ds41Engram::read_raw(int e, uint32_t row, uint8_t * dst) const {
 // from another checkpoint's Engram (e.g. V4.1 vs 1017 - same geometry, different weights) is caught and skipped.
 bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
     const auto t0 = std::chrono::steady_clock::now();
-    const int fd = ::open(path.c_str(), O_RDONLY);
+    const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
     if (fd < 0) { err = "cannot open"; return false; }
     struct Hdr { char magic[8]; uint32_t version, slots, dim, srsz; uint64_t fp, count; } h {};
     const int64_t srsz = dim_ / 32, rsz = dim_ + srsz;
-    bool ok = ::pread(fd, &h, sizeof h, 0) == (ssize_t) sizeof h;
+    bool ok = ds41_sys::pread(fd, &h, sizeof h, 0) == (ssize_t) sizeof h;
     if (ok && (std::memcmp(h.magic, "XENGHOT1", 8) != 0 || h.version != 1)) { err = "not a hot-set pack"; ok = false; }
     if (ok && (h.slots != tables_.size() || h.dim != (uint32_t) dim_ || h.srsz != (uint32_t) srsz)) { err = "shape mismatch"; ok = false; }
     if (ok && h.fp != geometry_fingerprint()) { err = "geometry fingerprint mismatch (built for another model)"; ok = false; }
-    struct stat st;
-    if (ok && (::fstat(fd, &st) != 0 || (uint64_t) st.st_size != sizeof h + h.count * (8 + (uint64_t) rsz))) { err = "truncated"; ok = false; }
+    ds41_sys::Stat st;
+    if (ok && (ds41_sys::fstat(fd, &st) != 0 || (uint64_t) st.st_size != sizeof h + h.count * (8 + (uint64_t) rsz))) { err = "truncated"; ok = false; }
     if (ok) {
-        ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+        ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
         hot_keys_.resize((size_t) h.count);
         hot_pool_.resize((size_t) h.count * (size_t) rsz);
         auto rd = [&](void * dst, uint64_t n, uint64_t off) {
             for (uint64_t done = 0; done < n;) {
-                const ssize_t r = ::pread(fd, (uint8_t *) dst + done, (size_t) std::min<uint64_t>(n - done, 1ull << 28), (off_t) (off + done));
+                const ssize_t r = ds41_sys::pread(fd, (uint8_t *) dst + done, (size_t) std::min<uint64_t>(n - done, 1ull << 28), (int64_t) (off + done));
                 if (r <= 0) return false;
                 done += (uint64_t) r;
             }
@@ -267,7 +267,7 @@ bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
         ok = rd(hot_keys_.data(), h.count * 8, sizeof h) && rd(hot_pool_.data(), hot_pool_.size(), sizeof h + h.count * 8);
         if (!ok) err = "read failed";
     }
-    ::close(fd);
+    ds41_sys::close(fd);
     for (size_t i = 1; ok && i < hot_keys_.size(); ++i)
         if (hot_keys_[i] <= hot_keys_[i - 1]) { err = "keys not sorted"; ok = false; }
     for (size_t i = 0; ok && i < hot_keys_.size(); ++i) {
