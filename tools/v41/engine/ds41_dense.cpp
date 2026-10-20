@@ -4448,6 +4448,7 @@ bool Ds41Dense::capture_conversation(int64_t positions, std::vector<uint8_t> & o
         ggml_backend_tensor_get(t, out.data() + o, off, n);
     };
     for (auto & L : im.ly) {
+        if (!L.raw) continue;
         for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
             if (t) put_tensor(t, 0, ggml_nbytes(t));
         for (ggml_tensor * t : { L.comp, L.idxk }) {
@@ -4480,6 +4481,7 @@ bool Ds41Dense::restore_conversation(const std::vector<uint8_t> & in) {
         return true;
     };
     for (auto & L : im.ly) {
+        if (!L.raw) continue;
         for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
             if (!get_tensor(t, t ? ggml_nbytes(t) : 0)) return false;
         for (ggml_tensor * t : { L.comp, L.idxk }) {
