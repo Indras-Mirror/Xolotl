@@ -295,7 +295,7 @@ int main(int argc, char ** argv) {
         const int sa = 2 * K - 2, sb = sa == K ? 2 * K - 1 : K;   // two different slots (bind is done with both)
         const int L = (int) P[1].size();
         Ds41ConvStore pool;
-        if (!pool.init(dense, ctx, (size_t) 512 << 20, 8, false, err)) { std::fprintf(stderr, "pool init: %s\n", err.c_str()); return 1; }
+        if (!pool.init(dense, ctx, (size_t) 512 << 20, 8, !ggml_backend_is_cpu(be), err)) { std::fprintf(stderr, "pool init: %s\n", err.c_str()); return 1; }
         std::vector<float> last;
         if (!solo_prompt(sa, P[1], 0, L, &last)) { std::fprintf(stderr, "pool prompt: %s\n", err.c_str()); return 1; }
         a_pool.add(cmp(ref_last[1].data(), last.data(), nv));
