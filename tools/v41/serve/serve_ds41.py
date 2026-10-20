@@ -275,6 +275,19 @@ class Ds41Vision(_Vision):
         args = [cfg.get("python") or sys.executable, str(V41 / "vision" / "ds41_vision.py"), *args[1:]]
         if cfg.get("reference_dir"):
             args += ["--reference-dir", os.path.abspath(cfg["reference_dir"])]
+        # the encoder's numerics / placement (ds41_vision.py): "dtype" f32 (default) | bf16 | f16, "device" cpu | cuda
+        # (the server's own "gpu": true already passes --gpu = cuda); on the card "offload": true keeps the weights in
+        # pinned RAM between images, "tf32": true, "warmup_tokens": N (the warm-up grid; default max_tokens / 1024)
+        if cfg.get("dtype"):
+            args += ["--dtype", str(cfg["dtype"])]
+        if cfg.get("device"):
+            args += ["--device", str(cfg["device"])]
+        if cfg.get("offload") is True:
+            args.append("--offload")
+        if cfg.get("tf32") is True:
+            args.append("--tf32")
+        if cfg.get("warmup_tokens"):
+            args += ["--warmup-tokens", str(int(cfg["warmup_tokens"]))]
         self.spawn = (args, log, env)
         if not lazy and not self.lazy_vision and not self.elastic:
             self._start()
