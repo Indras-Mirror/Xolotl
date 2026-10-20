@@ -1,7 +1,9 @@
 // test_ds41_batch - the batch-slot gates on the CPU backend with the real model (tools/v41/engine/ds41_batch.hpp).
 //
 //   test_ds41_batch -m M.gguf --engram A:B --prompts p0.i32,p1.i32,p2.i32 [--steps 8] [--feed 24] [--threads 48]
-//                   [--ctx 8192] [--json out.json]
+//                   [--ctx 8192] [--json out.json] [--backend cpu|cuda] [--kv-fp4]
+// --backend cuda: the dense half on the card (the batched graphs' CUDA kernels), the routed experts still on the CPU tier
+// (row by row, the same bits whatever the window) - the card's batch-vs-solo numbers without the VRAM expert tier.
 //
 // K conversations (prompt files of int32 ids).  Slots 0..K-1 hold the SOLO references, slots K..2K-1 the batch runs.
 //   ref    every conversation alone: its prompt as solo passes of <= 16 rows (Ds41RowsStep, the per-slot reference
@@ -90,7 +92,8 @@ struct Agg {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    std::string model, engram, prompts_csv, json_out;
+    std::string model, engram, prompts_csv, json_out, backend = "cpu";
+    bool kv_fp4 = false;
     int steps = 8, feed = 24, threads = 48;
     int64_t ctx = 8192;
     for (int i = 1; i < argc; ++i) {
@@ -104,6 +107,8 @@ int main(int argc, char ** argv) {
         else if (k == "--threads") threads = std::atoi(next().c_str());
         else if (k == "--ctx") ctx = std::atoll(next().c_str());
         else if (k == "--json") json_out = next();
+        else if (k == "--backend") backend = next();
+        else if (k == "--kv-fp4") kv_fp4 = true;
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return 2; }
     }
     std::vector<std::vector<int>> P;
@@ -113,8 +118,10 @@ int main(int argc, char ** argv) {
     for (auto & p : P) if (p.size() < (size_t) feed + 4) { std::fprintf(stderr, "a prompt is shorter than --feed + 4\n"); return 2; }
     if (K > Ds41Dense::kMaxRows) { std::fprintf(stderr, "at most %d prompts\n", Ds41Dense::kMaxRows); return 2; }
 
-    ggml_backend_t be = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    ggml_backend_cpu_set_n_threads(be, threads);
+    ggml_backend_t be = backend == "cuda" ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr)
+                                          : ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!be) { std::fprintf(stderr, "no %s backend\n", backend.c_str()); return 1; }
+    if (ggml_backend_is_cpu(be)) ggml_backend_cpu_set_n_threads(be, threads);
     Ds41DenseConfig dc;
     dc.backend = be;
     dc.n_threads = threads;
@@ -123,6 +130,7 @@ int main(int argc, char ** argv) {
     dc.prompt_batch = 0;
     { std::stringstream ss(engram); std::string d; while (std::getline(ss, d, ':')) if (!d.empty()) dc.engram_dirs.push_back(d); }
     dc.n_slots = 2 * K;
+    dc.kv_fp4 = kv_fp4;
     Ds41Dense dense;
     std::string err;
     const double t_load = now_s();

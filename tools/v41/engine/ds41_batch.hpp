@@ -137,10 +137,11 @@ public:
     /// Since the last reset: windows, rows, and the wall split (ms) - dense (begin / attention / finish), tier, logits.
     std::string stats_line(bool reset) {
         char b[256];
-        std::snprintf(b, sizeof b, "%ld windows, %.2f rows each, %.1f ms a window (dense %.1f, experts %.1f, logits %.1f)",
-                      windows_, windows_ ? (double) rows_ / windows_ : 0.0, windows_ ? ms_all_ / windows_ : 0.0,
-                      windows_ ? ms_dense_ / windows_ : 0.0, windows_ ? ms_tier_ / windows_ : 0.0, windows_ ? ms_logits_ / windows_ : 0.0);
-        if (reset) { windows_ = rows_ = 0; ms_all_ = ms_dense_ = ms_tier_ = ms_logits_ = 0; }
+        const double w = windows_ ? (double) windows_ : 1.0;
+        std::snprintf(b, sizeof b, "%ld windows, %.2f rows each, %.1f ms a window (dense %.1f = prefetch %.1f + attention %.1f + "
+                      "finish %.1f, experts %.1f, logits %.1f)", windows_, windows_ ? (double) rows_ / windows_ : 0.0, ms_all_ / w,
+                      ms_dense_ / w, ms_pred_ / w, ms_attn_ / w, ms_fin_ / w, ms_tier_ / w, ms_logits_ / w);
+        if (reset) { windows_ = rows_ = 0; ms_all_ = ms_dense_ = ms_tier_ = ms_logits_ = ms_pred_ = ms_attn_ = ms_fin_ = 0; }
         return b;
     }
 
@@ -158,6 +159,7 @@ private:
         const bool pf = rdev && d3_pf > 0 && m <= 8;
         double tq = now();
         for (int l = 0; l < nl; ++l) {
+            const double tp0 = now();
             if (pf) {
                 pred_.resize((size_t) m * 16);
                 if (d_.predict_multi(l, pred_.data())) {
@@ -175,9 +177,11 @@ private:
                     t_.prefetch_multi(l, rank_.data(), (int) rank_.size(), d3_pf);
                 }
             }
+            const double ta0 = now();
+            ms_pred_ += ta0 - tp0;
             const float * fn = nullptr;
             if (!d_.attn_router(l, ids_.data(), w_.data(), &fn)) { err = d_.last_error(); return false; }
-            double t = now(); ms_dense_ += t - tq; tq = t;
+            double t = now(); ms_dense_ += t - tq; ms_attn_ += t - ta0; tq = t;
             if (rdev) {
                 constexpr int kMM = Ds41MoeTier::kMaxMulti;
                 for (int off = 0; off < m; off += kMM) {
@@ -192,7 +196,7 @@ private:
             }
             t = now(); ms_tier_ += t - tq; tq = t;
             if (!d_.finish(l, rdev ? nullptr : routed_.data())) { err = d_.last_error(); return false; }
-            t = now(); ms_dense_ += t - tq; tq = t;
+            t = now(); ms_dense_ += t - tq; ms_fin_ += t - tq; tq = t;
         }
         return true;
     }
@@ -204,7 +208,7 @@ private:
     std::vector<float> w_, routed_;
     std::vector<std::pair<int, int>> score_;
     long windows_ = 0, rows_ = 0;
-    double ms_all_ = 0, ms_dense_ = 0, ms_tier_ = 0, ms_logits_ = 0;
+    double ms_all_ = 0, ms_dense_ = 0, ms_tier_ = 0, ms_logits_ = 0, ms_pred_ = 0, ms_attn_ = 0, ms_fin_ = 0;
 };
 
 }  // namespace strata::v41

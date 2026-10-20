@@ -656,6 +656,13 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // the indexer's query / weights (index source layers), every row
     ggml_tensor * x_iq = nullptr, * x_iw = nullptr;
     std::vector<ggml_tensor *> o_parts;
+    // a batch pass with several groups: their key sets (window + top-k rows, each padded to the longest) go into ONE
+    // flash-attn over every row - per query its own keys either way, so only the -inf padding is added (STRATA_ROWS_FA=0:
+    // one flash-attn per group)
+    static const bool rows_fa = !(std::getenv("STRATA_ROWS_FA") && std::getenv("STRATA_ROWS_FA")[0] == '0');
+    const bool merge_fa = rows_fa && im.rows_mode && grps.size() > 1;
+    struct KPart { ggml_tensor * K, * M; int64_t k; bool f16; };
+    std::vector<KPart> k_parts;
     for (const Grp & gp : grps) {
         const bool whole = grps.size() == 1 && gp.k == n;   // the single-sequence graph, exactly as before
         const int64_t gk = gp.k, gc0 = gp.c, rel = gp.c - col0;   // rel: the group's first column among this graph's n
@@ -816,6 +823,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         // ---- attention: per query its window rows + its top-k compressed rows, one flash-attn with the query as batch
         ggml_tensor * Kall = Kc ? ggml_concat(gc, Kw, Kc, 1) : Kw;                                 // [DH, M, k]
         ggml_tensor * Mall = Mc ? ggml_concat(gc, Mw, Mc, 0) : Mw;                                 // [M, k]
+        if (merge_fa) { k_parts.push_back(KPart { Kall, Mall, gk, f16 }); continue; }
         int64_t M = Kall->ne[1];
         if (!im.cpu && M % 256) {   // ggml-cuda's flash-attn for d 512 wants the key count a multiple of 256
             const int64_t pad = 256 - M % 256;
@@ -834,6 +842,32 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         ggml_tensor * og = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
         ggml_flash_attn_ext_add_sinks(og, im.BL(il, "attn_sinks.weight"));
         o_parts.push_back(ggml_reshape_3d(gc, og, DH, NH, gk));
+    }
+    if (merge_fa) {
+        int64_t Mx = 0;
+        for (const KPart & kp : k_parts) Mx = std::max<int64_t>(Mx, kp.K->ne[1]);
+        if (!im.cpu && Mx % 256) Mx += 256 - Mx % 256;   // ggml-cuda's flash-attn for d 512: a multiple of 256 keys
+        ggml_tensor * Kx = nullptr, * Mxk = nullptr;
+        for (const KPart & kp : k_parts) {
+            ggml_tensor * K = kp.K, * Mk = kp.M;
+            const int64_t pad = Mx - K->ne[1];
+            if (pad > 0) {
+                K = kp.f16 ? ggml_concat(gc, K, ggml_reshape_3d(gc, rows_as(gc, im.zpad16, ggml_view_1d(gc, im.zidx, pad * kp.k, 0), true),
+                                                                DH, pad, kp.k), 1)
+                           : ggml_pad(gc, K, 0, (int) pad, 0, 0);
+                Mk = ggml_concat(gc, Mk, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, kp.k), NEG_INF), 0);
+            }
+            if (Kx && K->type != Kx->type) K = ggml_cast(gc, K, Kx->type);
+            Kx = Kx ? ggml_concat(gc, Kx, K, 2) : K;                                               // [DH, Mx, n]
+            Mxk = Mxk ? ggml_concat(gc, Mxk, Mk, 1) : Mk;                                          // [Mx, n]
+        }
+        ggml_tensor * k4 = Kx->type == GGML_TYPE_F16 ? ggml_reshape_4d(gc, Kx, DH, Mx, 1, n)
+                                                     : ggml_cast(gc, ggml_reshape_4d(gc, Kx, DH, Mx, 1, n), GGML_TYPE_F16);
+        ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, q, DH, NH, 1, n), 0, 2, 1, 3);      // [DH, 1, NH, n]
+        ggml_tensor * m4 = ggml_cast(gc, ggml_reshape_4d(gc, Mxk, Mx, 1, 1, n), GGML_TYPE_F16);
+        ggml_tensor * og = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(og, im.BL(il, "attn_sinks.weight"));
+        o_parts.push_back(ggml_reshape_3d(gc, og, DH, NH, n));
     }
     ggml_tensor * o = o_parts[0];
     for (size_t i = 1; i < o_parts.size(); ++i) o = ggml_concat(gc, o, o_parts[i], 2);         // [DH, NH, n]
