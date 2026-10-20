@@ -262,6 +262,11 @@ struct Ds41Dense::Impl {
     struct RowGroup { int slot; int64_t c, k, pos0; int64_t cap[3]; };
     std::vector<RowGroup> rgroups;
     bool rows_mode = false;
+    // STRATA_ROWS_GRAPH_CACHE (default on, =0 off): a batch pass's graphs are cached by its LAYOUT (the groups' slot,
+    // columns and visible caps): consecutive decode windows of the same slots reuse them (and ggml-cuda its CUDA graph
+    // captures) instead of building / allocating 40 layer graphs a window.  rows_sig = the layout's key (0 = uncached).
+    int64_t rows_sig = 0;
+    std::map<int64_t, std::vector<int64_t>> rows_sigs;   // key -> the layout it stands for (a hash collision is not cached)
     std::vector<int> rows_slot;          // per row: its slot / position (the Engram reads)
     std::vector<int64_t> rows_pos;
     bool upload_rows(const Ds41Dense::Row * rows, int n);
@@ -1878,11 +1883,33 @@ bool Ds41Dense::begin_rows(const Row * rows, int n) {
     }
     for (auto & G : im.rgroups) span_pass_caps(im, (int) G.pos0, (int) G.k, G.cap);
     im.rows_mode = true;
+    im.rows_sig = 0;
+    static const bool rows_cache = !(std::getenv("STRATA_ROWS_GRAPH_CACHE") && std::getenv("STRATA_ROWS_GRAPH_CACHE")[0] == '0');
+    if (rows_cache) {
+        std::vector<int64_t> sig;
+        for (const auto & G : im.rgroups) { sig.push_back(G.slot); sig.push_back(G.c); sig.push_back(G.k); sig.push_back(G.cap[1]); sig.push_back(G.cap[2]); }
+        uint64_t h = 1469598103934665603ull;
+        for (int64_t v : sig) { h ^= (uint64_t) v; h *= 1099511628211ull; }
+        int64_t key = (int64_t) (h & 0x3fffffffffffffffull) | 1;
+        auto it = im.rows_sigs.find(key);
+        if (it == im.rows_sigs.end()) im.rows_sigs.emplace(key, sig);
+        else if (it->second != sig) key = 0;   // a collision: this layout runs uncached
+        im.rows_sig = key;
+    }
     im.pos0 = 0;
     im.n = n;
     im.pass_cap[0] = im.pass_cap[1] = im.pass_cap[2] = 0;   // per group (read_sel has nothing to show)
     if (!im.upload_rows(rows, n)) { im.rows_mode = false; return false; }
     // embeddings -> state, as begin()
+    if (im.rows_sig) {
+        const Impl::GKey key { -1, 10, 0, n, -1 };
+        auto it = im.graphs.find(key);
+        if (it == im.graphs.end()) {
+            if (!im.gctx_room()) im.reset_graphs();
+            it = im.graphs.emplace(key, build_init(im, im.gctx, n)).first;
+        }
+        return im.compute(it->second, true);
+    }
     std::vector<uint8_t> meta(ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(64, false));
     ggml_init_params p = { meta.size(), meta.data(), true };
     ggml_context * gc = ggml_init(p);
@@ -2125,13 +2152,14 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     const int64_t cap = r ? im.pass_cap[r] : 0;
     ggml_cgraph * gf = nullptr;
     ggml_context * gc = nullptr;
-    const bool cached = n == 1 && !im.rows_mode;   // a batch pass's graph reads its rows' slots: built per pass
+    // a batch pass's graph reads its rows' slots: cached by the pass's layout (rows_sig), or built per pass
+    const bool cached = (n == 1 && !im.rows_mode) || (im.rows_mode && im.rows_sig != 0);
     if (cached) {
-        const Impl::GKey key { il, 1, cap, 1, im.cur_slot };
+        const Impl::GKey key = im.rows_mode ? Impl::GKey { il, 8, im.rows_sig, n, -1 } : Impl::GKey { il, 1, cap, 1, im.cur_slot };
         auto it = im.graphs.find(key);
         if (it == im.graphs.end()) {
             if (!im.gctx_room()) im.reset_graphs();   // many slots' decode graphs: start the cache over (rebuilt lazily)
-            it = im.graphs.emplace(key, build_attn(im, im.gctx, il, 1)).first;
+            it = im.graphs.emplace(key, build_attn(im, im.gctx, il, n)).first;
         }
         gf = it->second;
     } else {
@@ -2204,11 +2232,15 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
     if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) (im.D * n) * 4);
     ggml_cgraph * gf = nullptr;
     ggml_context * gc = nullptr;
-    const bool cached = n == 1;
+    const bool cached = n == 1 || (im.rows_mode && im.rows_sig != 0);   // (a batch pass: by its width)
     std::vector<uint8_t> meta;
     if (cached) {
-        auto it = im.graphs.find({ -1, 2, 0, 1 });
-        if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 2, 0, 1 }, build_finish(im, im.gctx, 1)).first;
+        const Impl::GKey key = n == 1 ? Impl::GKey { -1, 2, 0, 1 } : Impl::GKey { -1, 9, 0, n, -1 };
+        auto it = im.graphs.find(key);
+        if (it == im.graphs.end()) {
+            if (n > 1 && !im.gctx_room()) im.reset_graphs();
+            it = im.graphs.emplace(key, build_finish(im, im.gctx, n)).first;
+        }
         gf = it->second;
     } else {
         meta.resize(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
