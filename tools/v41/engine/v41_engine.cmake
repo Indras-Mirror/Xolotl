@@ -175,4 +175,7 @@ endif()
 # the engine links the pool (nothing is pulled in until ds41_generate.cpp uses it: the default binary is unchanged)
 if(TARGET ds41_conv_pool AND TARGET ds41_generate)
     target_link_libraries(ds41_generate PRIVATE ds41_conv_pool)
+    if(TARGET test_ds41_batch)
+        target_link_libraries(test_ds41_batch PRIVATE ds41_conv_pool)   # the gate's pool check: the pinned store too
+    endif()
 endif()

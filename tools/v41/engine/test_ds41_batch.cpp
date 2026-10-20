@@ -12,9 +12,13 @@
 //   (c)    feed: the last conversation's last --feed prompt tokens are read as rows INSIDE the windows of the others'
 //          decode (ds41_plan_rows, <= 16 rows a window), then it decodes with them: its last prompt row and its decode
 //          rows against its solo reference, the others' rows as in (b).
-//   bind   the solo path on another slot: slot 0's conversation read again in slot 2K-1 must be bit-exact.
+//   bind   the solo path on another slot: slot 0's conversation read again in slot 2K-1 must be bit-exact; half way
+//          through its decode the slot is swap_slots()'d with slot K and decodes on there (bit-exact again).
+//   pool   the conversation pool across slots: conversation 1's turn boundary saved from slot 2K-2, restored into slot
+//          K, decoded there - bit-exact with its solo reference (the pool's default store, host memory on the CPU).
 // DS41_TEST_LAYERS=n runs only the first n layers (a faster gate of the same code; not the model's logits).
 #include "ds41_batch.hpp"
+#include "ds41_conv_reuse.hpp"
 #include "ds41_dense.hpp"
 #include "ds41_moe.hpp"
 
@@ -258,20 +262,58 @@ int main(int argc, char ** argv) {
     // ---- bind: conversation 0 solo again on the last slot (its state is (c)'s, overwritten from position 0)
     Agg a_bind;
     {
-        const int s2 = 2 * K - 1;
+        int s2 = 2 * K - 1;
         std::vector<float> last;
         if (!solo_prompt(s2, P[0], 0, (int) P[0].size(), &last)) { std::fprintf(stderr, "bind prompt: %s\n", err.c_str()); return 1; }
         a_bind.add(cmp(ref_last[0].data(), last.data(), nv));
         rs.set_reference(true);
         int x = ref_tok[0][0];
         for (int s = 0; s < steps; ++s) {
+            if (s == steps / 2) {   // the conversation moves to slot K (whose own state goes to s2)
+                if (!dense.swap_slots(s2, K)) { std::fprintf(stderr, "swap: %s\n", dense.last_error().c_str()); return 1; }
+                s2 = K;
+            }
             Ds41Dense::Row r { s2, (int) P[0].size() + s, x };
             const int w = 0;
             if (!rs.run(&r, 1, &w, 1, nullptr, lg, err)) { std::fprintf(stderr, "bind decode: %s\n", err.c_str()); return 1; }
             a_bind.add(cmp(ref_dec[0][(size_t) s].data(), lg.data(), nv));
             x = ref_tok[0][(size_t) s + 1];
         }
-        std::fprintf(stderr, "bind: conversation 0 on slot %d vs slot 0: %s\n", s2, a_bind.json().c_str());
+        std::fprintf(stderr, "bind: conversation 0 on slot %d (swapped to slot %d half way) vs slot 0: %s\n", 2 * K - 1, s2, a_bind.json().c_str());
+    }
+    // ---- pool: conversation 1 saved at its prompt's end from slot 2K-2, restored into another slot (K)
+    Agg a_pool;
+    {
+        const int sa = 2 * K - 2, sb = sa == K ? 2 * K - 1 : K;   // two different slots (bind is done with both)
+        const int L = (int) P[1].size();
+        Ds41ConvStore pool;
+        if (!pool.init(dense, ctx, (size_t) 512 << 20, 8, false, err)) { std::fprintf(stderr, "pool init: %s\n", err.c_str()); return 1; }
+        std::vector<float> last;
+        if (!solo_prompt(sa, P[1], 0, L, &last)) { std::fprintf(stderr, "pool prompt: %s\n", err.c_str()); return 1; }
+        a_pool.add(cmp(ref_last[1].data(), last.data(), nv));
+        if (!dense.bind_slot(sa) || !dense.snapshot(L)) { std::fprintf(stderr, "pool snapshot: %s\n", dense.last_error().c_str()); return 1; }
+        if (!pool.save(dense, P[1].data(), nullptr, 0, L, last.data(), last.size(), err)) { std::fprintf(stderr, "pool save: %s\n", err.c_str()); return 1; }
+        if (!pool.fence(&err)) { std::fprintf(stderr, "pool fence: %s\n", err.c_str()); return 1; }
+        // slot sa goes on with something else (its rings / rows overwritten from position 0) before the restore
+        if (!solo_prompt(sa, P[2], 0, 40, nullptr)) { std::fprintf(stderr, "pool other: %s\n", err.c_str()); return 1; }
+        if (!dense.bind_slot(sb)) { std::fprintf(stderr, "pool bind: %s\n", dense.last_error().c_str()); return 1; }
+        const ConvMatch m = pool.best_prefix(P[1].data(), nullptr, 0, L);
+        ConvRestore rr;
+        if (m.pos != L || !pool.restore(dense, m, 0, rr, err)) { std::fprintf(stderr, "pool restore (match %lld): %s\n", (long long) m.pos, err.c_str()); return 1; }
+        dense.rearm((int) rr.pos);
+        if (!dense.restore()) { std::fprintf(stderr, "pool rearm: %s\n", dense.last_error().c_str()); return 1; }
+        dense.set_engram_history(L - 3, 3, P[1].data() + L - 3, nullptr);   // as the serve loop does on a resume
+        a_pool.add(cmp(ref_last[1].data(), rr.logits.data(), nv));
+        rs.set_reference(true);
+        int x = argmax(rr.logits.data(), nv);
+        for (int s = 0; s < steps; ++s) {
+            Ds41Dense::Row r { sb, L + s, x };
+            const int w = 0;
+            if (!rs.run(&r, 1, &w, 1, nullptr, lg, err)) { std::fprintf(stderr, "pool decode: %s\n", err.c_str()); return 1; }
+            a_pool.add(cmp(ref_dec[1][(size_t) s].data(), lg.data(), nv));
+            x = ref_tok[1][(size_t) s + 1];
+        }
+        std::fprintf(stderr, "pool: conversation 1 saved from slot %d, restored into slot %d (%s): %s\n", sa, sb, pool.kind(), a_pool.json().c_str());
     }
     int free_top1 = 0, free_n = 0;
     for (int k = 0; k < K; ++k)
@@ -281,10 +323,11 @@ int main(int argc, char ** argv) {
                      ", \"b_reference\": " + b_ref.json() + ", \"b_batched\": " + b_bat.json() +
                      ", \"b_greedy_same\": [" + std::to_string(free_top1) + ", " + std::to_string(free_n) + "]" +
                      ", \"c_others\": " + c_dec.json() + ", \"c_fed_last_row\": " + c_feed_last.json() +
-                     ", \"c_fed_decode\": " + c_feed_dec.json() + ", \"bind\": " + a_bind.json() + "}";
+                     ", \"c_fed_decode\": " + c_feed_dec.json() + ", \"bind\": " + a_bind.json() + ", \"pool\": " + a_pool.json() + "}";
     std::printf("RESULT %s\n", js.c_str());
     if (!json_out.empty()) { std::ofstream o(json_out); o << js << "\n"; }
-    const bool ok = b_ref.exact == b_ref.n && a_bind.exact == a_bind.n && b_bat.top1 == b_bat.n && c_feed_last.top1 == c_feed_last.n;
+    const bool ok = b_ref.exact == b_ref.n && a_bind.exact == a_bind.n && a_pool.exact == a_pool.n && b_bat.top1 == b_bat.n &&
+                    c_feed_last.top1 == c_feed_last.n;
     std::fprintf(stderr, "%s\n", ok ? "PASS" : "FAIL (see RESULT)");
     tier.close();
     std::fflush(stdout);
