@@ -1280,6 +1280,10 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     im_->g = geom;
     im_->cfg = cfg;
     im_->blobs = blobs;
+    // hand-port of sakamoto-sann b1e0db08: a NaN or negative auto budget would size the uniform cache nonsensically
+    if (!std::isfinite(cfg.slot_gib) || cfg.slot_gib < 0) {
+        err = "VRAM slot budget must be finite and nonnegative"; return false;
+    }
     if (!ds41_moe_blob_layout(geom, im_->f, err)) return false;
     im_->blob = (int64_t) im_->f.bytes;
     // per-CLASS formats and blob sizes (class = layer unless the geometry is per-expert; all equal to f / blob for a
