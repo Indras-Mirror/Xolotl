@@ -182,9 +182,12 @@ public:
     bool parked() const;
     /// A conversation's reusable device state at its snapshot, as regions of the device tensors: the snapshot rings
     /// (window K/V, ratio-2 compressor state) + rows [0, positions] of every compressed-KV / indexer-key cache and their
-    /// spare rows - exactly what park() copies.
+    /// spare rows - exactly what park() copies.  A conversation pool saves them right after snapshot(); writing them
+    /// back and rearm(pos) + restore() resumes that conversation at pos.
     struct StateRegion { ggml_tensor * t; size_t off, bytes; };
     std::vector<StateRegion> state_regions(int64_t positions) const;
+    /// The snapshot tensors now hold position `pos`'s state (a pool wrote them): restore() resumes there.
+    void rearm(int pos);
     /// Engram history: the n-gram hash of a pass's first positions reads the tokens before it from the history, which
     /// is kept BY POSITION - another request that wrote those positions since leaves its own tokens there.  Rewrite
     /// [pos0, pos0 + n) with tids (DEAD where dead[i] != 0: an image position).  A no-op without Engram.
