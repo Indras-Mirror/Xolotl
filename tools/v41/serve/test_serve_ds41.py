@@ -225,10 +225,34 @@ def t_http(tok_dir):
             print("---- server output (tail) ----\n" + out[-3000:])
 
 
+def t_parallel():
+    """#465 "parallel": N for the DeepSeek-V4.1 engine: --batch N (= its --batch-slots N), up to 16; its own --slots (the
+    expert cache) does not hide it; off (with a message) when the pool is off or STRATA_DS41_PARALLEL=0."""
+    S = D.S
+    check("parallel: the server calls the ds41 version", S.parallel_args is D.ds41_parallel_args)
+    pa = D.ds41_parallel_args
+    check("parallel 4 -> --batch 4", pa({"parallel": 4}, []) == ["--batch", "4"], pa({"parallel": 4}, []))
+    check("parallel beside the expert --slots", pa({"parallel": 3}, ["--slots", "1500"]) == ["--batch", "3"])
+    check("parallel 1 / absent: nothing", pa({"parallel": 1}, []) == [] and pa({}, []) == [])
+    check("parallel 40 -> 16", pa({"parallel": 40}, []) == ["--batch", "16"], pa({"parallel": 40}, []))
+    check("parallel: an explicit --batch-slots wins", pa({"parallel": 4}, ["--batch-slots", "2"]) == [])
+    check("parallel not a number: ignored", pa({"parallel": "4"}, []) == [] and pa({"parallel": True}, []) == [])
+    check("parallel without the pool: off", pa({"parallel": 4}, ["--conversation-cache-mib", "0"]) == [])
+    os.environ["STRATA_DS41_PARALLEL"] = "0"
+    try:
+        check("parallel with STRATA_DS41_PARALLEL=0: off", pa({"parallel": 4}, []) == [])
+    finally:
+        del os.environ["STRATA_DS41_PARALLEL"]
+    args = S.engine_args({"args": ["-m", "x.gguf", "--slots", "1500"], "parallel": 2}) if hasattr(S, "engine_args") else None
+    if args is not None:
+        check("engine_args: parallel reaches the ds41 engine", args[-2:] == ["--batch", "2"] or "--batch" in args, args)
+
+
 if __name__ == "__main__":
     t_template()
     t_effort_kwargs()
     t_parser()
+    t_parallel()
     if len(sys.argv) > 1:
         t_tokenizer(Path(sys.argv[1]))
         t_http(Path(sys.argv[1]))

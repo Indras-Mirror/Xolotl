@@ -3,9 +3,9 @@
 
 The engine under test runs the slot protocol of serve/server.py's generate_batched (BGEN / BADM / BT / BDONE / BSTOP /
 BYIELD); a second engine without slots answers the same prompts one at a time (GEN, greedy) as the reference.  With
-STRATA_BATCH_STUB=1 (the default here) every slot runs through the old single-sequence path, so a slot's tokens must
-equal the reference's exactly; with the dense half's per-slot core (--core) the batched rows differ only by the
-row-batched matmuls, so tokens are compared for agreement and the admission logits by KL.
+--mode serial (the default: the core's per-slot states, every window slot by slot through the old single-sequence path)
+or --mode stub (one state, host copies) a slot's tokens must equal the reference's exactly; with --mode core (batched
+windows) the rows differ only by the row-batched matmuls, so tokens are compared for agreement and logits by KL.
 
   check_batch_slots.py --bin build/ds41_generate --model M.gguf --engram A:B --tokenizer tokenizer.json \
       [--scenario all|order|cancel|...]
@@ -200,7 +200,10 @@ def main():
     ap.add_argument("--scenario", default="all")
     ap.add_argument("--threads", type=int, default=32)
     ap.add_argument("--out", default="/tmp/check_batch_slots")
-    ap.add_argument("--core", action="store_true", help="the dense half's per-slot core (no STRATA_BATCH_STUB)")
+    ap.add_argument("--mode", default="serial", choices=("serial", "stub", "core"),
+                    help="serial: the core's slots, windows slot by slot through the old path (STRATA_BATCH_SERIAL=1; "
+                         "tokens must equal the reference); stub: one state, host copies (STRATA_BATCH_STUB=1; equal too); "
+                         "core: batched windows (Ds41RowsStep; agreement and KL reported)")
     ap.add_argument("--extra", default="", help="extra engine args (both engines)")
     a = ap.parse_args()
     if not a.tokenizer:
@@ -211,9 +214,11 @@ def main():
               "--ctx", "4096", "--threads", str(a.threads), "--prompt-batch", "32", "--prefill-chunk", "16",
               "--stop", "1", "--no-enc-skip"] + (a.extra.split() if a.extra else [])
     env_b = {"STRATA_SERVE_PARK_MIN": "16", "STRATA_BATCH_TRACE": "1"}
-    if not a.core:
+    if a.mode == "stub":
         env_b["STRATA_BATCH_STUB"] = "1"
-    exact = not a.core
+    if a.mode == "serial":
+        env_b["STRATA_BATCH_SERIAL"] = "1"
+    exact = a.mode != "core"
     T = corpus(a.tokenizer)
     BOS = [0]
     A, B, C = BOS + T[0][:39], BOS + T[1][:47], BOS + T[2][:35]
