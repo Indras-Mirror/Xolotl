@@ -176,9 +176,15 @@ public:
         auto it = std::find_if(recs_.begin(), recs_.end(), [&](const Rec & r) { return r.id == rec; });
         if (it == recs_.end()) { err = "no such record"; return false; }
         (void) from;   // the host store copies whole regions (a region is one tensor's rows [0, n])
+        // batch slots: the record goes into the BOUND slot's tensors, whichever slot it was saved from (every slot
+        // has the same regions, in the same order, for the same n)
+        const auto regs = dense.state_regions((int64_t) it->tokens.size());
+        if (regs.size() != it->regions.size()) { err = "pool: the record's regions do not match the slot"; return false; }
+        for (size_t i = 0; i < regs.size(); ++i)
+            if (regs[i].bytes != it->regions[i].b.size() || regs[i].off != it->regions[i].off) { err = "pool: region size mismatch"; return false; }
         dense_sync(dense);
         out.live_clobbered = true;
-        for (const auto & g : it->regions) ggml_backend_tensor_set(g.t, g.b.data(), g.off, g.b.size());
+        for (size_t i = 0; i < regs.size(); ++i) ggml_backend_tensor_set(regs[i].t, it->regions[i].b.data(), regs[i].off, regs[i].bytes);
         dense_sync(dense);
         out.live_clobbered = false;
         out.pos = (int64_t) it->tokens.size();
