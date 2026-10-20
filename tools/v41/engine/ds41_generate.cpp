@@ -102,6 +102,7 @@ struct Args {
     std::vector<int> stop;
     bool ppl = false, serve = false, quiet = false, vram_lru = true, arena_adapt = false, chunk_mmq = true;
     bool act_quant = true, chunk_prefetch = true, kv_fp4 = false;
+    int  kv_type = -1;            // --kv-q8 / --kv-type N: the compressed KV + indexer keys' ggml type (-1 = BF16 with act_quant, else F32)
     int  enc_skip = -1;           // -1 = default (on for one-shot layer-major runs), 1 = --enc-skip, 0 = --no-enc-skip; only run the tokens before the replay window through layers 21-39
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
     float skip_miss = 0.0f, skip_file = 0.0f;
@@ -229,6 +230,12 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--ppl") a.ppl = true;
         else if (k == "--no-actquant") a.act_quant = false;
         else if (k == "--kv-fp4") a.kv_fp4 = true;
+        // 8-bit cache: the same compressed-KV / indexer-key tensors as Q8_0 instead of the default BF16 (act_quant).
+        // ggml's flash-attn takes Q8_0 K/V (its kv-type list), set_rows quantizes on the way in and the ring's
+        // ggml_cast dequantizes on the way out, so this halves the state's bytes at 8 bits a weight - the 4-bit
+        // grids (--kv-fp4) are the aggressive ones and need the packers of tools/v41/ggml/kv-fp4.patch.
+        else if (k == "--kv-q8") a.kv_type = (int) GGML_TYPE_Q8_0;
+        else if (k == "--kv-type") a.kv_type = std::atoi(next().c_str());
         else if (k == "--serve") a.serve = true;
         else if (k == "--prune") a.prune = next();
         else if (k == "--prune-penalty") a.prune_penalty = (float) std::atof(next().c_str());
@@ -419,6 +426,9 @@ int main(int argc, char ** argv) {
     // --kv-fp4 / STRATA_KV_FP4=1: the compressed KV + indexer keys packed to their exact FP4 grids (Ds41DenseConfig::kv_fp4)
     dc.kv_fp4 = a.kv_fp4 || (std::getenv("STRATA_KV_FP4") && std::getenv("STRATA_KV_FP4")[0] == '1');
     if (dc.kv_fp4) std::fprintf(stderr, "kv: compressed KV NVFP4 + indexer keys MXFP4 (--kv-fp4, exact)\n");
+    dc.kv_type = a.kv_type;
+    if (a.kv_type >= 0) std::fprintf(stderr, "kv: compressed KV + indexer keys as %s (--kv-q8/--kv-type)\n",
+                                     ggml_type_name((ggml_type) a.kv_type));
     // --batch-slots N | auto: decided before the dense half loads (its per-slot states are allocated with it).  Off,
     // with the reason in the log, when they cannot run: the server then says "N asked, the engine runs one at a time".
     int NS = 0;   // the batch slots the serve loop runs (0 = off: one request at a time, as before)
