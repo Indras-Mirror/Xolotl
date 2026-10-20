@@ -1232,7 +1232,9 @@ int main(int argc, char ** argv) {
         // STRATA_SERVE_PARK_MIN: only conversations of >= this many tokens (default 2048); STRATA_SERVE_PARK_MAX: the
         // most positions a side request may write (prompt + max tokens, default 65536 ~ 1 GB of host memory).
         const bool park_on = !(std::getenv("STRATA_SERVE_PARK") && std::getenv("STRATA_SERVE_PARK")[0] == '0');
-        const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN")) : 2048;
+        // (batch slots: 256 - a slot's conversation that another request takes over goes to the pool, and agents' turns
+        // under 2K tokens were simply lost then: 20.10 card, conversations of 1.5-1.9K read again after an eviction)
+        const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN")) : NS > 0 ? 256 : 2048;
         const int64_t park_max = std::getenv("STRATA_SERVE_PARK_MAX") ? std::atoll(std::getenv("STRATA_SERVE_PARK_MAX")) : 65536;
         std::vector<int> park_hist;       // the parked conversation's tokens (its snapshot length)
         std::vector<float> park_logits;

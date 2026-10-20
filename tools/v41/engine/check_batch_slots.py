@@ -97,7 +97,7 @@ class Engine:
         """Control lines up to (and including) the first starting with `until` (or ERR)."""
         out = {"resume": 0, "tokens": [], "lines": []}
         while True:
-            ln = self.ctl.get(timeout=3600)
+            ln = self.ctl.get(timeout=14400)   # (a card chain may freeze this test for hours)
             if ln is None:
                 raise RuntimeError(f"{self.name}: engine died; see {self.log_path}")
             out["lines"].append(ln)
@@ -144,7 +144,7 @@ class Engine:
             self._dumped(out)
         return out
 
-    def slot_run(self, slot, stop_after=0, timeout=3600):
+    def slot_run(self, slot, stop_after=0, timeout=14400):
         """A decoding slot's BT tokens up to its BDONE."""
         q, toks, end = self._q(slot), [], None
         while True:
