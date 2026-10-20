@@ -1965,6 +1965,39 @@ void Ds41Dense::drop_park() {
 
 bool Ds41Dense::parked() const { return p_->parked_pos >= 0; }
 
+void Ds41Dense::pool_regions(bool snap, std::vector<PoolRegion> & streams, std::vector<PoolRegion> & regions) const {
+    const Impl & im = *p_;
+    streams.clear();
+    regions.clear();
+    for (size_t l = 0; l < im.ly.size(); ++l) {
+        const auto & L = im.ly[l];
+        for (ggml_tensor * t : { L.comp, L.idxk }) {
+            if (!t) continue;
+            PoolRegion r;
+            r.name = std::string(t == L.comp ? "comp" : "idxk") + std::to_string(l);
+            r.data = t->data;
+            r.row_bytes = t->nb[1];
+            r.rows = t->ne[1] - 1;   // row cmax is the spare an open compressor group writes (a pass's scratch)
+            r.ratio = (int) L.ratio;
+            r.bytes = (size_t) r.rows * r.row_bytes;
+            streams.push_back(r);
+        }
+    }
+    for (size_t l = 0; l < im.ly.size(); ++l) {
+        const auto & L = im.ly[l];
+        ggml_tensor * ts[3] = { snap ? L.raw_snap : L.raw, snap ? L.st_kv_snap : L.st_kv, snap ? L.st_sc_snap : L.st_sc };
+        const char * nm[3] = { "raw", "st_kv", "st_sc" };
+        for (int i = 0; i < 3; ++i) {
+            if (!ts[i]) continue;
+            PoolRegion r;
+            r.name = std::string(nm[i]) + std::to_string(l);
+            r.data = ts[i]->data;
+            r.bytes = ggml_nbytes(ts[i]);
+            regions.push_back(r);
+        }
+    }
+}
+
 bool Ds41Dense::read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K) {
     Impl & im = *p_;
     const auto & L = im.ly[(size_t) il];
