@@ -333,10 +333,13 @@ def main():
             with open(E.log_path) as f:
                 f.seek(mark)
                 moved = f"slot {tgt} takes slot {solo_slot}'s conversation" in f.read()
+            again = E.gen(D, 2)                            # the same prompt again: the turn's snapshot is still at its end
             d = {"scenario": "promote", "solo_done": g["done"][5], "solo_slot": solo_slot, "slot": tgt, "moved": moved,
                  "resume": r["resume"], "expect_resume": len(D) + len(sofar) - 1,
-                 "tokens": same(sofar + r["tokens"] + toks, R["D"], "D solo then another slot"), "bdone": end}
-            d["ok"] = g["done"][5] == "cancel" and moved and r["resume"] == len(D) + len(sofar) - 1 and d["tokens"]["equal"]
+                 "tokens": same(sofar + r["tokens"] + toks, R["D"], "D solo then another slot"), "bdone": end,
+                 "again_resume": again["resume"], "again": same(again["tokens"], R["D"], "D again")}
+            d["ok"] = g["done"][5] == "cancel" and moved and r["resume"] == len(D) + len(sofar) - 1 and d["tokens"]["equal"] \
+                and again["resume"] == len(D) and d["again"]["equal"]
             report(d)
         if "yield" in want:
             r = E.bgen(1, Y, 4, then="BYIELD 1")

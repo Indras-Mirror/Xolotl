@@ -1835,6 +1835,12 @@ int main(int argc, char ** argv) {
             // last position writes what is there)
             const bool cont_last = NS > 0 && !hist.empty() && lcp == hist.size() && lcp == ids.size() && lcp >= 2 && !live_dirty &&
                                    (snap_len < 0 || (size_t) snap_len < ids.size());
+            // ... and such a request (the prompt is the slot's own history - its turn and what it generated - plus at most
+            // the last generated token) keeps the turn's snapshot at the prompt's end: a promotion is not a turn boundary,
+            // and the client's next turn (or the same prompt again) resumes at that end, not 2 tokens into the reply
+            // (20.10 card: snapshots taken at prompt + 2 left 5 of 8 conversations unreachable at N=8)
+            const bool keep_snap = NS > 0 && snap_len > 0 && !hist.empty() && lcp + 1 >= hist.size() &&
+                                   ids.size() <= hist.size() + 1 && (size_t) snap_len < ids.size();
             bool unparked = false;
             int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
             size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
@@ -2358,7 +2364,9 @@ int main(int argc, char ** argv) {
             live_id = rid;
             // the single park: no snapshot for an image prompt (a text request with the same ids would restore its
             // embeddings); the pool compares identities, so an image prompt is snapshotted like any other
-            if (total > reused && (!is_vision || pool_on) && dense.snapshot(total)) {
+            if (keep_snap && !unparked) {
+                if (btrace) std::fprintf(stderr, "strata batch: the turn's snapshot stays at %d (this request re-feeds its own output)\n", snap_len);
+            } else if (total > reused && (!is_vision || pool_on) && dense.snapshot(total)) {
                 snap_len = total;
                 snap_logits = last_logits;
                 snap_seed.swap(cur_seed);   // this prompt's DSpark tail rows (0 rows when DSpark is off / no tail ran)
