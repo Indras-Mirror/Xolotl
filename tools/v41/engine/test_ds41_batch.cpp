@@ -323,6 +323,24 @@ int main(int argc, char ** argv) {
         }
         std::fprintf(stderr, "pool: conversation 1 saved from slot %d, restored into slot %d (%s): %s\n", sa, sb, pool.kind(), a_pool.json().c_str());
     }
+    // ---- noise floor: the same decode positions of every conversation as ONE solo pass of `steps` rows (what a solo
+    // DSpark verify pass does) against the one-row steps - the batch-shape noise the solo path itself has
+    Agg a_noise;
+    {
+        const int s2 = 2 * K - 2;
+        for (int k = 0; k < K; ++k) {
+            const int L = (int) P[k].size();
+            if (!solo_prompt(s2, P[k], 0, L, nullptr)) { std::fprintf(stderr, "noise prompt: %s\n", err.c_str()); return 1; }
+            rs.set_reference(true);
+            const int m = std::min(steps, 16);
+            Ds41Dense::Row rows[16];
+            int want[16];
+            for (int i = 0; i < m; ++i) { rows[i] = Ds41Dense::Row { s2, L + i, ref_tok[k][(size_t) i] }; want[i] = i; }
+            if (!rs.run(rows, m, want, m, nullptr, lg, err)) { std::fprintf(stderr, "noise pass: %s\n", err.c_str()); return 1; }
+            for (int i = 0; i < m; ++i) a_noise.add(cmp(ref_dec[k][(size_t) i].data(), lg.data() + (size_t) i * nv, nv));
+        }
+        std::fprintf(stderr, "noise: the decode rows as one %d-row solo pass vs one-row steps: %s\n", std::min(steps, 16), a_noise.json().c_str());
+    }
     int free_top1 = 0, free_n = 0;
     for (int k = 0; k < K; ++k)
         for (int s = 0; s < steps; ++s) { ++free_n; free_top1 += g_bat[k][(size_t) s] == ref_tok[k][(size_t) s + 1]; }
@@ -331,7 +349,7 @@ int main(int argc, char ** argv) {
                      ", \"b_reference\": " + b_ref.json() + ", \"b_batched\": " + b_bat.json() +
                      ", \"b_greedy_same\": [" + std::to_string(free_top1) + ", " + std::to_string(free_n) + "]" +
                      ", \"c_others\": " + c_dec.json() + ", \"c_fed_last_row\": " + c_feed_last.json() +
-                     ", \"c_fed_decode\": " + c_feed_dec.json() + ", \"bind\": " + a_bind.json() + ", \"pool\": " + a_pool.json() + "}";
+                     ", \"c_fed_decode\": " + c_feed_dec.json() + ", \"bind\": " + a_bind.json() + ", \"pool\": " + a_pool.json() + ", \"noise\": " + a_noise.json() + "}";
     std::printf("RESULT %s\n", js.c_str());
     if (!json_out.empty()) { std::ofstream o(json_out); o << js << "\n"; }
     const bool ok = b_ref.exact == b_ref.n && a_bind.exact == a_bind.n && a_pool.exact == a_pool.n && b_bat.top1 == b_bat.n &&
