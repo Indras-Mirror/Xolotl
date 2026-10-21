@@ -60,8 +60,9 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
     num("ssm.inner_size", g.ssm_value_dim);
     num("full_attention_interval", g.qsa_interval);
     g.head_dim = key_length;
+    // both families: qwen35moe's MTP block, and a qwen4exp GGUF with llama.cpp's NextN block (the engine runs the trunk)
+    num("nextn_predict_layers", g.n_mtp_layers);
     if (family == strata::ModelFamily::Qwen35Moe) {
-        num("nextn_predict_layers", g.n_mtp_layers);
         g.hc = g.hc_lr = 0;                 // a plain pre-norm residual
         g.idx_q_heads = g.idx_key_dim = 0;  // dense attention, no sparse indexer
     } else {
@@ -124,7 +125,8 @@ inline std::string compiled_geometry_mismatch(const ModelGeometry& g) {
         {"hyper_connection.low_rank", g.hc_lr, c.hc_lr},
         {"expert_feed_forward_length", g.n_ff, c.n_ff},
         {"expert_shared_feed_forward_length", g.n_ff_shexp, c.n_ff_shexp},
-        {"the in-file MTP layers", g.n_mtp_layers, c.n_mtp_layers},
+        // not the in-file MTP layers: Flash-Next's engine runs the trunk and takes its draft head from --mtp, so a GGUF
+        // with llama.cpp's NextN block after the trunk (block_count 49, nextn_predict_layers 1) runs as the plain one
     };
     for (const F& f : fields)
         if (f.got != f.want) {
@@ -267,7 +269,10 @@ inline bool check_gguf_layout(const strata::GgufModel& m, const ModelGeometry& g
     };
     for (const TensorWant& w : global_tensors(g))
         if (!check(w.name, w.shape)) return false;
-    for (int64_t l = 0; l < g.n_layers + g.n_mtp_layers; ++l)
+    // qwen4exp: the table does not describe llama.cpp's NextN block (its norms are hyper-connection wide), which the
+    // engine never reads (--mtp is its draft head), so only the trunk is checked
+    const int64_t checked_layers = g.n_layers + (layout_table_complete(g) ? g.n_mtp_layers : 0);
+    for (int64_t l = 0; l < checked_layers; ++l)
         for (const TensorWant& w : layer_tensors(g, l))
             if (!check("blk." + std::to_string(l) + "." + w.name, w.shape)) return false;
     if (layout_table_complete(g)) {

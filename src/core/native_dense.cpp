@@ -150,6 +150,20 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
+// The first layer of an in-file MTP block (llama.cpp's NextN layout: block_count counts it, nextn_predict_layers says
+// how many) in the metadata shard `gguf`, or -1.  The engine runs the trunk and takes its draft head from --mtp, so the
+// block's projections are neither uploaded nor in the pack's table (tools/iq_pack.py leaves them out).
+int64_t mtp_first_layer(const strata::GgufFile& gguf) {
+    const auto* arch = gguf.get("general.architecture");
+    if (!arch) return -1;
+    const auto* blocks = gguf.get(arch->s + ".block_count");
+    const auto* nextn = gguf.get(arch->s + ".nextn_predict_layers");
+    if (!blocks || !nextn || !blocks->is_num() || !nextn->is_num() || nextn->u == 0 || nextn->u >= blocks->u) return -1;
+    return (int64_t) (blocks->u - nextn->u);
+}
+bool in_mtp_block(const std::string& name, int64_t first) {
+    return first >= 0 && name.rfind("blk.", 0) == 0 && std::strtol(name.c_str() + 4, nullptr, 10) >= first;
+}
 struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
@@ -164,11 +178,13 @@ struct Pending {
 bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
                                std::set<std::string>& out, std::string& err) {
     try {
+        int64_t mtp = -1;
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
+            if (gguf.get("general.architecture")) mtp = mtp_first_layer(gguf);   // shard 1 carries the metadata
             for (const auto& tensor : gguf.tensors())
-                if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
-                    tensor.shape.size() == 2)
+                if (eligible(tensor, include_ple_key) && !in_mtp_block(tensor.name, mtp) &&
+                    strata::kernels::native_mmvq_supported(tensor.type) && tensor.shape.size() == 2)
                     out.insert(tensor.name);
         }
         return true;
@@ -189,10 +205,12 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
     try {
         std::set<std::string> seen;
         uint64_t total = 0;
+        int64_t mtp = -1;
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
+            if (gguf.get("general.architecture")) mtp = mtp_first_layer(gguf);
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key)) continue;
+                if (!eligible(tensor, include_ple_key) || in_mtp_block(tensor.name, mtp)) continue;
                 if (tensor.name.rfind("blk.", 0) == 0) {
                     const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
                     if (l < lb || l >= le) continue;
@@ -265,6 +283,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
+        int64_t mtp = -1;                   // the in-file MTP block's first layer (mtp_first_layer)
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             const auto* count = gguf.get("split.count");
@@ -275,6 +294,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 err = strata::check_engine_architecture(gguf);
                 if (!err.empty()) return false;
                 have_architecture = true;
+                mtp = mtp_first_layer(gguf);
                 if (count && number && tensors && number->u == 0 && count->u > 1) {
                     split_count = count->u;
                     split_tensors = tensors->u;
@@ -323,12 +343,12 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     err = "native dense: overlapping payload " + tensor.name; return false;
                 }
                 // the uploads below read these: ask for them now so the reads overlap
-                if (eligible(tensor, include_ple_key) && !outside(tensor.name) &&
+                if (eligible(tensor, include_ple_key) && !outside(tensor.name) && !in_mtp_block(tensor.name, mtp) &&
                     strata::kernels::native_mmvq_supported(tensor.type))
                     strata::platform::advise_willneed(gguf.tensor_data(tensor), bytes);
             }
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
+                if (!eligible(tensor, include_ple_key) || outside(tensor.name) || in_mtp_block(tensor.name, mtp)) continue;
                 if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;

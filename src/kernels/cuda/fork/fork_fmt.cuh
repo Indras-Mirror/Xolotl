@@ -30,6 +30,9 @@ template<> struct Fmt<143> { static constexpr int qk = 128, ipb = 4, step = 1;
 // against the working tree: ~/AI/Strata-GLM/build-glm-gpu/glm_generate passes the same point and prints
 // "moe lora: routed-expert deltas on 26 layer(s) (n_embd 4096, n_ff 2048)".  Fmt<12>/Fmt<18>/Fmt<22> are all
 // defined in this build, so this is the whole fix (see HANDOFF.md §6).
-#define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(143)
+// MXFP4 (39) on gate/up too: Qwen3.8-Flash-Next-MXFP4 (all three projections MXFP4); Fmt<39> and the plain
+// per-column kernel were already there for the MiMo down outliers, only the gate/up list did not name it, so
+// native_expert_supported refused the file ("layer 0's experts are MXFP4/MXFP4 ..., no GPU kernels for")
+#define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(39) X(143)
 #define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(18) X(22) X(39) X(143)
 #define STRATA_MMVQ_FMTS_FORK(X) X(10) X(143)

@@ -548,5 +548,57 @@ class SplitArtifactTests(unittest.TestCase):
             self.assertEqual((pack / "experts.bin").read_bytes(), want)
 
 
+
+class InFileMtpTests(unittest.TestCase):
+    """llama.cpp's NextN layout (Qwen3.8-Flash-Next-MXFP4-ngramQ8-NextN.gguf): block_count counts the MTP block, which
+    sits after the trunk as blk.<trunk>.*.  The pack is the trunk's: the engine checks native_experts.txt against its
+    layer count, and the draft head comes from --mtp."""
+
+    def model(self, path, nextn):
+        writer = GGUFWriter(path, "qwen4exp")
+        writer.add_uint32("qwen4exp.block_count", 3)
+        if nextn is not None:
+            writer.add_uint32("qwen4exp.nextn_predict_layers", nextn)
+        for l in range(3):
+            writer.add_tensor(f"blk.{l}.ffn_gate_inp.weight", np.full((N_EXPERT, 32), 0.5, np.float32))
+            for i, r in enumerate(("gate", "up", "down")):
+                writer.add_tensor(f"blk.{l}.ffn_{r}_exps.weight", quants.quantize(expert(10 * l + i, (32, 32)), Q.Q8_0),
+                                  raw_dtype=Q.Q8_0)
+        for name in ("blk.2.nextn.enorm.weight", "blk.2.nextn.hnorm.weight"):
+            writer.add_tensor(name, np.ones(32, np.float32))
+        writer.add_tensor("blk.2.nextn.eh_proj.weight", quants.quantize(expert(99, (32,))[:2], Q.Q8_0),
+                          raw_dtype=Q.Q8_0)
+        writer.add_tensor("output_norm.weight", np.ones(32, np.float32))
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+    def test_the_mtp_block_is_left_out(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            self.model(root / "m.gguf", 1)
+            rc, log = run_pack(root / "m.gguf", root / "pack")
+            self.assertEqual(rc, 0, log)
+            self.assertIn("in-file MTP block (layer 2 on) is not packed", log)
+            lines = (root / "pack" / "native_experts.txt").read_text().splitlines()[1:]
+            self.assertEqual([int(x.split()[0]) for x in lines], [0, 1])     # the trunk's layers only
+            _, rows = iq_pack.read_index(root / "pack" / "index.txt")
+            self.assertEqual(sorted(n for n in rows if n.startswith("blk.2.")), [])
+            self.assertIn("blk.1.ffn_gate_inp.weight", rows)
+            self.assertIn("output_norm.weight", rows)
+
+    def test_without_the_key_every_layer_is_the_trunk(self):
+        for nextn in (None, 0):
+            with self.subTest(nextn=nextn), tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+                root = Path(tmp)
+                self.model(root / "m.gguf", nextn)
+                m = iq_pack.Model(root / "m.gguf")
+                self.assertIsNone(m.mtp_first)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _, text, _, _ = iq_pack.expert_layout(m, root / "m.gguf")
+                self.assertEqual(len(text.splitlines()), 4)                    # header + 3 layers, as before
+
+
 if __name__ == "__main__":
     unittest.main()

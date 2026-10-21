@@ -82,6 +82,7 @@ std::vector<Kv> metadata(const char* arch, const Dims& d, uint64_t vocab) {
         kv.push_back(fixture::u32(p + "hyper_connection.low_rank", d.hc_lr));
         kv.push_back(fixture::u32(p + "attention.indexer.head_count", d.idx_heads));
         kv.push_back(fixture::u32(p + "attention.indexer.key_length", d.idx_key));
+        if (d.nextn) kv.push_back(fixture::u32(p + "nextn_predict_layers", d.nextn));   // llama.cpp's NextN layout
     }
     std::vector<std::string> tokens;
     for (uint64_t i = 0; i < vocab; ++i) tokens.push_back("t" + std::to_string(i));
@@ -251,6 +252,15 @@ int main(int argc, char** argv) {
         fixture::write(cp, metadata("qwen4exp", coder, 8), {});
         check(geometry_of(cp, f, k, err) && f.n_expert == 256 && strata::core::compiled_geometry_mismatch(f).empty(),
               "the Coder's 256 experts are a run-time size, not a kernel mismatch");
+        Dims nextn = kFlashNext;
+        nextn.block_count = 49;
+        nextn.nextn = 1;
+        const fs::path np = d.path / "nextn.gguf";
+        fixture::write(np, metadata("qwen4exp", nextn, 8), {});
+        check(geometry_of(np, f, k, err) && f.n_layers == 48 && f.n_mtp_layers == 1 &&
+                  strata::core::compiled_geometry_mismatch(f).empty() &&
+                  strata::check_engine_architecture(strata::GgufFile(np.string())).empty(),
+              "a Flash-Next GGUF with its NextN block (block_count 49): the 48-layer trunk runs");
         Dims wrong = kQwen36;
         wrong.inner = 4000;
         const fs::path wp = d.path / "wrong.gguf";

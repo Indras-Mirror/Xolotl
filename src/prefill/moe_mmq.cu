@@ -201,6 +201,8 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
 // mmq_nvfp4_w4a8.cu: mmq.cuh's int8 NVFP4 path, compiled for this GPU with Blackwell's FP4 MMA hidden
 void run_nvfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
+// the same unit's MXFP4: Q8_1 activations on every card (its FP4 x FP4 instance wants FP4 rows, see there)
+void run_mxfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
 // mmq_nvfp4_w4a4.cu (the one unit built for 12xa): FP4 x FP4 and its activation quantizer, if this card runs it
 bool w4a4_available();
 void run_nvfp4_w4a4(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
@@ -246,6 +248,8 @@ bool supported(int t) {
 #if !defined(GGML_USE_HIP)
         case GGML_TYPE_NVFP4:
             return nvfp4_mode() != Nvfp4Mode::FP16;
+        case GGML_TYPE_MXFP4:   // mmq_nvfp4_w4a8.cu, not the generated list
+            return true;
 #endif
         default:
             return false;
@@ -401,6 +405,9 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_NVFP4:
             if (fp4_activations(t)) run_nvfp4_w4a4(ctx, a, s);
             else run_nvfp4_w4a8(ctx, a, s);
+            break;
+        case GGML_TYPE_MXFP4:
+            run_mxfp4_w4a8(ctx, a, s);
             break;
 #endif
         default:
