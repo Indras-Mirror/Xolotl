@@ -14,19 +14,26 @@ tokenizer.json, or DS41_TOKENIZER_JSON).
 
 Scenarios: park_partial (the STRATA_SERVE_PARK_PARTIAL resume 20 positions back, then 8 back), park16 (a partial
 resume 8 back, within the window ring, then 21 back), engram_hist (a side request longer than the parked
-conversation's end overwrites the Engram history), single (one growing text dialogue, a regenerate and a re-render).
+conversation's end overwrites the Engram history), single (one growing text dialogue, a regenerate and a re-render),
+abc (three conversations interleaved, two sharing a system prompt: the conversation pool), image (a dialogue with
+synthetic SVE1 image rows and img_keys, a text side request, and the same tokens with another picture).
 """
 import argparse
 import json
 import math
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 
 import numpy as np
+
+IMAGE_TOKEN = 129264
+N_EMBD = 5120
+
 
 class Engine:
     def __init__(self, binary, args, env, workdir, name, cpu=True, serve_flag=True):
@@ -123,6 +130,14 @@ def corpus(seed_files, tokenizer_json):
     return out
 
 
+def write_sve1(path, images):
+    """images: list of (nx, ny, rows[n, N_EMBD] float32)."""
+    with open(path, "wb") as f:
+        for nx, ny, rows in images:
+            f.write(struct.pack("<5i", 0x31455653, nx * ny, nx, ny, rows.shape[1]))
+            f.write(rows.astype(np.float32).tobytes())
+
+
 def build_steps(sc, out, tokenizer_json):
     """The scenario's requests: (label, ids, max_new, keys, embeddings file)."""
     out = Path(out)
@@ -165,6 +180,33 @@ def build_steps(sc, out, tokenizer_json):
             h = h + B[i * 30 + 20:(i + 1) * 30]   # the "assistant reply" as the client re-renders it
         steps.append(("regen", list(steps[-1][1]), 3, "", None))
         steps.append(("re-render 12 back", steps[-1][1][:-12] + C[:16], 3, "", None))
+    elif sc == "abc":
+        sys_p = BOS + A[:119]
+        convs = {"A": sys_p + B[:60], "B": sys_p + C[:60], "C": BOS + C[300:420]}
+        src = {"A": B[60:], "B": C[60:], "C": C[420:]}
+        k = {"A": 0, "B": 0, "C": 0}
+        for c in ["A", "B", "C", "A", "B", "C", "A"]:
+            convs[c] = convs[c] + src[c][k[c]:k[c] + 16]
+            k[c] += 16
+            steps.append((f"{c}{k[c] // 16}", list(convs[c]), 2, "", None))
+    elif sc == "image":
+        rng = np.random.default_rng(7)
+        img1 = rng.standard_normal((8 * 8, N_EMBD)).astype(np.float32) * 0.02
+        img2 = rng.standard_normal((6 * 6, N_EMBD)).astype(np.float32) * 0.02
+        e1 = out / "img1.sve"; write_sve1(e1, [(8, 8, img1)])
+        e12 = out / "img12.sve"; write_sve1(e12, [(8, 8, img1), (6, 6, img2)])
+        e2 = out / "img2.sve"; write_sve1(e2, [(8, 8, img2[:36].repeat(2, axis=0)[:64])])
+        k1, k2, k3 = "0123456789abcdef", "fedcba9876543210", "00000000deadbeef"
+        p0 = BOS + A[:99] + [IMAGE_TOKEN] * 64 + A[100:120]
+        p1 = p0 + A[120:136]
+        p2 = p1 + A[136:150] + [IMAGE_TOKEN] * 36 + A[150:166]
+        q0 = BOS + A[:99] + [IMAGE_TOKEN] * 64 + A[100:120] + A[120:136]   # the same tokens as p1, another picture
+        steps = [("img turn 0", p0, 2, f"img_keys={k1}", str(e1)),
+                 ("img turn 1 (+16)", p1, 2, f"img_keys={k1}", str(e1)),
+                 ("text side", BOS + C[:99], 2, "", None),
+                 ("img turn 2 (+2nd pic)", p2, 2, f"img_keys={k1},{k2}", str(e12)),
+                 ("same tokens as turn 1, other pic", q0, 2, f"img_keys={k3}", str(e2)),
+                 ("img turn 3 (+16)", p2 + A[166:182], 2, f"img_keys={k1},{k2}", str(e12))]
     else:
         raise SystemExit("unknown scenario " + sc)
     return steps

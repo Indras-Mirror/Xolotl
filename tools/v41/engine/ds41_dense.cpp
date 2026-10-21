@@ -1923,6 +1923,8 @@ std::vector<Ds41Dense::StateRegion> Ds41Dense::state_regions(int64_t positions) 
     return out;
 }
 
+void Ds41Dense::rearm(int pos) { p_->snap_pos = pos; }
+
 void Ds41Dense::set_engram_history(int64_t pos0, int n, const int * tids, const uint8_t * dead) {
     Impl & im = *p_;
     if (!im.engram.enabled()) return;
