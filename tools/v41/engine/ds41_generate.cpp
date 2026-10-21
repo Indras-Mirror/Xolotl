@@ -2629,14 +2629,17 @@ int main(int argc, char ** argv) {
             int sp_ids[5] = {0}, sp_tmp[5];
             float sp_conf[5];
 #if defined(DS41_HAVE_DSPARK)
-            if (ok && dsp && sp_tail > 0) {   // the tail through pass_v (chunks of <= 16), the cache open; routing as the passes
+            // the cache opens before dsp is tested: open_cache() re-creates DSpark when STRATA_SERVE_DSPARK_EVICT freed it
+            // for this prompt's batch (otherwise the tail is skipped and the turn decodes without drafts)
+            if (ok && sp_tail > 0 && defer_vram && !cache_open) {
                 const double to0 = now_ms();
-                if (defer_vram && !cache_open) {
-                    if (!open_cache()) { ferr = "VRAM seed failed: " + err; ok = false; }
-                    else cache_open = true;
-                }
+                if (!open_cache()) { ferr = "VRAM seed failed: " + err; ok = false; }
+                else cache_open = true;
                 ph_open = now_ms() - to0;
-                if (ok) { bias_now = pass_bias; apply_bias(); }
+            }
+            if (ok && dsp && sp_tail > 0) {   // the tail through pass_v (chunks of <= 16); routing as the passes
+                bias_now = pass_bias;
+                apply_bias();
                 const double tt0 = now_ms();
                 std::vector<int> spos;
                 if (bcap > 0) {   // the seed rows came off the batch (bcap_vh, its last bcap_got tokens): DSpark steps only
