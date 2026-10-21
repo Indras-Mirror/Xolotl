@@ -1,6 +1,7 @@
 // tools/v41/engine/ds41_conv_pool.cpp - see ds41_conv_pool.hpp.  Built with DS41_POOL_CUDA for the engine and the card
 // bench; without it (test_ds41_conv_pool) it is plain host code and makes no CUDA call at all.
 #include "ds41_conv_pool.hpp"
+#include "ds41_sys.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -158,7 +159,7 @@ struct Ds41ConvPool::Impl {
         } else
 #endif
         {
-            p = (uint8_t *) std::aligned_alloc(4096, ns * cfg.slab_bytes);
+            p = (uint8_t *) ds41_sys::aligned_alloc(4096, ns * cfg.slab_bytes);   // MSVC has no std::aligned_alloc
             if (!p) { err = "pool: out of host memory"; return false; }
         }
         extents.push_back(p);
@@ -414,7 +415,7 @@ Ds41ConvPool::~Ds41ConvPool() {
         return;
     }
 #endif
-    for (uint8_t * e : im.extents) std::free(e);
+    for (uint8_t * e : im.extents) ds41_sys::aligned_free(e);   // _aligned_free on Windows, free elsewhere
 }
 
 bool Ds41ConvPool::init(const Ds41PoolLayout & layout, const Ds41PoolConfig & cfg, std::string & err) {
