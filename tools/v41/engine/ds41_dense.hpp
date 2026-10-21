@@ -180,6 +180,31 @@ public:
     bool unpark();
     void drop_park();
     bool parked() const;
+    /// A conversation's reusable device state at its snapshot, as regions of the device tensors: the snapshot rings
+    /// (window K/V, ratio-2 compressor state) + rows [0, positions] of every compressed-KV / indexer-key cache and their
+    /// spare rows - exactly what park() copies.  A conversation pool saves them right after snapshot(); writing them
+    /// back and rearm(pos) + restore() resumes that conversation at pos.
+    struct StateRegion { ggml_tensor * t; size_t off, bytes; };
+    std::vector<StateRegion> state_regions(int64_t positions) const;
+    /// The snapshot tensors now hold position `pos`'s state (a pool wrote them): restore() resumes there.
+    void rearm(int pos);
+    /// Engram history: the n-gram hash of a pass's first positions reads the tokens before it from the history, which
+    /// is kept BY POSITION - another request that wrote those positions since leaves its own tokens there.  Rewrite
+    /// [pos0, pos0 + n) with tids (DEAD where dead[i] != 0: an image position).  A no-op without Engram.
+    void set_engram_history(int64_t pos0, int n, const int * tids, const uint8_t * dead);
+    /// Conversation pool (ds41_conv_pool, ds41_conv_pool_dense.hpp): where a conversation's device state at a turn
+    /// boundary lives.  `streams`: the position-indexed caches (compressed KV + indexer keys of every kv source layer;
+    /// row r holds positions [r * ratio, (r + 1) * ratio), `rows` = cmax, the spare row excluded).  `regions`: the window
+    /// rings and the ratio-2 compressor states - the *_snap copies (snap = true: what snapshot() / park() keep) or the
+    /// live ones.  Pointers into the state buffer (device memory on CUDA); the sizes never change after init.
+    struct PoolRegion {
+        std::string name;
+        void * data = nullptr;
+        size_t row_bytes = 0, bytes = 0;
+        int64_t rows = 0;
+        int ratio = 0;
+    };
+    void pool_regions(bool snap, std::vector<PoolRegion> & streams, std::vector<PoolRegion> & regions) const;
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns

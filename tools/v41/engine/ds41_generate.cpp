@@ -25,6 +25,7 @@
 // Load the real model only through tools/ds4/memguard.sh (RAM cap + the shared GPU lock).
 #include "ds41_dense.hpp"
 #include "ds41_moe.hpp"
+#include "ds41_conv_reuse.hpp"
 #if defined(DS41_HAVE_DSPARK)
 #include "ds41_dspark.hpp"
 #endif
@@ -90,6 +91,9 @@ struct Args {
     double chunk_prefetch_gib = 0.0;
     int image_token = 129264;     // --image-token N: the model's <|image|> id (each image is one run of it in the prompt)
     bool vision = false;
+    // --serve's conversation pool: --conversation-cache-mib N (default 8192; 0 = the single park of STRATA_SERVE_PARK)
+    // of host memory for conversations saved at their turn boundary, at most --conversation-cache-slots of them
+    int conv_mib = 8192, conv_slots = 64;
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -218,6 +222,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--enc-replay") a.enc_replay = std::atoi(next().c_str());
         else if (k == "--image-token") a.image_token = std::atoi(next().c_str());
         else if (k == "--vision") a.vision = true;
+        else if (k == "--conversation-cache-mib") a.conv_mib = std::max(0, std::atoi(next().c_str()));
+        else if (k == "--conversation-cache-slots") a.conv_slots = std::max(1, std::atoi(next().c_str()));
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty());
@@ -1149,6 +1155,42 @@ int main(int argc, char ** argv) {
         std::vector<float> park_logits;
         int64_t park_rows = 0;            // positions saved: a request writing past this invalidates the park
         bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
+        // STRATA_SERVE_DSPARK leaves the live state DIRTY when its last verify pass rejected drafts: the ratio-2
+        // compressor state ring then holds the rejected positions' states, so a request that continues the live
+        // history at an odd position (its group's first half is the last accepted token) must re-feed that token -
+        // the same rule as the in-request refeed (`dirty && (P + 1) & 1`).
+        bool live_dirty = false;
+        // ---- the conversation pool (--conversation-cache-mib, default 8192 MiB; 0 = the single park above): N agents
+        // that take turns on one engine (each conversation differs only by its tokens - there is no session id)
+        // re-read their whole prompt at every switch with one park, and a park needed the NEXT request's prompt +
+        // max tokens to fit STRATA_SERVE_PARK_MAX (an agent's max_tokens 32K kept it from parking at all).  Now the
+        // live conversation goes to the pool whenever a request does not continue it (at its turn boundary: the
+        // snapshot at its prompt's end, every position-indexed row before it), and a request resumes from whichever
+        // holds the longest prefix of it - the live state or a pool record (ties: the live one, no copy).  A position
+        // matches when its token AND its identity do (conv_img_ident: which picture row; 0 = text), so image prompts
+        // reuse like text.  STRATA_SERVE_PARK_MIN is the smallest conversation worth a record.  KV with --kv-fp4 is
+        // ~890 bytes a position (+ ~6 MB of rings a record): 8 GiB holds ~9M positions, i.e. ~150 agents at 60K.
+        const bool pool_on = park_on && a.conv_mib > 0;
+        Ds41ConvStore pool;
+        if (pool_on) {
+            std::string perr;
+            if (!pool.init(dense, ctx, (size_t) a.conv_mib << 20, (size_t) a.conv_slots, !ggml_backend_is_cpu(be), perr)) {
+                std::fprintf(stderr, "ds41_generate: conversation pool: %s\n", perr.c_str());
+                return 1;
+            }
+        }
+        std::vector<uint64_t> live_id;   // hist's position identities (its prompt part; past it: text = 0)
+        // the live conversation's turn boundary into the pool (logged as serve/server.py ConvCacheLog reads it)
+        auto save_live = [&](const char * why) {
+            if (!pool_on || snap_len < std::max(1, park_min) || hist.size() < (size_t) snap_len) return;
+            const double t0 = now_ms();
+            std::string perr;
+            const int64_t id = pool.save(dense, hist.data(), live_id.data(), live_id.size(), snap_len,
+                                         snap_logits.empty() ? nullptr : snap_logits.data(), snap_logits.size(), perr);
+            std::fprintf(stderr, "strata serve: conversation cache: %s %d tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu (%s%s%s)\n",
+                         id ? "parked" : "skipped", snap_len, now_ms() - t0, pool.size(), pool.bytes(), pool.evictions(), why,
+                         id ? "" : ": ", id ? "" : perr.c_str());
+        };
 #if defined(DS41_HAVE_DSPARK)
         // STRATA_SERVE_DSPARK: DSpark's window (main_hidden of the last <= 128 positions) is seeded by running a
         // request's last min(128, new) prompt tokens through pass_v instead of the passes / batch (no extra work), and
@@ -1165,8 +1207,13 @@ int main(int argc, char ** argv) {
         const int step_max = std::getenv("STRATA_SERVE_STEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_STEP_MAX")) : 768;
         // STRATA_SERVE_PASS_BIAS=0: those passes route exactly (the decode biases only while decoding)
         const bool pass_bias = !(std::getenv("STRATA_SERVE_PASS_BIAS") && std::getenv("STRATA_SERVE_PASS_BIAS")[0] == '0');
-        std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) tier.resident(),
+        std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld", ctxv, (long long) tier.resident(),
                     (long long) tier.arena_experts());
+        if (pool_on) std::printf(" conversation_cache_mib=%d conversation_cache_slots=%d", a.conv_mib, a.conv_slots);
+        std::printf("\n");
+        if (pool_on) std::fprintf(stderr, "serve: conversation pool %d MiB, %d slots, records >= %d tokens\n", a.conv_mib,
+                                  a.conv_slots, std::max(1, park_min));
+        if (pool_on) std::fprintf(stderr, "serve: conversation pool store: %s\n", pool.kind());
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
@@ -1186,8 +1233,9 @@ int main(int argc, char ** argv) {
             if (line == "QUIT") break;
             if (line == "STOP" || line.empty()) continue;
             dense.clear_vision();
-            if (previous_vision) {
+            if (previous_vision && !pool_on) {   // the single park: token-only reuse, an image prompt is never continued
                 hist.clear();
+                live_id.clear();
                 snap_len = -1;
                 previous_vision = false;
             }
@@ -1201,6 +1249,7 @@ int main(int argc, char ** argv) {
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
             float req_rb = cfg_route_bias, req_rbf = cfg_route_bias_file;
             int req_rprot = cfg_rprot, req_rpool = cfg_rpool;
+            std::vector<uint64_t> req_img_keys;   // img_keys=<hex>,<hex>.. (GENI): the server's key per picture, in prompt order
             ss >> w >> max_new;
             while (ss >> w) {
                 const size_t eq = w.find('=');
@@ -1218,6 +1267,16 @@ int main(int argc, char ** argv) {
                 else if (k == "route_bias_file") req_rbf = std::max(0.0f, (float) std::atof(v.c_str()));
                 else if (k == "route_protect") req_rprot = std::max(0, std::atoi(v.c_str()));
                 else if (k == "route_pool") req_rpool = std::max(0, std::atoi(v.c_str()));
+                else if (k == "img_keys") {
+                    std::stringstream ks(v);
+                    std::string h;
+                    while (std::getline(ks, h, ',')) {
+                        char * e = nullptr;
+                        const unsigned long long x = std::strtoull(h.c_str(), &e, 16);
+                        if (h.empty() || !e || *e != '\0') { req_img_keys.clear(); break; }
+                        req_img_keys.push_back((uint64_t) x);
+                    }
+                }
             }
             // a changed bias is applied again just before the decode: a repeated prompt (regenerate) runs no prompt pass,
             // and the passes are what turn the decode bias on - without this it decoded with the previous request's
@@ -1245,6 +1304,7 @@ int main(int argc, char ** argv) {
             // vision: resolve this request's image rows onto its image_token runs and hand them to the dense layers
             std::vector<float> vis_rows;
             std::vector<int64_t> vis_pos;
+            std::vector<uint64_t> rid;   // this prompt's position identities (empty: all text)
             const bool is_vision = geni;
             if (is_vision) {
                 if (!dense.vision()) { std::printf("ERR image input requires --vision\n"); std::fflush(stdout); continue; }
@@ -1257,23 +1317,85 @@ int main(int argc, char ** argv) {
                     std::printf("ERR %s\n", verr.c_str()); std::fflush(stdout); continue;
                 }
                 if (vis_rows.empty()) { std::printf("ERR GENI prompt has no image tokens\n"); std::fflush(stdout); continue; }
-                // an image prompt prefills fresh: every image span is the same run of image_token, so a token-only reuse
-                // test would "continue" a different image (same ids, different embeddings).  Empty hist / no snapshot / no park.
-                dense.drop_park();
-                park_hist.clear();
-                hist.clear();
-                snap_len = -1;
+                if (pool_on) {
+                    // every image span is the same run of image_token: the positions' identities tell the pictures
+                    // apart - the server's key for picture k (img_keys=, its normalized bytes' hash) or, without
+                    // keys, a hash of its rows - so reuse compares (token, identity) and an image prompt reuses too
+                    rid.assign(ids.size(), 0);
+                    const bool keyed = req_img_keys.size() == recs.size();
+                    size_t r = 0;
+                    for (size_t k = 0; k < recs.size(); ++k) {
+                        uint64_t key = 0;
+                        if (keyed) key = conv_mix64(req_img_keys[k]);
+                        else {
+                            key = conv_fnv1a(&counts[k], sizeof(counts[k]));
+                            key = conv_fnv1a(recs[k].data(), recs[k].size() * sizeof(float), key);
+                        }
+                        for (int64_t j = 0; j < counts[k] && r < vis_pos.size(); ++j, ++r)
+                            rid[(size_t) vis_pos[r]] = conv_img_ident(key, j);
+                    }
+                } else {
+                    // the single park: an image prompt prefills fresh (a token-only reuse test would "continue" a
+                    // different image: same ids, different embeddings).  Empty hist / no snapshot / no park.
+                    dense.drop_park();
+                    park_hist.clear();
+                    hist.clear();
+                    live_id.clear();
+                    snap_len = -1;
+                }
                 dense.set_vision(vis_rows.data(), vis_pos.data(), (int) vis_pos.size());
                 previous_vision = true;
             } else {
                 dense.clear_vision();
             }
-            size_t lcp = 0;
-            while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
+            size_t lcp = conv_common_prefix(hist.data(), live_id.data(), live_id.size(), hist.size(), ids.data(), rid.data(),
+                                            rid.size(), ids.size());
             bool unparked = false;
             int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
             size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
-            if (dense.parked()) {   // does this request continue the parked conversation (better than the live one)?
+            bool pool_regen = false;   // a pool record's boundary IS this prompt: sample from its saved logits
+            if (pool_on) {
+                // what the live state offers (the rules below): its history continued, or its snapshot restored
+                int live = 0;
+                if (!hist.empty() && lcp == hist.size() && lcp < ids.size()) live = (int) lcp;
+                else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len <= ids.size()) live = snap_len;
+                const ConvMatch m = pool.best_prefix(ids.data(), rid.data(), rid.size(), (int64_t) ids.size());
+                int64_t pr = m.resume();
+                const bool exact = m.pos > 0 && m.pos == (int64_t) ids.size();
+                if (exact && !m.has_logits) pr = 0;                      // nothing to sample the first token from
+                if (!exact && pr >= (int64_t) ids.size()) pr = 0;        // a partial resume must feed something
+                lp_show = (size_t) m.lcp;
+                if (pr > live) {
+                    save_live("switch");
+                    ConvRestore rs;
+                    std::string perr;
+                    const double t0 = now_ms();
+                    if (pool.restore(dense, m, (int64_t) std::min<size_t>(lcp, (size_t) pr), rs, perr)) {
+                        dense.rearm((int) rs.pos);
+                        dense.restore();
+                        // positions [0, pr) are this prompt's own (the match is strict on token + identity)
+                        hist.assign(ids.begin(), ids.begin() + pr);
+                        live_id.assign(rid.begin(), rid.begin() + std::min<size_t>(rid.size(), (size_t) pr));
+                        if (pr == rs.pos) { snap_len = (int) rs.pos; snap_logits = rs.logits; }
+                        else snap_len = -1;
+                        snap_seed_n = 0;   // no DSpark seed rows in a record: a repeat decodes its first tokens draftless
+                        live_dirty = false;
+                        reuse_override = (int) pr;
+                        pool_regen = exact;
+                        if (exact) last_logits = rs.logits;
+                        lcp = (size_t) pr;
+                        unparked = true;
+#if defined(DS41_HAVE_DSPARK)
+                        dsp_next = -1;
+#endif
+                        std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
+                                     (long long) pr, pr == rs.pos ? "pool" : "pool, partial", now_ms() - t0, pool.size(), pool.bytes());
+                    } else {
+                        std::fprintf(stderr, "strata serve: conversation cache: restore failed (%s)\n", perr.c_str());
+                        if (rs.live_clobbered) { hist.clear(); live_id.clear(); snap_len = -1; lcp = 0; }
+                    }
+                }
+            } else if (dense.parked()) {   // does this request continue the parked conversation (better than the live one)?
                 size_t lp = 0;
                 while (lp < park_hist.size() && lp < ids.size() && park_hist[lp] == ids[lp]) ++lp;
                 lp_show = lp;
@@ -1287,13 +1409,21 @@ int main(int argc, char ** argv) {
                 // at the longest common prefix even when it is below the snapshot").
                 static const bool park_partial = !(std::getenv("STRATA_SERVE_PARK_PARTIAL") && std::getenv("STRATA_SERVE_PARK_PARTIAL")[0] == '0');
                 const size_t lp_min = (size_t) std::max<int64_t>(park_min, (int64_t) park_hist.size() * 3 / 4);
-                if (park_partial && lp < park_hist.size() && lp >= lp_min && lp > lcp && dense.unpark()) {
-                    std::fprintf(stderr, "serve: unparked the %zu-token conversation at lcp %zu (partial: re-feeds from there)\n",
-                                 park_hist.size(), lp);
+                // ...but NOT every cache is positional: the window ring at the park's end P holds positions [P - RAW, P)
+                // (RAW = SWA + 16) and the ratio-2 compressor state P - 2, P - 1.  A resume at s < P reads the window
+                // [s - SWA + 1, s) from the ring and, at an odd s, the state of s - 1: exact only for an even s with
+                // P - s <= RAW - SWA = 16 - and only after restore() (the live rings are the side request's).  The
+                // old path resumed at any lp with the side request's rings (tools/v41/engine/check_conv_reuse.py
+                // park_partial, CPU: 20 back -> KL 2.1 against a fresh prefill, top-1 wrong).
+                const size_t ps = lp & ~(size_t) 1;
+                if (park_partial && lp < park_hist.size() && lp >= lp_min && ps > lcp && park_hist.size() - ps <= 16
+                    && dense.unpark() && dense.restore()) {
+                    std::fprintf(stderr, "serve: unparked the %zu-token conversation at %zu (lcp %zu; partial: re-feeds from there)\n",
+                                 park_hist.size(), ps, lp);
                     hist = park_hist;
                     snap_len = -1;        // the tail under the park's end is re-fed, so no snapshot survives this
-                    reuse_override = (int) lp;
-                    lcp = lp;
+                    reuse_override = (int) ps;
+                    lcp = ps;
                     unparked = true;
 #if defined(DS41_HAVE_DSPARK)
                     dsp_next = -1;        // DSpark's window holds the side request's states
@@ -1316,8 +1446,15 @@ int main(int argc, char ** argv) {
             }
             int reused = 0;
             bool regen = false;   // the snapshot's own prompt again: nothing new to feed
-            if (reuse_override >= 0) reused = reuse_override;   // a partial unpark: positions [0, lp) are the parked one's
-            else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
+            if (reuse_override >= 0) { reused = reuse_override; regen = pool_regen; }   // a partial unpark / a pool record
+            else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) {
+                reused = (int) lcp;
+                if (live_dirty && (reused & 1)) {   // re-feed the last accepted token (its group's ratio-2 state)
+                    --reused;
+                    hist.resize((size_t) reused);
+                    std::fprintf(stderr, "serve: the live state is dirty (DSpark) at an odd position: resuming at %d\n", reused);
+                }
+            }
             else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);   // the same prompt again (regenerate): its end state + saved logits
                 reused = snap_len;
@@ -1326,6 +1463,12 @@ int main(int argc, char ** argv) {
             } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
+            } else if (pool_on) {
+                // an unrelated request: the conversation it overwrites goes to the pool
+                save_live("unrelated");
+                hist.clear();
+                live_id.clear();
+                snap_len = -1;
             } else {
                 // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK)
                 const int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
@@ -1337,11 +1480,30 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "serve: parked the %d-token conversation (%lld positions saved)\n", snap_len, (long long) rows);
                 }
                 hist.clear();
+                live_id.clear();
                 snap_len = -1;
             }
+            live_dirty = false;
+            if (pool_on) {   // a save queued above reads positions this request is about to overwrite
+                std::string ferr2;
+                if (!pool.fence(&ferr2)) std::fprintf(stderr, "strata serve: conversation cache: fence: %s\n", ferr2.c_str());
+            }
+            if (pool_on) std::fprintf(stderr, "serve: reuse lcp=%zu pool=%zu lp=%zu hist=%zu snap=%d prompt=%zu images=%zu -> reused=%d\n",
+                                      lcp, pool.size(), lp_show, hist.size(), snap_len, ids.size(), vis_pos.size(), reused);
+            else
             std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
                          park_hist.size(), lp_show, hist.size(), snap_len, ids.size(), reused);
-            if (reused > 0) { std::printf("RESUME %d\n", reused); std::fflush(stdout); }
+            if (reused > 0) {
+                // the Engram hashes of the first new positions read the 3 tokens before `reused` from the history, which
+                // is kept by position: an unrelated request since (a parked conversation's side request) wrote its own
+                // tokens there.  The reused prefix is this prompt's own, so write it back (a no-op when unchanged).
+                const int h0 = std::max(0, reused - 3);
+                uint8_t dead[3] = { 0, 0, 0 };
+                for (int p = h0; p < reused; ++p) dead[p - h0] = (size_t) p < rid.size() && rid[(size_t) p] != 0;
+                dense.set_engram_history(h0, reused - h0, ids.data() + h0, dead);
+                std::printf("RESUME %d\n", reused);
+                std::fflush(stdout);
+            }
             const int total = (int) ids.size();
             // a long prompt runs layer-major without the VRAM cache (its pass / chunk buffers need that VRAM) and with
             // the prompt's routing (no decode bias).  A short one (<= step_max new tokens: a chat / agent turn's tool
@@ -1604,12 +1766,15 @@ int main(int argc, char ** argv) {
                 std::printf("ERR prefill failed: %s\n", ferr.c_str());
                 std::fflush(stdout);
                 hist.clear();
+                live_id.clear();
                 snap_len = -1;
                 continue;
             }
             hist = ids;
-            // no snapshot for an image prompt: a text request with the same ids (all image_token) would restore its embeddings
-            if (total > reused && !is_vision && dense.snapshot(total)) {
+            live_id = rid;
+            // the single park: no snapshot for an image prompt (a text request with the same ids would restore its
+            // embeddings); the pool compares identities, so an image prompt is snapshotted like any other
+            if (total > reused && (!is_vision || pool_on) && dense.snapshot(total)) {
                 snap_len = total;
                 snap_logits = last_logits;
                 snap_seed.swap(cur_seed);   // this prompt's DSpark tail rows (0 rows when DSpark is off / no tail ran)
@@ -1771,6 +1936,7 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "serve: lookup %ld/%ld drafts accepted in %ld passes\n", lk_acc, lk_dr, lk_pass);
                 dsp_next = P + 1;   // the ring holds every position <= P (the last emitted token is not fed)
                 if (std::strcmp(finish, "error") == 0) dsp_next = -1;
+                live_dirty = dirty;   // the last pass rejected drafts: the ratio-2 state ring holds rejected positions
                 sv_pass += rq_pass; sv_acc += rq_acc;
             }
 #endif
@@ -1792,6 +1958,7 @@ int main(int argc, char ** argv) {
             if (std::strcmp(finish, "error") == 0) {
                 std::fprintf(stderr, "serve: decode failed: %s\n", ferr.c_str());
                 hist.clear();
+                live_id.clear();
                 snap_len = -1;
                 finish = "length";
             }
