@@ -1839,13 +1839,6 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
                 im.slots[(size_t) sl].ly[(size_t) l] = X;
             }
         }
-        if (smart_router()) im.rknob = T(GGML_TYPE_F32, { kRK + 1, 2 });
-        im.sbuf = ggml_backend_alloc_ctx_tensors(im.sctx, im.backend);
-        if (!im.sbuf) { err = "cannot allocate the decode state"; return false; }
-        ggml_backend_buffer_clear(im.sbuf, 0);
-        for (auto & L : im.ly)
-            if (L.st_sc) { std::vector<float> v((size_t) (im.DH * 2), -1.0e30f); ggml_backend_tensor_set(L.st_sc, v.data(), 0, v.size() * 4); }
-        if (im.rknob) set_route_select(env_rank("STRATA_RB_PROTECT"), env_rank("STRATA_RB_POOL"));   // all-zero knobs would protect everything
     }
     if (!cfg.head_only && smart_router()) im.rknob = T(GGML_TYPE_F32, { kRK + 1, 2 });
     // batch slots 1..NS-1 without a slab: the same per-conversation tensors again (slot 0 = the ones above)
