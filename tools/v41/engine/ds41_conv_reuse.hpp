@@ -176,9 +176,15 @@ public:
         auto it = std::find_if(recs_.begin(), recs_.end(), [&](const Rec & r) { return r.id == rec; });
         if (it == recs_.end()) { err = "no such record"; return false; }
         (void) from;   // the host store copies whole regions (a region is one tensor's rows [0, n])
+        // batch slots: the record goes into the BOUND slot's tensors, whichever slot it was saved from (every slot
+        // has the same regions, in the same order, for the same n)
+        const auto regs = dense.state_regions((int64_t) it->tokens.size());
+        if (regs.size() != it->regions.size()) { err = "pool: the record's regions do not match the slot"; return false; }
+        for (size_t i = 0; i < regs.size(); ++i)
+            if (regs[i].bytes != it->regions[i].b.size() || regs[i].off != it->regions[i].off) { err = "pool: region size mismatch"; return false; }
         dense_sync(dense);
         out.live_clobbered = true;
-        for (const auto & g : it->regions) ggml_backend_tensor_set(g.t, g.b.data(), g.off, g.b.size());
+        for (size_t i = 0; i < regs.size(); ++i) ggml_backend_tensor_set(regs[i].t, it->regions[i].b.data(), regs[i].off, regs[i].bytes);
         dense_sync(dense);
         out.live_clobbered = false;
         out.pos = (int64_t) it->tokens.size();
@@ -228,6 +234,8 @@ public:
     bool init(const Ds41Dense & d, int64_t ctx, size_t budget, bool cuda, std::string & err) {
         Ds41PoolLayout lay;
         if (!ds41_pool_from_dense(d, ctx, lay, snap_, live_)) { err = "pool layout from the dense half failed"; return false; }
+        ctx_ = ctx;
+        slot_ = d.slot();
         Ds41PoolConfig c;
         c.budget_bytes = budget;
         c.cuda = cuda;
@@ -237,6 +245,7 @@ public:
                  const float * logits, size_t n_logits, std::string & err) {
         const uint64_t * ids = pad(ident, ident_n, n);
         ggml_backend_synchronize(dense.backend());   // the device data is final (the save reads it on the pool's stream)
+        if (!retarget(dense, err)) return 0;
         static_assert(sizeof(int) == sizeof(int32_t), "token ids are int32");
         return (int64_t) pool_.save(snap_, reinterpret_cast<const int32_t *>(tokens), ids, n, logits, n_logits, err);
     }
@@ -269,8 +278,9 @@ public:
         }
         return m;
     }
-    bool restore(Ds41Dense &, const ConvMatch & m, int64_t from, ConvRestore & out, std::string & err) {
+    bool restore(Ds41Dense & dense, const ConvMatch & m, int64_t from, ConvRestore & out, std::string & err) {
         out = ConvRestore();
+        if (!retarget(dense, err)) return false;
         const bool at_pos = m.pos > 0 && m.resume() == m.pos;
         const int b = at_pos ? m.boundary : m.next_boundary_idx;
         const int64_t bpos = at_pos ? m.pos : m.next_boundary;
@@ -296,8 +306,25 @@ private:
         idbuf_.resize((size_t) n, 0);
         return idbuf_.data();
     }
+    // batch slots: a record is saved from / restored into the BOUND slot's tensors (every slot has the same layout);
+    // the pointers are taken again whenever the bound slot or its state (swap_slots) may have changed - cheap
+    bool retarget(const Ds41Dense & d, std::string & err) {
+        if (d.n_slots() <= 1) return true;   // one slot: the pointers taken at init, as always
+        Ds41PoolLayout lay;
+        Ds41PoolTargets s, l;
+        if (!ds41_pool_from_dense(d, ctx_, lay, s, l) || s.layout_fp != snap_.layout_fp) {
+            err = "pool: slot " + std::to_string(d.slot()) + " does not have the pool's layout";
+            return false;
+        }
+        snap_ = std::move(s);
+        live_ = std::move(l);
+        slot_ = d.slot();
+        return true;
+    }
     Ds41ConvPool pool_;
     Ds41PoolTargets snap_, live_;
+    int64_t ctx_ = 0;
+    int slot_ = 0;
     std::vector<uint64_t> idbuf_;
 };
 #endif

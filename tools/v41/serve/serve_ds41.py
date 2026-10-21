@@ -414,6 +414,44 @@ F.OutputParser.feed = _op_feed_ds41
 F.OutputParser.finish = _op_finish_ds41
 S.OutputParser = F.OutputParser
 
+# ---- "parallel": N (#465's batch slots) on the DeepSeek-V4.1 engine.  ds41_generate --serve runs Strata's slot protocol
+# itself (BGEN / BADM / BT / BDONE / BSTOP / BYIELD: the server's generate_batched, unchanged) when started with
+# --batch N (= its --batch-slots N): INFO batch_slots=N.  The server's own parallel_args is Strata's: it skips the flag
+# whenever the args hold "--slots" - for ds41 that is the VRAM EXPERT cache, not batch slots - and caps at 8, where a
+# ds41 window takes 16 rows (one per slot).  When the engine cannot run the slots (no conversation pool, a build
+# without them) it says why in its log and the server says "N asked, the engine runs one at a time".
+DS41_PARALLEL_MAX = 16
+
+
+def ds41_parallel_args(cfg: dict, args: list[str]) -> list[str]:
+    if "--batch" in args or "--batch-slots" in args:
+        return []
+    n = cfg.get("parallel")
+    if n is None or n is False:
+        return []
+    if isinstance(n, bool) or not isinstance(n, int):
+        print(f'[strata] "parallel" must be a whole number of requests (2..{DS41_PARALLEL_MAX}), not {n!r}: ignored',
+              flush=True)
+        return []
+    if n <= 1:
+        return []
+    if os.environ.get("STRATA_DS41_PARALLEL", "1") == "0":
+        print(f'[strata] "parallel": {n} ignored: the DeepSeek-V4.1 engine\'s batch slots are turned off '
+              "(STRATA_DS41_PARALLEL=0); one request at a time", flush=True)
+        return []
+    if "--conversation-cache-mib" in args and args[args.index("--conversation-cache-mib") + 1:][:1] == ["0"]:
+        print(f'[strata] "parallel": {n} ignored: the DeepSeek-V4.1 engine\'s batch slots need its conversation pool '
+              "(--conversation-cache-mib 0 turns it off); one request at a time", flush=True)
+        return []
+    if n > DS41_PARALLEL_MAX:
+        print(f'[strata] "parallel": {n} - the DeepSeek-V4.1 engine runs at most {DS41_PARALLEL_MAX} requests together '
+              f"(a batch window is {DS41_PARALLEL_MAX} rows); it will use {DS41_PARALLEL_MAX}", flush=True)
+        n = DS41_PARALLEL_MAX
+    return ["--batch", str(n)]
+
+
+S.parallel_args = ds41_parallel_args
+
 # ---- full text log (llama.cpp-style): every request's thinking / answer / tool calls as they are generated, so a run
 # can be watched (`tail -f`) and checked afterwards (loops, what it was thinking).  STRATA_TEXT_LOG=<path> (default
 # /tmp/strata-ds41-text.log), STRATA_TEXT_LOG=0 = off.
@@ -422,7 +460,8 @@ import time as _time
 
 _TEXT_LOG = os.environ.get("STRATA_TEXT_LOG", os.path.join(__import__("tempfile").gettempdir(), "strata-ds41-text.log"))
 _text_lock = _th.Lock()
-_text_state = {"kind": None}
+_text_state = {"kind": None, "who": None, "n": 0}
+_text_req = _th.local()   # "parallel": requests write at once - each chunk says whose it is when the writer changes
 _KIND_LABEL = {"reasoning": "thinking", "content": "answer", "tool_start": "tool call", "tool_call": "tool call"}
 
 
@@ -445,9 +484,10 @@ def _note_ds41(self, n, evs, st=None, rate=None):
         if not ev.text:
             continue
         label = _KIND_LABEL.get(ev.kind, ev.kind)
-        if label != _text_state["kind"]:
-            _text_state["kind"] = label
-            out.append(f"\n--- {label} ---\n")
+        who = getattr(_text_req, "n", None)
+        if label != _text_state["kind"] or who != _text_state["who"]:
+            _text_state["kind"], _text_state["who"] = label, who
+            out.append(f"\n--- {label} ---\n" if who is None or not getattr(self.engine, "batch", 0) else f"\n--- [#{who}] {label} ---\n")
         out.append(ev.text)
     if out:
         _text_write("".join(out))
@@ -477,7 +517,10 @@ def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # 
                                    int(num("route_protect", _ROUTING[2])), int(num("route_pool", _ROUTING[3])))
     t0 = _time.time()
     _text_state["kind"] = None
-    _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request: prompt {len(ids):,} tokens, max {max_new}, "
+    with _text_lock:
+        _text_state["n"] += 1
+        _text_req.n = _text_state["n"]
+    _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request #{_text_req.n}: prompt {len(ids):,} tokens, max {max_new}, "
                 f"thinking {'on' if thinking else 'off'}, tools {len(tools or [])} =====\n")
     end = "(stream closed)"
     try:
@@ -487,7 +530,7 @@ def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # 
                 end = f"finish {d.get('finish')}, {d.get('completion_tokens')} tokens"
             yield item
     finally:
-        _text_write(f"\n===== end: {end}, {_time.time() - t0:.1f} s =====\n")
+        _text_write(f"\n===== end #{_text_req.n}: {end}, {_time.time() - t0:.1f} s =====\n")
 
 
 S.Service._note = _note_ds41

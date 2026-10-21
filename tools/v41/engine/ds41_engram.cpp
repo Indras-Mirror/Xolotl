@@ -362,7 +362,41 @@ void Ds41Engram::set_dead(int64_t pos) {
     hist_[(size_t) pos] = kEngramDead;
 }
 
-void Ds41Engram::hash(int64_t pos, int e, int64_t * out) const {
+void Ds41Engram::set_dead_in(int s, int64_t pos) {
+    std::vector<int64_t> & h = hist_of(s);
+    if (pos >= (int64_t) h.size()) h.resize((size_t) pos + 1024, 0);
+    h[(size_t) pos] = kEngramDead;
+}
+
+std::vector<int64_t> & Ds41Engram::hist_of(int s) {
+    if (s == hist_cur_) return hist_;
+    if (s >= (int) hist_store_.size()) hist_store_.resize((size_t) s + 1);
+    return hist_store_[(size_t) s];
+}
+
+void Ds41Engram::select_history(int s) {
+    if (s < 0 || s == hist_cur_) return;
+    const int need = std::max(s, hist_cur_) + 1;
+    if ((int) hist_store_.size() < need) hist_store_.resize((size_t) need);
+    std::swap(hist_, hist_store_[(size_t) hist_cur_]);   // the current history back to its place ...
+    std::swap(hist_, hist_store_[(size_t) s]);           // ... and slot s's in (its place keeps the empty placeholder)
+    hist_cur_ = s;
+}
+
+void Ds41Engram::swap_histories(int a, int b) {
+    if (a < 0 || b < 0 || a == b) return;
+    std::swap(hist_of(a), hist_of(b));
+}
+
+void Ds41Engram::set_token_in(int s, int64_t pos, int tid) {
+    std::vector<int64_t> & h = hist_of(s);
+    if (pos >= (int64_t) h.size()) h.resize((size_t) pos + 1024, 0);
+    h[(size_t) pos] = g_->engram_token_map[(size_t) tid];
+}
+
+void Ds41Engram::hash(int64_t pos, int e, int64_t * out) const { hash_in(hist_, pos, e, out); }
+
+void Ds41Engram::hash_in(const std::vector<int64_t> & hist, int64_t pos, int e, int64_t * out) const {
     const int64_t N = g_->engram_ngram, H = g_->engram_heads;
     int64_t tok[8];
     // Look-back stops at the start of the sequence and at any DEAD token: once blocked, this and every earlier token
@@ -372,7 +406,7 @@ void Ds41Engram::hash(int64_t pos, int e, int64_t * out) const {
         int64_t v = g_->engram_pad;
         if (pos - k < 0) blocked = true;
         else {
-            const int64_t h = hist_[(size_t) (pos - k)];
+            const int64_t h = pos - k < (int64_t) hist.size() ? hist[(size_t) (pos - k)] : 0;
             if (h == kEngramDead) blocked = true;
             else if (!blocked) v = h;
         }
@@ -474,14 +508,34 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
     const int64_t nel = (int64_t) tables_.size();
     if (nel == 0) { err = "engram: no tables"; return nullptr; }
     if (n <= 0) { err = "engram: empty batch"; return nullptr; }
+    const int64_t m = n * cols_;
+    std::vector<int64_t> ids((size_t) (nel * m));
+    for (int64_t e = 0; e < nel; ++e)
+        for (int64_t t = 0; t < n; ++t) hash(pos0 + t, (int) e, &ids[(size_t) ((e * n + t) * cols_)]);
+    return start_ids(ids, n, out, err);
+}
+
+bool Ds41Engram::rows_at(const int * slot, const int64_t * pos, int n, std::vector<std::vector<float>> & out, std::string & err) {
+    const int64_t nel = (int64_t) tables_.size();
+    if (nel == 0) { err = "engram: no tables"; return false; }
+    if (n <= 0) { err = "engram: empty batch"; return false; }
+    const int64_t m = n * cols_;
+    std::vector<int64_t> ids((size_t) (nel * m));
+    for (int64_t e = 0; e < nel; ++e)
+        for (int64_t t = 0; t < n; ++t) hash_in(hist_of(slot[t]), pos[t], (int) e, &ids[(size_t) ((e * n + t) * cols_)]);
+    auto b = start_ids(ids, n, out, err);
+    if (!b) return false;
+    return wait(b, err);
+}
+
+// The reads of n rows' hash ids (ids[(e * n + t) * cols + c], every Engram slot e): start() and rows_at().
+std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start_ids(std::vector<int64_t> & ids, int n, std::vector<std::vector<float>> & out,
+                                                         std::string & err) {
+    const int64_t nel = (int64_t) tables_.size();
     auto b = std::make_shared<Batch>();
     b->n = n;
     b->out = &out;
     const int64_t cols = cols_, dim = dim_, srsz = dim / 32, m = n * cols;
-
-    std::vector<int64_t> ids((size_t) (nel * m));
-    for (int64_t e = 0; e < nel; ++e)
-        for (int64_t t = 0; t < n; ++t) hash(pos0 + t, (int) e, &ids[(size_t) ((e * n + t) * cols)]);
 
     out.resize((size_t) nel);
     b->uniq.resize((size_t) nel); b->packed.resize((size_t) nel); b->run_begin.resize((size_t) nel);

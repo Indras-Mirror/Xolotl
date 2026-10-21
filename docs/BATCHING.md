@@ -302,6 +302,69 @@ python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --b
     --extra "--batch-mtp --pcie-frac 0 --adapt-every 1000000"
 ```
 
+## DeepSeek-V4.1 (`ds41_generate`)
+
+The V4.1 engine speaks the same slot protocol (the table below). Add `"parallel": N` to a ds41 config (the
+DeepSeek-V4.1 server passes `--batch N`; by hand: `--batch-slots N`, or `--batch-slots auto`). The slots need the
+conversation pool (`--conversation-cache-mib`, on by default). Without the option the engine is the one-slot engine
+it always was, bit for bit.
+
+**What a slot is.** Each slot holds a whole conversation of the full `--ctx`: the window rings and their snapshot, the
+ratio-2 compressor states, the compressed KV and the indexer keys, the turn snapshot, the park and the Engram history.
+With `--kv-fp4` a slot is 234 MiB at 256K (0.46 GiB at 512K, 0.91 GiB at 1M). That VRAM comes out of the expert cache,
+about 67 experts per GiB. `--batch-slots auto` takes as many slots as 2 GiB holds (`STRATA_BATCH_SLOTS_GIB`), from 2 to
+8. The engine prints `batch slots: N x ... MiB` when it starts.
+
+**A batch window.** A window carries one token of every decoding slot, plus rows of a short prompt being read
+(`STRATA_SERVE_STEP_MAX`, 96 in the shipped wrapper), at most 16 rows in all. The window goes through every layer in
+one pass:
+
+- the projections, hyper-connections, router, shared expert and head run over all rows;
+- the rings, compressed rows and indexer keys of all slots of a layer live in one tensor (a slab). So the ring
+  write, the window gather, the compressor, the compressed-row gather and the flash-attn run once for all rows. Only
+  the indexer ranks each slot's rows separately;
+- the routed experts run once per layer over the union of the rows (`run_multi_to_dev`).
+
+A request alone runs the single-sequence path with DSpark, exactly as without slots.
+
+**Exactness.** On the CPU backend a window's rows are bit for bit each conversation's solo rows (`test_ds41_batch`:
+40 layers, 3 conversations, 8 steps, and a prompt read inside the windows). On the GPU the dense matmuls run on more columns, so the bits differ from solo. The difference stays inside the noise
+of the solo path itself (`test_ds41_batch --backend cuda`, 3 conversations x 8 steps). Batch windows against solo
+steps: top-1 23 of 24, KL mean 3.9e-3, max 1.2e-2. A solo 8-row pass (what a DSpark verify pass is) against the same
+steps: 22 of 24, KL mean 4.4e-3, max 1.7e-2. The slabs and the merged flash-attn change nothing in that: without them
+the windows give the same numbers. The solo path keeps its bits on the GPU. Its serve text set gives the same logit
+dumps as the engine without slots, and a slot moved by `swap_slots` or restored from the pool into another slot
+decodes bit for bit as before.
+
+**Measured** (RTX 5090, EPYC with 624 GB RAM, heretic 1017 Q3_K experts in pinned RAM, exact routing, `--kv-fp4`,
+`--tier-batch-pcie 0.1`, 48 threads, 8 slots of 256K). Each conversation is a ~1,500-token text plus growing turns.
+Each request asks a short new question (~40 new tokens) and decodes 200 greedy tokens, all N at once. "Steady" means
+the tokens decoded while all N were running:
+
+| Concurrent | Steady total tok/s | Per request tok/s | First token (mean / max) | Window (rows) |
+| ---: | ---: | ---: | ---: | --- |
+| 1 (solo, DSpark) | 48-51 | 48-51 | 0.4 s | - |
+| 2 | 62.5-63 | 30.5 | 0.6-0.7 / 0.9 s | 30.5 ms (2) |
+| 4 | 74-81 | 18-19.5 | 1.1-1.2 / 1.9 s | 47.6 ms (4) |
+| 8 | 94-95 | 11.6 | 2.4-2.6 / 4.8 s | 75.1 ms (7.8): dense 23.3 + experts 50.0 |
+
+With the same prompts as their solo turns (nothing to read), 2 / 4 / 8 conversations decoded at 65 / 82 / 103 tok/s.
+That matches a cost model fitted on the production log before the work: 62 / 82 / 103, against 50 tok/s one at a
+time. Without the slabs (`STRATA_SLOT_SLAB=0`, each slot's attention on its own tensors) a window of 8 rows takes
+90.5 ms instead of 78. The experts' part
+follows the cost of the unique experts per window; the rows of different conversations share few experts (about 27%
+at 8 rows), so the gain comes from sharing the fixed part of a pass.
+
+**Limits.** DSpark runs only for a request alone. `-exact` and `-fast` requests never share a window, because the
+route bias is global. Pictures are read alone, and their decode joins the windows. A prompt with more than 96 new
+tokens is read layer-major while the windows wait.
+
+**Testing.** `test_ds41_batch -m M --engram A:B --prompts p0.i32,p1.i32,p2.i32 [--backend cuda --kv-fp4]` checks
+the engine core: solo against the reference path and the batched windows, a prompt read in the windows, a slot moved
+by `swap_slots`, a conversation saved from one slot and restored into another, and the noise floor of a multi-row solo
+pass. `DS41_TEST_LAYERS=n` runs the first n layers only. `tools/v41/engine/check_batch_slots.py` checks the protocol
+against one-at-a-time references.
+
 ## Engine protocol (`--serve`)
 
 On top of `GEN` / `GENI`:

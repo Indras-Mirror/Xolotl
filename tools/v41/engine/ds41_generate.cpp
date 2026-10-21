@@ -15,6 +15,21 @@
 //   in:  GEN <max_new> [temperature=.. top_p=.. top_k=.. min_p=.. seed=..] <ids csv> | STOP | QUIT
 //        GENI <max_new> [k=v ..] <image embeddings file> <ids csv>   (GEN with vision; see --image-token)
 //   out: READY <ctx> stop, RESUME <reused>, PP <read> <total> <ms> <tok/s>, T <id>, DONE ..., ERR <text>
+// --batch-slots N (or Strata's --batch N, which serve/server.py passes for "parallel": N): N conversations decode
+// together, one row each per batch window (Strata's slot protocol, serve/server.py generate_batched; INFO batch_slots=N):
+//   in:  BGEN <slot> <max_new> [k=v ..] <ids csv> | BGENI <slot> <max_new> [k=v ..] <file> <ids csv> | BSTOP <slot> |
+//        BYIELD <slot>
+//   out: BGEN reads the prompt into <slot> as a GEN 1 (RESUME / PP / T / DONE on the control lines), then
+//        BADM <slot> <1 = it decodes on in the slot | 0 = done>; the slot's tokens are BT <slot> <id> lines and its end
+//        BDONE <slot> <produced> <stop|length|cancel|nonfinite> <ms>.  BSTOP ends a slot before its next window;
+//        BYIELD <slot> stops a long prompt read at its next layer-major batch: the part read stays in <slot>,
+//        YIELDED <slot> <tokens> + DONE .. cancel (+ BADM <slot> 0), and the read goes on from there when it is sent again.
+// A window takes every decoding slot of one routing class (the decode biases are global: -exact and -fast requests never
+// share a window) plus up to 16 - that rows of a short prompt being read (<= STRATA_BATCH_MIX_MAX new tokens); a longer
+// prompt, or one with images, is read alone between windows (layer-major) and the slots wait.  With one slot left a window
+// is the old single-sequence step.  GEN (alone: the server sends it when no slot is busy) runs as before, DSpark included,
+// in the idle slot that holds the longest start of its prompt.  A slot's conversation stays in it after BDONE (and goes to
+// the conversation pool then); the next BGEN / GEN picks the slot (swap_slots) or the pool record that holds the most.
 // Conversation reuse: a request that extends what the state has seen continues; one that shares the last prompt
 // restores the snapshot taken at its end (Ds41Dense::snapshot: every other cache is position-indexed); the same prompt
 // again (regenerate) restores it and samples from the saved last-row logits without a prefill.  VRAM: a multi-token
@@ -26,6 +41,8 @@
 #include "ds41_dense.hpp"
 #include "ds41_moe.hpp"
 #include "ds41_conv_reuse.hpp"
+#include "ds41_batch_slots.hpp"
+#include "ds41_batch.hpp"
 #if defined(DS41_HAVE_DSPARK)
 #include "ds41_dspark.hpp"
 #endif
@@ -94,6 +111,10 @@ struct Args {
     // --serve's conversation pool: --conversation-cache-mib N (default 8192; 0 = the single park of STRATA_SERVE_PARK)
     // of host memory for conversations saved at their turn boundary, at most --conversation-cache-slots of them
     int conv_mib = 8192, conv_slots = 64;
+    // --batch-slots N | auto (--batch N: the server's "parallel": N): conversation states held at once for the batch
+    // windows (ds41_batch.hpp; the protocol in the serve loop); 1 = the single-sequence engine as before, 0 = auto
+    // (Ds41DenseConfig::n_slots)
+    int batch_slots = 1;
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -224,6 +245,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--vision") a.vision = true;
         else if (k == "--conversation-cache-mib") a.conv_mib = std::max(0, std::atoi(next().c_str()));
         else if (k == "--conversation-cache-slots") a.conv_slots = std::max(1, std::atoi(next().c_str()));
+        else if (k == "--batch-slots" || k == "--batch") { const std::string v = next(); a.batch_slots = v == "auto" ? 0 : std::max(1, std::atoi(v.c_str())); }
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty());
@@ -397,12 +419,52 @@ int main(int argc, char ** argv) {
     // --kv-fp4 / STRATA_KV_FP4=1: the compressed KV + indexer keys packed to their exact FP4 grids (Ds41DenseConfig::kv_fp4)
     dc.kv_fp4 = a.kv_fp4 || (std::getenv("STRATA_KV_FP4") && std::getenv("STRATA_KV_FP4")[0] == '1');
     if (dc.kv_fp4) std::fprintf(stderr, "kv: compressed KV NVFP4 + indexer keys MXFP4 (--kv-fp4, exact)\n");
+    // --batch-slots N | auto: decided before the dense half loads (its per-slot states are allocated with it).  Off,
+    // with the reason in the log, when they cannot run: the server then says "N asked, the engine runs one at a time".
+    int NS = 0;   // the batch slots the serve loop runs (0 = off: one request at a time, as before)
+    const bool slots_stub = std::getenv("STRATA_BATCH_STUB") && std::getenv("STRATA_BATCH_STUB")[0] == '1';
+    bool slots_on = false;
+    if (a.batch_slots != 1) {
+        const char * off = nullptr;
+        const bool park_env_off = std::getenv("STRATA_SERVE_PARK") && std::getenv("STRATA_SERVE_PARK")[0] == '0';
+        if (!a.serve) off = "--serve only";
+        else if (std::getenv("STRATA_BATCH_SLOTS") && std::getenv("STRATA_BATCH_SLOTS")[0] == '0') off = "STRATA_BATCH_SLOTS=0";
+        else if (a.conv_mib <= 0 || park_env_off) off = "they need the conversation pool (--conversation-cache-mib > 0)";
+        else if (!ds41_core_slots() && !slots_stub)
+            off = "this build's dense half has no per-slot states (STRATA_BATCH_STUB=1 runs them one by one, for tests)";
+        else if (a.batch_slots == 0 && (slots_stub || !ds41_core_slots())) off = "--batch-slots auto needs the dense half's slots";
+        const std::string asked = a.batch_slots == 0 ? std::string("auto") : std::to_string(a.batch_slots);
+        if (off) std::fprintf(stderr, "batch slots: --batch-slots %s asked, OFF: %s - one request at a time\n", asked.c_str(), off);
+        else {
+            slots_on = true;
+            NS = a.batch_slots == 0 ? 0 : std::min(a.batch_slots, (int) Ds41MoeTier::kMaxMulti);
+            if (a.batch_slots > NS)
+                std::fprintf(stderr, "batch slots: %d asked, %d run (a window is at most %d rows, one per slot)\n",
+                             a.batch_slots, NS, (int) Ds41MoeTier::kMaxMulti);
+        }
+    }
+    const bool slots_core = slots_on && ds41_core_slots() && !slots_stub;
+    ds41_k_config(dc, slots_core ? NS : 1);   // (0 = auto: the core sizes them)
     Ds41Dense dense;
     std::string err;
     const double t_load = now_ms();
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds41_generate: dense init: %s\n", err.c_str()); return 1; }
+    if (slots_core) {
+        const int k = ds41_k_n(dense);
+        if (NS > 0 && k != NS) std::fprintf(stderr, "batch slots: %d asked, the dense half holds %d\n", NS, k);
+        NS = k < 2 ? 0 : std::min(k, (int) Ds41MoeTier::kMaxMulti);
+        if (NS == 0) std::fprintf(stderr, "batch slots: OFF (the dense half holds %d) - one request at a time\n", k);
+    }
+    if (NS > 0)
+        std::fprintf(stderr, "batch slots: %d (%s)\n", NS, slots_core ? "per-slot states in the dense half"
+                                                                       : "STUB: one state, the slots run one by one");
     const Ds41Geometry & G = dense.geom();
     const int n_layer = (int) dense.n_layer(), n_embd = (int) G.n_embd, top_k = (int) G.n_used, nv = (int) G.vocab;
+    // gate tap: the single-sequence paths on another batch slot (they must not care which one)
+    if (const char * e = std::getenv("DS41_TEST_SOLO_SLOT"); e && !dense.bind_slot(std::atoi(e))) {
+        std::fprintf(stderr, "ds41_generate: DS41_TEST_SOLO_SLOT: %s\n", dense.last_error().c_str());
+        return 2;
+    }
     // enc-skip's layer 20: the LAST kv source (every compressed-KV / index-key write is owned by a kv source, and the
     // layers above it only read that owner's state, so the cut belongs there).  Also the window reach R = swa *
     // (n_layer - cut_layer) is what --enc-replay defaults to.
@@ -933,9 +995,16 @@ int main(int argc, char ** argv) {
         ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
         std::fprintf(stderr, "vram trace: %s %d free %.2f GiB\n", where, a, tf / 1073741824.0);
     };
+    // --batch-slots' BYIELD: asked before each layer-major batch of a read (c0, its width B) whether that batch is the
+    // read's last one; then its enc-skip cut ends at the batch's own end (the replay window before it is computed in
+    // full, so the read can go on from there) and feed() stops after it with feed_stopped = the tokens fed.
+    std::function<bool(int, int)> feed_yield;
+    int feed_stopped = -1;
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
+        feed_stopped = -1;
         for (int c0 = 0; c0 < n; ) {
+            bool yield_here = false;
             if (PB > 1 && n - c0 >= 2) {
                 // ---- layer-major: up to B tokens of every layer, the experts run once per layer over the whole batch
                 int B = std::min(pb_cap, n - c0);
@@ -968,10 +1037,12 @@ int main(int argc, char ** argv) {
                 // enc-skip: columns whose global position is before `pos0 + n - ER` are phase A (layers past layer 20
                 // are never read for them), rounded DOWN to a sub-batch boundary so a straddling sub-batch still runs
                 // the full path (more work, never wrong); the last sub-batches holding the final token are always full.
+                if (feed_yield && c0 + B < n) yield_here = feed_yield(c0, B);
+                const int n_cut = yield_here ? c0 + B : n;   // (the read's end, as far as enc-skip is concerned)
                 int cut = 0;
                 if (enc_skip) {
                     const int64_t gpos = (int64_t) pos0 + c0;
-                    const int64_t ta = (int64_t) pos0 + n - ER - gpos;
+                    const int64_t ta = (int64_t) pos0 + n_cut - ER - gpos;
                     cut = ta <= 0 ? 0 : ta >= B ? B : (int) ta;
                     cut = (cut / SB) * SB;
                     if (!enc_reported) { enc_reported = true; std::fprintf(stderr, "enc-skip: first batch B=%d, cut=%d (phase A %d cols, phase B %d)\n", B, cut, cut, B - cut); }
@@ -1101,6 +1172,7 @@ int main(int argc, char ** argv) {
                 c0 += m;
             }
             progress(c0);
+            if (yield_here) { feed_stopped = c0; break; }
         }
         if (dc.elastic_cols) {   // back to S columns
             if (!dense.set_columns(0)) { ferr = dense.last_error(); return false; }
@@ -1160,7 +1232,9 @@ int main(int argc, char ** argv) {
         // STRATA_SERVE_PARK_MIN: only conversations of >= this many tokens (default 2048); STRATA_SERVE_PARK_MAX: the
         // most positions a side request may write (prompt + max tokens, default 65536 ~ 1 GB of host memory).
         const bool park_on = !(std::getenv("STRATA_SERVE_PARK") && std::getenv("STRATA_SERVE_PARK")[0] == '0');
-        const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN")) : 2048;
+        // (batch slots: 256 - a slot's conversation that another request takes over goes to the pool, and agents' turns
+        // under 2K tokens were simply lost then: 20.10 card, conversations of 1.5-1.9K read again after an eviction)
+        const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN")) : NS > 0 ? 256 : 2048;
         const int64_t park_max = std::getenv("STRATA_SERVE_PARK_MAX") ? std::atoll(std::getenv("STRATA_SERVE_PARK_MAX")) : 65536;
         std::vector<int> park_hist;       // the parked conversation's tokens (its snapshot length)
         std::vector<float> park_logits;
@@ -1221,6 +1295,7 @@ int main(int argc, char ** argv) {
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld", ctxv, (long long) tier.resident(),
                     (long long) tier.arena_experts());
         if (pool_on) std::printf(" conversation_cache_mib=%d conversation_cache_slots=%d", a.conv_mib, a.conv_slots);
+        if (NS > 0) std::printf(" batch_slots=%d slot_cache=1", NS);   // serve/server.py: the slot protocol (generate_batched)
         std::printf("\n");
         if (pool_on) std::fprintf(stderr, "serve: conversation pool %d MiB, %d slots, records >= %d tokens\n", a.conv_mib,
                                   a.conv_slots, std::max(1, park_min));
@@ -1240,9 +1315,376 @@ int main(int argc, char ** argv) {
         int cur_rprot = cfg_rprot, cur_rpool = cfg_rpool;
         std::string line;
         bool previous_vision = false;
-        while (next_line(line)) {
+        // ---- batch slots (--batch-slots N; the protocol is at the top of this file).  Slot s's conversation is a Conv
+        // (what the request path calls hist / live_id / snap_len / ..: those locals belong to the slot the request on
+        // the control lines works in, `gslot`, and are swapped in and out around it) plus its device state (the core's
+        // slot s, or the stub's copy).  A decoding slot is a BSlot.
+        struct Conv {
+            std::vector<int> hist;
+            std::vector<uint64_t> live_id;
+            int snap_len = -1;
+            std::vector<float> snap_logits, snap_seed;
+            int snap_seed_n = 0;
+            bool live_dirty = false;
+            double used = 0;
+        };
+        struct RouteCls {
+            float rb = 0, rbf = 0;
+            int prot = 0, pool = 0;
+            bool operator==(const RouteCls & o) const { return rb == o.rb && rbf == o.rbf && prot == o.prot && pool == o.pool; }
+        };
+        struct BSlot {
+            bool active = false, stop = false;
+            int x = 0, p = 0;                  // the token the next window feeds, at position p
+            int64_t produced = 0, max_new = 0;
+            double t0 = 0;
+            float temp = 0, top_p = 1, min_p = 0;
+            int top_k = 0;
+            std::mt19937_64 rng;
+            RouteCls cls;
+        };
+        std::vector<Conv> cv((size_t) NS);
+        std::vector<BSlot> bs((size_t) NS);
+        std::vector<RouteCls> cls_seen;      // routing classes by id (the planner compares ids)
+        auto cls_id = [&](const RouteCls & c) -> int {
+            for (size_t i = 0; i < cls_seen.size(); ++i) if (cls_seen[i] == c) return (int) i;
+            cls_seen.push_back(c);
+            return (int) cls_seen.size() - 1;
+        };
+        int gslot = -1;                      // the slot of the request on the control lines (-1: none)
+        int64_t batch_epoch = 0;             // bumped by every window / admission / swap (DSpark's window is the solo path's)
+#if defined(DS41_HAVE_DSPARK)
+        int dsp_slot = -1;
+        int64_t dsp_epoch = -1;
+#endif
+        auto conv_pos = [&](int s) -> int64_t {   // the positions slot s's conversation has in its state
+            const std::vector<int> & h = s == gslot ? hist : cv[(size_t) s].hist;
+            const int sl = s == gslot ? snap_len : cv[(size_t) s].snap_len;
+            return std::max<int64_t>((int64_t) h.size(), sl);
+        };
+        Ds41SlotsStub stub;
+        if (NS > 0 && !slots_core)
+            stub.init(dense, NS, conv_pos, [&]() { if (pool_on) pool.fence(); });
+        auto bind = [&](int s) -> bool {
+            if (slots_core ? !ds41_k_bind(dense, s) : !stub.bind_slot(s, ferr)) {
+                if (slots_core) ferr = dense.last_error();
+                return false;
+            }
+            return true;
+        };
+        auto conv_swap = [&](Conv & c) {   // the request path's locals <-> a slot's record
+            std::swap(hist, c.hist);
+            std::swap(live_id, c.live_id);
+            std::swap(snap_len, c.snap_len);
+            std::swap(snap_logits, c.snap_logits);
+            std::swap(snap_seed, c.snap_seed);
+            std::swap(snap_seed_n, c.snap_seed_n);
+            std::swap(live_dirty, c.live_dirty);
+        };
+        // exchange two idle slots' conversations (device state and records): a conversation moves to the slot id the
+        // server asked for, or the one a yielded read waits in
+        auto swap_conv = [&](int x, int y) -> bool {
+            if (x == y) return true;
+            if (slots_core ? !ds41_k_swap(dense, x, y) : !stub.swap_slots(x, y, ferr)) {
+                if (slots_core) ferr = dense.last_error();
+                return false;
+            }
+            std::swap(cv[(size_t) x], cv[(size_t) y]);
+            ++batch_epoch;
+            return true;
+        };
+        // what slot s's live state offers a prompt (the request path's own rules): its history continued, or its
+        // snapshot restored
+        auto live_offer = [&](const Conv & c, const std::vector<int> & q, const std::vector<uint64_t> & qid) -> int {
+            const size_t l = conv_common_prefix(c.hist.data(), c.live_id.data(), c.live_id.size(), c.hist.size(), q.data(),
+                                                qid.data(), qid.size(), q.size());
+            if (!c.hist.empty() && l == c.hist.size() && l < q.size()) return (int) l;
+            if (!c.hist.empty() && l == c.hist.size() && l == q.size() && l >= 2 && !c.live_dirty &&
+                (c.snap_len < 0 || (size_t) c.snap_len < q.size()))
+                return (int) l - 1;   // (cont_last below)
+            if (c.snap_len > 0 && l >= (size_t) c.snap_len && (size_t) c.snap_len <= q.size()) return c.snap_len;
+            return 0;
+        };
+        auto any_active = [&]() { for (const BSlot & b : bs) if (b.active) return true; return false; };
+        // a conversation that has ended in its slot goes to the pool (its turn boundary, as save_live)
+        auto save_conv = [&](int s, const char * why) {
+            Conv & c = cv[(size_t) s];
+            if (!pool_on || c.snap_len < std::max(1, park_min) || c.hist.size() < (size_t) c.snap_len) return;
+            if (!bind(s)) { std::fprintf(stderr, "strata batch: slot %d: %s\n", s, ferr.c_str()); return; }
+            const double t0 = now_ms();
+            std::string perr;
+            const int64_t id = pool.save(dense, c.hist.data(), c.live_id.data(), c.live_id.size(), c.snap_len,
+                                         c.snap_logits.empty() ? nullptr : c.snap_logits.data(), c.snap_logits.size(), perr);
+            std::fprintf(stderr, "strata serve: conversation cache: %s %d tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu (%s, slot %d%s%s)\n",
+                         id ? "parked" : "skipped", c.snap_len, now_ms() - t0, pool.size(), pool.bytes(), pool.evictions(), why,
+                         s, id ? "" : ": ", id ? "" : perr.c_str());
+        };
+        auto try_line = [&](std::string & out) -> bool {
+            std::lock_guard<std::mutex> lk(qm);
+            if (q.empty()) return false;
+            out = q.front();
+            q.pop_front();
+            return true;
+        };
+        // the slot lines that may come while a prompt is read: BSTOP is taken at once; BYIELD (`yield`: the slot it
+        // names, else -1) - the rest wait their turn
+        auto take_slot_lines = [&](int * yield) {
+            std::lock_guard<std::mutex> lk(qm);
+            for (auto it = q.begin(); it != q.end();) {
+                if (it->rfind("BSTOP ", 0) == 0) {
+                    const int b = std::atoi(it->c_str() + 6);
+                    if (b >= 0 && b < NS) bs[(size_t) b].stop = true;
+                    it = q.erase(it);
+                } else if (it->rfind("BYIELD", 0) == 0) {
+                    if (yield) *yield = it->size() > 7 ? std::atoi(it->c_str() + 7) : -1;
+                    it = q.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        };
+        auto set_class = [&](const RouteCls & c) {   // the dense half's decode biases for this window's rows
+            if (a.route_bias != c.rb || a.route_bias_file != c.rbf || !bias_now) {
+                a.route_bias = c.rb;
+                a.route_bias_file = c.rbf;
+                bias_now = true;
+                apply_bias();
+            }
+            if ((c.prot != cur_rprot || c.pool != cur_rpool) && dense.set_route_select(c.prot, c.pool)) {
+                cur_rprot = c.prot;
+                cur_rpool = c.pool;
+            }
+        };
+        static const bool btrace = std::getenv("STRATA_BATCH_TRACE") != nullptr;
+        // STRATA_BATCH_MIX_MAX: a BGEN prompt of at most this many new tokens is read in the windows (its rows beside
+        // the decoding slots'); a longer one alone (layer-major), the slots waiting.  Default: STRATA_SERVE_STEP_MAX.
+        const int mix_max = std::getenv("STRATA_BATCH_MIX_MAX") ? std::atoi(std::getenv("STRATA_BATCH_MIX_MAX")) : step_max;
+        constexpr int kRows = Ds41MoeTier::kMaxMulti;
+        // the prompt being read in the windows (its slot, its rows still to go, its class)
+        struct Mix {
+            int slot = -1, pos = 0, left = 0;
+            const int * ids = nullptr;            // the whole prompt (Engram history: the 3 tokens before a pass)
+            const uint64_t * rid = nullptr;
+            size_t nrid = 0;
+            RouteCls cls;
+        };
+        std::vector<float> wlog, wlog2;
+        std::vector<int> wslot, wpos, wtok, wwant;
+        std::vector<Ds41Dense::Row> wrows;
+        Ds41RowsStep rows_step(dense, tier);
+        // STRATA_BATCH_SERIAL=1: every window slot by slot through the old single-sequence path (bind + step / pass_m)
+        // on the core's per-slot states - the solo engine's numbers exactly (the protocol checks), not its speed
+        static const bool slots_serial = std::getenv("STRATA_BATCH_SERIAL") && std::getenv("STRATA_BATCH_SERIAL")[0] == '1';
+        int win_rr = 0;
+        int64_t bw_windows = 0, bw_rows = 0, bw_read = 0, bw_tokens = 0;
+        double bw_ms = 0, bw_start = 0;
+        // the stub's Engram history: one history for every slot, so a slot's pass at p rewrites the 3 tokens before it
+        auto engram_tail = [&](int p, const int * toks, const uint64_t * idn, size_t nidn) {
+            if (slots_core || p <= 0) return;
+            const int h0 = std::max(0, p - 3);
+            uint8_t dead[3] = { 0, 0, 0 };
+            for (int i = h0; i < p; ++i) dead[i - h0] = (size_t) i < nidn && idn[(size_t) i] != 0;
+            dense.set_engram_history(h0, p - h0, toks + h0, dead);
+        };
+        auto end_slot = [&](int b, const char * fin) {
+            BSlot & sl = bs[(size_t) b];
+            std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, now_ms() - sl.t0);
+            sl.active = false;
+            sl.stop = false;
+            if (std::strcmp(fin, "nonfinite") == 0) {   // its state is not worth keeping
+                cv[(size_t) b].hist.clear();
+                cv[(size_t) b].live_id.clear();
+                cv[(size_t) b].snap_len = -1;
+            } else {
+                save_conv(b, "slot done");
+            }
+            cv[(size_t) b].used = now_ms();
+        };
+        // one batch window: every decoding slot of one routing class + rows of the prompt being read (`mx`); the rows
+        // of each slot through the dense half: the core's begin_rows when several slots share it, else the old step /
+        // pass_m on the bound slot (one slot left = the solo engine).  The read's last row's logits -> last_logits.
+        auto run_window = [&](Mix * mx) -> bool {
+            for (int b = 0; b < NS; ++b)   // BSTOPped slots end before their next row
+                if (bs[(size_t) b].active && bs[(size_t) b].stop) end_slot(b, "cancel");
+            std::vector<Ds41PlanSlot> ps((size_t) NS);
+            for (int b = 0; b < NS; ++b) ps[(size_t) b] = { bs[(size_t) b].active, bs[(size_t) b].active ? cls_id(bs[(size_t) b].cls) : -1 };
+            const Ds41Plan pl = ds41_plan_window(ps, mx ? mx->slot : -1, mx ? cls_id(mx->cls) : -1, mx ? mx->left : 0, kRows, win_rr);
+            if (pl.cls < 0) { std::fflush(stdout); return true; }
+            const double tw0 = now_ms();
+            if (bw_windows == 0) bw_start = tw0;
+            set_class(cls_seen[(size_t) pl.cls]);
+            if (defer_vram && !cache_open) {   // a long read released the cache: it opens into what is free now
+                if (!open_cache()) { std::printf("ERR batch window: VRAM seed failed: %s\n", err.c_str()); return false; }
+                cache_open = true;
+                set_class(cls_seen[(size_t) pl.cls]);
+            }
+            const int A = (int) pl.dec.size(), R = pl.read_rows, n = A + R;
+            wslot.assign((size_t) n, 0); wpos.assign((size_t) n, 0); wtok.assign((size_t) n, 0);
+            for (int i = 0; i < A; ++i) {
+                const BSlot & sl = bs[(size_t) pl.dec[(size_t) i]];
+                wslot[(size_t) i] = pl.dec[(size_t) i]; wpos[(size_t) i] = sl.p; wtok[(size_t) i] = sl.x;
+            }
+            for (int i = 0; i < R; ++i) {
+                wslot[(size_t) (A + i)] = mx->slot; wpos[(size_t) (A + i)] = mx->pos + i; wtok[(size_t) (A + i)] = mx->ids[mx->pos + i];
+            }
+            const bool read_ends = R > 0 && R == mx->left;
+            wlog.resize((size_t) std::max(n, 1) * (size_t) nv);
+            int groups = 0;
+            for (int i = 0; i < n; ++i) groups += i == 0 || wslot[(size_t) i] != wslot[(size_t) i - 1];
+            bool ok = true;
+            if (slots_core && groups > 1 && !slots_serial) {
+                // ---- one pass over every row (the core's per-slot states, Ds41RowsStep): the dense half batched over the
+                // rows, attention per slot, the tier once per layer over the union of the rows' experts
+                wrows.resize((size_t) n);
+                for (int i = 0; i < n; ++i) wrows[(size_t) i] = Ds41Dense::Row{ wslot[(size_t) i], wpos[(size_t) i], wtok[(size_t) i] };
+                wwant.clear();
+                for (int i = 0; i < A; ++i) wwant.push_back(i);
+                if (read_ends) wwant.push_back(n - 1);
+                if (!rows_step.run(wrows.data(), n, wwant.data(), (int) wwant.size(), rdev1, wlog2, ferr)) ok = false;
+                for (size_t k = 0; ok && k < wwant.size(); ++k)
+                    std::copy_n(wlog2.data() + k * (size_t) nv, nv, wlog.data() + (size_t) wwant[k] * nv);
+            } else {
+                // ---- slot by slot through the old single-sequence path (the stub; or one slot in the window): the
+                // read's rows last, so its slot is the bound one afterwards
+                for (int i0 = 0; ok && i0 < n;) {
+                    int i1 = i0 + 1;
+                    while (i1 < n && wslot[(size_t) i1] == wslot[(size_t) i0]) ++i1;
+                    const int s = wslot[(size_t) i0], m = i1 - i0, p0 = wpos[(size_t) i0];
+                    if (!bind(s)) { ok = false; break; }
+                    if (i0 < A) {
+                        const Conv & c = cv[(size_t) s];
+                        engram_tail(p0, c.hist.data(), c.live_id.data(), c.live_id.size());
+                    } else {
+                        engram_tail(p0, mx->ids, mx->rid, mx->nrid);
+                    }
+                    if (!(m == 1 ? step(wtok[(size_t) i0], p0) : pass_m(wtok.data() + i0, m, p0))) { ok = false; break; }
+                    const bool want = i0 < A || (read_ends && i1 == n);
+                    if (want && !dense.logits(m - 1, 1, wlog.data() + (size_t) (i1 - 1) * nv)) { ferr = dense.last_error(); ok = false; }
+                    i0 = i1;
+                }
+            }
+            if (!ok) {
+                std::printf("ERR batch window: %s\n", ferr.c_str());
+                std::fflush(stdout);
+                return false;
+            }
+            ++batch_epoch;
+            for (int i = 0; i < A; ++i) {
+                const int b = pl.dec[(size_t) i];
+                BSlot & sl = bs[(size_t) b];
+                const float * lg = wlog.data() + (size_t) i * nv;
+                bool finite = true;
+                for (int v = 0; v < nv && finite; ++v) finite = std::isfinite(lg[v]);
+                if (!finite) {
+                    std::fprintf(stderr, "strata batch: non-finite logits in slot %d at position %d: it ends (BDONE nonfinite)\n", b, sl.p);
+                    end_slot(b, "nonfinite");
+                    continue;
+                }
+                const int y = sample_p(lg, nv, sl.temp, sl.top_k, sl.top_p, sl.min_p, sl.rng);
+                cv[(size_t) b].hist.push_back(sl.x);   // the fed token is in the slot's state now
+                std::printf("BT %d %d\n", b, y);
+                ++sl.produced;
+                ++bw_tokens;
+                const char * fin = is_stop(y) ? "stop" : sl.stop ? "cancel" : (sl.produced >= sl.max_new && sl.max_new > 0) ? "length"
+                                 : sl.p + 2 > ctxv ? "length" : nullptr;
+                if (fin) { end_slot(b, fin); continue; }
+                sl.x = y;
+                sl.p += 1;
+            }
+            if (R > 0) {
+                if (read_ends) std::copy(wlog.begin() + (size_t) (n - 1) * nv, wlog.begin() + (size_t) n * nv, last_logits.begin());
+                mx->pos += R;
+                mx->left -= R;
+            }
+            std::fflush(stdout);
+            tier.rebalance_tick();
+            const double wms = now_ms() - tw0;
+            ++bw_windows;
+            bw_rows += A;
+            bw_read += R;
+            bw_ms += wms;
+            if (btrace) {
+                std::string who;
+                for (int i = 0; i < A; ++i) who += (i ? "," : "") + std::to_string(pl.dec[(size_t) i]);
+                std::fprintf(stderr, "strata batch: window %lld class %d (bias %.2f/%.2f) decode [%s] read %d%s - %.1f ms\n",
+                             (long long) bw_windows, pl.cls, cls_seen[(size_t) pl.cls].rb, cls_seen[(size_t) pl.cls].rbf,
+                             who.c_str(), R, R ? (" of slot " + std::to_string(mx->slot)).c_str() : "", wms);
+            }
+            if (!any_active() && !(mx && mx->left > 0)) {   // all idle: one line for the run of windows
+                const double wall = now_ms() - bw_start;
+                std::fprintf(stderr, "strata batch: %lld windows, %lld decode rows + %lld prompt rows in %.2f s (windows %.2f s) = "
+                                     "%.1f tok/s decoded, %.2f rows/window\n", (long long) bw_windows, (long long) bw_rows,
+                             (long long) bw_read, wall / 1000.0, bw_ms / 1000.0, 1000.0 * bw_tokens / std::max(wall, 1e-9),
+                             (double) (bw_rows + bw_read) / std::max<int64_t>(1, bw_windows));
+                if (slots_core && !slots_serial) std::fprintf(stderr, "strata batch: rows passes: %s\n", rows_step.stats_line(true).c_str());
+                bw_windows = bw_rows = bw_read = bw_tokens = 0;
+                bw_ms = 0;
+            }
+            return true;
+        };
+        // the slot of a request: an admission (BGEN) takes its slot - first exchanged with an idle slot whose live state
+        // offers more of the prompt; a solo request (GEN) the idle slot that offers the most, else an empty one, else
+        // the one used longest ago.  -1: no slots.
+        auto pick_slot = [&](int admit, const std::vector<int> & q, const std::vector<uint64_t> & qid) -> int {
+            if (NS <= 0) return -1;
+            auto empty = [&](int k) { return cv[(size_t) k].hist.empty() && cv[(size_t) k].snap_len < 0; };
+            int target = admit, best = admit >= 0 ? live_offer(cv[(size_t) admit], q, qid) : -1, bk = -1;
+            for (int k = 0; k < NS; ++k) {
+                if (k == admit || bs[(size_t) k].active) continue;
+                const int o = live_offer(cv[(size_t) k], q, qid);
+                if (admit >= 0) {
+                    if (o > best) { best = o; bk = k; }
+                } else if (target < 0 || o > best ||
+                           (o == best && (empty(k) != empty(target) ? empty(k) : cv[(size_t) k].used < cv[(size_t) target].used))) {
+                    target = k;
+                    best = o;
+                }
+            }
+            if (admit >= 0 && bk >= 0) {
+                if (swap_conv(admit, bk)) std::fprintf(stderr, "strata batch: slot %d takes slot %d's conversation (%d tokens of the prompt)\n", admit, bk, best);
+                else std::fprintf(stderr, "strata batch: swap %d <-> %d failed: %s\n", admit, bk, ferr.c_str());
+            }
+            return target;
+        };
+        if (NS > 0)
+            std::fprintf(stderr, "serve: batch slots %d (%s), prompts of <= %d new tokens read in the windows\n", NS,
+                         !slots_core ? "stub" : slots_serial ? "core, windows slot by slot" : "core", mix_max);
+        for (;;) {
+            if (NS > 0 && any_active()) {   // slots decoding: a window whenever no line is waiting
+                if (!try_line(line)) {
+                    if (!run_window(nullptr)) { std::fflush(stdout); std::fflush(stderr); std::_Exit(1); }
+                    continue;
+                }
+            } else if (!next_line(line)) {
+                break;
+            }
             if (line == "QUIT") break;
             if (line == "STOP" || line.empty()) continue;
+            // the slot lines: BSTOP ends a slot at its next window; BYIELD for a read that has ended meanwhile; BGEN
+            // <slot> <max_new> .. reads the prompt into <slot> as a GEN 1, then the slot decodes on (BADM)
+            int admit = -1;
+            long long admit_max = 0;
+            if (line.rfind("BSTOP ", 0) == 0) {
+                const int b = std::atoi(line.c_str() + 6);
+                if (b >= 0 && b < NS) bs[(size_t) b].stop = true;
+                continue;
+            }
+            if (line.rfind("BYIELD", 0) == 0) continue;
+            if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
+                const bool bimg = line.rfind("BGENI ", 0) == 0;
+                char * e1 = nullptr;
+                const long b = std::strtol(line.c_str() + (bimg ? 6 : 5), &e1, 10);
+                char * e2 = nullptr;
+                const long long mn = std::strtoll(e1, &e2, 10);
+                if (b < 0 || b >= NS || bs[(size_t) b].active || mn < 1 || e2 == e1) {
+                    std::printf("ERR BGEN: no such free slot (--batch-slots %d) or a bad max_new\n", NS);
+                    std::fflush(stdout);
+                    continue;
+                }
+                admit = (int) b;
+                admit_max = mn;
+                line = std::string(bimg ? "GENI 1" : "GEN 1") + e2;
+            }
             dense.clear_vision();
             if (previous_vision && !pool_on) {   // the single park: token-only reuse, an image prompt is never continued
                 hist.clear();
@@ -1359,8 +1801,48 @@ int main(int argc, char ** argv) {
             } else {
                 dense.clear_vision();
             }
+            // batch slots: the request works in its slot (an admission's, or the idle one that offers the most): the dense
+            // half is bound to it, and hist / live_id / snap_len / .. below are its conversation until this iteration ends
+            const int my_slot = pick_slot(admit, ids, rid);
+            struct SlotScope {
+                std::function<void()> f;
+                ~SlotScope() { if (f) f(); }
+            } slot_scope;
+            if (my_slot >= 0) {
+                if (!bind(my_slot)) {
+                    std::printf("ERR batch slot %d: %s\n", my_slot, ferr.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
+                conv_swap(cv[(size_t) my_slot]);
+                gslot = my_slot;
+                if (btrace) std::fprintf(stderr, "strata batch: request in slot %d (%s)\n", my_slot, admit >= 0 ? "BGEN" : "GEN");
+                slot_scope.f = [&, my_slot]() {
+                    conv_swap(cv[(size_t) my_slot]);
+                    cv[(size_t) my_slot].used = now_ms();
+                    gslot = -1;
+                    feed_yield = nullptr;
+                    dense.clear_vision();   // a window's rows are text (and these rows die with the request)
+                };
+#if defined(DS41_HAVE_DSPARK)
+                if (admit < 0 && (my_slot != dsp_slot || batch_epoch != dsp_epoch)) dsp_next = -1;   // another conversation
+#endif
+                if (admit >= 0) ++batch_epoch;
+            }
             size_t lcp = conv_common_prefix(hist.data(), live_id.data(), live_id.size(), hist.size(), ids.data(), rid.data(),
                                             rid.size(), ids.size());
+            // batch slots: the live state holds the WHOLE prompt (a solo request STOPped for a promotion fed its last token
+            // before it saw the STOP): continue it by re-feeding that one token instead of restoring the prompt's snapshot
+            // and re-reading everything generated since (the ring and ratio-2 states are position-indexed: re-feeding the
+            // last position writes what is there)
+            const bool cont_last = NS > 0 && !hist.empty() && lcp == hist.size() && lcp == ids.size() && lcp >= 2 && !live_dirty &&
+                                   (snap_len < 0 || (size_t) snap_len < ids.size());
+            // ... and such a request (the prompt is the slot's own history - its turn and what it generated - plus at most
+            // the last generated token) keeps the turn's snapshot at the prompt's end: a promotion is not a turn boundary,
+            // and the client's next turn (or the same prompt again) resumes at that end, not 2 tokens into the reply
+            // (20.10 card: snapshots taken at prompt + 2 left 5 of 8 conversations unreachable at N=8)
+            const bool keep_snap = NS > 0 && snap_len > 0 && !hist.empty() && lcp + 1 >= hist.size() &&
+                                   ids.size() <= hist.size() + 1 && (size_t) snap_len < ids.size();
             bool unparked = false;
             int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
             size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
@@ -1369,6 +1851,7 @@ int main(int argc, char ** argv) {
                 // what the live state offers (the rules below): its history continued, or its snapshot restored
                 int live = 0;
                 if (!hist.empty() && lcp == hist.size() && lcp < ids.size()) live = (int) lcp;
+                else if (cont_last) live = (int) lcp - 1;
                 else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len <= ids.size()) live = snap_len;
                 const ConvMatch m = pool.best_prefix(ids.data(), rid.data(), rid.size(), (int64_t) ids.size());
                 int64_t pr = m.resume();
@@ -1466,6 +1949,10 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "serve: the live state is dirty (DSpark) at an odd position: resuming at %d\n", reused);
                 }
             }
+            else if (!unparked && cont_last) {
+                reused = (int) lcp - 1;
+                hist.resize((size_t) reused);
+            }
             else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);   // the same prompt again (regenerate): its end state + saved logits
                 reused = snap_len;
@@ -1523,7 +2010,7 @@ int main(int argc, char ** argv) {
             const int delta = total - reused;
             int sp_tail = 0;   // DSpark: the last new prompt tokens, fed by pass_v (seeds the window)
 #if defined(DS41_HAVE_DSPARK)
-            if (dsp_path) {
+            if (dsp_path && admit < 0) {   // (an admission decodes on in a slot: no drafts there)
                 if (!(reused > 0 && reused == dsp_next) && dsp) dsp->reset();
                 dsp_next = -1;
                 sp_tail = std::min(128, delta);
@@ -1550,6 +2037,10 @@ int main(int argc, char ** argv) {
                 bcap = sp_tail; dh = delta; force_batch = true; by_step = false;
             }
             (void) force_batch;
+            // batch slots: a short BGEN prompt is read in the windows, its rows beside the decoding slots' (feed_mixed);
+            // an image prompt, or a longer one, alone (the slots wait)
+            const bool mix_read = NS > 0 && admit >= 0 && !is_vision && dh >= 1 && dh <= mix_max && any_active();
+            if (mix_read && defer_vram) by_step = true;
             if (by_step && !cache_open) {
                 if (!open_cache()) { std::printf("ERR VRAM seed failed: %s\n", err.c_str()); std::fflush(stdout); continue; }
                 cache_open = true;
@@ -1689,8 +2180,52 @@ int main(int argc, char ** argv) {
             const double fd0[3] = { fd_dense, fd_tier, fd_logits };   // this request's batch split (stderr)
             bcap_n = bcap; bcap_got = 0;
             if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
+            auto feed_mixed = [&]() -> bool {   // the read's rows go into the windows, up to 16 - the decoding rows each
+                Mix mx;
+                mx.slot = gslot;
+                mx.pos = reused;
+                mx.left = dh;
+                mx.ids = ids.data();
+                mx.rid = rid.data();
+                mx.nrid = rid.size();
+                const RouteCls own{ a.route_bias, a.route_bias_file, cur_rprot, cur_rpool };
+                mx.cls = own;
+                if (exact_pass) mx.cls.rb = mx.cls.rbf = 0.0f;
+                while (mx.left > 0) {
+                    take_slot_lines(nullptr);   // BSTOPs now; a short read gives way to nobody (BYIELD not taken)
+                    const int before = dh - mx.left;
+                    if (!run_window(&mx)) { std::fflush(stdout); std::fflush(stderr); std::_Exit(1); }
+                    if (!bind(gslot)) return false;
+                    const int done = dh - mx.left;
+                    if (done / 64 != before / 64 && mx.left > 0) pp(done);
+                }
+                pp(dh);
+                set_class(own);
+                return true;
+            };
+            // BYIELD during a long read (a solo one, or this admission's): at the next layer-major batch boundary the
+            // part read stays in the named slot (the admission's own, or a free one the server reserved for a solo read)
+            int yield_slot = -1;
+            if (NS > 0 && !is_vision)
+                feed_yield = [&](int c0, int B) -> bool {
+                    int ys = -1;
+                    take_slot_lines(&ys);
+                    if (ys < 0) return false;
+                    const int rest = dh - (c0 + B);
+                    const bool can = ys < NS && !bs[(size_t) ys].active && (admit < 0 || ys == admit) && rest > std::max(SB, 16) &&
+                                     (!enc_skip || B >= ER || c0 == 0);
+                    if (!can) {
+                        std::fprintf(stderr, "strata batch: BYIELD %d not taken at %d of %d new tokens\n", ys, c0, dh);
+                        return false;
+                    }
+                    yield_slot = ys;
+                    std::fprintf(stderr, "strata batch: the prompt read gives way after %d of %d new tokens; slot %d holds it\n",
+                                 c0 + B, dh, ys);
+                    return true;
+                };
             dense.reset_span_width();   // a sub-batch narrowed by the last prompt's tight card starts wide again
-            bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
+            bool ok = total == reused || dh == 0 || (mix_read ? feed_mixed() : by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
+            feed_yield = nullptr;
             bcap_n = 0;
             if (kept) {   // the batch is done: the tail slots back (exactly the evicted experts), decode biases on
                 std::string kerr;
@@ -1704,6 +2239,28 @@ int main(int argc, char ** argv) {
                     apply_bias();
                 }
             }
+            if (ok && feed_stopped >= 0 && yield_slot >= 0 && !by_step && !mix_read) {   // BYIELD taken: the read goes on later
+                const int qn = reused + feed_stopped;
+                feed_stopped = -1;
+                hist.assign(ids.begin(), ids.begin() + qn);
+                live_id.assign(rid.begin(), rid.begin() + std::min<size_t>(rid.size(), (size_t) qn));
+                snap_len = -1;
+                live_dirty = false;
+                std::printf("YIELDED %d %d\n", yield_slot, qn);
+                std::printf("DONE 0 %d %.1f 0.0 cancel 0 0 %d 0 0 0 0 0.0 %d\n", total, now_ms() - tp0, reused, qn - reused);
+                if (admit >= 0) std::printf("BADM %d 0\n", admit);
+                std::fflush(stdout);
+                if (yield_slot != gslot) {   // a solo read: into the slot the server reserved for it
+                    const int from = gslot;
+                    slot_scope.f();
+                    slot_scope.f = nullptr;
+                    if (!swap_conv(yield_slot, from))
+                        std::fprintf(stderr, "strata batch: swap %d <-> %d failed: %s\n", yield_slot, from, ferr.c_str());
+                }
+                ++batch_epoch;
+                continue;
+            }
+            feed_stopped = -1;
             double ph_feed = now_ms() - tph0, ph_open = 0, ph_tail = 0;   // the request's prompt phases (stderr)
             int sp_t = -1;   // DSpark: the first decode token (sampled from the last prompt row), its drafts in sp_ids
             int sp_ids[5] = {0}, sp_tmp[5];
@@ -1760,7 +2317,7 @@ int main(int argc, char ** argv) {
                 if (ok) { bias_now = true; apply_bias(); }
                 ph_tail = now_ms() - tt0;
                 pp(delta);
-            } else if (ok && regen && dsp && snap_seed_n > 0) {   // a repeated prompt: re-seed DSpark from the snapshot's rows
+            } else if (ok && regen && dsp && snap_seed_n > 0 && admit < 0) {   // a repeated prompt: re-seed DSpark from the snapshot's rows
                 const double tt0 = now_ms();
                 dsp->reset();
                 std::vector<int> spos;
@@ -1809,7 +2366,9 @@ int main(int argc, char ** argv) {
             live_id = rid;
             // the single park: no snapshot for an image prompt (a text request with the same ids would restore its
             // embeddings); the pool compares identities, so an image prompt is snapshotted like any other
-            if (total > reused && (!is_vision || pool_on) && dense.snapshot(total)) {
+            if (keep_snap && !unparked) {
+                if (btrace) std::fprintf(stderr, "strata batch: the turn's snapshot stays at %d (this request re-feeds its own output)\n", snap_len);
+            } else if (total > reused && (!is_vision || pool_on) && dense.snapshot(total)) {
                 snap_len = total;
                 snap_logits = last_logits;
                 snap_seed.swap(cur_seed);   // this prompt's DSpark tail rows (0 rows when DSpark is off / no tail ran)
@@ -1975,9 +2534,11 @@ int main(int argc, char ** argv) {
                 sv_pass += rq_pass; sv_acc += rq_acc;
             }
 #endif
+            int last_tok = -1;   // (an admission's first token: its slot feeds it first)
             while (sp_t < 0 && (gen < max_new || max_new <= 0)) {
                 if (stop_pending()) { finish = "cancel"; break; }
                 const int tok = sample_p(lg.data(), nv, temp, tk, top_p, min_p, rng);
+                last_tok = tok;
                 std::printf("T %d\n", tok);
                 std::fflush(stdout);
                 ++gen;
@@ -2032,6 +2593,40 @@ int main(int argc, char ** argv) {
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
                         (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, total - reused);
             std::fflush(stdout);
+            if (admit >= 0) {   // BADM: the request decodes on in its slot (the windows), or it is done
+                const bool cont = gen == 1 && last_tok >= 0 && admit_max > 1 && std::strcmp(finish, "length") == 0 &&
+                                  (int) hist.size() == total && total + 1 < ctxv;
+                if (cont) {
+                    BSlot & sl = bs[(size_t) admit];
+                    sl = BSlot();
+                    sl.active = true;
+                    sl.x = last_tok;
+                    sl.p = total;
+                    sl.produced = 1;
+                    sl.max_new = admit_max;
+                    sl.t0 = now_ms();
+                    sl.temp = temp; sl.top_k = tk; sl.top_p = top_p; sl.min_p = min_p;
+                    sl.rng = rng;
+                    sl.cls = RouteCls{ a.route_bias, a.route_bias_file, cur_rprot, cur_rpool };
+                    std::fprintf(stderr, "strata batch: slot %d decodes on from %d tokens (%d reused; route bias %.2f/%.2f)\n",
+                                 admit, total, reused, a.route_bias, a.route_bias_file);
+                }
+                std::printf("BADM %d %d\n", admit, cont ? 1 : 0);
+                std::fflush(stdout);
+                ++batch_epoch;
+                if (!cont) save_live("turn end");   // (a slot that decodes on goes to the pool at its BDONE)
+            }
+            // batch slots: every turn's boundary into the pool at once (an async copy of the new tail).  With one live
+            // state the pool got it when the next request overwrote it; with slots a side request takes another slot,
+            // nothing is overwritten, and an earlier boundary of this conversation (an edited turn's resume point) would
+            // be gone with the slot's next snapshot (20.10 card: c3edit read 8185 tokens again instead of resuming at 8081)
+            else if (my_slot >= 0) {
+                save_live("turn end");
+#if defined(DS41_HAVE_DSPARK)
+                dsp_slot = my_slot;         // a solo request: DSpark's window is this slot's conversation now
+                dsp_epoch = batch_epoch;
+#endif
+            }
         }
         tier.close();
         // the stdin reader thread (detached) sits in getline holding cin's lock: a normal exit's stream teardown waits
