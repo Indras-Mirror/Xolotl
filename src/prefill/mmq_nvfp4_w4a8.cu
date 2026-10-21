@@ -7,6 +7,12 @@
 // sm_120 by hiding Blackwell's FP4 MMA from mmq.cuh on both sides: the device code (BLACKWELL_MMA_AVAILABLE) and
 // the host's tile config (blackwell_mma_available(cc)) - they must agree, the host sizes shared memory for the
 // device's layout. The two non-static templates are renamed so the linker cannot fold them with the W4A4 instance.
+//
+// MXFP4 (Qwen3.8-Flash-Next-MXFP4's experts, MiMo's outliers) takes the same int8 path here, and only here. With
+// Blackwell's FP4 MMA visible, mmq.cuh's MXFP4 instance reads its activations as block_fp4_mmq (ggml quantizes them
+// with quantize_mmq_fp4_cuda), but the prompt path quantizes them as Q8_1 (mmq::quantize, the layout every other
+// type reads): on an sm_120a build every prompt of an MXFP4 model ended in non-finite logits. On a plain sm_120 build
+// that instance did not compile at all. Elsewhere (sm_89 and older) this is the instance mmq.cuh always built.
 #include "common.cuh"
 
 #undef BLACKWELL_MMA_AVAILABLE
@@ -16,9 +22,13 @@
 #include "mmq.cuh"
 
 DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+DECL_MMQ_CASE(GGML_TYPE_MXFP4);
 
 namespace strata::prefill::mmq {
 void run_nvfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s) {
     strata_w4a8_mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, a, s);
+}
+void run_mxfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s) {
+    strata_w4a8_mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, a, s);
 }
 }  // namespace strata::prefill::mmq

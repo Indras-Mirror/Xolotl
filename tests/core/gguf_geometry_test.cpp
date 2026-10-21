@@ -228,6 +228,26 @@ int main(int argc, char** argv) {
               "a float where a count belongs is refused");
     }
     {
+        // llama.cpp's NextN layout (Qwen3.8-Flash-Next-MXFP4-ngramQ8-NextN.gguf): block_count counts the MTP block that
+        // follows the trunk; compress_ratios lists the trunk's 48 layers.  The engine runs the trunk.
+        const fixture::Kv bc = fixture::u32(p + "block_count", 49), nx = fixture::u32(p + "nextn_predict_layers", 1);
+        const Result r = run(d.path, with(with(full_keys(), bc.key, &bc), nx.key, &nx));
+        check(r.read_err.empty() && r.g.n_layers == 48 && r.g.n_mtp_layers == 1,
+              "block_count 49, nextn_predict_layers 1: a 48-layer trunk and one MTP block" +
+                  (r.read_err.empty() ? "" : ": " + r.read_err));
+        check(r.unsupported.empty() && r.guard.empty(), "  which the kernels run, and the guard passes");
+        const fixture::Kv zero = fixture::u32(p + "nextn_predict_layers", 0);
+        const Result z = run(d.path, with(full_keys(), zero.key, &zero));
+        check(z.read_err.empty() && z.g.n_layers == 48 && z.g.n_mtp_layers == 0 && z.guard.empty(),
+              "nextn_predict_layers 0: no MTP block");
+        const fixture::Kv all = fixture::u32(p + "nextn_predict_layers", 49);
+        check(has(run(d.path, with(with(full_keys(), bc.key, &bc), all.key, &all)).read_err,
+                  "nextn_predict_layers = 49 is not smaller than block_count = 49"),
+              "an MTP count that leaves no trunk is refused");
+        check(has(run(d.path, with(full_keys(), nx.key, &nx)).guard, "each of the 47 layers"),
+              "block_count 48 with an MTP block is a 47-layer trunk: its 48 compress_ratios do not fit");
+    }
+    {
         // a consistent file of another shape reads, and the kernels refuse it naming the key
         const fixture::Kv bc = fixture::u32(p + "block_count", 40);
         const fixture::Kv cr = fixture::u32s(p + "attention.compress_ratios", ratios(40, 4, 4));

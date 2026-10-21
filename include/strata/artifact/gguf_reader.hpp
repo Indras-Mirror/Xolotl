@@ -706,6 +706,17 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
     };
     for (const Key& k : keys)
         if (!read_int(k.key, g.*k.field, k.required)) return err;
+    // An in-file MTP block (llama.cpp's NextN layout: the "-NextN" / "MTP" GGUFs) is counted in block_count and stored
+    // after the trunk as blk.<trunk>.*.  The engine runs the trunk; its draft head is --mtp, so the block is left out.
+    if (const MetaValue* v = f.get(p + "nextn_predict_layers")) {
+        if (!v->is_num() || v->type == MetaType::F32 || v->type == MetaType::F64 || v->type == MetaType::BOOL)
+            return p + "nextn_predict_layers is not an integer";
+        if ((int64_t) v->u < 0 || (int64_t) v->u >= g.n_layers)
+            return p + "nextn_predict_layers = " + std::to_string((int64_t) v->u) + " is not smaller than block_count = " +
+                   std::to_string(g.n_layers);
+        g.n_mtp_layers = (int64_t) v->u;
+        g.n_layers -= g.n_mtp_layers;
+    }
 
     int64_t value_length = g.head_dim, ff_shexp = g.n_ff;
     if (!read_int("attention.value_length", value_length, false) ||

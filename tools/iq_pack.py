@@ -156,6 +156,7 @@ class Model:
         self.files = [G.GGUFFile(p) for p in paths]
         self.sizes = [p.stat().st_size for p in paths]
         check_split(self.files)
+        self.mtp_first = mtp_first_layer(self.files[0].metadata)
         self.where = {}
         for p, g in zip(paths, self.files):
             mm = np.memmap(p, dtype=np.uint8, mode="r")
@@ -224,6 +225,23 @@ def is_expert(name: str) -> bool:
     return name.startswith("blk.") and name.endswith(("_exps.weight",))
 
 
+def mtp_first_layer(meta: dict) -> int | None:
+    """The first layer of an in-file MTP block, or None.  llama.cpp's NextN layout (the "-NextN" / "MTP" GGUFs, e.g.
+    Qwen3.8-Flash-Next-MXFP4-ngramQ8-NextN) counts the block in <arch>.block_count (49) and stores it after the trunk
+    as blk.48.*, with <arch>.nextn_predict_layers = 1.  The engine runs the trunk's 48 layers and takes its draft head
+    from --mtp (tools/mtp_pack.py), so the block is not packed: its experts would be a 49th line of native_experts.txt,
+    which the engine refuses ("a malformed line"), and its other tensors would be loaded for nothing."""
+    arch = meta.get("general.architecture")
+    blocks, nextn = meta.get("%s.block_count" % arch), meta.get("%s.nextn_predict_layers" % arch)
+    if not isinstance(blocks, int) or not isinstance(nextn, int) or not 0 < nextn < blocks:
+        return None
+    return blocks - nextn
+
+
+def in_mtp_block(name: str, first: int | None) -> bool:
+    return first is not None and name.startswith("blk.") and int(name.split(".")[1]) >= first
+
+
 def convert(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool):
     """The pack form of one tensor the engine reads from dense.bin: (kind, stored bytes, destination bytes,
     record or None), or an error string.  `record` describes a conversion for conversions.json."""
@@ -277,7 +295,7 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
     reads them (FORM; converted when stored otherwise, see above), quantized ones served natively from the GGUF."""
     todo, problems = [], []
     for name, (g, t, mm, p) in model.where.items():
-        if is_expert(t.name) or t.name in NOT_IN_PACK:
+        if is_expert(t.name) or t.name in NOT_IN_PACK or in_mtp_block(name, model.mtp_first):
             continue
         if len(t.shape) > 2:
             print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
@@ -433,7 +451,11 @@ def expert_layout(model: Model, src: pathlib.Path):
     shards do not start their data section at the same byte, so one role's data_start must not be used for
     another's (per-role data_start as in #255, gopinath87607)."""
     T = {n: w[1] for n, w in model.where.items()}
-    exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")]
+    exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")
+            and not in_mtp_block(n, model.mtp_first)]
+    if model.mtp_first is not None:
+        print("the in-file MTP block (layer %d on) is not packed: the engine runs the trunk, its draft head is --mtp"
+              % model.mtp_first)
     if not exps:
         return "the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)"
     n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
