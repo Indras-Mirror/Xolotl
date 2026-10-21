@@ -1,21 +1,27 @@
 """test_ds41_vision.py - the gate for tools/v41/vision/ds41_vision.py.
 
     python3 tools/v41/vision/test_ds41_vision.py            # CPU, 4 torch threads (run it under nice -n 10)
+    DS41_VISION_WEIGHTS=<tower.safetensors | checkpoint dir | mmproj.gguf> ...   # the encoder on the full tower
+    DS41_TEST_DEVICE=cuda ...                                 # the encoder on the GPU (the reference stays on the CPU)
 
 1. Reference = DeepSeek's own ViT + Aligner (reference `vision.py`) with the ORIGINAL checkpoint weights
    (the FP8/BF16 shards holding vision.*/aligner.*/image_*), the span assembled the way
-   model.py:merge_image_embeddings does.  Encoder = the sidecar weights.  Per-row cosine over the whole
-   span: min >= 0.999.
-2. The same comparison with the reference built from the SAME dequantized sidecar weights: the forward
-   path and the span assembly must agree to <= 1e-2 (bf16 level).
+   model.py:merge_image_embeddings does.  Encoder = the sidecar weights, or DS41_VISION_WEIGHTS (the encoder's
+   --vision-weights) when set.  Per-row cosine over the whole span: min >= 0.999.  (The sidecar's Q8_0 tower
+   alone is ~0.996 on the 300x1200 image; the full tower passes.)
+2. The same comparison with the reference built from the encoder's OWN weights (the dequantized sidecar, or the
+   --vision-weights tensors): the forward path and the span assembly must agree to <= 1e-2 (bf16 level).
+   With DS41_VISION_WEIGHTS the max |diff| of those tensors against the checkpoint's is printed too (0 for BF16).
 3. Three synthetic PIL images (640x480 text+shapes, 300x1200 tall, 50x50 tiny): every row count equals
    image_processor.num_image_tokens(plan_image_grid(...)).
 4. Protocol smoke: spawn ds41_vision.py exactly as serve/server.py's `class Vision` would, encode two
    images, and read the files the engine's GENI path reads (generate.cpp:6313-6331).
 
 No image is ever read from disk as a fixture or displayed; images exist only in memory (a temp file is
-written solely because the ENC protocol takes a path).  The GPU is untouched: the encoder forces
-CUDA_VISIBLE_DEVICES=-1 and the test never calls torch.cuda.
+written solely because the ENC protocol takes a path).  By default the GPU is untouched: the encoder forces
+CUDA_VISIBLE_DEVICES=-1 and the test never calls torch.cuda.  DS41_TEST_DEVICE=cuda puts the encoder (in-process
+and the protocol-smoke subprocess, --device cuda) on the GPU; there the subprocess rows must match the in-process
+ones to 1e-5 relative instead of bit for bit.
 """
 import io
 import json
@@ -47,6 +53,8 @@ from gguf import quants as Q  # noqa: E402
 SIDECAR = os.environ.get("DS41_SIDECAR", V.DEFAULT_SIDECAR)
 REFERENCE = os.environ.get("DS41_REFERENCE", V.DEFAULT_REFERENCE)
 CHECKPOINT = os.environ.get("V41_CHECKPOINT", G.MAIN)
+WEIGHTS = os.environ.get("DS41_VISION_WEIGHTS") or None
+DEVICE = os.environ.get("DS41_TEST_DEVICE", "cpu")
 
 sys.path.insert(0, os.path.abspath(REFERENCE))
 import image_processor as IP  # noqa: E402
@@ -164,6 +172,8 @@ def main():
     print(f"reference dir : {REFERENCE}")
     print(f"checkpoint    : {CHECKPOINT}")
     print(f"sidecar       : {SIDECAR}")
+    print(f"weights       : {WEIGHTS or '(the sidecar)'}")
+    print(f"device        : {DEVICE}")
 
     print("\n== item 1: sidecar Q8_0 vs the sidecar's delimiters sanity ==")
     kv, side = sidecar_weights()
@@ -173,9 +183,22 @@ def main():
     ck = checkpoint_weights()
     print(f"checkpoint vision tensors: {len(ck)} loaded in {time.time() - t0:.1f}s")
 
+    own = side
+    if WEIGHTS:
+        src = V.open_weights(WEIGHTS)
+        own = {n: src.get(n) for n in src.names()}
+        src.close()
+        assert sorted(own) == sorted(ck), (len(own), len(ck))
+        worst = max(float(np.abs(own[n] - ck[n]).max()) for n in ck)
+        nz = sum(float(np.abs(own[n] - ck[n]).max()) != 0.0 for n in ck)
+        print(f"--vision-weights vs checkpoint: {len(own)} tensors, max |diff| {worst:.3g} ({nz} tensors differ)")
+
     t0 = time.time()
-    enc = V.Encoder(SIDECAR, reference_dir=REFERENCE, device="cpu", threads=4, dtype="f32")
-    print(f"encoder built in {time.time() - t0:.1f}s (n_embd {enc.n_embd})")
+    enc = V.Encoder(SIDECAR, reference_dir=REFERENCE, device=DEVICE, threads=4, dtype="f32", weights=WEIGHTS)
+    print(f"encoder built in {time.time() - t0:.1f}s (n_embd {enc.n_embd}, weights: {enc.weights_desc})")
+    if DEVICE == "cuda":
+        s, h, w = enc.warmup()
+        print(f"cuda warm-up {h}x{w} grid in {s:.2f}s")
 
     imgs = synth_images()
     results, spans = [], {}
@@ -184,6 +207,11 @@ def main():
         e0 = time.time()
         span_e, n_llm_h, n_llm_w, n_vit_h, n_vit_w = enc.encode(data)
         enc_s = time.time() - e0
+        if DEVICE == "cuda":                                 # a second, warm encode for the timing column
+            e0 = time.time()
+            span_e2 = enc.encode(data)[0]
+            enc_s = time.time() - e0
+            assert float((span_e2 - span_e).abs().max()) <= 1e-5 * float(span_e.abs().max()), "cuda encode not stable"
         patches, vh, vw, nh, nw = IP.load_image({"data": data}, args)
         assert (vh, vw, nh, nw) == (n_vit_h, n_vit_w, n_llm_h, n_llm_w)
         n_expect = IP.num_image_tokens(n_llm_h, n_llm_w)
@@ -192,7 +220,7 @@ def main():
         assert nx * ny == n_expect
 
         span_ck, _ = reference_span(ck, patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w, args)
-        span_sc, _ = reference_span(side, patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w, args)
+        span_sc, _ = reference_span(own, patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w, args)
 
         cos = torch.nn.functional.cosine_similarity(span_e, span_ck, dim=1)
         rel_ck = ((span_e - span_ck).norm(dim=1) / span_ck.norm(dim=1).clamp_min(1e-12)).max().item()
@@ -202,7 +230,7 @@ def main():
         spans[label] = span_e
         print(f"  {label:20s} vit {n_vit_h}x{n_vit_w} llm {n_llm_h}x{n_llm_w} rows {n_expect:4d} "
               f"grid {nx}x{ny} | cos min {cos.min().item():.6f} mean {cos.mean().item():.6f} | "
-              f"relerr vs FP8 {rel_ck:.2e} vs sidecar {rel_sc:.2e} | {enc_s:.1f}s")
+              f"relerr vs FP8 {rel_ck:.2e} vs own weights {rel_sc:.2e} | {enc_s:.2f}s")
 
     print("\n== item 4: protocol smoke (subprocess, argv + stdin as server.py's Vision) ==")
     smoke = protocol_smoke(imgs, results, spans)
@@ -213,7 +241,7 @@ def main():
         good = r[8] >= 0.999 and r[11] <= 1e-2
         ok &= good
         print(f"  {'PASS' if good else 'FAIL'} {r[0]:20s} cosine>={0.999} (min {r[8]:.6f}), "
-              f"sidecar relerr<={1e-2} ({r[11]:.2e})")
+              f"own-weights relerr<={1e-2} ({r[11]:.2e})")
     ok &= smoke
     print(f"  {'PASS' if smoke else 'FAIL'} protocol smoke")
     print(f"\ntotal {time.time() - t_start:.1f}s")
@@ -226,7 +254,13 @@ def protocol_smoke(imgs, results, spans):
     argv = [sys.executable, os.path.join(HERE, "ds41_vision.py"),
             "--mmproj", SIDECAR, "--model", "unused.gguf", "--threads", "4",
             "--reference-dir", REFERENCE]
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="-1")
+    if WEIGHTS:
+        argv += ["--vision-weights", WEIGHTS]
+    if DEVICE == "cuda":
+        argv += ["--device", "cuda"]
+        env = dict(os.environ)
+    else:
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES="-1")
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, bufsize=1, env=env)
     ready = proc.stdout.readline().strip()                     # server.py:1297 demands "READY"
@@ -246,11 +280,13 @@ def protocol_smoke(imgs, results, spans):
         assert line.startswith("OK"), f"encoder said: {line!r}"
         n, nx, ny = (int(x) for x in line.split()[1:4])
         rows, gx, gy = V.read_sve(out)                         # engine parse (generate.cpp:6319)
-        dev = float(np.abs(rows - spans[label].numpy()).max())
+        ref_rows = spans[label].numpy()
+        dev = float(np.abs(rows - ref_rows).max())
+        tol = 0.0 if DEVICE != "cuda" else 1e-5 * float(np.abs(ref_rows).max())
         ok = (n == n_expect and rows.shape == (n_expect, 5120) and (nx, ny) == (gx, gy) == (nx_e, ny_e)
-              and dev == 0.0)
+              and dev <= tol)
         print(f"  ENC {label:20s} -> {line} | file {rows.shape} grid {gx}x{gy} | "
-              f"rows == in-process: {dev == 0.0} (max |diff| {dev:g})")
+              f"rows == in-process: {dev <= tol} (max |diff| {dev:g}{f', tol {tol:.2g}' if tol else ''})")
         outs.append(ok)
     proc.stdin.write("QUIT\n")
     proc.stdin.flush()

@@ -886,6 +886,11 @@ int main(int argc, char ** argv) {
             } else return false;
         }
         seed_s = (now_ms() - ts) / 1000.0;
+        // every seed (the DSpark tail opens the cache silently otherwise): what another process on the card - the
+        // image encoder - costs the decode is the slot count here
+        if (std::getenv("STRATA_SEED_LOG"))
+            std::fprintf(stderr, "seed: %.2f GiB free (margin %.2f) -> %.2f GiB of slots: %lld experts in VRAM (%.2f s)\n",
+                         seed_free, a.vram_margin_gib, seed_gib, (long long) tier.resident(), seed_s);
         proxy_res.clear();   // the real VRAM set from here on
         bias_now = true;     // decode: route bias + file penalty on
         apply_bias();
