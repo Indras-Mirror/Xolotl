@@ -1905,26 +1905,43 @@ bool Ds41Dense::restore() {
 
 int Ds41Dense::snapshot_pos() const { return p_->snap_pos; }
 
+std::vector<Ds41Dense::StateRegion> Ds41Dense::state_regions(int64_t positions) const {
+    const Impl & im = *p_;
+    std::vector<StateRegion> out;
+    if (positions < 1) return out;
+    for (const auto & L : im.ly) {
+        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
+            if (t) out.push_back({ t, 0, ggml_nbytes(t) });
+        for (ggml_tensor * t : { L.comp, L.idxk }) {   // row r holds a position >= r (ratio 1 or 2): rows [0, n] cover n positions
+            if (!t) continue;
+            const int64_t rows = t->ne[1];
+            const int64_t n = std::min<int64_t>(rows - 1, positions + 1);
+            out.push_back({ t, 0, (size_t) n * t->nb[1] });
+            out.push_back({ t, (size_t) (rows - 1) * t->nb[1], t->nb[1] });   // the spare row (open compressor groups write it)
+        }
+    }
+    return out;
+}
+
+void Ds41Dense::set_engram_history(int64_t pos0, int n, const int * tids, const uint8_t * dead) {
+    Impl & im = *p_;
+    if (!im.engram.enabled()) return;
+    for (int i = 0; i < n; ++i) {
+        if (pos0 + i < 0) continue;
+        if (dead && dead[i]) im.engram.set_dead(pos0 + i);
+        else im.engram.set_token(pos0 + i, tids[i]);
+    }
+}
+
 bool Ds41Dense::park(int64_t positions) {
     Impl & im = *p_;
     if (im.snap_pos < 0 || positions < 1) return false;
     ggml_backend_synchronize(im.backend);
     im.parked.clear();
-    auto put = [&](ggml_tensor * t, size_t off, size_t n) {
-        Impl::ParkedRows r{ t, off, std::vector<uint8_t>(n) };
-        ggml_backend_tensor_get(t, r.b.data(), off, n);
-        im.parked.push_back(std::move(r));
-    };
-    for (auto & L : im.ly) {
-        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
-            if (t) put(t, 0, ggml_nbytes(t));
-        for (ggml_tensor * t : { L.comp, L.idxk }) {   // row r holds a position >= r (ratio 1 or 2): rows [0, n] cover n positions
-            if (!t) continue;
-            const int64_t rows = t->ne[1];
-            const int64_t n = std::min<int64_t>(rows - 1, positions + 1);
-            put(t, 0, (size_t) n * t->nb[1]);
-            put(t, (size_t) (rows - 1) * t->nb[1], t->nb[1]);   // the spare row (open compressor groups write it)
-        }
+    for (const StateRegion & r : state_regions(positions)) {
+        Impl::ParkedRows pr{ r.t, r.off, std::vector<uint8_t>(r.bytes) };
+        ggml_backend_tensor_get(r.t, pr.b.data(), r.off, r.bytes);
+        im.parked.push_back(std::move(pr));
     }
     im.parked_pos = im.snap_pos;
     return true;

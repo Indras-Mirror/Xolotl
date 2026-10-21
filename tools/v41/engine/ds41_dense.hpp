@@ -180,6 +180,15 @@ public:
     bool unpark();
     void drop_park();
     bool parked() const;
+    /// A conversation's reusable device state at its snapshot, as regions of the device tensors: the snapshot rings
+    /// (window K/V, ratio-2 compressor state) + rows [0, positions] of every compressed-KV / indexer-key cache and their
+    /// spare rows - exactly what park() copies.
+    struct StateRegion { ggml_tensor * t; size_t off, bytes; };
+    std::vector<StateRegion> state_regions(int64_t positions) const;
+    /// Engram history: the n-gram hash of a pass's first positions reads the tokens before it from the history, which
+    /// is kept BY POSITION - another request that wrote those positions since leaves its own tokens there.  Rewrite
+    /// [pos0, pos0 + n) with tids (DEAD where dead[i] != 0: an image position).  A no-op without Engram.
+    void set_engram_history(int64_t pos0, int n, const int * tids, const uint8_t * dead);
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns
