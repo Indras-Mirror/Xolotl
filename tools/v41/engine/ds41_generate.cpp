@@ -1050,6 +1050,12 @@ int main(int argc, char ** argv) {
                 for (int s = 0; tail_keep > 0 && s < B; s += SB)   // one sub-batch at a time, as above
                     if (!capture_tail(n, c0 + s, std::min(SB, B - s), s)) return false;
                 fd_logits += now_ms() - tl;
+                if (vram_trace) {   // the batch's peak is its last layers' (the pass graph only grows within a prompt)
+                    size_t tf = 0, tt = 0;
+                    ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
+                    std::fprintf(stderr, "vram trace: batch at %d (B %d) done: free %.2f GiB; %s\n", pos0 + c0, B,
+                                 tf / 1073741824.0, dense.vram_ledger().c_str());
+                }
                 c0 += B;
             } else {
                 // ---- the sequential chunk path (unchanged): one pass of up to NP tokens through every layer
@@ -1648,18 +1654,42 @@ int main(int argc, char ** argv) {
                 // a column" is a mis-derivation (1424/8192) and the decomposition is really ~5.7 GiB fixed + 0.78 a
                 // column.  Same line, same fit - but it matters: a wide batch's per-column STATE is what starves the
                 // fixed graph buffer (16384 = 5.14 GiB of state, 1.03 GiB short), not the graph itself.
+                // 2026-10-20: the GRAPH also grows with the CONTEXT.  The indexer's score / mask tensors are
+                // [visible compressed rows x queries] (build_attn), and the visible rows are a power of two: a
+                // ratio-1 layer past 2^19 rows builds a 9.06 GiB span graph untiled (5.56 with build_attn's indexer
+                // tile) instead of ~1.2, and it is built first by
+                // the prompt's LAST batch (under enc-skip the only one that runs layers 21-39) - long after this width
+                // took the columns.  The line above budgets the graph as its own decomposition says, 2.19 GiB + 0.17
+                // MiB a column (4.2 GiB at 12288 columns): room for some growth over the 1.16 GiB a short context
+                // builds, none for 9 GiB.  So the width must also fit the batch's memory WITHOUT that allowance plus
+                // the graph this prompt's last sub-batch will really build, as the allocator plans it:
+                //     need(B) = max(4.3 GiB + 0.95 MiB * B,  2.5 GiB + 0.78 MiB * B + graph)
+                // The second term is a 5090 trace (2026-10-20, 12288 columns, 18.74 GiB free at the cap): a 512K
+                // prompt's batches took 13.01 GiB with a 1.16 GiB graph - 11.85 GiB besides it = 2.5 GiB + run20's
+                // 0.78 MiB a column - and its last batch's 4.56 GiB graph left 2.33 GiB free, as the term says.  Up to
+                // the allowance (here every context up to 512K at the full width) the cap is the one it was.
+                // STRATA_PB_GRAPH=0: the line alone (diagnostics).
+                static const bool pb_graph = !(std::getenv("STRATA_PB_GRAPH") && std::atoi(std::getenv("STRATA_PB_GRAPH")) == 0);
+                const double g_need = pb_graph ? (double) dense.span_graph_bytes(total, SB) : 0.0;   // memoized per row count
                 const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - 4.3 * 1073741824.0;
-                const int fit = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
+                const double room_g = (double) frb - a.vram_margin_gib * 1073741824.0 - 2.5 * 1073741824.0 - g_need;
+                const int fit_line = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
+                const int fit_g = pb_graph ? (int) std::max<int64_t>(2, (int64_t) (room_g / (0.78 * 1048576.0))) : fit_line;
+                const int fit = std::min(fit_line, fit_g);
                 pb_cap = std::min(PB, std::max(SB, fit));
-                if (vram_trace) std::fprintf(stderr, "vram trace: cap free %.2f GiB room %.2f GiB fit %d -> pb_cap %d\n",
-                                             frb / 1073741824.0, room / 1073741824.0, fit, pb_cap);
-                if (pb_cap < PB) std::fprintf(stderr, "serve: VRAM %.2f GiB free -> prompt batch %d (of %d)\n",
-                                              frb / 1073741824.0, pb_cap, PB);
+                if (vram_trace) std::fprintf(stderr, "vram trace: cap free %.2f GiB room %.2f GiB fit %d, graph %.2f GiB fit %d -> pb_cap %d\n",
+                                             frb / 1073741824.0, room / 1073741824.0, fit_line, g_need / 1073741824.0, fit_g, pb_cap);
+                if (fit_g < fit_line && fit_g < PB)
+                    std::fprintf(stderr, "serve: a %d-token context's pass graph needs %.2f GiB -> prompt batch %d (of %d)\n",
+                                 total, g_need / 1073741824.0, pb_cap, PB);
+                else if (pb_cap < PB) std::fprintf(stderr, "serve: VRAM %.2f GiB free -> prompt batch %d (of %d)\n",
+                                                   frb / 1073741824.0, pb_cap, PB);
             }
             const double tph0 = now_ms();
             const double fd0[3] = { fd_dense, fd_tier, fd_logits };   // this request's batch split (stderr)
             bcap_n = bcap; bcap_got = 0;
             if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
+            dense.reset_span_width();   // a sub-batch narrowed by the last prompt's tight card starts wide again
             bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
             bcap_n = 0;
             if (kept) {   // the batch is done: the tail slots back (exactly the evicted experts), decode biases on
