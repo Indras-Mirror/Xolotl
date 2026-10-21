@@ -2022,7 +2022,21 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
     if (pin_after) {
         // registered after the fill below
     } else if (im_->cfg.pin) {
-        gp.arena.owner.reset(new strata::core::PinnedArena(gp.arena.bytes));
+        // STRATA_ARENA_SLICE_GIB=N (opt-in): when CUDA refuses to register the whole arena in one call (Windows: a
+        // single block over ~50 GiB can fail while the same memory in 4 GiB pieces registers), pin it in N-GiB pieces
+        // instead of leaving it unpinned.  The cuts fall on blob boundaries (a copy of one blob must not span two
+        // registered regions).  Unset or 0: one registration, as before.
+        const char* sl = std::getenv("STRATA_ARENA_SLICE_GIB");
+        const uint64_t slice = sl ? (uint64_t) std::max(0, std::atoi(sl)) << 30 : 0;
+        std::vector<uint64_t> cuts;
+        if (slice > 0) {
+            cuts.push_back(0);
+            for (const uint64_t o : gp.arena.off)
+                if (o >= cuts.back() + slice && o < gp.arena.bytes) cuts.push_back(o);
+            cuts.push_back(gp.arena.bytes);
+        }
+        if (cuts.size() >= 3) gp.arena.owner.reset(new strata::core::PinnedArena(gp.arena.bytes, cuts));
+        else gp.arena.owner.reset(new strata::core::PinnedArena(gp.arena.bytes));
         if (!gp.arena.owner->valid()) {
             err = "pinned arena allocation of " + std::to_string(gib) + " GiB failed";
             gp.arena.close();

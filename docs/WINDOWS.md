@@ -103,6 +103,7 @@ The Windows configs are `strata-ds41*-win.json`. They carry `ds41-engine.sh`'s s
 
 Notes from this machine:
 - **Large pages are not needed for CUDA copies on Windows.** 4 KB pinned pages copy to the card at 26 GB/s here (PCIe 4.0 x16).
+- **A 72 GiB arena can come up unpinned.** The log then says `cudaHostRegister FAILED (out of memory) - the arena is NOT pinned`, and decode falls by about a third. On one PC (RTX 5090, 128 GB, Windows 11) one registration over about 50 GiB was refused (48 GiB pinned, 56 GiB did not), with one or two cards visible, while 4 GiB blocks registered up to at least 96 GiB in total. `STRATA_ARENA_SLICE_GIB=4` (opt-in; unset keeps one registration) pins the arena in 4 GiB pieces cut on expert boundaries and locks what is left (log: `18 slices pinned (71 GiB)`). 1017 XQ, `--arena-gib 72`, `decode_bench.py` (4 prompts, 400 tokens, greedy): 19.4-21.1 tok/s unpinned, 30.5 and 32.3 with the sliced pin, 32.8 and 34.3 with a 48 GiB arena in one registration. Agent bench (29.5K-token first prompt, 4 more turns): decode 29.5 tok/s, 63.3 s for the first prompt. One PC, one run each.
 - **Decode is bound by kernel-launch overhead.** CUDA graphs halve the dense half's time (`GGML_CUDA_DISABLE_GRAPHS=1` doubles it); the expert tier is not graphed yet.
 
 ## What the port changed
