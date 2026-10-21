@@ -1121,7 +1121,77 @@ __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t valu
     while (*flag < value) strata_spin_pause();
     __threadfence_system();
 }
+
+// the GPU's clock in ns (the same sources as gpu_stamp_kernel)
+__device__ __forceinline__ unsigned long long strata_now_ns() {
+    unsigned long long t;
+#if defined(STRATA_HIP_GFX906)
+    t = wall_clock64() * 40ull;
+#elif defined(__HIPCC__)
+    t = wall_clock64() * 10ull;
+#else
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+#endif
+    return t;
+}
+
+// the overlapped split's hand-off wait, bounded: spin until *flag >= value, or give up after timeout_ns (0: never),
+// marking *err = 1 (mapped) so the host fails the window instead of using a stale hand-off.  The window's later
+// kernels still run (on whatever the hand-off buffer holds) so the graph completes and no stream is left hanging.
+__global__ void wait_handoff_kernel(const volatile uint32_t* flag, uint32_t value, uint32_t* err,
+                                    unsigned long long timeout_ns) {
+    const unsigned long long t0 = timeout_ns ? strata_now_ns() : 0ull;
+    while (*flag < value) {
+        strata_spin_pause();
+        if (timeout_ns && strata_now_ns() - t0 > timeout_ns) {
+            *(volatile uint32_t*) err = 1u;
+            __threadfence_system();
+            return;
+        }
+    }
+    __threadfence_system();
+}
+
+__global__ void handoff_publish_kernel(float* dst, const float* __restrict__ a, int64_t na, const float* __restrict__ b,
+                                       int64_t nb, const float* __restrict__ c, int64_t nc, uint32_t* counter,
+                                       uint32_t* flag, const volatile uint32_t* drop) {
+    const int64_t n = na + nb + nc;
+    volatile float* const out = dst;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        out[i] = i < na ? a[i] : i < na + nb ? b[i - na] : c[i - na - nb];
+    __threadfence_system();   // this thread's stores reach host memory before the block counts itself done
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const uint32_t prev = atomicAdd(counter, 1u);
+        if (prev == gridDim.x - 1) {   // every block's payload is out: raise the next stage's flag
+            *(volatile uint32_t*) counter = 0u;
+            __threadfence_system();
+            if (drop == nullptr || *drop == 0u) {   // test hook (STRATA_TEST_HANDOFF_DROP): a lost publish
+                *(volatile uint32_t*) flag = 1u;
+                __threadfence_system();
+            }
+        }
+    }
+}
 }  // namespace
+
+void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned long long timeout_ns, void* stream) {
+    wait_handoff_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, err, timeout_ns);
+    check("wait_handoff");
+}
+
+void handoff_publish(float* dst, const float* a, int64_t na, const float* b, int64_t nb, const float* c, int64_t nc,
+                     uint32_t* counter, uint32_t* flag, void* stream, const uint32_t* drop) {
+    const int64_t n = na + nb + nc;
+    if (n <= 0 || dst == nullptr || counter == nullptr || flag == nullptr) {
+        std::fprintf(stderr, "handoff_publish: invalid arguments\n");
+        std::exit(1);
+    }
+    const int64_t nb256 = (n + 255) / 256;
+    const int blocks = (int) (nb256 < 64 ? nb256 : 64);
+    handoff_publish_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(dst, a, na, b, nb, c, nc, counter, flag, drop);
+    check("handoff_publish");
+}
 
 namespace {
 // one thread per window entry: up to kVerifyMaxT tokens x 10 routed experts (80), so 128 (#646 had 64: a window of

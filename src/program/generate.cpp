@@ -3344,7 +3344,7 @@ int main(int argc, char** argv) {
                                          "MB/s of random 4 KiB reads): a prompt can spend minutes reading layer 1 and trip the "
                                          "stall watchdog (#1425, #1629). --ple-io mmap was 40-100x faster on some DRAM-less NVMe drives but 7x slower on a SATA SSD (#2040), so it is not chosen for you; "
                                          "--ple-io ram needs the RAM for the table%s\n", rps, rps * 4096.0 / 1e6,
-                                 o.ple_io_explicit ? "" : " (kept direct: pass --ple-io mmap or --ple-io ram to change it)");
+                                 o.ple_io_explicit ? "" : " (kept direct: pass --ple-io mmap or --ple-io ram to change it; in a config file's \"args\" they are two entries: \"--ple-io\", \"mmap\")");
                 }
             }
         }
@@ -7838,11 +7838,33 @@ int main(int argc, char** argv) {
                 }
                 std::memset(hh, 0, hb);
             }
+            // STRATA_SPLIT_OVERLAP=1 (opt-in; measured on 2x RX 7900 XTX only): a ready word per hand-off, raised by the
+            // writing stage's GPU, so the next stage's window is launched early and the host never syncs between
+            // stages (Verifier::set_handoff_flags).  Not for --split-device 0 (both stages on one GPU).
+            const bool overlap = !split_same && [] {
+                const char* v = std::getenv("STRATA_SPLIT_OVERLAP");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            std::vector<uint32_t*> hflag_h((size_t) n_stages - 1, nullptr), hflag_d((size_t) n_stages - 1, nullptr);
+            if (overlap)
+                for (size_t i = 0; i < hflag_h.size(); ++i) {
+                    if (cudaHostAlloc((void**) &hflag_h[i], 64, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                        cudaHostGetDevicePointer((void**) &hflag_d[i], hflag_h[i], 0) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: the layer-split hand-off flag allocation failed\n");
+                        return 1;
+                    }
+                    std::memset(hflag_h[i], 0, 64);
+                }
             split_drive.base = &drive;
             split_drive.n = n_stages;
             for (int st = 0; st < n_stages; ++st) {
                 stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
                                         st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
+                if (overlap)
+                    stage_ver(st).set_handoff_flags(st == 0 ? nullptr : hflag_h[(size_t) st - 1],
+                                                    st == 0 ? nullptr : hflag_d[(size_t) st - 1],
+                                                    st + 1 < n_stages ? hflag_h[(size_t) st] : nullptr,
+                                                    st + 1 < n_stages ? hflag_d[(size_t) st] : nullptr);
                 split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
@@ -7882,7 +7904,8 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st)
                 plan_s += ", " + std::to_string(split_at[(size_t) st - 1]) + "-" + std::to_string(split_drive.end[st] - 1) +
                           " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
-            std::fprintf(stderr, "strata serve: layer split: layers %s, one hand-off per window\n", plan_s.c_str());
+            std::fprintf(stderr, "strata serve: layer split: layers %s, one hand-off per window%s\n", plan_s.c_str(),
+                         overlap ? " (overlapped: STRATA_SPLIT_OVERLAP=1)" : "");
         }
         // --pipeline-windows: the odd windows' verifiers and their hand-off (initialized before `ver`, which stays the
         // watchdog's verifier), and the drafter's own row buffer, which either parity's rows are copied into
@@ -12003,6 +12026,9 @@ int main(int argc, char** argv) {
                 PW undo_w;
                 int undo_keep = 0;
                 int32_t undo_ple[2] = {-1, -1};
+                PW kv_from;
+                int kv_keep = 0;
+                int64_t kv_target = 0;
                 int chain_kind = 0;      // 1: after an on-path verdict (A's drafts forced); 2: fresh (A's drafts from it)
                 bool early_used = false;
                 bool b_done = false;     // B has been made from the chain in flight
@@ -12287,6 +12313,30 @@ int main(int argc, char** argv) {
                         if (!doomed) break;
                         continue;
                     }
+                    // Grow only at a verified boundary. A speculative B must finish and its state must be restored
+                    // before the expert slots that back the new K/V cells can be moved or unmapped.
+                    if (kv_target != 0 && !doomed) {
+                        pl_drain();
+                        if (pl_adapt_thr.joinable()) pl_adapt_thr.join();
+                        if (!pl_adapt_ok) return die("an adaptive refill failed");
+                        if (exch_wait) pl_release();
+                        a_pl_settle();
+                        if (!adapt_tick(true, false)) return die("an adaptive refill failed");
+                        if (!kvg_ensure(kv_target, [&] { cudaDeviceSynchronize(); apply_pending(true); }))
+                            return die("the K/V cannot grow: no VRAM is left");
+                        if (ajob) a_pl_idle = [&](int st) { return !PV[st][0]->in_flight() && !PV[st][1]->in_flight(); };
+                        tre("KG", A.seq);
+                        kv_target = 0;
+                        mtp.set_source_R(V1(kv_from).final_R(0));
+                        chain_n = strata::kernels::kVerifyMaxT - 1;
+                        if (!mtp.chain_launch(kv_from.T, outp.data(), kv_from.p, kv_keep - 1,
+                                              nullptr, 0, chain_n, chain_n, err))
+                            return die(err);
+                        chain_kind = 2;
+                        tre("CL", kv_from.seq, 2);
+                        early_used = false;
+                        b_done = false;
+                    }
                     // ---- the drafter's chain, read as its outputs land (an event after each): a fresh A once its size
                     // is decided, then B once ITS size is decided - its bonus guess and a draft below spec_min_p (or
                     // S_mtp - 1 drafts) - so stage 0 need not wait for the whole chain
@@ -12460,7 +12510,12 @@ int main(int argc, char** argv) {
                     else if (eos) finish = "stop";
                     else if (stop_req.load()) finish = "cancel";
                     const bool last = nf || eos || produced_n >= max_new || stop_req.load();
-                    const bool on = !nf && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
+                    // Cover both verifier windows and the drafter's lookahead, as the serial loop covers its window.
+                    // Do not promote B across a growth boundary: even a correct guess must be drained and rolled back.
+                    const int64_t next_cells = std::min<int64_t>(o.max_context,
+                        A.p + a + 1 + 2 * strata::kernels::kVerifyMaxT + 64);
+                    if (!last && kvg.on && next_cells > kvg.cells) kv_target = next_cells;
+                    const bool on = kv_target == 0 && !nf && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                         const int bin = std::min(9, std::max(0, (int) (B.p_on * 10.0f)));
@@ -12522,14 +12577,19 @@ int main(int argc, char** argv) {
                         // would finish it, and the other would wait for it forever)
                         B = PW{};
                         if (!last) {
-                            mtp.set_source_R(V1(A).final_R(0));
-                            chain_n = strata::kernels::kVerifyMaxT - 1;
-                            if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
-                                return die(err);
-                            chain_kind = 2;
-                            tre("CL", A.seq, 2);
-                            early_used = false;
-                            b_done = false;
+                            if (kv_target != 0) {
+                                kv_from = A;
+                                kv_keep = a + 1;
+                            } else {
+                                mtp.set_source_R(V1(A).final_R(0));
+                                chain_n = strata::kernels::kVerifyMaxT - 1;
+                                if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
+                                    return die(err);
+                                chain_kind = 2;
+                                tre("CL", A.seq, 2);
+                                early_used = false;
+                                b_done = false;
+                            }
                             PW nA;
                             nA.seq = A.seq + 1;
                             nA.p = A.p + a + 1;

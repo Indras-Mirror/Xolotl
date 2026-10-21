@@ -556,6 +556,49 @@ def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # 
 S.Service._note = _note_ds41
 S.Service.run = _run_ds41
 
+
+def _cache_slots_value(slots):
+    """Engine flag value for --conversation-cache-slots; None = omit (engine default)."""
+    if slots is None:
+        return None
+    if isinstance(slots, str) and slots.strip().lower() in ("auto", "default", ""):
+        return None
+    return str(int(slots))
+
+
+def expand_ds41_config_cache(cfg: dict) -> None:
+    """Flatten nested conversation_cache / prompt_cache; accept slots: \"auto\" (do not int() it)."""
+    args = list(cfg.get("args") or [])
+    cc = cfg.get("conversation_cache")
+    if isinstance(cc, dict):
+        mib = cc.get("mib", cc.get("budget_mib"))
+        if mib is not None and "--conversation-cache-mib" not in args:
+            args += ["--conversation-cache-mib", str(int(mib))]
+        slots = _cache_slots_value(cc.get("slots"))
+        if slots is not None and "--conversation-cache-slots" not in args:
+            args += ["--conversation-cache-slots", slots]
+        every = cc.get("prompt_cache_every", cc.get("every"))
+        if every is not None and "--prompt-cache-every" not in args:
+            args += ["--prompt-cache-every", str(int(every))]
+        pc = cc.get("prompt_cache")
+        if pc is not None and "--prompt-cache" not in args:
+            if isinstance(pc, str) and pc.strip().lower() in ("auto", "default", ""):
+                pass
+            else:
+                args += ["--prompt-cache", str(int(pc))]
+        cfg["args"] = args
+
+
+_engine_args = S.engine_args
+
+
+def engine_args_ds41(cfg: dict) -> list[str]:
+    expand_ds41_config_cache(cfg)
+    return _engine_args(cfg)
+
+
+S.engine_args = engine_args_ds41
+
 if __name__ == "__main__":
     for i, v in enumerate(sys.argv[:-1]):   # paths are the caller's; the server runs from Strata's directory
         if v in ("--config", "--tokenizer", "--mcp-config"):

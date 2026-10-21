@@ -64,6 +64,15 @@ struct Ds41DenseConfig {
     /// a single-slot engine has always had (n_slots = 1 = the engine as before, byte for byte).  Every single-sequence
     /// call works on the BOUND slot (bind_slot); begin_rows() runs rows of several slots in one pass.
     int     n_slots = 1;
+    int64_t layer_lo = 0;   ///< layer split: first layer this instance runs (inclusive)
+    int64_t layer_hi = -1;  ///< exclusive end; -1 = all layers in the file
+    /// Tail stage with layer_hi == n_layer: skip output_norm / output.weight (they live on head_device).
+    bool omit_output_head = false;
+    /// Logits-only instance: output_norm + output.weight and a minimal x/pre state (no transformer layers).
+    bool head_only = false;
+    int cuda_device = -1;   ///< CUDA ordinal (for peer copies); -1 = unknown
+    /// Layers below layer_lo whose KV / indexer state is copied from the previous pipeline stage at handoff.
+    std::vector<int64_t> shadow_layers;
 };
 
 class Ds41Dense {
@@ -211,6 +220,33 @@ public:
     std::string vram_ledger() const;
     bool restore();
     int snapshot_pos() const;
+    /// Layer split: only run and retain KV for layers in [layer_lo, layer_hi).  head/logits require layer_hi == n_layer().
+    void set_layer_range(int64_t layer_lo, int64_t layer_hi);
+    int64_t layer_lo() const;
+    int64_t layer_hi() const;
+    bool owns_head() const;
+    /// Current pass width / start position (set by begin / begin_batch / begin_*_continued).
+    int pass_size() const;
+    int pass_pos0() const;
+    /// After a pipeline handoff: mirror the source pass layout so logits() row checks match (head-only and trunk).
+    bool set_pass_layout(int n, int pos0);
+    /// PCIe handoff between pipeline stages: per-column x_state [D,HC] then pre_state [HC], column-major (n columns).
+    size_t handoff_bytes_per_column() const;
+    bool export_handoff(int col0, int n, float * dst) const;
+    bool import_handoff(int col0, int n, const float * src);
+    /// Copy handoff columns from `src`: CUDA peer when available, else explicit pinned-host staging on `cuda_stream`.
+    bool import_handoff_from(const Ds41Dense & src, int src_cuda_device, int dst_cuda_device, int col0, int n, void * cuda_stream,
+                             std::vector<float> & pinned_host);
+    /// Copy persistent / per-column layer state for a dependency layer from `src` (pipeline handoff).
+    bool import_layer_cache_from(const Ds41Dense & src, int64_t global_layer, int col0, int n);
+    bool import_cand_from(const Ds41Dense & src, int col0, int n);
+    /// begin() without the embedding init graph; state columns must already hold the handoff (import_handoff).
+    bool begin_continued(const int * tids, int n, int pos0);
+    /// Layer-major batch after import_handoff: same span_cap / batch fields as begin_batch, no init graph.
+    bool begin_batch_continued(const int * tids, int B, int pos0);
+    /// Full dense+KV image for conversation parking (positions [0, positions)).
+    bool capture_conversation(int64_t positions, std::vector<uint8_t> & out) const;
+    bool restore_conversation(const std::vector<uint8_t> & in);
     /// Serve: keep a conversation through an UNRELATED request.  An unrelated request writes its own positions from 0, so
     /// it overwrites the start of every position-indexed cache (compressed KV, indexer keys) and the snapshot rings.
     /// park(n) copies the snapshot rings + the first n positions' rows of those caches (and their spare rows) to host

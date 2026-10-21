@@ -321,6 +321,7 @@ struct Ds41MoeConfig {
     /// 52.9 s file wait is what this moves off the critical path.
     bool chunk_prefetch = true;
     double chunk_prefetch_gib = 0.0;
+    int cuda_device = 0;   ///< CUDA ordinal for this tier (layer split)
     /// REAP saliency (calibration only): every prompt chunk reads its experts' outputs back and accumulates, per
     /// (layer, expert), sum of routing weight x ||expert output||_2 and the token count (saliency_sum / saliency_count).
     bool saliency = false;

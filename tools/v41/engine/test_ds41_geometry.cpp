@@ -3,18 +3,27 @@
 #include "ds41_geometry.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 
 using namespace strata;
 using namespace strata::v41;
 
 int main(int argc, char ** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: test_ds41_geometry <file.gguf>\n"); return 2; }
+    const char * gguf = nullptr;
+    if (argc >= 2 && argv[1][0] != '\0') gguf = argv[1];
+    else if (const char * env = std::getenv("DS41_TEST_GGUF")) {
+        if (env[0] != '\0') gguf = env;
+    }
+    if (!gguf) {
+        std::fprintf(stderr, "test_ds41_geometry: skipped (pass a .gguf path or set DS41_TEST_GGUF)\n");
+        return 77;
+    }
     int fails = 0;
     auto check = [&](const char * what, bool ok, const std::string & detail = "") {
         std::printf("%s %s%s%s\n", ok ? "ok  " : "FAIL", what, detail.empty() ? "" : "  ", detail.c_str());
         fails += !ok;
     };
-    GgufModel m = GgufModel::open(argv[1]);
+    GgufModel m = GgufModel::open(gguf);
     Ds41Geometry G;
     std::string e = ds41_read_geometry(m, G);
     check("geometry", e.empty(), e);
