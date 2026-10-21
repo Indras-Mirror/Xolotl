@@ -13,7 +13,7 @@ if(STRATA_NATIVE_EXPERTS AND TARGET strata_kernels_cpu)
   endif()
 endif()
 
-if(STRATA_BUILD_TESTS AND TARGET strata_artifact)
+if(STRATA_BUILD_TESTS AND TARGET strata_artifact AND NOT TARGET ds4_geometry_test)
   # DSV4 geometry + full tensor map (header mmap only; the real-file part skips without $DS4_GGUF/argv[1])
   add_executable(ds4_geometry_test tests/core/ds4_geometry_test.cpp)
   target_link_libraries(ds4_geometry_test PRIVATE strata_artifact)
