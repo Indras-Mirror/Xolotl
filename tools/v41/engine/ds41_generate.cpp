@@ -1636,6 +1636,7 @@ int main(int argc, char ** argv) {
         auto env_rank = [](const char * k) { const char * e = std::getenv(k); return e ? std::max(0, std::atoi(e)) : 0; };
         const int cfg_rprot = env_rank("STRATA_RB_PROTECT"), cfg_rpool = env_rank("STRATA_RB_POOL");
         int cur_rprot = cfg_rprot, cur_rpool = cfg_rpool;
+        static const bool rewind1 = std::getenv("STRATA_SERVE_REWIND1") && std::getenv("STRATA_SERVE_REWIND1")[0] == '1';
         std::string line;
         bool previous_vision = false;
         // ---- batch slots (--batch-slots N; the protocol is at the top of this file).  Slot s's conversation is a Conv
@@ -2290,6 +2291,19 @@ int main(int argc, char ** argv) {
             } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
+            } else if (rewind1 && !unparked && snap_len > 1 && lcp + 1 == (size_t) snap_len && lcp < ids.size() && dense.restore()) {
+                // STRATA_SERVE_REWIND1=1 (opt-in): the request matches the snapshot's prompt except its LAST token -
+                // DeepSeek's template, in thinking mode, re-renders the previous turn's "<think>" generation prompt as
+                // "</think>" once a new user message follows (drop_thinking), so every new user message re-read the whole
+                // conversation.  Restore the snapshot and re-feed from that token: one token back is exact - after
+                // restore() the window ring holds [P - RAW, P) and the ratio-2 compressor state P - 2, P - 1, so the
+                // re-fed token's window and group partner are intact; KV / compressed / indexer rows and Engram's history
+                // are positional and are overwritten.  Two tokens back would not be (see the partial unpark above).
+                hist.resize(lcp);
+                if (live_id.size() > lcp) live_id.resize(lcp);
+                reused = (int) lcp;
+                std::fprintf(stderr, "serve: rewound the snapshot one token (%d -> %zu)\n", snap_len, lcp);
+                snap_len = -1;
             } else if (pool_on) {
                 // an unrelated request: the conversation it overwrites goes to the pool
                 save_live("unrelated");
