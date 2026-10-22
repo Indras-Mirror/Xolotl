@@ -8,7 +8,11 @@ or --mode stub (one state, host copies) a slot's tokens must equal the reference
 windows) the rows differ only by the row-batched matmuls, so tokens are compared for agreement and logits by KL.
 
   check_batch_slots.py --bin build/ds41_generate --model M.gguf --engram A:B --tokenizer tokenizer.json \
-      [--scenario all|order|cancel|...]
+      [--scenario all|order|cancel|...] [--env K=V ...] [--ref-env K=V ...]
+
+Both engines start from a clean environment: STRATA_* / DS41_* of the calling shell are NOT passed on (so a stray
+setting cannot change the reference).  Settings for the engine under test go in --env K=V, for the reference in
+--ref-env K=V (repeatable; a scenario's own settings, e.g. STRATA_BATCH_MIX_MAX=0, still win).
 
 Scenarios (each prints a JSON line; SUMMARY at the end):
   order      three BGEN while the others decode (reads alone: STRATA_BATCH_MIX_MAX=0): every slot's tokens = reference
@@ -206,9 +210,28 @@ def main():
                          "tokens must equal the reference); stub: one state, host copies (STRATA_BATCH_STUB=1; equal too); "
                          "core: batched windows (Ds41RowsStep; agreement and KL reported)")
     ap.add_argument("--extra", default="", help="extra engine args (both engines)")
+    ap.add_argument("--env", action="append", default=[], metavar="K=V",
+                    help="environment of the engine under test (repeatable): the caller's STRATA_* / DS41_* are not "
+                         "passed on, so engine settings go here")
+    ap.add_argument("--ref-env", action="append", default=[], metavar="K=V",
+                    help="environment of the reference engine (repeatable)")
     a = ap.parse_args()
     if not a.tokenizer:
         ap.error("--tokenizer (or DS41_TOKENIZER_JSON) is required")
+
+    def kv_env(items, flag):
+        d = {}
+        for kv in items:
+            k, eq, v = kv.partition("=")
+            if not k or not eq:
+                ap.error(f"{flag} {kv!r}: expected K=V")
+            d[k] = v
+        return d
+    env_x, env_r = kv_env(a.env, "--env"), kv_env(a.ref_env, "--ref-env")
+    dropped = sorted(k for k in os.environ if k.startswith(("STRATA_", "DS41_")) and k != "DS41_TOKENIZER_JSON"
+                     and k not in env_x)
+    if dropped:
+        print(f"note: not passed to the engines (use --env K=V): {' '.join(dropped)}", flush=True)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     common = ["-m", a.model, "--engram", a.engram, "--backend", "cpu", "--experts", "cpu", "--arena-gib", "0",
@@ -219,6 +242,7 @@ def main():
         env_b["STRATA_BATCH_STUB"] = "1"
     if a.mode == "serial":
         env_b["STRATA_BATCH_SERIAL"] = "1"
+    env_b.update(env_x)
     exact = a.mode != "core"
     T = corpus(a.tokenizer)
     BOS = [0]
@@ -241,7 +265,7 @@ def main():
                 "ok": bool(ok)}
 
     # ---- the reference: one request at a time, no slots
-    ref = Engine(a.ref_bin or a.bin, common, {"STRATA_SERVE_PARK_MIN": "16"}, out, "ref")
+    ref = Engine(a.ref_bin or a.bin, common, {"STRATA_SERVE_PARK_MIN": "16", **env_r}, out, "ref")
     R = {}
     for k, ids, n in (("A", A, 14), ("B", B, 6), ("C", C, 6), ("D", D, 6), ("Y", Y, 4), ("Y2", Y2, 4)):
         r = ref.gen(ids, n)
