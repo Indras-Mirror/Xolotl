@@ -363,7 +363,8 @@ tokens is read layer-major while the windows wait.
 the engine core: solo against the reference path and the batched windows, a prompt read in the windows, a slot moved
 by `swap_slots`, a conversation saved from one slot and restored into another, and the noise floor of a multi-row solo
 pass. `DS41_TEST_LAYERS=n` runs the first n layers only. `tools/v41/engine/check_batch_slots.py` checks the protocol
-against one-at-a-time references.
+against one-at-a-time references. Its engines do not inherit `STRATA_*` / `DS41_*` from the shell: engine settings
+go in `--env K=V` (the engine under test) or `--ref-env K=V` (the reference).
 
 ## Engine protocol (`--serve`)
 
