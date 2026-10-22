@@ -373,9 +373,10 @@ struct Ds41MoeStats {
     int64_t vram_swaps = 0;         ///< vram_lru: misses / prefetches moved into a VRAM slot
     int64_t vram_demotes = 0;       ///< ...of which the victim went back to the arena (it had no arena copy)
     int64_t skipped = 0;            ///< skip_miss: low-weight misses dropped
+    int64_t remote = 0;             ///< computed by the STRATA_DS41_REMOTE helper's GPU
 
     void add(const Ds41MoeStats& o);
-    int64_t lookups() const { return hits + cpu + pcie + skipped; }
+    int64_t lookups() const { return hits + cpu + pcie + skipped + remote; }
 };
 
 /// The tier's private state, defined in ds4_moe.cpp.  It carries the CUDA members in a CUDA build and none in a
@@ -482,6 +483,8 @@ public:
     bool in_remote(int64_t layer, int64_t expert) const;
     int64_t remote_experts() const;
     double remote_gib() const;
+    /// Whether the STRATA_DS41_REMOTE helper holds `expert` of `layer` (false without one).
+    bool remote_holds(int64_t layer, int64_t expert) const;
     /// `nt` (1..4) tokens of one layer at once - draft verification: `ids`/`w` are nt*top_k (token-major), `x` and
     /// `out` nt*n_embd.  Each distinct expert is read/fetched once and applied to every token that routed to it.
     bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out);
