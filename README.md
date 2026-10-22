@@ -71,7 +71,8 @@ DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts
   and the expert-cache fixes from clawdia-saka.
 - **DeepSeek-V4.1-Flash-1017 builds** of the October checkpoint:
   [IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored)
-  (V2 142 GiB; V3 152 GiB, recalibrated on a code + agentic heavy mix). A V4 is in the works.
+  (V2 142 GiB; V3 152 GiB, recalibrated on a code + agentic heavy mix). **V4** (same size as V3, with our XQ
+  refinement on every expert) is quantising now. Early per-layer error is 29-48% below V3's; release expected around 26-27 Oct.
 - **Native Windows** for the DeepSeek-V4.1 engine (MSVC + CUDA, RTX 50 notes from #14): [docs/WINDOWS.md](docs/WINDOWS.md).
 - **Vision** input for DeepSeek-V4.1 (#8), per-request routing options (#11), a 16-row tier call (#9) and a uniform
   VRAM expert cache under the auto slot budget (#15).
