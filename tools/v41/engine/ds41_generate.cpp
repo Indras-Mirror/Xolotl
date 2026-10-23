@@ -557,7 +557,10 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "ds41_generate: --head-device requires --stage-devices (the trunk GPUs, not the head)\n");
             return 2;
         } else {
-            for (int d = 0; d < n_dev && (int) split_devs.size() < 2; ++d) split_devs.push_back(d);
+            // one GPU per stage, in order: "24" = 2 stages, "7,14,20,27,34" = 6 (it took the first 2 GPUs whatever the
+            // split, so a 3+ stage split without --stage-devices failed with "need N stage devices", issue #33)
+            const int want = a.layer_split == "auto" ? 2 : 2 + (int) std::count(a.layer_split.begin(), a.layer_split.end(), ',');
+            for (int d = 0; d < n_dev && (int) split_devs.size() < want; ++d) split_devs.push_back(d);
         }
         if (head_cuda_device >= 0 && split_devs.size() < 2) {
             std::fprintf(stderr, "ds41_generate: --head-device needs a multi-stage layer split\n");
