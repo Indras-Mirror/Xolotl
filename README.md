@@ -14,6 +14,11 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 > DeepSeek-V4.1 engine (faster now), plus GLM-5.3-Flash and the Qwen3.8 models, in one tree. Old links and clones
 > redirect here; nothing DeepSeek-V4.1 was removed.
 
+> **DeepSeek-V4.1 V4 quant: in progress (Sat 24 Oct).** 22 of 40 layers done, should finish tonight (~11:00 UTC 24 Oct).
+> Same size as V3 (152 GiB), and so far each layer's expert error on held-out text is about 44% lower than V3's on
+> average. Upload to [Hugging Face](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored) starts
+> as soon as the first tests are in, so around 25-26 Oct. Progress and numbers go on the model card as they come in.
+
 ## What one PC can do
 
 **One RTX 4090 (24 GB) · Ryzen 7 5700X · 90 GB DDR4 · one NVMe drive.** Every number is measured on that machine,
