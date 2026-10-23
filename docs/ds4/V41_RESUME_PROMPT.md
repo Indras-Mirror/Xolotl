@@ -2033,3 +2033,23 @@ after real ppl + tok/s.
    int32 pairs), vram-lru, arena budget, chunk MMQ, decode graph reuse; target > GLM (25 tok/s decode, 400 tok/s
    prefill); 512K context (caches: ~1.5 GB at 512K with BF16 storage - set kv_type BF16).
 4. Serving: ds41-engine.sh / configs / strata-ds41-quetza wrapper (copy GLM's); tool-call + coherence checks.
+
+## GPU window 1 (2026-10-23) - decode is PCIe-bound; prefetch precision is the lever
+
+Full numbers: `private/notes/research/2026-10-23_gpu-profile-prefetch.md`; rerun with
+`tools/v41/gpu_window1.sh` (refuses while the V4 pass holds the card). V3 + serve flags,
+256-token decode = 22.2 tok/s; GPU busy only 46% of decode.
+
+- `attn_router 17.3` / `tier 23.5` ms/token. The tier stage is almost entirely host->device DMA:
+  32.5 GiB per 64 tokens (508 MiB/token, 22.6 GB/s = the PCIe x16 ceiling).
+- 3,328 large copies = 454 demand misses + 2,874 prefetch DMA; only **1,309 prefetches were used
+  (45.6%)**. The waste is ~15 GiB / ~10 ms per token on a saturated bus.
+- Device->host (the per-layer routing readback lich-77 removes) is **0.31 ms/token** - that idea is
+  dead for us; the prefetcher is the thing to fix.
+- Cheap predictors cannot replace `Ds41Dense::predict` (temporal 8%, spatial 0.3%, frequency 11% vs
+  the deployed 45.6%): consecutive-token routing overlap is only 42-48%, so an unranked pick is
+  chance. Keep the head; add a confidence margin.
+- Kernels are not the problem (268 ms per 64 tokens; `native_*` already do 2-4 rows per warp).
+- Next: `--pf-b` sweep 0 / 0.7 / 1.43 / 2.0 / 2.9, `STRATA_PF_NO_DUMMY=1`, then a top-1-vs-top-2
+  score margin in `build_predict`. Rerun C now that the sidecar name is fixed
+  (`V41-MTP-Vision-1017.Q2_K.gguf`) for the DSpark depth-4 baseline.
