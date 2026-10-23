@@ -40,6 +40,6 @@ PY
     bash tools/ds4/memguard.sh 86 72 -- build-xolotl/ds41_generate "${COMMON[@]}" --ids-file "$OUT/q_$arm.i32" -n 1 --ppl \
         --dump-logits "$TMP/q_$arm.pre" > "$OUT/qp_$arm.out" 2> "$OUT/qp_$arm.log"
     echo "q_$arm prefill rc=$? N=$N $(nice -n 19 python3 tools/v41/eval/dspark_tap_kl.py "$TMP/q_$arm.dump" "$TMP/q_$arm.pre" "$N")"
-    rm -f "$TMP/q_$arm.dump" "$TMP/q_$arm.pre"
+    [ "${KEEP_DUMPS:-0}" = 1 ] || rm -f "$TMP/q_$arm.dump" "$TMP/q_$arm.pre"
 done
 echo "done $(date +%T)"

@@ -21,11 +21,17 @@ rec = 16 + 4 * nv
 assert raw.size % rec == 0, f'dump size {raw.size} is not a multiple of {rec}'
 R = raw.reshape(-1, rec)
 hdr = R[:, :16].copy().view(np.int32).reshape(-1, 4)
-kl = agree = cnt = 0.0
+# A verify row past a rejected draft was computed on the DRAFT tokens, not the stream's, so it has no prefill row to
+# match.  The last write of each position is the one whose inputs are the final stream's (a rejected position is
+# verified again after the correction), so only that one is scored.  (2026-10-23: scoring every row gave a nonsense
+# floor - KL 4.17, top-1 63 % for the run WITHOUT any approximation.)
+last = {}
 for i in range(len(R)):
     pos = int(hdr[i, 0])
-    if pos >= n - 1 or pos < 0:
-        continue
+    if 0 <= pos < n - 1:
+        last[pos] = i
+kl = agree = cnt = 0.0
+for pos, i in sorted(last.items()):
     q = R[i, 16:].copy().view(np.float32).astype(np.float64)
     p = P[pos].astype(np.float64)
     lp = p - (np.log(np.exp(p - p.max()).sum()) + p.max())
