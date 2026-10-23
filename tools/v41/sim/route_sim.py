@@ -75,6 +75,14 @@ class Sim:
         self.vmiss = np.full((L, X), -10**9, np.int64)  # layer call count at the last miss (admission window)
         self.lcalls = np.zeros(L, np.int64)
         self.n = {HIT: 0, PCIE: 0, FILEG: 0, PF: 0}
+        # SLRU (llama.cpp #30637): a VRAM expert hit again moves to the protected segment (<= `prot` of its
+        # (layer, class) slots, overflow demoted back to probation by LRU); victims come from probation first
+        self.prot = np.zeros((L, X), bool)
+        self.prot_frac = 0.5
+        self.cap = {}
+        for l in range(L):
+            for c in np.unique(self.cls[l]):
+                self.cap[(l, int(c))] = int((self.vram[l] & (self.cls[l] == c)).sum())
         self.swaps = 0
 
     def victim(self, l, e, used, ci):
@@ -84,6 +92,9 @@ class Sim:
             return -1
         if self.policy == 'oracle':
             return max(cand, key=lambda c: self.nxt(l, c, self.tick))
+        if self.policy == 'slru':
+            prob = [c for c in cand if not self.prot[l, c]]
+            return min(prob or cand, key=lambda c: self.last[l, c])
         if self.policy == 'lru2':
             return min(cand, key=lambda c: (self.last2[l, c], self.last[l, c]))
         if self.policy == 'lfu':
@@ -100,6 +111,14 @@ class Sim:
             e = int(e)
             if self.vram[l, e]:
                 out.append(HIT)
+                if self.policy == 'slru' and not self.prot[l, e]:
+                    self.prot[l, e] = True
+                    ci = int(self.cls[l, e])
+                    pm = np.nonzero(self.prot[l] & (self.cls[l] == ci))[0]
+                    if len(pm) > self.prot_frac * self.cap[(l, ci)]:
+                        d = min((c for c in pm if c != e), key=lambda c: self.last[l, c], default=-1)
+                        if d >= 0:
+                            self.prot[l, d] = False
                 continue
             c = PCIE if self.arena[l, e] else FILEG
             if fp and c == PCIE:
@@ -128,6 +147,8 @@ class Sim:
                 continue   # MIN with bypass: the incoming one is needed later than every candidate
             if self.policy == 'tinylfu' and self.freq[l, e] + 1.0 <= self.freq[l, v]:
                 continue   # TinyLFU admission: a miss must be used more often than the LRU victim it would replace
+            self.prot[l, v] = False
+            self.prot[l, e] = False
             self.vram[l, v] = False
             self.arena[l, v] = True     # demoted into the slot e vacates
             self.vram[l, e] = True
@@ -174,6 +195,7 @@ def policy_report(traces, c_p, c_f):
         configs = [('lru', 4, False, .98), ('lru', 1, False, .98), ('lru', 8, False, .98), ('lru', 10**9, False, .98),
                    ('lru2', 4, False, .98), ('lfu', 4, False, .98), ('lfu', 4, False, .9), ('lfu', 4, False, .995),
                    ('tinylfu', 10**9, False, .98), ('tinylfu', 4, False, .98), ('tinylfu', 10**9, False, .995),
+                   ('slru', 4, False, .98), ('slru', 10**9, False, .98),
                    ('oracle', 0, False, .98)]
         base = None
         for pol, win, af, dec in configs:
