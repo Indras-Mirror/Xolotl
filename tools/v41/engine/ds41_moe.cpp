@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <condition_variable>
@@ -62,6 +63,16 @@ namespace cpu = strata::kernels::cpu;
 namespace strata::v41 {
 
 namespace {
+// Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver) - where a
+// large pin mapped into two CUDA contexts leaves WDDM refusing later allocations (#32; strata generate's #253).
+[[maybe_unused]] bool ds41_under_wddm() {
+#ifdef _WIN32
+    return true;
+#else
+    static const bool dxg = std::filesystem::exists("/dev/dxg");
+    return dxg;
+#endif
+}
 
 constexpr int kMaxParts = 8;   ///< the grouped kernel's group/entry cap; top-k 6 needs no more
 constexpr int kMaxTok = Ds41MoeTier::kMaxMulti;   ///< tokens one run_multi call takes (a verify pass: 5-6 at depth 4)
@@ -2142,7 +2153,24 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
         // instead of leaving it unpinned.  The cuts fall on blob boundaries (a copy of one blob must not span two
         // registered regions).  Unset or 0: one registration, as before.
         const char* sl = std::getenv("STRATA_ARENA_SLICE_GIB");
-        const uint64_t slice = sl ? (uint64_t) std::max(0, std::atoi(sl)) << 30 : 0;
+        // #32: --remote-device under WDDM (Windows, WSL2) maps every pinned page into BOTH cards' contexts, and pinned
+        // past ~48-56 GiB WDDM refuses every later allocation (5090 + 4080, 128 GB, driver 617.42: a 56 GiB pin left
+        // cudaMemGetInfo at 0/0 and the conversation pool's stream "out of memory"; 40 and 48 GiB loaded with the pool
+        // off).  The auto cap (#243) reads one card's shared budget (101.5 GiB there) and pins past it.  So, as
+        // strata generate does for a multi-GPU run (#253, 8 GiB), the pin starts capped: 32 GiB leaves the default
+        // 8 GiB conversation pool room under the 48 that loaded.  The rest of the arena stays locked in RAM (slower
+        // streaming, not wrong).  STRATA_ARENA_PIN_GIB=N / auto / 0 (whole arena) overrides it.  On Windows the
+        // separate-process helper (STRATA_DS41_REMOTE, #31) has no such limit and measured faster than both.
+        uint64_t cap = 0;
+        if (im_->cfg.remote_device >= 0 && strata::core::arena_pin_cap_gib() == -1 && ds41_under_wddm()) {
+            cap = 32ull << 30;
+            if (cap < gp.arena.bytes)
+                std::fprintf(stderr, "arena: --remote-device under WDDM: at most %llu GiB of the arena is pinned (#32; "
+                                     "STRATA_ARENA_PIN_GIB changes it; STRATA_DS41_REMOTE avoids the limit)\n",
+                             (unsigned long long) (cap >> 30));
+        }
+        uint64_t slice = sl ? (uint64_t) std::max(0, std::atoi(sl)) << 30 : 0;
+        if (cap && slice == 0) slice = 4ull << 30;   // a capped pin registers in pieces (PinnedArena needs the cuts)
         std::vector<uint64_t> cuts;
         if (slice > 0) {
             cuts.push_back(0);
@@ -2150,7 +2178,7 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
                 if (o >= cuts.back() + slice && o < gp.arena.bytes) cuts.push_back(o);
             cuts.push_back(gp.arena.bytes);
         }
-        if (cuts.size() >= 3) gp.arena.owner.reset(new strata::core::PinnedArena(gp.arena.bytes, cuts));
+        if (cuts.size() >= 3) gp.arena.owner.reset(new strata::core::PinnedArena(gp.arena.bytes, cuts, cap));
         else gp.arena.owner.reset(new strata::core::PinnedArena(gp.arena.bytes));
         if (!gp.arena.owner->valid()) {
             err = "pinned arena allocation of " + std::to_string(gib) + " GiB failed";
