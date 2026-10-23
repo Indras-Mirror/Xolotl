@@ -2623,7 +2623,7 @@ void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
         }
         // No DMA for a guess outside the arena (its slot is -1 below either way, so routing and tokens are
         // unchanged) - the zero blob only kept the replay's timing, and it shares the H2D engine with the demand
-        // misses.  The 2026-10-23 profile (private/notes/research/2026-10-23_gpu-profile-prefetch.md) showed the
+        // misses.  The 2026-10-23 GPU profile (maintainer notes) showed the
         // H2D bus saturated by prefetch, so the skip is now the default; STRATA_PF_NO_DUMMY=0 restores the old
         // replay-exact timing (246 of 2,874 prefetches were dummies on that run).
         static const bool no_dummy = !(std::getenv("STRATA_PF_NO_DUMMY") && std::getenv("STRATA_PF_NO_DUMMY")[0] == '0');

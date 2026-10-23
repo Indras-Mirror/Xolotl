@@ -6,7 +6,7 @@
 #   ./gpu_window1.sh OUTDIR A B D    only the named runs
 #
 # Refuses to start while the V4 quant pass holds the card (pass.pid alive) unless FORCE=1.
-# Numbers from the 2026-10-23 window: private/notes/research/2026-10-23_gpu-profile-prefetch.md
+# Numbers from the 2026-10-23 window: in the maintainer notes (not in this repo)
 set -u
 OUT=${1:-/home/mal/v41-work/gpuwin-$(date +%H%M)}; shift || true
 RUNS=${*:-A B C D E F}

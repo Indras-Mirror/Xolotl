@@ -2036,7 +2036,7 @@ after real ppl + tok/s.
 
 ## GPU window 1 (2026-10-23) - decode is PCIe-bound; prefetch precision is the lever
 
-Full numbers: `private/notes/research/2026-10-23_gpu-profile-prefetch.md`; rerun with
+Full numbers: the 2026-10-23 GPU profile (maintainer notes, not in this repo); rerun with
 `tools/v41/gpu_window1.sh` (refuses while the V4 pass holds the card). V3 + serve flags,
 256-token decode = 22.2 tok/s; GPU busy only 46% of decode.
 
