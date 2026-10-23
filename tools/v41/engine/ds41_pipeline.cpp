@@ -239,10 +239,12 @@ bool Ds41Pipeline::sync_head_state(int col0, int n, std::string & err) {
         err = "head handoff: tail pass not active (pass_size=" + std::to_string(pass_n) + ")";
         return false;
     }
+    void * head_stream = nullptr;   // (no stream member without CUDA: a CPU-tier build, issue #34)
 #ifdef STRATA_ENABLE_CUDA
     cudaSetDevice(head->cuda_device);
+    head_stream = head->cuda_stream;
 #endif
-    if (!hd.import_handoff_from(tail, tail_dev, head->cuda_device, col0, n, head->cuda_stream, handoff_host)) {
+    if (!hd.import_handoff_from(tail, tail_dev, head->cuda_device, col0, n, head_stream, handoff_host)) {
         err = "head handoff: " + hd.last_error();
         return false;
     }

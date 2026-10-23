@@ -115,7 +115,15 @@ if(TARGET ds41_dense AND TARGET ds41_moe_cuda)
     target_link_libraries(test_ds41_batch PRIVATE ds41_dense ds41_moe_cuda)
     target_compile_definitions(ds41_generate PRIVATE STRATA_ENABLE_CUDA=1)
 elseif(TARGET ds41_dense AND TARGET ds41_moe_cpu)
-    add_executable(ds41_generate ${_v41_dir}/ds41_generate.cpp ${_v41_dir}/ds41_pipeline.cpp ${_v41_dir}/ds41_conversation.cpp)
+    # the DeepSeek-V4.1 GPU tier is CUDA only (ds41_moe_cuda needs CUDA::cudart + strata_kernels): a HIP build gets this
+    # CPU-tier engine, which runs but is far too slow for the 552B model (issue #34)
+    if(STRATA_ENABLE_HIP)
+        message(WARNING "ds41_generate (DeepSeek-V4.1) has no HIP/ROCm GPU tier yet: this build gets the CPU-only expert "
+                        "tier, which is not usable for the full model.  The other engines (Qwen3.8 etc.) build for HIP as usual.")
+    endif()
+    # ds41_cuda_policy.cpp: ds41_generate calls ds41_apply_mmq_cc_policy unconditionally (a no-op off CUDA)
+    add_executable(ds41_generate ${_v41_dir}/ds41_generate.cpp ${_v41_dir}/ds41_cuda_policy.cpp ${_v41_dir}/ds41_pipeline.cpp
+                                  ${_v41_dir}/ds41_conversation.cpp)
     target_include_directories(ds41_generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(ds41_generate PRIVATE ds41_dense ds41_moe_cpu)
     add_executable(test_ds41_batch ${_v41_dir}/test_ds41_batch.cpp)

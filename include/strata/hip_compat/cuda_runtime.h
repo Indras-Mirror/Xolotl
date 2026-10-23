@@ -97,6 +97,8 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes);
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
+#define cudaMemcpyPeer hipMemcpyPeer
+#define cudaDeviceDisablePeerAccess hipDeviceDisablePeerAccess
 #define cudaMemcpyDefault hipMemcpyDefault
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost

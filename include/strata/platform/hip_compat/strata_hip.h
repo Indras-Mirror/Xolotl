@@ -106,6 +106,8 @@ inline hipError_t strata_device_get_attribute(int* v, hipDeviceAttribute_t a, in
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
+#define cudaMemcpyPeer hipMemcpyPeer
+#define cudaDeviceDisablePeerAccess hipDeviceDisablePeerAccess
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync

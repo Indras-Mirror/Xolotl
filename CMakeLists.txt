@@ -1666,6 +1666,11 @@ if(STRATA_NATIVE_EXPERTS)
     target_include_directories(strata_mmq
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    # moe_mmq.cu includes the generated strata/prefill/mmq_types.inc - the CUDA branch generates it, HIP did not
+    # (issue #34): the same generator over this branch's type list, into generated/ as the CUDA branch does
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/mmq_types.cmake)
+    strata_gen_mmq_types(${CMAKE_CURRENT_BINARY_DIR}/generated/strata/prefill/mmq_types.inc "${_strata_mmq_types}")
+    target_include_directories(strata_mmq PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
