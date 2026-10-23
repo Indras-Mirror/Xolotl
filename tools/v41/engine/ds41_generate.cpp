@@ -713,7 +713,11 @@ int main(int argc, char ** argv) {
             if (!r) { r = 1; ++got; }
         }
     }
+    // STRATA_DS41_REMOTE_BIAS=1 (with STRATA_DS41_REMOTE): the helper's experts take --route-bias's bonus too, as the
+    // ones in this card's VRAM do (they cost a round trip that runs under the layer's own work, not a PCIe copy)
+    static const bool remote_bias = std::getenv("STRATA_DS41_REMOTE_BIAS") && std::getenv("STRATA_DS41_REMOTE_BIAS")[0] == '1';
     auto resident_now = [&](int64_t l, int64_t e) {
+        if (remote_bias && ds41_tier_for(pipe, (int) l).remote_holds(l, e)) return true;
         if (!proxy_res.empty()) return proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
         return ds41_tier_for(pipe, (int) l).resident(l, e);
     };
@@ -2962,9 +2966,11 @@ int main(int argc, char ** argv) {
                 snap_len = -1;
                 finish = "length";
             }
-            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file\n",
+            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file",
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
                          (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
+            if (st.remote > 0) std::fprintf(stderr, ", %lld remote", (long long) st.remote);   // STRATA_DS41_REMOTE
+            std::fprintf(stderr, "\n");
             if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
                 size_t tf = 0, tt = 0;
                 ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
