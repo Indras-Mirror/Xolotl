@@ -50,6 +50,10 @@ int main(int argc, char ** argv) {
     const std::vector<int64_t> layers = ds41_file_layers(m, G);
     e = ds41_check_tensors(m, G, layers);
     check("full tensor map", e.empty(), e);
+    if (!e.empty()) {   // the expert tables are filled only by a successful map (indexing them now would read past them)
+        std::printf("FAILED\n");
+        return 1;
+    }
     for (int64_t l : layers) {
         std::map<std::pair<int, int>, int> pairs;
         const auto & X = G.experts[(size_t) l];
