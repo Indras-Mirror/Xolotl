@@ -19,6 +19,17 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 > average. Upload to [Hugging Face](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored) starts
 > as soon as the first tests are in, so around 25-26 Oct. Progress and numbers go on the model card as they come in.
 
+> **Want to try DeepSeek-V4.1 while you wait for our abliterated V4?** Xolotl can now load
+> [ISTA-DASLab](https://huggingface.co/ISTA-DASLab)'s [GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
+> of DeepSeek-V4.1-Flash-1017 (the IQ2_XXS and IQ2_XS builds), thanks heaps to ISTA for putting those out. Heads up
+> though, I haven't had a chance to run them on the GPU yet (my card's busy quantising V4). So far it's only tested on
+> the CPU side: their split shards, quant types and Engram layout all load and check out, and every quant type they
+> use has a GPU kernel, so it should work, but if something breaks please open an issue with the log and I'll sort it.
+> I'll update this once I've done a proper run. To use it, set `-m` in the DeepSeek config to their first shard
+> (`...-00001-of-00004.gguf`, the other shards get picked up automatically) and keep `--engram` pointing at our Engram
+> tables (steps on our HF card). Their separate Engram GGUF isn't read yet, but the hash tables are identical so ours
+> work with their weights.
+
 ## What one PC can do
 
 **One RTX 4090 (24 GB) · Ryzen 7 5700X · 90 GB DDR4 · one NVMe drive.** Every number is measured on that machine,
