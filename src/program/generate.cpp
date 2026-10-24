@@ -3887,10 +3887,15 @@ int main(int argc, char** argv) {
         const double cover_b = std::getenv("STRATA_SPLIT_COVER_B") ? std::atof(std::getenv("STRATA_SPLIT_COVER_B")) : 3.0;
         std::vector<double> mass(n_ranked);
         double total_mass = 0;
-        // Up to 3 GPUs the 0.1.39 curve (r+1)^-1.2 is kept, so 2- and 3-GPU placements do not move (the new curve is a
-        // fit to a 4-way rig and was not measured on them); STRATA_SPLIT_COVER_B asks for the coverage curve at any
-        // GPU count.
-        const bool coverage_curve = ns >= 4 || std::getenv("STRATA_SPLIT_COVER_B") != nullptr;
+        // THE COVERAGE CURVE AT EVERY GPU COUNT.  Up to 3 GPUs the 0.1.39 curve (r+1)^-1.2 used to be kept, so 2- and
+        // 3-GPU placements would not move.  On two unequal cards it tells the search that the faster card's cache
+        // already holds nearly all the mass, so the slower card gets almost no layers: RTX 5090 (x16) + RTX 4080 (PCIe
+        // 4.0 x4), Swift 1.5 IQ3_S, auto chose K=3 (decode 90.6 tok/s, a 29K prompt in 15.0 s); with the coverage
+        // curve it chooses K=12 (159.3 tok/s, 8.2 s).  Where a cache holds most of the profile (f ~ 0.8, the 5080+3090
+        // regime the old curve was fitted on) the two curves agree, see b = 3 above.  STRATA_SPLIT_POWER_CURVE=1 keeps
+        // the old curve up to 3 GPUs.
+        static const bool power_curve = [] { const char* v = std::getenv("STRATA_SPLIT_POWER_CURVE"); return v && v[0] == '1'; }();
+        const bool coverage_curve = ns >= 4 || !power_curve || std::getenv("STRATA_SPLIT_COVER_B") != nullptr;
         for (size_t r = 0; r < n_ranked; ++r) {
             if (!coverage_curve) {
                 total_mass += (mass[r] = std::pow((double) r + 1.0, -1.2));
