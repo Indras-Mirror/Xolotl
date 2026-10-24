@@ -5593,6 +5593,12 @@ void Ds41MoeTier::profiler(bool on) {
 #endif
 }
 
+void Ds41MoeTier::device_sync() {
+#if defined(DS4_MOE_CUDA)
+    cudaDeviceSynchronize();
+#endif
+}
+
 bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids || !w || !x || !out_dev || nt < 1 || nt > kMaxTok) return false;
