@@ -14,21 +14,21 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 > DeepSeek-V4.1 engine (faster now), plus GLM-5.3-Flash and the Qwen3.8 models, in one tree. Old links and clones
 > redirect here; nothing DeepSeek-V4.1 was removed.
 
-> **DeepSeek-V4.1 V4 quant: in progress (Sat 24 Oct).** 22 of 40 layers done, should finish tonight (~11:00 UTC 24 Oct).
-> Same size as V3 (152 GiB), and so far each layer's expert error on held-out text is about 44% lower than V3's on
-> average. Upload to [Hugging Face](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored) starts
-> as soon as the first tests are in, so around 25-26 Oct. Progress and numbers go on the model card as they come in.
+> **DeepSeek-V4.1 V4 is up (25 Oct)** on [Hugging Face](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)
+> (`v4/`, same size as V3). It's the best build so far: on held-out text it agrees with the full-precision model 85.7%
+> of the time on the top-1 token vs V3's 81.5%, with KL 0.343 vs 0.471 (86.8% / 0.316 through the real engine), and
+> its perplexity is within 0.4% of the full model's. The 1,056 hottest experts are kept exactly as DeepSeek trained them
+> (native FP4). Heads up though, right now it decodes slower than V3 (about 16 vs 25 tok/s one-shot) because those hot
+> experts are bigger, so fewer fit in VRAM. I'm working on that in the engine now and the numbers go on the HF card as
+> they land. Needs Xolotl from 21 Oct or newer.
 
-> **Want to try DeepSeek-V4.1 while you wait for our abliterated V4?** Xolotl can now load
-> [ISTA-DASLab](https://huggingface.co/ISTA-DASLab)'s [GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF)
-> of DeepSeek-V4.1-Flash-1017 (the IQ2_XXS and IQ2_XS builds), thanks heaps to ISTA for putting those out. Heads up
-> though, I haven't had a chance to run them on the GPU yet (my card's busy quantising V4). So far it's only tested on
-> the CPU side: their split shards, quant types and Engram layout all load and check out, and every quant type they
-> use has a GPU kernel, so it should work, but if something breaks please open an issue with the log and I'll sort it.
-> I'll update this once I've done a proper run. To use it, set `-m` in the DeepSeek config to their first shard
-> (`...-00001-of-00004.gguf`, the other shards get picked up automatically) and keep `--engram` pointing at our Engram
-> tables (steps on our HF card). Their separate Engram GGUF isn't read yet, but the hash tables are identical so ours
-> work with their weights.
+> **ISTA-DASLab's GGUFs work too.** Xolotl loads [ISTA-DASLab](https://huggingface.co/ISTA-DASLab)'s
+> [GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) of DeepSeek-V4.1-Flash-1017
+> (the unedited model, IQ2_XXS and IQ2_XS), thanks heaps to ISTA for putting those out. I've now run IQ2_XS on my 4090
+> and it works: perplexity 3.93 on a 256-token test (our V3 3.60, same flags) and sane chat answers. To use it, set `-m`
+> in the DeepSeek config to their first shard (`...-00001-of-00004.gguf`, the other shards get picked up automatically)
+> and keep `--engram` pointing at our Engram tables (steps on our HF card). The hash tables are identical so ours work
+> with their weights.
 
 ## What one PC can do
 
@@ -87,8 +87,8 @@ DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts
   and the expert-cache fixes from clawdia-saka.
 - **DeepSeek-V4.1-Flash-1017 builds** of the October checkpoint:
   [IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-GSQ-Uncensored)
-  (V2 142 GiB; V3 152 GiB, recalibrated on a code + agentic heavy mix). **V4** (same size as V3, with our XQ
-  refinement on every expert) is quantising now. Early per-layer error is 29-48% below V3's; release expected around 26-27 Oct.
+  (V2 142 GiB; V3 152 GiB, recalibrated on a code + agentic heavy mix; **V4** 152 GiB, out 25 Oct, with our XQ
+  refinement on every expert and the hottest experts kept in native FP4: 85.7% top-1 agreement with the full model vs V3's 81.5%).
 - **Native Windows** for the DeepSeek-V4.1 engine (MSVC + CUDA, RTX 50 notes from #14): [docs/WINDOWS.md](docs/WINDOWS.md).
 - **Vision** input for DeepSeek-V4.1 (#8), per-request routing options (#11), a 16-row tier call (#9) and a uniform
   VRAM expert cache under the auto slot budget (#15).
