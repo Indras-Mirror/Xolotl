@@ -8,6 +8,11 @@
 // ascending and the unique rows whose bytes share a 4 KiB page are one pread - which on the exFAT volume the tables live
 // on is the difference between a random walk the driver serializes (~23K reads/s) and a sorted one it does not (~135K/s).
 // rows_reference() keeps the original per-row random reader so the bench can diff the two byte for byte.
+//
+// The tables can also come from a GGUF (ISTA-DASLab's DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf: blk.{1,14}.engram_embd.weight
+// IQ4_NL [256, rows], one 144-byte row per hash id): pass the .gguf file itself as an --engram entry.  The row reader is the
+// same (sorted, page-coalesced preads, row cache); a row is one span (no separate scale tensor) dequantized at read.  The
+// hash geometry still comes from the backbone GGUF; the table rows must match it.  The hot set (FP8 rows) is not used then.
 #pragma once
 
 #include "ds41_geometry.hpp"
@@ -92,6 +97,12 @@ private:
     struct ReadGroup;               // one coalesced pread (defined in the .cpp)
     const Ds41Geometry * g_ = nullptr;
     std::vector<Table> tables_;
+    // Row format.  qtype_ < 0: the HF FP8 tables - wrow_ = dim fp8 bytes (F8_E4M3) + srow_ = dim/32 scale bytes (F8_E8M0, in
+    // the .scale tensor).  qtype_ = 20 (IQ4_NL): a GGUF table - wrow_ = dim/32 blocks of 18 bytes, srow_ = 0 (no scale span).
+    int qtype_ = -1;
+    int64_t wrow_ = 0, srow_ = 0;
+    void deq_row(const uint8_t * w, const uint8_t * s, float * out) const;   ///< one raw row -> dim_ floats
+    bool open_gguf(const std::string & path, std::string & err);
     // Row cache: raw rows (dim weight bytes + dim/32 scale bytes) already read, keyed (layer slot << 32 | row).  Filled
     // by every read until `cache_cap_` rows (STRATA_ENGRAM_CACHE_ROWS, default 2M ~ 0.6 GB; 0 = off), never evicted:
     // a prompt's rows are all cached as it is read, so decode n-grams that repeat the context skip the disk (the Engram
