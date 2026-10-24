@@ -74,6 +74,9 @@ DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts
 
 ## Recently added
 
+- **GLM-5.3-Flash long conversations no longer crash** (#46, vthomasino): when the graph pool fills and gets rebuilt,
+  every cached graph (predict and rows included) and the CUDA backend's captured graphs are dropped too, so nothing
+  replays against freed memory. Regression tool: `tools/xolotl-glm-manylengths.py`.
 - **Batch slots** for the DeepSeek-V4.1 engine (#22, NektoDron): `"parallel": N` in a ds41 config runs several
   requests in one pass over the model, one token each, on the server's existing slot scheduler. How it works, what a
   slot costs and the limits: [docs/BATCHING.md](docs/BATCHING.md).
