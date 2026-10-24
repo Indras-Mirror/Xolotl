@@ -6513,7 +6513,8 @@ bool Ds41FileBlobs::open(std::string& err) {
     const char* dv = std::getenv("STRATA_BLOB_DIRECT");
     direct_ok_ = !(dv && dv[0] == '0');
     for (size_t s = 0; s < m->size(); ++s) {   // every shard (a single-file GGUF: just the file)
-        const std::string sp = s == 0 ? path_ : m->shard(s).path();
+        // every shard from the canonical split order (#38: `path_` may name any shard, and shard 0 is the metadata one)
+        const std::string sp = m->shard(s).path();
         const int f = ds41_sys::open(sp.c_str(), O_RDONLY);
         if (f < 0) { err = "cannot open " + sp; return false; }
         ds41_sys::posix_fadvise(f, 0, 0, POSIX_FADV_RANDOM);

@@ -599,9 +599,42 @@ def engine_args_ds41(cfg: dict) -> list[str]:
 
 S.engine_args = engine_args_ds41
 
+def vision_refusal(cfg: dict) -> str | None:
+    """Why this config's vision can't run with its model, or None.  The engine needs the router's image-position bias
+    (`exp_probs_b_vl.bias`) in every layer for --vision; llama.cpp-convention GGUFs (ISTA-DASLab's GSQ-RCO) don't carry
+    it.  Checked from the GGUF headers before the encoder takes the card, instead of the engine dying after it (#43)."""
+    if not isinstance(cfg.get("vision"), dict):
+        return None
+    args = [str(x) for x in cfg.get("args") or []]
+    model = next((args[i + 1] for i, v in enumerate(args[:-1]) if v in ("-m", "--model")), None)
+    if not model:
+        return None
+    path = Path(os.path.join(cfg.get("cwd") or ".", os.path.expanduser(model)))
+    m = re.match(r"(.*-)(\d{5})(-of-)(\d{5})(\.gguf)$", str(path))
+    shards = [Path(f"{m[1]}{i:05d}{m[3]}{m[4]}{m[5]}") for i in range(1, int(m[4]) + 1)] if m else [path]
+    try:
+        from gguf_reader import GGUFFile
+        names = [t.name for sp in shards for t in GGUFFile(sp).tensors]
+    except Exception:   # unreadable here: leave the verdict to the engine
+        return None
+    if not any(n.endswith("exp_probs_b.bias") for n in names) or any(n.endswith("exp_probs_b_vl.bias") for n in names):
+        return None
+    return (f"{path.name} has no exp_probs_b_vl.bias (the router's image-position bias; llama.cpp-convention GGUFs "
+            "such as ISTA-DASLab's GSQ-RCO leave it out), so this model runs text only: remove the config's "
+            '"vision" section')
+
+
 if __name__ == "__main__":
     for i, v in enumerate(sys.argv[:-1]):   # paths are the caller's; the server runs from Strata's directory
         if v in ("--config", "--tokenizer", "--mcp-config"):
             sys.argv[i + 1] = os.path.abspath(sys.argv[i + 1])
+        if v == "--config":
+            try:
+                why = vision_refusal(json.loads(Path(sys.argv[i + 1]).read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                why = None
+            if why:
+                print(f"serve_ds41: refusing --vision: {why}", file=sys.stderr)
+                sys.exit(2)
     os.chdir(str(STRATA))
     sys.exit(S.main())

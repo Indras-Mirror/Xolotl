@@ -530,6 +530,12 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
                 const TensorInfo * t0 = m.find(b + "ffn_" + roles[0] + "_exps.weight");
                 if (!t0) return "missing " + b + "ffn_" + roles[0] + "_exps.weight (and no " + mapn + ")";
                 for (uint64_t e = 0; e < NE; ++e) { tv[e] = (int) t0->type; sv[e] = (int) e; }
+                if (!k) {   // gate and up share one type and one byte stride per expert, even where the dense types are free (#38)
+                    const TensorInfo * tu = m.find(b + "ffn_up_exps.weight");
+                    if (tu && tu->type != t0->type)
+                        return b + "ffn_up_exps.weight is " + std::string(ggml_type_name(tu->type)) + ", its gate is " +
+                               ggml_type_name(t0->type) + " (gate and up must share a type)";
+                }
                 for (const char * r : roles) {
                     if (!r) continue;
                     const std::string n = b + "ffn_" + r + "_exps.weight";

@@ -28,7 +28,8 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 > and it works: perplexity 3.93 on a 256-token test (our V3 3.60, same flags) and sane chat answers. To use it, set `-m`
 > in the DeepSeek config to their first shard (`...-00001-of-00004.gguf`, the other shards get picked up automatically)
 > and keep `--engram` pointing at our Engram tables (steps on our HF card). The hash tables are identical so ours work
-> with their weights.
+> with their weights. They're text only in Xolotl (their files don't carry the router's image bias), so leave the
+> `vision` section out of the config for them.
 
 ## What one PC can do
 
