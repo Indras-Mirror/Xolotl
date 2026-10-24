@@ -1,7 +1,26 @@
-diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+diff --git i/ggml/include/ggml-cuda.h w/ggml/include/ggml-cuda.h
+index 1cd81eeae..516aaccd5 100644
+--- i/ggml/include/ggml-cuda.h
++++ w/ggml/include/ggml-cuda.h
+@@ -24,6 +24,14 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
+ 
+ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+ 
++// xolotl: drop every CUDA graph this backend has cached.  A cached graph's kernels point at the buffers of the ggml
++// context that built it.  When a caller frees that context and builds a new one of the same size (the GLM engine
++// does this when its one fixed graph pool fills up), the new context and its buffers land at the same addresses,
++// the cache key (cgraph->nodes[0]) collides, and the next compute replays a stale executable against freed memory:
++// "ds4_moe: chunk sync: an illegal memory access was encountered" and a SIGSEGV in ggml_backend_cuda_graph_compute.
++// Call this before freeing the context.  No-op when the backend is not CUDA.
++GGML_BACKEND_API void ggml_backend_cuda_graph_cache_clear(ggml_backend_t backend);
++
+ // device buffer
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
+ 
+diff --git i/ggml/include/ggml.h w/ggml/include/ggml.h
 index 224bdef92..3af3fd72c 100644
---- a/ggml/include/ggml.h
-+++ b/ggml/include/ggml.h
+--- i/ggml/include/ggml.h
++++ w/ggml/include/ggml.h
 @@ -585,6 +585,8 @@ extern "C" {
          GGML_OP_DSV4_HC_COMB,
          GGML_OP_DSV4_HC_PRE,
@@ -41,10 +60,10 @@ index 224bdef92..3af3fd72c 100644
      // custom operators
  
      typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
-diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+diff --git i/ggml/src/ggml-backend-meta.cpp w/ggml/src/ggml-backend-meta.cpp
 index 3ec40fb1a..58f5a3644 100644
---- a/ggml/src/ggml-backend-meta.cpp
-+++ b/ggml/src/ggml-backend-meta.cpp
+--- i/ggml/src/ggml-backend-meta.cpp
++++ w/ggml/src/ggml-backend-meta.cpp
 @@ -1037,7 +1037,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              } break;
              case GGML_OP_DSV4_HC_COMB:
@@ -56,10 +75,10 @@ index 3ec40fb1a..58f5a3644 100644
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
              } break;
              case GGML_OP_UNARY: {
-diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+diff --git i/ggml/src/ggml-cpu/ggml-cpu.c w/ggml/src/ggml-cpu/ggml-cpu.c
 index 8bb0ff7bc..dd97d59a3 100644
---- a/ggml/src/ggml-cpu/ggml-cpu.c
-+++ b/ggml/src/ggml-cpu/ggml-cpu.c
+--- i/ggml/src/ggml-cpu/ggml-cpu.c
++++ w/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -2109,6 +2109,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
              {
                  ggml_compute_forward_dsv4_hc_post(params, tensor);
@@ -84,10 +103,10 @@ index 8bb0ff7bc..dd97d59a3 100644
              {
                  n_tasks = n_threads;
              } break;
-diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+diff --git i/ggml/src/ggml-cpu/ops.cpp w/ggml/src/ggml-cpu/ops.cpp
 index ba00a0a73..c1404693f 100644
---- a/ggml/src/ggml-cpu/ops.cpp
-+++ b/ggml/src/ggml-cpu/ops.cpp
+--- i/ggml/src/ggml-cpu/ops.cpp
++++ w/ggml/src/ggml-cpu/ops.cpp
 @@ -12204,3 +12204,92 @@ void ggml_compute_forward_lightning_indexer(
          }
      }
@@ -181,10 +200,10 @@ index ba00a0a73..c1404693f 100644
 +        y[i] = post ? s * 2.0f : s + eps;
 +    }
 +}
-diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+diff --git i/ggml/src/ggml-cpu/ops.h w/ggml/src/ggml-cpu/ops.h
 index 2728b08b6..a3edb34fb 100644
---- a/ggml/src/ggml-cpu/ops.h
-+++ b/ggml/src/ggml-cpu/ops.h
+--- i/ggml/src/ggml-cpu/ops.h
++++ w/ggml/src/ggml-cpu/ops.h
 @@ -108,6 +108,8 @@ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * p
  void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -194,10 +213,10 @@ index 2728b08b6..a3edb34fb 100644
  void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
-diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
+diff --git i/ggml/src/ggml-cuda/argsort.cu w/ggml/src/ggml-cuda/argsort.cu
 index 24115da09..3f7bf1fbd 100644
---- a/ggml/src/ggml-cuda/argsort.cu
-+++ b/ggml/src/ggml-cuda/argsort.cu
+--- i/ggml/src/ggml-cuda/argsort.cu
++++ w/ggml/src/ggml-cuda/argsort.cu
 @@ -216,6 +216,143 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
      }
  }
@@ -363,10 +382,10 @@ index 24115da09..3f7bf1fbd 100644
  #ifdef GGML_CUDA_USE_CUB
      const int    ncols_pad      = next_power_of_2(ncols);
      const size_t shared_mem     = ncols_pad * sizeof(int);
-diff --git a/ggml/src/ggml-cuda/cpy-utils.cuh b/ggml/src/ggml-cuda/cpy-utils.cuh
+diff --git i/ggml/src/ggml-cuda/cpy-utils.cuh w/ggml/src/ggml-cuda/cpy-utils.cuh
 index 7697c292d..f98b32a81 100644
---- a/ggml/src/ggml-cuda/cpy-utils.cuh
-+++ b/ggml/src/ggml-cuda/cpy-utils.cuh
+--- i/ggml/src/ggml-cuda/cpy-utils.cuh
++++ w/ggml/src/ggml-cuda/cpy-utils.cuh
 @@ -186,6 +186,98 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
      y->d = sumq2 > 0 ? sumqx/sumq2 : d;
  }
@@ -466,10 +485,10 @@ index 7697c292d..f98b32a81 100644
  // Wrapper functions for cpy.cu compatibility
  static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
      quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);
-diff --git a/ggml/src/ggml-cuda/dequantize.cuh b/ggml/src/ggml-cuda/dequantize.cuh
+diff --git i/ggml/src/ggml-cuda/dequantize.cuh w/ggml/src/ggml-cuda/dequantize.cuh
 index 651524be7..57c5b8ae7 100644
---- a/ggml/src/ggml-cuda/dequantize.cuh
-+++ b/ggml/src/ggml-cuda/dequantize.cuh
+--- i/ggml/src/ggml-cuda/dequantize.cuh
++++ w/ggml/src/ggml-cuda/dequantize.cuh
 @@ -435,6 +435,24 @@ static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const
      }
  }
@@ -495,10 +514,10 @@ index 651524be7..57c5b8ae7 100644
  template<typename dst_t>
  static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
  
-diff --git a/ggml/src/ggml-cuda/dsv4-hc.cu b/ggml/src/ggml-cuda/dsv4-hc.cu
+diff --git i/ggml/src/ggml-cuda/dsv4-hc.cu w/ggml/src/ggml-cuda/dsv4-hc.cu
 index ca1d2dc8a..4705c2304 100644
---- a/ggml/src/ggml-cuda/dsv4-hc.cu
-+++ b/ggml/src/ggml-cuda/dsv4-hc.cu
+--- i/ggml/src/ggml-cuda/dsv4-hc.cu
++++ w/ggml/src/ggml-cuda/dsv4-hc.cu
 @@ -314,3 +314,130 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
              nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
              nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
@@ -630,20 +649,20 @@ index ca1d2dc8a..4705c2304 100644
 +                                                   (const float *) base->data, (float *) dst->data, hc, nt, eps);
 +    CUDA_CHECK(cudaGetLastError());
 +}
-diff --git a/ggml/src/ggml-cuda/dsv4-hc.cuh b/ggml/src/ggml-cuda/dsv4-hc.cuh
+diff --git i/ggml/src/ggml-cuda/dsv4-hc.cuh w/ggml/src/ggml-cuda/dsv4-hc.cuh
 index 2379aaefb..fca38ee8d 100644
---- a/ggml/src/ggml-cuda/dsv4-hc.cuh
-+++ b/ggml/src/ggml-cuda/dsv4-hc.cuh
+--- i/ggml/src/ggml-cuda/dsv4-hc.cuh
++++ w/ggml/src/ggml-cuda/dsv4-hc.cuh
 @@ -4,3 +4,5 @@
  void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
  void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +void ggml_cuda_op_dsv41_fake_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +void ggml_cuda_op_dsv41_hc_mixes(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
-diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+diff --git i/ggml/src/ggml-cuda/fattn-common.cuh w/ggml/src/ggml-cuda/fattn-common.cuh
 index b527b1cf6..db7cced27 100644
---- a/ggml/src/ggml-cuda/fattn-common.cuh
-+++ b/ggml/src/ggml-cuda/fattn-common.cuh
+--- i/ggml/src/ggml-cuda/fattn-common.cuh
++++ w/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -617,6 +617,28 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
      }
  }
@@ -682,10 +701,10 @@ index b527b1cf6..db7cced27 100644
      } else {
          static_assert(type_V == -1, "bad type");
          return nullptr;
-diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+diff --git i/ggml/src/ggml-cuda/fattn-mma-f16.cuh w/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 index dc18a091a..e10175b29 100644
---- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-+++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+--- i/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ w/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 @@ -1744,7 +1744,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  }
              }
@@ -695,10 +714,10 @@ index dc18a091a..e10175b29 100644
              __syncthreads();
          }
      }
-diff --git a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
+diff --git i/ggml/src/ggml-cuda/getrows.cu w/ggml/src/ggml-cuda/getrows.cu
 index 6b36b8fbc..ae3bf82d1 100644
---- a/ggml/src/ggml-cuda/getrows.cu
-+++ b/ggml/src/ggml-cuda/getrows.cu
+--- i/ggml/src/ggml-cuda/getrows.cu
++++ w/ggml/src/ggml-cuda/getrows.cu
 @@ -404,6 +404,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
              get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t>>(src0_d, src1_d, dst_d,
                  ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
@@ -710,10 +729,10 @@ index 6b36b8fbc..ae3bf82d1 100644
          default:
              GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
              break;
-diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a9038f1f4..644e089ba 100644
---- a/ggml/src/ggml-cuda/ggml-cuda.cu
-+++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+diff --git i/ggml/src/ggml-cuda/ggml-cuda.cu w/ggml/src/ggml-cuda/ggml-cuda.cu
+index a9038f1f4..a462357be 100644
+--- i/ggml/src/ggml-cuda/ggml-cuda.cu
++++ w/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -2391,6 +2391,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_DSV4_HC_POST:
              ggml_cuda_op_dsv4_hc_post(ctx, dst);
@@ -753,7 +772,29 @@ index a9038f1f4..644e089ba 100644
          // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
          if (node->op == GGML_OP_MUL_MAT_ID) {
              const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -5209,6 +5227,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -4797,6 +4815,21 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
+     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
+ }
+ 
++// xolotl: drop every cached CUDA graph.  See ggml-cuda.h for why: a caller that frees its ggml graph context and
++// re-creates one of the same size gets the same node pointers back, so a cached graph would be replayed against
++// freed buffers.  Waiting for the device first means no captured kernel is still running when the execs go away.
++void ggml_backend_cuda_graph_cache_clear(ggml_backend_t backend) {
++    if (!ggml_backend_is_cuda(backend)) {
++        return;
++    }
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++#ifdef USE_CUDA_GRAPH
++    ggml_cuda_set_device(ctx->device);
++    CUDA_CHECK(cudaDeviceSynchronize());
++    ctx->cuda_graphs.clear();   // ~ggml_cuda_graph destroys each exec and graph
++#endif
++}
++
+ int ggml_backend_cuda_get_device_count() {
+     return ggml_cuda_info().device_count;
+ }
+@@ -5209,6 +5242,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          return true;
                      case GGML_TYPE_IQ4_NL:
                      case GGML_TYPE_MXFP4:
@@ -761,7 +802,7 @@ index a9038f1f4..644e089ba 100644
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
                          return op->src[0]->ne[0] % QK_K == 0;
-@@ -5226,7 +5245,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5226,7 +5260,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                             (
                                 (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                 op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
@@ -771,7 +812,7 @@ index a9038f1f4..644e089ba 100644
                                 op->src[0]->type == GGML_TYPE_F32
                             ) || (
                                 op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
-@@ -5499,6 +5519,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5499,6 +5534,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -783,10 +824,10 @@ index a9038f1f4..644e089ba 100644
          case GGML_OP_FLASH_ATTN_EXT:
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_CROSS_ENTROPY_LOSS:
-diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
+diff --git i/ggml/src/ggml-cuda/lightning-indexer.cu w/ggml/src/ggml-cuda/lightning-indexer.cu
 index 5edc967e0..e56bb13ea 100644
---- a/ggml/src/ggml-cuda/lightning-indexer.cu
-+++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+--- i/ggml/src/ggml-cuda/lightning-indexer.cu
++++ w/ggml/src/ggml-cuda/lightning-indexer.cu
 @@ -448,7 +448,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
  
      if (n_embd == 128 && n_head == 64) {
@@ -829,10 +870,10 @@ index 5edc967e0..e56bb13ea 100644
              return true;
          default:
              return false;
-diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+diff --git i/ggml/src/ggml-cuda/mmq.cu w/ggml/src/ggml-cuda/mmq.cu
 index b13b34ee9..20d07e579 100644
---- a/ggml/src/ggml-cuda/mmq.cu
-+++ b/ggml/src/ggml-cuda/mmq.cu
+--- i/ggml/src/ggml-cuda/mmq.cu
++++ w/ggml/src/ggml-cuda/mmq.cu
 @@ -91,7 +91,10 @@ void ggml_cuda_mul_mat_q(
      GGML_TENSOR_BINARY_OP_LOCALS;
  
@@ -958,10 +999,10 @@ index b13b34ee9..20d07e579 100644
  
      ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
  }
-diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+diff --git i/ggml/src/ggml-cuda/mmq.cuh w/ggml/src/ggml-cuda/mmq.cuh
 index 6923f3510..c4359210d 100644
---- a/ggml/src/ggml-cuda/mmq.cuh
-+++ b/ggml/src/ggml-cuda/mmq.cuh
+--- i/ggml/src/ggml-cuda/mmq.cuh
++++ w/ggml/src/ggml-cuda/mmq.cuh
 @@ -208,7 +208,7 @@ struct ggml_cuda_mmq_config {
          static_assert((nthreads_) %  32 == 0 && (nthreads_)       <= 512, "bad nthreads");                                                \
          static_assert(                          (occupancy_)      <=   8, "bad occupancy");                                               \
@@ -1075,10 +1116,10 @@ index 6923f3510..c4359210d 100644
          mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
      }
  }
-diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
+diff --git i/ggml/src/ggml-cuda/set-rows.cu w/ggml/src/ggml-cuda/set-rows.cu
 index 465997065..57cdad285 100644
---- a/ggml/src/ggml-cuda/set-rows.cu
-+++ b/ggml/src/ggml-cuda/set-rows.cu
+--- i/ggml/src/ggml-cuda/set-rows.cu
++++ w/ggml/src/ggml-cuda/set-rows.cu
 @@ -317,6 +317,26 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
              nb1, nb2, nb3,
              stream
@@ -1106,10 +1147,10 @@ index 465997065..57cdad285 100644
      } else {
          GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
      }
-diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+diff --git i/ggml/src/ggml.c w/ggml/src/ggml.c
 index 175281409..e0176016b 100644
---- a/ggml/src/ggml.c
-+++ b/ggml/src/ggml.c
+--- i/ggml/src/ggml.c
++++ w/ggml/src/ggml.c
 @@ -1084,6 +1084,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "DSV4_HC_COMB",
      "DSV4_HC_PRE",

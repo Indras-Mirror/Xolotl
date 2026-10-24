@@ -11,6 +11,9 @@
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"   // ggml_cgraph::uid + ggml_graph_next_uid (graph reuse)
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"   // ggml_backend_cuda_graph_cache_clear: drop cached CUDA graphs when the pool is rebuilt
+#endif
 
 #include "strata/artifact/gguf_reader.hpp"
 
@@ -268,6 +271,9 @@ struct GlmDense::Impl {
     int pred_ready = -1;
     bool fused_pred = true;
     ggml_context * gctx = nullptr;   // graph node structs
+    size_t gctx_bytes = 0;           // the graph pool's size (see reset_graph_cache)
+    int64_t gctx_resets = 0;         // how many times the cache was rebuilt (logged; 0 in a short session)
+    bool predict_stale = false;      // reset_graph_cache dropped build_predict's graphs; ensure_n builds them again
 
     // pass state
     ggml_tensor * x_state = nullptr;     // [D, HC, NT]
@@ -407,6 +413,62 @@ struct GlmDense::Impl {
         if (ictx) ggml_free(ictx);
         if (gctx) ggml_free(gctx);
         if (own_backend && backend) ggml_backend_free(backend);
+    }
+
+    /// Free every cached graph and start the graph context over.  `ensure_n` caches one graph set per prompt length
+    /// and per attention capacity for the whole session; a long conversation reaches many of them and the single
+    /// fixed pool fills up.  ggml's allocator then returns NULL from ggml_new_object and the engine died with a NULL
+    /// dereference (2026-10-22: "not enough space in the context's memory pool (needed 536919568, available
+    /// 536870912)" then exit 139).  Rebuilding a graph costs milliseconds, so the cache is dropped when the pool is
+    /// over half full, and the graphs a request needs are built again by ensure_n.  Only safe at a request's start,
+    /// which is where ensure_n is called.
+    ///
+    /// The CUDA backend caches one captured graph per first-node pointer.  Freeing gctx frees the pool those
+    /// pointers live in, and re-creating it at the same size hands back the same addresses, so a cached graph whose
+    /// kernels still point at the freed buffers would be replayed as-is: 2026-10-22 "ds4_moe: chunk sync: an illegal
+    /// memory access was encountered" and a SIGSEGV in ggml_backend_cuda_graph_compute at pool 6.5 of 512 MiB.  The
+    /// cache has to be dropped here, before the pool goes away, so the next build captures afresh.
+    void reset_graph_cache() {
+        #ifdef GGML_USE_CUDA
+        if (backend) ggml_backend_cuda_graph_cache_clear(backend);
+        #endif
+        for (Layer & L : ly) {
+            for (Var & v : L.vars) if (v.allo && v.allo != allo_big) ggml_gallocr_free(v.allo);
+            L.vars.clear();
+            for (ggml_gallocr_t a : L.allo_finish) if (a && a != allo_big) ggml_gallocr_free(a);
+            std::fill(L.allo_finish.begin(), L.allo_finish.end(), nullptr);
+            std::fill(L.gf_finish.begin(), L.gf_finish.end(), nullptr);
+            // build_predict runs once at load time and ensure_n never rebuilds it: after gctx goes away
+            // L.gf_predict and L.predict_out point into freed memory, so the next predict() would hand
+            // ggml_backend_cuda_graph_compute a cgraph whose nodes[0] is unmapped (2026-10-22: SEGV_MAPERR at
+            // graph_compute +0xbae446).  Drop them; ensure_n builds them again in the new pool.
+            if (L.allo_predict && L.allo_predict != allo_big) ggml_gallocr_free(L.allo_predict);
+            L.allo_predict = nullptr;
+            L.gf_predict = nullptr;
+            L.predict_out = nullptr;
+            L.fused_next = false;
+        }
+        for (ggml_gallocr_t a : allo_init) if (a && a != allo_big) ggml_gallocr_free(a);
+        for (ggml_gallocr_t a : allo_head) if (a && a != allo_big) ggml_gallocr_free(a);
+        std::fill(gf_init.begin(), gf_init.end(), nullptr);
+        std::fill(gf_head.begin(), gf_head.end(), nullptr);
+        std::fill(allo_init.begin(), allo_init.end(), nullptr);
+        std::fill(allo_head.begin(), allo_head.end(), nullptr);
+        std::fill(logits_t.begin(), logits_t.end(), nullptr);
+        // logits_rows caches its graphs and output tensors in gf_rows/rows_t too.  clear() (not fill) so the next
+        // call sees empty() and creates a fresh allocator; the graphs themselves are rebuilt lazily there.
+        gf_rows.clear();
+        rows_t.clear();
+        if (allo_rows && allo_rows != allo_big) ggml_gallocr_free(allo_rows);
+        allo_rows = nullptr;
+        predict_stale = true;
+        if (gctx) ggml_free(gctx);
+        ggml_init_params gp = { gctx_bytes, nullptr, true };
+        gctx = ggml_init(gp);
+        if (!gctx) { err = "the graph cache could not be re-created"; return; }
+        ++gctx_resets;
+        std::fprintf(stderr, "glm: graph cache rebuilt (%lld time(s); the pool held %.1f MiB of %.1f MiB)\n",
+                     (long long) gctx_resets, (double) gctx_bytes / 1048576.0, (double) gctx_bytes / 1048576.0);
     }
 
     // MLA through the lightning indexer once a token can see more than idx_top_k earlier positions (below that the
@@ -755,6 +817,13 @@ static ggml_cgraph * build_head(GlmDense::Impl & im, int64_t n) {
 
 bool GlmDense::Impl::ensure_n(int64_t n) {
     if (n < 1 || n > NT) { err = "pass size " + std::to_string(n) + " out of range 1.." + std::to_string(NT); return false; }
+    if (!gf_init[(size_t) n] && gctx_bytes && ggml_used_mem(gctx) * 2 > gctx_bytes) reset_graph_cache();
+    if (!gctx) return false;
+    if (predict_stale) {   // reset_graph_cache dropped build_predict's graphs (they lived in the old pool)
+        for (size_t il = 0; il < ly.size(); ++il)
+            if (ly[il].routed) build_predict(*this, (int) il);
+        predict_stale = false;
+    }
     if (!gf_init[(size_t) n]) {
         gf_init[(size_t) n] = build_init(*this, n);
         allo_init[(size_t) n] = allo_for(n);
@@ -958,6 +1027,7 @@ bool GlmDense::init(const std::string & model_path, const GlmDenseConfig & cfg, 
     }
 
     ggml_init_params gp = { 512ull * 1024 * 1024, nullptr, true };
+    im.gctx_bytes = (size_t) gp.mem_size;
     im.gctx = ggml_init(gp);
     if (!im.gctx) { err = "ggml_init(graph) failed"; return false; }
     im.gf_init.assign((size_t) NT + 1, nullptr);
@@ -1046,6 +1116,7 @@ bool GlmDense::predict(int il, int * top_ids, int n_top) {
     Impl::Layer & L = im.ly[(size_t) il];
     for (int i = 0; i < n_top; ++i) top_ids[i] = -1;
     if (!L.routed) return false;
+    if (!L.gf_predict || !L.predict_out) { im.err = "predict: graph missing"; return false; }
     std::vector<float> sel((size_t) ggml_nelements(L.predict_out));
     if (im.pred_ready == il) {   // finish(il-1) already computed it
         ggml_backend_tensor_get_async(im.backend, im.pred_sel, sel.data(), 0, sel.size() * 4);
