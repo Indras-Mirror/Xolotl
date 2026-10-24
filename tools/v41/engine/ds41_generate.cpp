@@ -2873,6 +2873,15 @@ int main(int argc, char ** argv) {
                         while (kk < k && 1.0f / (1.0f + std::exp(-sp_conf[kk])) >= conf_tau_s) ++kk;
                         k = kk;
                     }
+                    // STRATA_DSPARK_CUM=<c> (after upstream Strata f73ae5a6): also stop where the product of the leading
+                    // drafts' confidences - the chance they all survive - falls below c.  Lossless, as the cut above.
+                    static const float cum_s = std::getenv("STRATA_DSPARK_CUM") ? (float) std::atof(std::getenv("STRATA_DSPARK_CUM")) : -1.0f;
+                    if (cum_s > 0) {
+                        float pc = 1.0f;
+                        int kk = 0;
+                        while (kk < k && (pc *= 1.0f / (1.0f + std::exp(-sp_conf[kk]))) >= cum_s) ++kk;
+                        k = kk;
+                    }
                     const bool refeed = dirty && ((P + 1) & 1);
                     for (int i = 0; i < k; ++i) dr[i] = sp_ids[i];
                     bool is_lk = false;
@@ -3206,6 +3215,13 @@ int main(int argc, char ** argv) {
             if (conf_tau >= 0) {
                 int kk = 0;
                 while (kk < k && sig(sp_conf[kk]) >= conf_tau) ++kk;
+                k = kk;
+            }
+            static const float cum = std::getenv("STRATA_DSPARK_CUM") ? (float) std::atof(std::getenv("STRATA_DSPARK_CUM")) : -1.0f;
+            if (cum > 0) {   // STRATA_DSPARK_CUM=<c>: as the serve loop
+                float pc = 1.0f;
+                int kk = 0;
+                while (kk < k && (pc *= sig(sp_conf[kk])) >= cum) ++kk;
                 k = kk;
             }
             const bool refeed = dirty && ((P + 1) & 1);

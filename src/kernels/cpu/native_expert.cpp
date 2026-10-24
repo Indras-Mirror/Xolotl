@@ -241,6 +241,28 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             }
         return;
     }
+    // Q2_0 gate/up (ggml type 42, the V4.1 XQ middle tier): ggml-cpu's Q2_0 dot is the scalar _generic one on x86
+    // (~0.5 GB/s a core); q2_0_rows_q8_0 decodes each block once for every token in AVX2.  STRATA_NO_Q2_ROWS=1 = ggml.
+    static const bool q2_rows = cpu_avx2_ok() && std::getenv("STRATA_NO_Q2_ROWS") == nullptr;
+    if (q2_rows && f.gu_type == kQ2_0Type && !mixed && r1 > r0) {
+        const int R = r1 - r0, n = (int) f.n_embd;
+        thread_local std::vector<float> gb, ub;
+        gb.resize((size_t) nt * (size_t) R);
+        ub.resize((size_t) nt * (size_t) R);
+        float* gp[MAXT];
+        float* upp[MAXT];
+        for (int t = 0; t < nt; ++t) { gp[t] = gb.data() + (size_t) t * R; upp[t] = ub.data() + (size_t) t * R; }
+        q2_0_rows_q8_0(blob + (size_t) r0 * f.gu_row, f.gu_row, n, act, nt, gp, 0, R);
+        q2_0_rows_q8_0(blob + f.up_off + (size_t) r0 * f.gu_row, f.gu_row, n, act, nt, upp, 0, R);
+        const float lim = f.swiglu_limit;
+        for (int t = 0; t < nt; ++t)
+            for (int i = 0; i < R; ++i) {
+                const float g = std::min(gp[t][i], lim);       // DeepSeek-V4's clamp, as below
+                const float u = std::min(std::max(upp[t][i], -lim), lim);
+                ff[t][r0 + i] = (g / (1.f + std::exp(-g))) * u;
+            }
+        return;
+    }
     // UNION (xolotl): upstream's older-CPU 128-bit tier - independent of the PTQ1_0 path above (disjoint quant types)
     if (avx1 && nt >= mt_min && iq128_supported(f.gu_type)) {
         iq128_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
@@ -311,6 +333,11 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     static const bool ptq_rows = std::getenv("STRATA_NO_PTQ1_ROWS") == nullptr;
     if (ptq_rows && f.d_type == kPtq1Type) {   // PTQ1_0 down: as the gate/up rows above
         ptq1_0_rows_q8_0(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    static const bool q2_rows = cpu_avx2_ok() && std::getenv("STRATA_NO_Q2_ROWS") == nullptr;
+    if (q2_rows && f.d_type == kQ2_0Type) {   // Q2_0 down: as the gate/up rows (ggml's x86 dot is scalar)
+        q2_0_rows_q8_0(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     // UNION (xolotl): the older-CPU tier - IQ4_NL and Q2_0 down rows in 128-bit (ggml-cpu's dots for both are scalar here)

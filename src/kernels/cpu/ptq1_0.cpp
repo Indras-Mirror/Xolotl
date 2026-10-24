@@ -270,6 +270,50 @@ STRATA_PTQ_AVX2_FMA void rows_avx2(const uint8_t* w, size_t rb, int n, const Q8*
         for (int t = 0; t < NT; ++t) out[t][r] = rhsum(acc[t]);
     }
 }
+// ---- q2_0_rows_q8_0's AVX2 kernel (ggml's Q2_0: fp16 d + 16 bytes, 64 weights, byte p holding weights 4p..4p+3 in
+// bit pairs 0/2/4/6, code - 1 in {-1,0,1,2}).  ggml-cpu has only the scalar _generic dot for Q2_0 on x86 (~0.5 GB/s a
+// core); here a block's codes are decoded once for every token: four shifted copies masked to 2 bits, interleaved back
+// to weight order by two unpack rounds.  Per token and 32-weight half: sum(code * q) - sum(q) exactly in int32 (codes
+// <= 3, so maddubs cannot saturate), then * d_a * d_w in fp32.
+STRATA_PTQ_AVX2_FMA inline void q2unpack(const uint8_t* qs, __m256i& lo, __m256i& hi) {
+    const __m128i v = _mm_loadu_si128((const __m128i*) qs), m3 = _mm_set1_epi8(3);
+    const __m128i s0 = _mm_and_si128(v, m3), s1 = _mm_and_si128(_mm_srli_epi16(v, 2), m3);
+    const __m128i s2 = _mm_and_si128(_mm_srli_epi16(v, 4), m3), s3 = _mm_and_si128(_mm_srli_epi16(v, 6), m3);
+    const __m128i a0 = _mm_unpacklo_epi8(s0, s1), a1 = _mm_unpackhi_epi8(s0, s1);   // (s0[p], s1[p]) pairs
+    const __m128i b0 = _mm_unpacklo_epi8(s2, s3), b1 = _mm_unpackhi_epi8(s2, s3);
+    lo = _mm256_set_m128i(_mm_unpackhi_epi16(a0, b0), _mm_unpacklo_epi16(a0, b0));   // weights 0..31
+    hi = _mm256_set_m128i(_mm_unpackhi_epi16(a1, b1), _mm_unpacklo_epi16(a1, b1));   // weights 32..63
+}
+template <int NT>
+STRATA_PTQ_AVX2_FMA void q2_rows_avx2(const uint8_t* w, size_t rb, int n, const Q8* const* y, float* const* out, int r0, int r1) {
+    const __m256i ones16 = _mm256_set1_epi16(1), ones8 = _mm256_set1_epi8(1);
+    const int nb = n / 64;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * rb;
+        __m256 acc[NT];
+        for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* blk = x + (size_t) b * 18;
+            uint16_t hd;
+            std::memcpy(&hd, blk, 2);
+            __m256i c[2];
+            q2unpack(blk + 2, c[0], c[1]);
+            const __m256 vdw = _mm256_set1_ps(ptq_h2f(hd));
+            for (int t = 0; t < NT; ++t) {
+                const Q8* a = y[t] + b * 2;
+                __m256 bs = _mm256_setzero_ps();
+                for (int k = 0; k < 2; ++k) {
+                    const __m256i q = _mm256_loadu_si256((const __m256i*) a[k].qs);
+                    const __m256i cq = _mm256_madd_epi16(_mm256_maddubs_epi16(c[k], q), ones16);
+                    const __m256i sq = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, q), ones16);
+                    bs = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(cq, sq)), _mm256_set1_ps(ptq_h2f(a[k].d)), bs);
+                }
+                acc[t] = _mm256_fmadd_ps(bs, vdw, acc[t]);
+            }
+        }
+        for (int t = 0; t < NT; ++t) out[t][r] = rhsum(acc[t]);
+    }
+}
 }  // namespace
 #endif
 
@@ -294,6 +338,45 @@ void ptq1_0_rows_q8_0(const uint8_t* w, size_t row_bytes, int n, const void* con
 #endif
     for (int r = r0; r < r1; ++r)
         for (int t = 0; t < nt; ++t) ptq1_0_vec_dot_q8_0(n, &out[t][r], 0, w + (size_t) r * row_bytes, 0, act[t], 0, 1);
+}
+
+void q2_0_rows_q8_0(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
+#if STRATA_PTQ1_X86
+    static const bool avx2 = cpu_avx2_ok();
+    if (avx2) {
+        for (int t0 = 0; t0 < nt; t0 += 4) {
+            const int g = nt - t0 < 4 ? nt - t0 : 4;
+            const Q8* y[4];
+            for (int t = 0; t < g; ++t) y[t] = (const Q8*) act[t0 + t];
+            switch (g) {
+                case 1: q2_rows_avx2<1>(w, row_bytes, n, y, out + t0, r0, r1); break;
+                case 2: q2_rows_avx2<2>(w, row_bytes, n, y, out + t0, r0, r1); break;
+                case 3: q2_rows_avx2<3>(w, row_bytes, n, y, out + t0, r0, r1); break;
+                default: q2_rows_avx2<4>(w, row_bytes, n, y, out + t0, r0, r1); break;
+            }
+        }
+        return;
+    }
+#endif
+    for (int r = r0; r < r1; ++r)   // scalar: ggml's _generic arithmetic
+        for (int t = 0; t < nt; ++t) {
+            const uint8_t* x = w + (size_t) r * row_bytes;
+            const Q8* y = (const Q8*) act[t];
+            float sumf = 0.f;
+            for (int b = 0; b < n / 64; ++b) {
+                uint16_t hd;
+                std::memcpy(&hd, x + (size_t) b * 18, 2);
+                const uint8_t* qs = x + (size_t) b * 18 + 2;
+                float sumi = 0.f;
+                for (int k = 0; k < 2; ++k) {
+                    int si = 0;
+                    for (int j = 0; j < 32; ++j) si += (((qs[k * 8 + j / 4] >> (2 * (j % 4))) & 3) - 1) * y[2 * b + k].qs[j];
+                    sumi += h2f(y[2 * b + k].d) * (float) si;
+                }
+                sumf += h2f(hd) * sumi;
+            }
+            out[t][r] = sumf;
+        }
 }
 
 void ptq1_0_vec_dot_q8_0(int n, float* s, size_t, const void* vx, size_t, const void* vy, size_t, int) {

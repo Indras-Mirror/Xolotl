@@ -22,6 +22,7 @@ namespace strata::kernels::cpu {
 inline constexpr int kPtq1Type = 143;      ///< GGML type id in llama-tq (not in upstream ggml: GGML_TYPE_COUNT is 43)
 inline constexpr int kPtq1Block = 128;     ///< weights per block
 inline constexpr int kPtq1Bytes = 28;      ///< bytes per block
+inline constexpr int kQ2_0Type = 42;      ///< ggml's Q2_0 ({-1,0,1,2} x fp16 per 64; the V4.1 XQ middle tier)
 
 /// Bytes of one PTQ1_0 row of n weights (n a multiple of 128).
 inline size_t ptq1_0_row_bytes(int64_t n) { return (size_t) (n / kPtq1Block) * kPtq1Bytes; }
@@ -43,5 +44,9 @@ void ptq1_0_vec_dot_q8_0_scalar(int n, float* s, const void* vx, const void* vy)
 /// and keeps each 32-weight sub-block's sum exact in int32 (as the scalar dot) - 3.9x the per-token dot at one token,
 /// 6-8x at 2-3 (s11 2026-10-15, one Zen 3 core).  Without AVX2: the per-token dot.
 void ptq1_0_rows_q8_0(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1);
+/// Rows [r0, r1) of a ggml Q2_0 matrix (18-byte blocks of 64 weights) against nt Q8_0 rows: out[t][r] = row r .
+/// act[t].  ggml-cpu has only the scalar _generic Q2_0 dot on x86; the AVX2 path decodes each block once for all
+/// tokens with the same integer sums.  Without AVX2: the scalar arithmetic of ggml's _generic dot.
+void q2_0_rows_q8_0(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1);
 
 }  // namespace strata::kernels::cpu
