@@ -2472,8 +2472,13 @@ int main(int argc, char ** argv) {
             prefill_cancelled = false;
             auto feed_steps = [&]() -> bool {   // the short-turn path: passes of up to pass_max tokens (a lone token: a step)
                 int last_rows = 1;
+                // STRATA_BIAS_REFRESH (see the decode loop): the biased passes (STRATA_SERVE_PASS_BIAS=1) rebuild the bias too
+                static const int fs_refresh = std::getenv("STRATA_BIAS_REFRESH") ? std::atoi(std::getenv("STRATA_BIAS_REFRESH")) : 0;
+                int fs_n = 0;
                 for (int i = 0; i < dh; ) {
                     if (stop_prefill()) return false;
+                    if (fs_refresh > 0 && bias_now && bias_set && fs_n > 0 && fs_n % fs_refresh == 0) apply_bias();
+                    ++fs_n;
                     const int m = std::min(pass_max, dh - i);
                     if (m == 1) {
                         const double ts0 = now_ms();
@@ -2926,6 +2931,12 @@ int main(int argc, char ** argv) {
                     if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, temp, tk, top_p, min_p, rng);
                     const double tq2 = now_ms();
                     ++rq_pass; rq_acc += acc;
+                    // STRATA_BIAS_REFRESH=N (opt-in; CHANGES OUTPUTS like any residency change): the route bias + file penalty
+                    // are a snapshot of the VRAM set taken when the request's decode starts, while the vram_lru admissions
+                    // and arena rebalance keep changing that set - so a long decode biases toward evicted experts and away
+                    // from admitted ones.  Every N verify passes the bias is rebuilt from the set as it is now.
+                    static const int bias_refresh = std::getenv("STRATA_BIAS_REFRESH") ? std::atoi(std::getenv("STRATA_BIAS_REFRESH")) : 0;
+                    if (bias_refresh > 0 && bias_now && bias_set && rq_pass % bias_refresh == 0) apply_bias();
                     if (is_lk) {
                         ++lk_pass; lk_dr += k; lk_acc += acc;
                         if (2 * acc < k) { lk_cool = lk_back; lk_back = std::min(64, lk_back * 2); }
