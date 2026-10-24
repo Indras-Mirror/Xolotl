@@ -119,8 +119,30 @@ Same day, upstream main 03be8a60 with the Windows fixes, the settings of "Measur
 | `STRATA_DS41_REMOTE` (this helper on the RTX 4080) | 40.1 / 42.9 tok/s | 32.1 / 32.0 s | 37.4 / 40.3 tok/s | 62.5 / 60.3 s |
 
 Most of `--remote-device`'s loss here is the pin cap: the RTX 5090 alone with the same cap loses about as much. With
-the helper the engine's process sees one card and pins the whole arena. Not tested: `--remote-device` on Linux, where
-this limit does not apply (it was built on Linux).
+the helper the engine's process sees one card and pins the whole arena. On Linux, where this limit does not apply,
+`--remote-device` is as fast as the helper on decode (below).
+
+## Linux
+
+The same PC on Ubuntu 26.04 (kernel 7.0, driver 595.99.02, CUDA 13.2, `iommu=pt`), main e9d0826d built for sm_89;120a
+with `-DSTRATA_GGML_CUDA=ON`. The settings of the Windows table without the three Windows-only ones
+(`STRATA_BLOB_DIRECT=0`, `STRATA_ARENA_SLICE_GIB`, the expert mirror); the model on ext4. `--remote-device 1` at its
+defaults (no pin cap, conversation pool on). Interleaved; fresh = the agent bench's first, 29K-token prompt:
+
+| | decode | fresh prompt | agent turns' prefill | agent total |
+| --- | ---: | ---: | ---: | ---: |
+| RTX 5090 alone | 51.9 / 53.5 / 52.2 tok/s | 55.6 / 56.1 / 54.9 s | 40.5 / 40.8 / 40.3 s | 60.4 / 64.1 / 62.1 s |
+| `--remote-device 1` (RTX 4080) | 58.8 / 59.3 tok/s | 60.1 / 56.9 s | 33.4 / 33.7 s | 52.7 / 51.0 s |
+| `STRATA_DS41_REMOTE` (this helper on the RTX 4080) | 59.6 / 59.8 / 58.9 tok/s | 49.3 / 49.6 / 49.3 s | 31.7 / 32.1 / 31.9 s | 50.0 / 49.9 / 47.9 s |
+
+The two tie on decode; the helper reads a fresh long prompt 7-10 s faster. The helper builds from main as is
+(`ninja -C <build> ds41_generate ds41_helper`) and is started the same way as on Windows:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID ds41_helper -m V41-XQ-1017.gguf --rank rank-1017-085.bin --device 1 --skip-gib 22 --gib 13.5 &
+export STRATA_DS41_REMOTE=ds41_remote STRATA_D3_DMA_STREAM=1
+# ... then the usual serve_ds41.py start (the config's "gpu": 0 keeps the engine on the first card)
+```
 
 ## Settings
 
@@ -155,6 +177,5 @@ One engine per helper. The helper keeps serving when the engine restarts.
 
 ## Not done
 
-- Linux: the segment uses `shm_open`; not built or run on Linux yet.
 - The helper's set is fixed at start-up (the profile's order). The engine's own cache adapts; the helper's does not.
 - A chunk wider than `--chunk-tok`, or with more of the helper's entries than half its entries, runs without it.
