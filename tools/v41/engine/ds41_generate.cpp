@@ -763,6 +763,9 @@ int main(int argc, char ** argv) {
     };
     // STRATA_DEC_PROF=1: per-stage wall time of the decode step (begin / predict+prefetch / attn_router / tier / finish)
     static const bool dprof = std::getenv("STRATA_DEC_PROF") != nullptr;
+    // STRATA_DEC_PROF=2: a device sync before each stamp, so each stage holds its own GPU work (slower; diagnostic)
+    static const bool dsync = dprof && std::getenv("STRATA_DEC_PROF")[0] == '2';
+    auto dp_now = [&]() { if (dsync) Ds41MoeTier::device_sync(); return now_ms(); };
     // decode: finish(l) and predict(l+1) as one graph (identical results; STRATA_NO_FUSE_PREDICT=1 = separate graphs)
     static const bool fuse_predict = std::getenv("STRATA_NO_FUSE_PREDICT") == nullptr;
     // STRATA_ADVISE_AHEAD=k (0 = off): at layer l, predict layer l+k's routing from the current state and hint its
@@ -802,14 +805,14 @@ int main(int argc, char ** argv) {
     double dp[6] = {0, 0, 0, 0, 0, 0};
     long dp_n = 0;
     auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via dense.logits
-        double ta = dprof ? now_ms() : 0;
+        double ta = dprof ? dp_now() : 0;
         if (dump_main) {
             dm_tok = tok;
             dm_pos = pos;
             dm_row.assign((size_t) 3 * n_embd, 0.0f);
         }
         if (!pipe.dense(0).begin(&tok, 1, pos)) { ferr = pipe.dense(0).last_error(); return false; }
-        if (dprof) { const double t = now_ms(); dp[0] += t - ta; ta = t; }
+        if (dprof) { const double t = dp_now(); dp[0] += t - ta; ta = t; }
         int32_t top16[16];
         bool have_pred = false;
         auto one_layer = [&](int l) -> bool {
@@ -840,10 +843,10 @@ int main(int argc, char ** argv) {
                 }
                 have_pred = false;
             }
-            if (dprof) { const double t1 = now_ms(); dp[1] += t1 - ta; ta = t1; }
+            if (dprof) { const double t1 = dp_now(); dp[1] += t1 - ta; ta = t1; }
             const float * fn = nullptr;
             if (!d.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = d.last_error(); return false; }
-            if (dprof) { const double t1 = now_ms(); dp[2] += t1 - ta; ta = t1; }
+            if (dprof) { const double t1 = dp_now(); dp[2] += t1 - ta; ta = t1; }
             if (file_pred) {
                 for (int j = 0; j < top_k; ++j) {
                     const int e = ids1[(size_t) j];
@@ -864,7 +867,7 @@ int main(int argc, char ** argv) {
             const bool tok_ok = rdev ? t.run_to_dev(l, ids1.data(), w1.data(), fn, rdev)
                                      : t.run(l, ids1.data(), w1.data(), fn, routed1.data());
             if (!tok_ok) { ferr = "tier.run failed"; return false; }
-            if (dprof) { const double t1 = now_ms(); dp[3] += t1 - ta; ta = t1; }
+            if (dprof) { const double t1 = dp_now(); dp[3] += t1 - ta; ta = t1; }
             const float * rsum = rdev ? nullptr : routed1.data();
             if (fuse_predict && mc.pf_b > 0 && !mc.cpu_only && l + 1 < stage_end) {
                 int t16[16];
@@ -872,16 +875,16 @@ int main(int argc, char ** argv) {
                     int ahead[16 * 8];
                     const int na = std::max(0, std::min({spec_ahead, 8, stage_end - l - 2}));
                     if (!d.finish_predict_ahead(l, rsum, l + 1, t16, 16, na, ahead)) { ferr = d.last_error(); return false; }
-                    if (dprof) { const double t1 = now_ms(); dp[4] += t1 - ta; ta = t1; }
+                    if (dprof) { const double t1 = dp_now(); dp[4] += t1 - ta; ta = t1; }
                     if (spec_l1 && l + 1 < stage_end) t.spec_read(l + 1, t16, std::min(spec_top, 16));
                     for (int ai = 0; ai < na; ++ai)
                         if (l + 2 + ai < stage_end) t.spec_read(l + 2 + ai, ahead + ai * 16, std::min(spec_top, 16));
-                    if (dprof) { const double t1 = now_ms(); dp[5] += t1 - ta; ta = t1; }
+                    if (dprof) { const double t1 = dp_now(); dp[5] += t1 - ta; ta = t1; }
                 } else if (!d.finish_predict(l, rsum, l + 1, t16, 16)) { ferr = d.last_error(); return false; }
                 for (int i = 0; i < 16; ++i) top16[i] = t16[i];
                 have_pred = true;
             } else if (!d.finish(l, rsum)) { ferr = d.last_error(); return false; }
-            if (dprof) { const double t1 = now_ms(); dp[4] += t1 - ta; ta = t1; }
+            if (dprof) { const double t1 = dp_now(); dp[4] += t1 - ta; ta = t1; }
             for (int j = 0; dump_main && j < 3; ++j) {
                 if (l != dm_layers[j]) continue;
                 d.read_state(dm_x, dm_pre);
@@ -971,7 +974,7 @@ int main(int argc, char ** argv) {
         // only) and faster (verify 167.6 -> ~100 ms/pass).  STRATA_TIER_BATCH=0 = the per-token run_to_dev path.
         static const bool no_tier_batch = [] { const char* v = std::getenv("STRATA_TIER_BATCH"); return v && v[0] == '0'; }();
         double tq = now_ms();
-        auto lap = [&](int i) { const double t = now_ms(); pv_ms[i] += t - tq; tq = t; };
+        auto lap = [&](int i) { const double t = dp_now(); pv_ms[i] += t - tq; tq = t; };
         ++pv_n; pv_tok += m;
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);

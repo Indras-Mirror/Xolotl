@@ -678,6 +678,25 @@ static int g_dprof_slot = -1;    // which of build/alloc/compute buckets compute
 
 bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
     Allo & a = cached ? allo_dec : allo_pass;
+    // DS41_GRAPH_OPS=1 (diagnostic): the op mix of the first 200 distinct one-token graphs (count per op; matmul weight MiB)
+    static const bool gops = std::getenv("DS41_GRAPH_OPS") != nullptr;
+    static std::set<const ggml_cgraph *> gops_seen;
+    if (gops && cached && gops_seen.size() < 200 && gops_seen.insert(gf).second) {
+        std::map<std::string, int> cnt;
+        double wmib = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * t = ggml_graph_node(gf, i);
+            std::string k = ggml_op_desc(t);
+            if (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) {
+                wmib += ggml_nbytes(t->src[0]) / 1048576.0;
+                k += std::string("(") + ggml_type_name(t->src[0]->type) + ")";
+            }
+            ++cnt[k];
+        }
+        std::string s;
+        for (const auto & kv : cnt) s += " " + kv.first + "x" + std::to_string(kv.second);
+        std::fprintf(stderr, "graph ops: %d nodes, %.1f MiB matmul weights:%s\n", ggml_graph_n_nodes(gf), wmib, s.c_str());
+    }
     const double tq0 = g_dprof_on ? dprof_now() : 0;
     bool ok_alloc = a.alloc(gf, cached && env_on("DS41_GRAPH_REUSE", true));
     const double tq1 = g_dprof_on ? dprof_now() : 0;

@@ -509,6 +509,8 @@ public:
     void trace_mark(const float* v, int n);
     /// cudaProfilerStart / Stop (nsys --capture-range=cudaProfilerApi); a no-op without CUDA.
     static void profiler(bool on);
+    /// cudaDeviceSynchronize (STRATA_DEC_PROF=2: each stage's time includes its GPU work); a no-op without CUDA.
+    static void device_sync();
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU
     /// tier: every expert on the card - resident from its slot, the rest streamed once per chunk (MiMo prefill;
     /// MIMO_CHUNK_STAGE_MIB sizes the two streaming halves, default 1024).  CPU tier: token by token.
