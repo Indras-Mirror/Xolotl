@@ -33,10 +33,6 @@ bench/ds4-2026-10-08/ctx/
 *.occ1
 td.log
 
-# the expert-cache profile: regenerate with tools/make_default_profile.py (or make_profile.py
-# from a --dump-routing trace); setup.py points every model config's --expert-profile at it
-/data/expert-profile.bin
-
 # created by setup.py on the user's machine
 /.venv/
 /build/
