@@ -578,7 +578,10 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                 ++rq_n;
                 rq_from += (size_t) ggml_nrows(t) * ggml_row_size((ggml_type) ti.type, t->ne[0]);
             }
-        if (rq_n) std::fprintf(stderr, "dense requant: %zu Q8_0 matrices -> %s, %.2f -> %.2f GB%s\n", rq_n, ggml_type_name(rq),
+        if (rq_n && rq == GGML_TYPE_COUNT)   // requant off: only type conversions (a llama.cpp GGUF's BF16 -> F32 / F16)
+            std::fprintf(stderr, "dense convert: %zu matrices to the engine's types, %.2f -> %.2f GB\n", rq_n, rq_from / 1e9,
+                         rq_to / 1e9);
+        else if (rq_n) std::fprintf(stderr, "dense requant: %zu Q8_0 matrices -> %s, %.2f -> %.2f GB%s\n", rq_n, ggml_type_name(rq),
                                rq_from / 1e9, rq_to / 1e9, rq_in ? " (from the cache)" : rq_out ? " (cache written)" : "");
         if (rq_in) std::fclose(rq_in);
         if (rq_out) {
