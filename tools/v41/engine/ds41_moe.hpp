@@ -260,6 +260,16 @@ private:
     std::string path_;
     int fd_ = -1;
     int dfd_ = -1;               ///< O_DIRECT twin of fd_ (-1 where the filesystem refused it)
+    /// A split GGUF (`-0000k-of-0000N`, ISTA-DASLab's 4 shards): every offset below carries its shard in the top bits
+    /// (off >> kShardShift; 0 = the first file, so a single-file GGUF's offsets are the plain file offsets) and
+    /// sfd_ / sdfd_ hold each shard's fds (fd_ / dfd_ = shard 0's).  A blob's three spans each lie in one tensor, so in
+    /// one shard; a span's sub-range (read_part) keeps its tag.
+    static constexpr int kShardShift = 44;
+    std::vector<int> sfd_, sdfd_;
+    bool direct_ok_ = false;     ///< every shard has its O_DIRECT twin
+    int sfd(uint64_t off) const { return sfd_[(size_t) (off >> kShardShift)]; }
+    int sdfd(uint64_t off) const { return sdfd_[(size_t) (off >> kShardShift)]; }
+    static uint64_t sloc(uint64_t off) { return off & ((1ull << kShardShift) - 1); }
     size_t scratch_ = 0;         ///< the aligned bounce one read_direct span needs
     Ds41MoeGeom g_;
     size_t max_ = 0;

@@ -6412,8 +6412,8 @@ void Ds41MoeStats::add(const Ds41MoeStats& o) {
 
 Ds41FileBlobs::Ds41FileBlobs(std::string gguf) : path_(std::move(gguf)) {}
 Ds41FileBlobs::~Ds41FileBlobs() {
-    if (fd_ >= 0) ds41_sys::close(fd_);
-    if (dfd_ >= 0) ds41_sys::close(dfd_);
+    for (int f : sfd_) if (f >= 0) ds41_sys::close(f);   // (fd_ / dfd_ are shard 0's)
+    for (int f : sdfd_) if (f >= 0) ds41_sys::close(f);
     if (mfd_ >= 0) ds41_sys::close(mfd_);
     for (uint8_t* p : ball_) ds41_sys::aligned_free(p);
 }
@@ -6440,7 +6440,7 @@ bool Ds41FileBlobs::open(std::string& err) {
     std::unique_ptr<GgufModel> m;
     try { m = std::make_unique<GgufModel>(GgufModel::open(path_)); }
     catch (const std::exception& e) { err = e.what(); return false; }
-    if (m->size() != 1) { err = "Ds41FileBlobs: expected a single-file GGUF"; return false; }
+    if (m->size() > ((size_t) 1 << (64 - kShardShift))) { err = "Ds41FileBlobs: too many shards"; return false; }
     Ds41Geometry G;
     if (!(err = ds41_read_geometry(*m, G)).empty()) return false;
     const std::vector<int64_t> layers = ds41_file_layers(*m, G);
@@ -6468,7 +6468,12 @@ bool Ds41FileBlobs::open(std::string& err) {
         }
     g_.gu_type = g_.cls_gu[0];
     g_.d_type = g_.cls_d[0];
-    const GgufFile& f = m->shard(0);
+    // tensor name -> its shard's file + the tag its offsets carry (a split GGUF; one shard = tag 0)
+    auto locate = [&](const std::string& n, const TensorInfo*& t) -> uint64_t {
+        size_t si = 0;
+        t = m->find(n, &si);
+        return t ? ((uint64_t) si << kShardShift) + m->shard(si).data_start() : 0;
+    };
     auto rb = [](int t, int64_t n) {
         int be = 0, bb = 0;
         block_geometry((uint32_t) t, be, bb);
@@ -6485,25 +6490,33 @@ bool Ds41FileBlobs::open(std::string& err) {
         const Ds41ExpertMap& X = G.experts[(size_t) l];
         for (int64_t e = 0; e < NE; ++e) {
             const int gt = X.gu_type[(size_t) e], dt = X.d_type[(size_t) e];
-            const TensorInfo* tg = f.find(X.gate_t.at(gt));
-            const TensorInfo* tu = f.find(X.up_t.at(gt));
-            const TensorInfo* td = f.find(X.down_t.at(dt));
+            const TensorInfo *tg = nullptr, *tu = nullptr, *td = nullptr;
+            const uint64_t bg = locate(X.gate_t.at(gt), tg), bu = locate(X.up_t.at(gt), tu), bd = locate(X.down_t.at(dt), td);
+            if (!tg || !tu || !td) { err = "Ds41FileBlobs: an expert tensor of layer " + std::to_string(l) + " is missing"; return false; }
             const uint64_t gb = rb(gt, D) * (uint64_t) FF, db = rb(dt, FF) * (uint64_t) D;
             const size_t i = (size_t) (l * NE + e);
-            gate_off_[i] = f.data_start() + tg->offset + (uint64_t) X.gu_slot[(size_t) e] * gb;
-            up_off_[i] = f.data_start() + tu->offset + (uint64_t) X.gu_slot[(size_t) e] * gb;
-            down_off_[i] = f.data_start() + td->offset + (uint64_t) X.d_slot[(size_t) e] * db;
+            gate_off_[i] = bg + tg->offset + (uint64_t) X.gu_slot[(size_t) e] * gb;
+            up_off_[i] = bu + tu->offset + (uint64_t) X.gu_slot[(size_t) e] * gb;
+            down_off_[i] = bd + td->offset + (uint64_t) X.d_slot[(size_t) e] * db;
         }
     }
     for (size_t c = 0; c < g_.cls_gu.size(); ++c)
         max_ = std::max<size_t>(max_, (size_t) (2 * (uint64_t) gu_rb_[c] * (uint64_t) FF + (uint64_t) d_rb_[c] * (uint64_t) D));
-    fd_ = ds41_sys::open(path_.c_str(), O_RDONLY);
-    if (fd_ < 0) { err = "cannot open " + path_; return false; }
-    ds41_sys::posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
     // The chunk-prefetch reader pool's O_DIRECT twin (measured 2.25 -> 4.65 GB/s on the scattered expert pattern).
     // STRATA_BLOB_DIRECT=0 keeps the buffered path; a filesystem that refuses O_DIRECT just leaves dfd_ = -1.
     const char* dv = std::getenv("STRATA_BLOB_DIRECT");
-    if (!(dv && dv[0] == '0')) dfd_ = ds41_sys::open(path_.c_str(), O_RDONLY | O_DIRECT);
+    direct_ok_ = !(dv && dv[0] == '0');
+    for (size_t s = 0; s < m->size(); ++s) {   // every shard (a single-file GGUF: just the file)
+        const std::string sp = s == 0 ? path_ : m->shard(s).path();
+        const int f = ds41_sys::open(sp.c_str(), O_RDONLY);
+        if (f < 0) { err = "cannot open " + sp; return false; }
+        ds41_sys::posix_fadvise(f, 0, 0, POSIX_FADV_RANDOM);
+        sfd_.push_back(f);
+        sdfd_.push_back(direct_ok_ ? ds41_sys::open(sp.c_str(), O_RDONLY | O_DIRECT) : -1);
+        direct_ok_ = direct_ok_ && sdfd_.back() >= 0;
+    }
+    fd_ = sfd_[0];
+    dfd_ = direct_ok_ ? sdfd_[0] : -1;
     // decode misses (read_part) through it too: random 6.75 MB blobs 1.43 vs 1.99 ms cold (rdbench, SSD NVME), and no
     // page-cache churn inside the 84 GiB cgroup that also holds the pinned arena
     const char* pd = std::getenv("STRATA_DECODE_DIRECT");
@@ -6523,7 +6536,9 @@ bool Ds41FileBlobs::open(std::string& err) {
     const bool mirror_ok = dfd_ >= 0;
 #endif
     const char* mp = std::getenv("STRATA_BLOB_MIRROR");
-    if (mp && mp[0] && part_direct_ && mirror_ok) {
+    if (mp && mp[0] && sfd_.size() > 1) {
+        std::fprintf(stderr, "blob mirror: NOT used (a split GGUF; the mirror is single-file only)\n");
+    } else if (mp && mp[0] && part_direct_ && mirror_ok) {
         std::string merr;
         if (!open_mirror(mp, merr)) std::fprintf(stderr, "blob mirror: NOT used (%s)\n", merr.c_str());
     }
@@ -6611,6 +6626,7 @@ bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
 bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::pair<int32_t, int32_t>>& order,
                                  uint64_t budget, std::string& err) const {
     if (fd_ < 0) { err = "source not open"; return false; }
+    if (sfd_.size() > 1) { err = "the mirror is single-file only (this GGUF is split)"; return false; }
     ds41_sys::Stat ss{};
     ds41_sys::fstat(fd_, &ss);
     std::vector<MirrorEnt> ent;
@@ -6706,7 +6722,11 @@ bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::
 }
 
 bool Ds41FileBlobs::read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes, int fd) const {
-    if (fd < 0) fd = dfd_;
+    if (fd < 0) {   // the model file: the shard the tag names (an explicit fd = the mirror, plain offsets)
+        if (!direct_ok_) return false;
+        fd = sdfd(off);
+        off = sloc(off);
+    }
     if (fd < 0 || !scratch || !n) return false;
     constexpr uint64_t A = 4096;
     const uint64_t a0 = off & ~(A - 1), a1 = (off + n + A - 1) & ~(A - 1);
@@ -6740,7 +6760,7 @@ void Ds41FileBlobs::read_staged(int64_t layer, int64_t expert, uint8_t* dst, uin
             if (ok) return;
         }
     }
-    if (dfd_ < 0 || scratch_bytes < scratch_) {
+    if (!direct_ok_ || scratch_bytes < scratch_) {
         read(layer, expert, dst);
         return;
     }
@@ -6761,7 +6781,7 @@ void Ds41FileBlobs::advise(int64_t layer, int64_t expert) const {
     Span s[3];
     spans(layer, expert, s);
     for (const Span& x : s)
-        if (x.bytes) ds41_sys::posix_fadvise(fd_, (int64_t) x.off, (int64_t) x.bytes, POSIX_FADV_WILLNEED);
+        if (x.bytes) ds41_sys::posix_fadvise(sfd(x.off), (int64_t) sloc(x.off), (int64_t) x.bytes, POSIX_FADV_WILLNEED);
 }
 
 size_t Ds41FileBlobs::expert_bytes(int64_t l, int64_t e) const {
@@ -6803,7 +6823,7 @@ void Ds41FileBlobs::read(int64_t layer, int64_t expert, uint8_t* dst) const {
     spans(layer, expert, s);
     uint64_t at = 0;
     for (const Span& x : s) {
-        pread_all(fd_, dst + at, x.off, x.bytes);
+        pread_all(sfd(x.off), dst + at, sloc(x.off), x.bytes);
         at += x.bytes;
     }
 }
@@ -6817,7 +6837,7 @@ void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int npart
     if (part + 1 < nparts) hi &= ~(uint64_t) 4095;
     else hi = total;
     uint64_t at = 0;
-    uint8_t* bb = part_direct_ && (dfd_ >= 0 || mfd_ >= 0) ? take_bounce() : nullptr;
+    uint8_t* bb = part_direct_ && (direct_ok_ || mfd_ >= 0) ? take_bounce() : nullptr;
     // the mirror's share of the parts: part p goes there when floor((p+1)*share) > floor(p*share) - spread evenly,
     // and a 1-part read stays on the model file.  The mirror blob is contiguous: [lo, hi) is one aligned span there.
     if (mfd_ >= 0 && bb && nparts > 1 && ((part + 1) * mpshare_) / 1000 != (part * mpshare_) / 1000) {
@@ -6836,7 +6856,7 @@ void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int npart
     for (const Span& x : s) {
         const uint64_t a = std::max(lo, at), b = std::min(hi, at + x.bytes);
         if (a < b && !(bb && read_direct(x.off + (a - at), (size_t) (b - a), dst + a, bb, scratch_)))
-            pread_all(fd_, dst + a, x.off + (a - at), b - a);
+            pread_all(sfd(x.off), dst + a, sloc(x.off) + (a - at), b - a);
         at += x.bytes;
     }
     if (bb) give_bounce(bb);

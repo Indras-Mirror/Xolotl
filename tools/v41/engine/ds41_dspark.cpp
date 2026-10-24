@@ -1,5 +1,6 @@
 // tools/v41/engine/ds41_dspark.cpp - see ds41_dspark.hpp.  Line references are to DeepSeek's inference/model.py
 // (DSparkBlock / DSparkAttention / forward_embed / forward_head ~1021-1160, Block ~907-995, MoE / Gate ~792-905).
+#include "ds41_embd.hpp"
 #include "ds41_dspark.hpp"
 
 #include "ds41_geometry.hpp"
@@ -40,7 +41,8 @@ struct Ds41DSpark::Impl {
     ggml_context * wctx = nullptr;
     ggml_backend_buffer_t wbuf = nullptr;
     std::map<std::string, ggml_tensor *> w;
-    const uint8_t * embd = nullptr;    // trunk token_embd F16 rows on the mmap
+    const uint8_t * embd = nullptr;    // trunk token_embd rows on the mmap (embd_type: F16 ours, Q5_K ISTA's)
+    int embd_type = GGML_TYPE_F16;
     size_t wbytes = 0;
     // state: per block window ring [DH, WIN]; inputs
     ggml_context * sctx = nullptr;
@@ -107,7 +109,8 @@ bool Ds41DSpark::Impl::load(std::string & e) {
     const TensorInfo * out = main->find("output.weight", &si);
     const TensorInfo * te = main->find("token_embd.weight");
     if (!out || !te) { e = "the trunk GGUF lacks output.weight / token_embd.weight"; return false; }
-    if (te->type != GGML_TYPE_F16) { e = "token_embd must be F16"; return false; }
+    if (!strata::v41::ds41_embd_type_ok((int) te->type)) { e = "token_embd type has no row reader"; return false; }
+    embd_type = (int) te->type;
     if (!cfg.shared_head) src.push_back({ main.get(), out });
     // STRATA_DSPARK_EXP_TYPE=<ggml type name> (q4_K, q3_K, q2_K, iq4_xs, ...): the routed experts
     // (mtp.*.ffn.experts.w1/w2/w3, MXFP4 in the sidecar) are requantized ON LOAD (dequantize -> quantize, CPU threads).
@@ -508,11 +511,11 @@ bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int *
     const bool draft = bonus >= 0;
     if (draft) {
         const int p = pos[k - 1];
-        // embeddings of [bonus, noise x4] (trunk token_embd, F16 rows)
+        // embeddings of [bonus, noise x4] (trunk token_embd rows, ds41_embd_row: F16 or a quant type)
         std::vector<float> emb((size_t) (im.D * im.BS));
         for (int64_t t = 0; t < im.BS; ++t) {
             const int id = t == 0 ? bonus : im.cfg.noise_id;
-            ggml_fp16_to_fp32_row((const ggml_fp16_t *) (im.embd + (size_t) id * (size_t) im.D * 2), emb.data() + (size_t) (t * im.D), im.D);
+            strata::v41::ds41_embd_row(im.embd, im.embd_type, im.D, id, emb.data() + (size_t) (t * im.D));
         }
         std::vector<int32_t> bp((size_t) im.BS);
         for (int64_t t = 0; t < im.BS; ++t) bp[(size_t) t] = p + 1 + (int) t;
