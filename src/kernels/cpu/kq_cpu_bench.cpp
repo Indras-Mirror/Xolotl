@@ -8,6 +8,7 @@
 //                  [--mb 4096] [--reps 3] [--ram-gbs N]
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/ptq1_0.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -29,10 +30,11 @@ namespace cpu = strata::kernels::cpu;
 
 namespace {
 
-constexpr int64_t kH = 2560, kFF = 640;
+int64_t kH = 2560, kFF = 640;   // --dims H,FF (DeepSeek-V4.1: 4096,2048)
 constexpr int kMaxT = 8;
 
 int type_of(const std::string& s) {
+    if (s == "ptq1_0") return cpu::kPtq1Type;   // llama-tq's ternary type, not in ggml's table
     for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
         const char* n = ggml_type_name((ggml_type) t);
         if (n != nullptr && s == n) return t;
@@ -57,15 +59,17 @@ std::vector<std::string> split(const std::string& s) {
 void make_blob(const cpu::NativeFmt& f, uint8_t* blob, std::mt19937& rng) {
     std::normal_distribution<float> nd(0.f, 0.02f);
     std::vector<float> row((size_t) std::max(kH, kFF));
-    const auto* tg = ggml_get_type_traits_cpu((ggml_type) f.gu_type);
-    const auto* td = ggml_get_type_traits_cpu((ggml_type) f.d_type);
+    auto quant = [](int type, const float* x, uint8_t* dst, int64_t n) {
+        if (type == cpu::kPtq1Type) cpu::ptq1_0_quantize_ref(x, dst, n);
+        else ggml_get_type_traits_cpu((ggml_type) type)->from_float(x, dst, n);
+    };
     for (int64_t r = 0; r < 2 * kFF; ++r) {
         for (int64_t i = 0; i < kH; ++i) row[(size_t) i] = nd(rng);
-        tg->from_float(row.data(), blob + (size_t) r * f.gu_row, kH);
+        quant(f.gu_type, row.data(), blob + (size_t) r * f.gu_row, kH);
     }
     for (int64_t r = 0; r < kH; ++r) {
         for (int64_t i = 0; i < kFF; ++i) row[(size_t) i] = nd(rng);
-        td->from_float(row.data(), blob + f.down_off + (size_t) r * f.d_row, kFF);
+        quant(f.d_type, row.data(), blob + f.down_off + (size_t) r * f.d_row, kFF);
     }
 }
 
@@ -82,6 +86,7 @@ int main(int argc, char** argv) {
         const bool more = i + 1 < argc;
         auto ints = [](const std::string& s) { std::vector<int> v; for (auto& x : split(s)) v.push_back(std::atoi(x.c_str())); return v; };
         if (a == "--pairs" && more) pairs = split(argv[++i]);
+        else if (a == "--dims" && more) { const auto d = split(argv[++i]); kH = std::atoll(d[0].c_str()); kFF = std::atoll(d.at(1).c_str()); }
         else if (a == "--threads" && more) threads = ints(argv[++i]);
         else if (a == "--nt" && more) nts = ints(argv[++i]);
         else if (a == "--mb" && more) mb = std::atoi(argv[++i]);
@@ -105,8 +110,8 @@ int main(int argc, char** argv) {
             std::printf("%s: %s\n", pair.c_str(), err.empty() ? "unknown types" : err.c_str());
             continue;
         }
-        ggml_quantize_init((ggml_type) gt);   // the i-quants' quantizers need their grids first
-        ggml_quantize_init((ggml_type) dt);
+        if (gt < GGML_TYPE_COUNT) ggml_quantize_init((ggml_type) gt);   // the i-quants' quantizers need their grids first
+        if (dt < GGML_TYPE_COUNT) ggml_quantize_init((ggml_type) dt);
         const size_t E = std::max<size_t>(64, ((size_t) mb << 20) / f.bytes);
         std::unique_ptr<uint8_t[]> mem(new uint8_t[E * f.bytes + 4096]);
         uint8_t* blobs = (uint8_t*) (((uintptr_t) mem.get() + 4095) & ~(uintptr_t) 4095);
