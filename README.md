@@ -18,8 +18,10 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 > (`v4/`, same size as V3). It's the best build so far: on held-out text it agrees with the full-precision model 85.7%
 > of the time on the top-1 token vs V3's 81.5%, with KL 0.343 vs 0.471 (86.8% / 0.316 through the real engine), and
 > its perplexity is within 0.4% of the full model's. The 1,056 hottest experts are kept exactly as DeepSeek trained them
-> (native FP4). Heads up though, right now it decodes slower than V3 (about 16 vs 25 tok/s one-shot) because those hot
-> experts are bigger, so fewer fit in VRAM. I'm working on that in the engine now and the numbers go on the HF card as
+> (native FP4). On the full Gauntlet v2 it solved 6/7 (score 6.50), against the DeepSeek API's 5/7 (6.41) and our
+> September build's 4/7 (6.20), one run each. Heads up though, right now it's slower than V3 (17.7 tok/s served on the
+> Gauntlet vs V3's 22.3) because those hot experts are bigger, so fewer fit in VRAM. I'm working on that in the engine
+> now (a faster CPU path for the misses is already in, the Q2_0 rows went 5-9x) and the numbers go on the HF card as
 > they land. Needs Xolotl from 21 Oct or newer.
 
 > **ISTA-DASLab's GGUFs work too.** Xolotl loads [ISTA-DASLab](https://huggingface.co/ISTA-DASLab)'s
