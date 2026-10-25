@@ -328,7 +328,7 @@ STRATA_PTQ_AVX2_FMA void q2_rows_avx2(const uint8_t* w, size_t rb, int n, const 
 //           differs: max |err| ~2e-6 of the rows' rms vs the scalar ref, rows_avx2 ~8e-7).  A row's last n/128 % 4
 //           blocks take rows_avx2's per-block path.  7 threads, 2.4 GB of weights, 5700X: 1 / 2 / 4 tokens
 //           17.7 / 13.9 / 9.6 -> 28.2 / 21.9 / 13.5 GB/s (5120 in), 17.9 / 13.9 / 9.2 -> 26.9 / 19.3 / 13.2 (2304 in).
-//   STRATA_PTQ1_ROWS3=1 turns it on (default off: see ptq1_0_rows_q8_0).
+//   Default on; STRATA_PTQ1_ROWS3=0 = rows_avx2 (see ptq1_0_rows_q8_0).
 struct R3Group { int8_t q[16][32]; float da[16][8]; };
 struct R3Tok { std::vector<R3Group> g; std::vector<float> C; const Q8* raw = nullptr; };
 struct R3Map {
@@ -480,11 +480,11 @@ STRATA_PTQ_AVX2_FMA void rows3(const uint8_t* w, size_t rb, int n, const R3Tok* 
 void ptq1_0_rows_q8_0(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
 #if STRATA_PTQ1_X86
     static const bool avx2 = cpu_avx2_ok();   // AVX, AVX2, FMA and F16C (expert_layout.hpp)
-    // OPT-IN (STRATA_PTQ1_ROWS3=1): 1.4-1.6x rows_avx2 alone, but served V4 decode (2026-10-25, same binary, 8K, 6 runs)
-    // averaged ~142 ms/pass on vs ~128 off - the CPU pool shares the host-RAM bus with the PCIe/NVMe traffic and the
-    // faster kernel only competed harder for it (the GPU's dense step slowed too).  Worth re-testing with more RAM
-    // bandwidth (2666+ MT/s) or where the pool runs alone.
-    static const bool r3 = std::getenv("STRATA_PTQ1_ROWS3") && std::getenv("STRATA_PTQ1_ROWS3")[0] == '1';
+    // DEFAULT ON (STRATA_PTQ1_ROWS3=0 = rows_avx2): 1.4-1.6x rows_avx2 alone.  Served V4 decode on a 2133 MT/s box is
+    // a tie at 7 pool threads (2026-10-25 paired run: 129.6 vs 129.7 ms/pass; earlier 6-run ~142 vs ~128 was noise) -
+    // the CPU pool shares the host-RAM bus with the PCIe/NVMe traffic there; more RAM bandwidth (2666+ MT/s) or a pool
+    // running alone should show the kernel's own gain.
+    static const bool r3 = !(std::getenv("STRATA_PTQ1_ROWS3") && std::getenv("STRATA_PTQ1_ROWS3")[0] == '0');
     if (avx2 && r3 && n >= 4 * kPtq1Block) {   // rows3 (above): tokens in groups of <= 4, activations permuted per call
         // the prepared activations are kept per thread and reused while the same bytes come back (memcmp, exact): the
         // pool hands a thread 50-100-row slices of one or two experts, all against the same token rows in a gate/up
