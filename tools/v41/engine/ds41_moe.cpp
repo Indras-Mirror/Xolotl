@@ -755,6 +755,7 @@ struct Ds41MoeImpl {
 };
 
 void rebal_count(Ds41MoeImpl& im, int64_t layer, const int32_t* ids, int64_t n);   // defined with rebalance_*
+const std::vector<float>* rebal_score(const Ds41MoeImpl& im);   ///< the conversation's decayed counts, or null
 
 // ---- the remote card (Ds41MoeConfig::remote_device) ---------------------------------------------------------------
 
@@ -2371,6 +2372,48 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
     // is ranked[i]'s and fits it exactly; the cache never evicts, so a slot never meets another layer's blob.
     // slots=0 + slot_gib>0 (buster dual-V100): size the VRAM cache from free GiB, not a fake slot count.
     const bool want_cache = !im_->cfg.no_cache && (im_->cfg.slots > 0 || im_->cfg.slot_gib > 0);
+    // STRATA_VRAM_CONV=<per mille> (default 500, 0 = off): a sized cache (V4) opens with that share of its byte budget given
+    // to the experts THIS conversation routes most (the conversation-adaptive arena's decayed prompt + decode counts,
+    // STRATA_ARENA_REBAL), most-used first; the rest, and everything without counts, from the global rank.  The cache
+    // re-opens after every batch turn, so each decode starts from the conversation's own hot set.  V4, Mal's serve
+    // config, turnprobe x3 interleaved (2026-10-25): decode after an 8K prompt 13.1 -> 16.9 tok/s (median), after
+    // +32 / +50 / +85-token turns 17.1 / 19.1 / 16.9 -> 19.7 / 20.7 / 18.0; prompt times unchanged.
+    std::vector<std::pair<int32_t, int32_t>> conv_ranked;
+    if (im_->mixed_sizes && im_->gpu && !im_->gpu->cache && want_cache) {
+        const double budget = im_->cfg.slot_gib > 0 ? im_->cfg.slot_gib * 1073741824.0
+                                                     : (double) im_->cfg.slots * (double) im_->blob;
+        static const int conv_share = std::getenv("STRATA_VRAM_CONV") ? std::max(0, std::min(1000, std::atoi(std::getenv("STRATA_VRAM_CONV")))) : 500;
+        const std::vector<float>* sc = rebal_score(*im_);
+        if (conv_share > 0 && sc && !sc->empty()) {
+            const int64_t NX = im_->g.n_experts;
+            std::vector<std::pair<float, int32_t>> top;   // (score, layer * NX + expert)
+            for (size_t i = 0; i < sc->size(); ++i)
+                if ((*sc)[i] >= 1.0f) top.push_back({(*sc)[i], (int32_t) i});
+            std::sort(top.begin(), top.end(), [](const std::pair<float, int32_t>& a, const std::pair<float, int32_t>& b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second; });
+            std::vector<char> in((size_t) (im_->g.n_layers * NX), 0), ok((size_t) (im_->g.n_layers * NX), 0);
+            for (const auto& le : ranked)   // only what the rank list holds (excluded / remote-card experts are not in it)
+                if (le.first >= 0 && le.first < im_->g.n_layers && le.second >= 0 && le.second < NX) ok[(size_t) (le.first * NX + le.second)] = 1;
+            const double cap = budget * conv_share / 1000.0;
+            double got = 0;
+            for (const auto& t : top) {
+                const int32_t l = t.second / (int32_t) NX, e = t.second % (int32_t) NX;
+                if (!im_->g.routed(l) || !ok[(size_t) t.second]) continue;
+                const double b = (double) im_->bl[(size_t) im_->g.cls(l, e)];
+                if (got + b > cap) break;
+                got += b;
+                in[(size_t) t.second] = 1;
+                conv_ranked.push_back({l, e});
+            }
+            const int64_t n_conv = (int64_t) conv_ranked.size();
+            for (const auto& le : ranked)
+                if (le.first >= 0 && le.second >= 0 && le.second < NX && !in[(size_t) (le.first * NX + le.second)])
+                    conv_ranked.push_back(le);
+            std::fprintf(stderr, "vram seed: %lld experts by this conversation's routing first (%.2f GiB), then the rank\n",
+                         (long long) n_conv, got / 1073741824.0);
+        }
+    }
+    const std::vector<std::pair<int32_t, int32_t>>& c_ranked = conv_ranked.empty() ? ranked : conv_ranked;
     if (im_->mixed_sizes && im_->gpu && !im_->gpu->cache && want_cache) {
         const double budget = im_->cfg.slot_gib > 0 ? im_->cfg.slot_gib * 1073741824.0
                                                      : (double) im_->cfg.slots * (double) im_->blob;
@@ -2379,7 +2422,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         std::vector<int64_t> sizes;
         std::vector<char> seen((size_t) (im_->g.n_layers * im_->g.n_experts), 0);
         double used = 0;
-        for (const auto& le : ranked) {
+        for (const auto& le : c_ranked) {
             if ((int64_t) sizes.size() >= max_slots) break;
             if (!im_->g.routed(le.first) || le.second < 0 || le.second >= im_->g.n_experts) continue;
             char& sn = seen[(size_t) (le.first * im_->g.n_experts + le.second)];
@@ -2417,7 +2460,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         : im_->gpu->cache->full_slots();
     // the order the slots fill in.  A per-layer-sized cache (MiMo) keeps the rank: its sizes list above pairs slot
     // i with ranked[i].  Everywhere else a preceding release_cache() supplies the warm set.
-    const std::vector<std::pair<int32_t, int32_t>> fill_order = im_->mixed_sizes ? ranked : warm_first(*im_, ranked, want);
+    const std::vector<std::pair<int32_t, int32_t>> fill_order = im_->mixed_sizes ? c_ranked : warm_first(*im_, ranked, want);
     int64_t filled = 0;
     // vram_lru: the LRU's starting order = the fill order: the last-seeded expert goes out first
     auto lru_seed_order = [&](int64_t n_seeded) {
@@ -6214,6 +6257,8 @@ struct Rebal {
     int per_tick = 64, every = 4, max_plan = 6000, max_inflight = 4096, end_batch = 2048;
     bool decode_reads = false;  ///< reads only between requests (s6: reads during decode cost it 5-19 %); STRATA_ARENA_REBAL_DECODE=1 = also during decode
 };
+
+const std::vector<float>* rebal_score(const Ds41MoeImpl& im) { return im.rebal ? &im.rebal->score : nullptr; }
 
 void rebal_count(Ds41MoeImpl& im, int64_t layer, const int32_t* ids, int64_t n) {
     if (!im.rebal || layer < 0 || layer >= im.g.n_layers) return;

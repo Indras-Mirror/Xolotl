@@ -2359,6 +2359,11 @@ int main(int argc, char ** argv) {
                 std::fflush(stdout);
             }
             const int total = (int) ids.size();
+            // STRATA_PROFILE_SERVE_REQ=N (diagnostic): nsys --capture-range=cudaProfilerApi captures exactly request N
+            // (0-based, prompt + decode) of a serve run
+            static const int prof_req = std::getenv("STRATA_PROFILE_SERVE_REQ") ? std::atoi(std::getenv("STRATA_PROFILE_SERVE_REQ")) : -1;
+            static bool prof_req_on = false;
+            if (prof_req >= 0 && n_req == prof_req && !prof_req_on) { Ds41MoeTier::profiler(true); prof_req_on = true; }
             // a long prompt runs layer-major without the VRAM cache (its pass / chunk buffers need that VRAM) and with
             // the prompt's routing (no decode bias).  A short one (<= step_max new tokens: a chat / agent turn's tool
             // result) runs on the decode side instead - small dense passes, the cache and the decode biases: the
@@ -3061,6 +3066,7 @@ int main(int argc, char ** argv) {
             }
 #endif
             tier.rebalance_tick(true);   // the gap until the next request: retire a large batch for the reader
+            if (prof_req_on) { Ds41MoeTier::profiler(false); prof_req_on = false; }
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
                         (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, total - reused);
             std::fflush(stdout);
