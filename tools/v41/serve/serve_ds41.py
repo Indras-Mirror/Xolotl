@@ -347,6 +347,16 @@ F.call_end = ds41_call_end
 F.parse_tool_call = ds41_parse_tool_call
 # frontend.forced_call writes the forced-call (tool_choice) prefix in Qwen's `<function=NAME>` shape; V4.1's
 # DSML puts the name in the call OPENER itself, so a forced call has to be written in that shape here.
+# The opening is exactly what DeepSeek's encoder writes before an assistant message's tool call (encode_messages:
+# "</think>" + content + "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"X\">\n<｜DSML｜ parameter ..."): the `calls`
+# wrapper and the line break after the name included.  Without them (the opener alone, glued to "</think>") the model
+# is outside the format it was trained on and writes the arguments in some other shape: the call parsed with
+# `arguments: {}` (seen on V4.1-1017: finish_reason "tool_calls", ~120 tokens generated, no parameter).  The server
+# puts the forced text after the blank line that follows the thinking (Service.run's wrap-up / "\n" * k); without
+# thinking it goes right after the prompt, which ends with "</think>" here, so prepare() adds that blank line.
+FORCED_HEAD = CALLS_OPEN + "\n" + INVOKE_OPEN + ' name="'
+
+
 def ds41_forced_call(tool_choice, tools):
     """tool_choice -> the DSML text that opens the call the reply must make (None: the model decides)."""
     kind, name = F.tool_choice_of(tool_choice)
@@ -356,15 +366,28 @@ def ds41_forced_call(tool_choice, tools):
     if kind == "required" and len(names) == 1:
         kind, name = "named", next(iter(names))
     if kind == "required" and names:
-        return INVOKE_OPEN + " "
+        return FORCED_HEAD                                  # the model names one of the tools
     if kind == "named" and name in names:
-        return INVOKE_OPEN + f' name="{name}">'
+        return FORCED_HEAD + f'{name}">\n'
     return None
 
 
 F.forced_call = ds41_forced_call
 if hasattr(S, "forced_call"):
     S.forced_call = ds41_forced_call
+_svc_prepare = S.Service.prepare
+
+
+def _prepare_ds41(self, messages, tools, kwargs, max_new=None, force=None, **k):
+    """Without thinking the forced opening ends the prompt (Service.prepare); V4.1's chat prompt ends with "</think>"
+    and its encoder puts a blank line between that and the `calls` block (Qwen's prompt already ends with one).  Only
+    the prompt gets it: Service.run feeds the parser the opening itself, and a blank line there is no answer text."""
+    if force and kwargs.get("enable_thinking", True) is False and force.startswith(CALLS_OPEN):
+        force = "\n\n" + force
+    return _svc_prepare(self, messages, tools, kwargs, max_new, force=force, **k)
+
+
+S.Service.prepare = _prepare_ds41
 _op_init, _op_feed, _op_finish = F.OutputParser.__init__, F.OutputParser.feed, F.OutputParser.finish
 WRAPPERS = (CALLS_OPEN, CALLS_CLOSE)
 

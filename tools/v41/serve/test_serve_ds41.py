@@ -140,6 +140,50 @@ def t_tokenizer(tok_dir):
     svc = S.Service(S.MockEngine(tok, "x"), tok, D.Ds41Template())
     check("stop ids = <｜end▁of▁sentence｜> only", svc.stop_ids == set(tok.encode(E.eos_token, parse_special=True)), svc.stop_ids)
     t_image_prompt(svc)
+    t_forced_call(tok)
+
+
+def t_forced_call(tok):
+    """tool_choice naming a function (or "required"): the server writes the call's opening itself.  The prompt the
+    engine then continues must be what DeepSeek's encoder writes before that call (the blank line after </think>, the
+    `calls` wrapper, the line break after the name) - the bare `<｜DSML｜ invoke name="X">` glued to </think> left the
+    model outside its format and the call came back with `arguments: {}` - and the reply must parse to the call."""
+    import serve.server as S
+    from threading import Event as Cancel
+    one = [t["function"] for t in TOOLS]
+    two = one + [{"name": "list_dir", "description": "List a directory", "parameters": {"type": "object", "properties": {}}}]
+    named = {"type": "function", "function": {"name": "read_file"}}
+    check("forced: named -> the encoder's opening",
+          D.ds41_forced_call(named, one) == f'{D.CALLS_OPEN}\n{D.INVOKE_OPEN} name="read_file">\n', D.ds41_forced_call(named, one))
+    check("forced: required -> the opening up to the name",
+          D.ds41_forced_call("required", two) == f'{D.CALLS_OPEN}\n{D.INVOKE_OPEN} name="', D.ds41_forced_call("required", two))
+    check("forced: required with one tool -> that tool", D.ds41_forced_call("required", one) == D.ds41_forced_call(named, one))
+    check("forced: auto / unknown name -> the model decides", D.ds41_forced_call("auto", one) is None and
+          D.ds41_forced_call({"type": "function", "function": {"name": "nope"}}, one) is None)
+    args = {"path": "a b.txt", "lines": 3}
+    msgs = [{"role": "user", "content": "read a b.txt"}]
+    for mode, kw in (("chat", {"enable_thinking": False}), ("thinking", {})):
+        reasoning = "" if mode == "chat" else "need the file"
+        for label, choice, tools in (("named", named, one), ("required", "required", two)):
+            ref = E.encode_messages([{"role": "system", "content": "", "tools": [{"type": "function", "function": t} for t in tools]}]
+                                    + msgs + [{"role": "assistant", "content": "", "reasoning_content": reasoning,
+                                               "tool_calls": [{"id": "c1", "type": "function", "function": {
+                                                   "name": "read_file", "arguments": json.dumps(args)}}]}],
+                                    thinking_mode=mode)
+            force = D.ds41_forced_call(choice, tools)
+            head = ref[:ref.rindex(force) + len(force)]          # the reference text up to the end of the opening
+            rest = ref[len(head):-len(E.eos_token)]              # what the model writes after it
+            scripts = [rest] if mode == "chat" else [reasoning + E.thinking_end_token, rest]
+            svc = S.Service(S.MockEngine(tok, scripts), tok, D.Ds41Template())
+            ids, thinking, max_new = svc.prepare(msgs, tools, dict(kw), 400, force=force)
+            evs = [x for kind, x in svc.run(ids, thinking, tools, max_new, {}, Cancel(), force=force) if kind == "event"]
+            prompt = tok.decode(svc.engine.last_prompt)
+            check(f"forced {label} ({mode}): the engine continues the encoder's own text", prompt == head,
+                  (prompt[-120:], head[-120:]))
+            calls = [(e.call.name, e.call.arguments) for e in evs if e.kind == "tool_call"]
+            text = "".join(e.text or "" for e in evs if e.kind == "content")
+            check(f"forced {label} ({mode}): the reply parses to the call", calls == [("read_file", args)] and not text.strip(),
+                  (calls, text[:200]))
 
 
 def t_image_prompt(svc):
