@@ -2387,7 +2387,10 @@ int main(int argc, char ** argv) {
             // (+ 32-token decode) passes / batch: +30 5.0 (1.7) / 6.0 (2.0), +60 6.6 (1.7) / 7.0 (2.0), +90 9.7 (1.0) /
             // 7.7 (1.7), +150 17.6 (1.4) / 9.8 (1.6).  Decode right after a batch starts colder (the VRAM cache is
             // re-seeded), hence the margin above the ~80-token crossover.
-            static const int batch_min = std::getenv("STRATA_SERVE_BATCH_MIN") ? std::atoi(std::getenv("STRATA_SERVE_BATCH_MIN")) : 128;
+            // V4 (2026-10-25, Mal's serve config, warm cache, turnprobe.py x3 interleaved): 16 is the default now - the
+            // batch won at every size, decode after it no slower: +32 tokens 7.37 -> 3.94 s, +50 5.62 -> 4.40 s,
+            // +85 9.41 -> 5.27 s (decode after 16.7 / 21.3 / 18.4 -> 17.7 / 21.0 / 20.8 tok/s).
+            static const int batch_min = std::getenv("STRATA_SERVE_BATCH_MIN") ? std::atoi(std::getenv("STRATA_SERVE_BATCH_MIN")) : 16;
             bool force_batch = false;
             if (batch_min > 0 && batch_tail && sp_tail > 0 && bcap == 0 && delta >= batch_min && PB > 1 && delta >= 2) {
                 bcap = sp_tail; dh = delta; force_batch = true; by_step = false;
