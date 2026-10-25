@@ -160,6 +160,21 @@ def _pread(fd, n, off):
     return os.read(fd, n)
 
 
+def _pread_all(fd, nbytes, off, name):
+    """All `nbytes` at `off` (looping on short reads, through the platform-aware _pread), or OSError naming `name`."""
+    raw = bytearray()
+    while len(raw) < nbytes:
+        b = _pread(fd, nbytes - len(raw), off + len(raw))
+        if not b:
+            raise OSError(f"{name}: short read")
+        raw += b
+    return bytes(raw)
+
+
+def _open_ro(path):
+    return os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))   # O_BINARY: Windows opens text mode otherwise
+
+
 class SidecarWeights:
     """Reads only the vision.* / aligner.* / image_* tensors of the sidecar GGUF, by offset."""
 
@@ -169,7 +184,7 @@ class SidecarWeights:
         self.tensors = {n: (s, t, o) for n, s, t, o in tensors if n.startswith(VISION_PREFIXES)}
         if not self.tensors:
             raise ValueError(f"{path}: no vision.* / aligner.* / image_* tensors")
-        self.fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))   # O_BINARY: Windows opens text otherwise
+        self.fd = _open_ro(path)
 
     def names(self):
         return sorted(self.tensors)
@@ -178,14 +193,8 @@ class SidecarWeights:
         """-> float32 numpy array in the checkpoint's own HF orientation (C-order over ne0, so
         [out, in] for a Linear weight -- the reverse of the ggml header shape)."""
         shape, ty, off = self.tensors[name]
-        nbytes = ggml_nbytes(shape, ty)
-        raw = bytearray()
-        while len(raw) < nbytes:
-            b = _pread(self.fd, nbytes - len(raw), self.data_start + off + len(raw))
-            if not b:
-                raise OSError(f"{name}: short read")
-            raw += b
-        return dequantize(bytes(raw), ty).reshape(shape[::-1]).astype(np.float32)
+        raw = _pread_all(self.fd, ggml_nbytes(shape, ty), self.data_start + off, name)
+        return dequantize(raw, ty).reshape(shape[::-1]).astype(np.float32)
 
     def torch(self, name, tp, dtype):
         return tp.from_numpy(np.ascontiguousarray(self.get(name))).to(dtype)
@@ -210,16 +219,6 @@ class SidecarWeights:
 
 _GGML_NAMES = {F32: "F32", F16: "F16", Q8_0: "Q8_0", BF16: "BF16"}
 _ST_TYPES = {"F32": (F32, 4), "F16": (F16, 2), "BF16": (BF16, 2)}
-
-
-def _pread(fd, nbytes, off, name):
-    raw = bytearray()
-    while len(raw) < nbytes:
-        b = os.pread(fd, nbytes - len(raw), off + len(raw))
-        if not b:
-            raise OSError(f"{name}: short read")
-        raw += b
-    return bytes(raw)
 
 
 class SafetensorsWeights:
@@ -249,7 +248,7 @@ class SafetensorsWeights:
                 (n,) = struct.unpack("<Q", fh.read(8))
                 hdr = json.loads(fh.read(n))
             self.meta.update(hdr.pop("__metadata__", None) or {})
-            fd = os.open(f, os.O_RDONLY)
+            fd = _open_ro(f)
             self.fds.append(fd)
             for name, e in hdr.items():
                 if not name.startswith(VISION_PREFIXES):
@@ -267,7 +266,7 @@ class SafetensorsWeights:
 
     def get(self, name):
         fd, off, nb, ty, shape, _ = self.tensors[name]
-        return dequantize(_pread(fd, nb, off, name), ty).reshape(shape).astype(np.float32)
+        return dequantize(_pread_all(fd, nb, off, name), ty).reshape(shape).astype(np.float32)
 
     def torch(self, name, tp, dtype):
         return tp.from_numpy(np.ascontiguousarray(self.get(name))).to(dtype)
@@ -321,7 +320,7 @@ class MmprojWeights:
         if self.kv.get("clip.projector_type") != "deepseek41v":
             raise ValueError(f"{path}: clip.projector_type {self.kv.get('clip.projector_type')!r}, expected deepseek41v")
         self.src = {n: (s, t, o) for n, s, t, o in tensors}
-        self.fd = os.open(path, os.O_RDONLY)
+        self.fd = _open_ro(path)
         self.map = {}                                  # checkpoint name -> list of mmproj names (concatenated on dim 0)
         for n in self.src:
             if n in self._SIMPLE:
@@ -344,7 +343,7 @@ class MmprojWeights:
 
     def _one(self, n):
         shape, ty, off = self.src[n]
-        return dequantize(_pread(self.fd, ggml_nbytes(shape, ty), self.data_start + off, n), ty).reshape(shape[::-1])
+        return dequantize(_pread_all(self.fd, ggml_nbytes(shape, ty), self.data_start + off, n), ty).reshape(shape[::-1])
 
     def get(self, name):
         parts = [self._one(n) for n in self.map[name]]
