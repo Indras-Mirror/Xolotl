@@ -306,10 +306,10 @@ int main(int argc, char** argv) {
                   ck(cudaMalloc(&m_h, (size_t) kMr * (size_t) FF * 4), "m_h") &&
                   ck(cudaMalloc(&m_xg, mmq::q8_bytes(kMr, H)), "m_xg") && ck(cudaMalloc(&m_xu, mmq::q8_bytes(kMr, H)), "m_xu") &&
                   ck(cudaMalloc(&m_xd, mmq::q8_bytes(kMr, FF)), "m_xd") &&
-                  ck(cudaMalloc(&m_iota, sizeof(int32_t) * (size_t) kMr), "m_iota") &&
+                  ck(cudaMalloc(&m_iota, sizeof(int32_t) * (size_t) (kMr + kMmqIdSlack)), "m_iota") &&   // MMQ id over-read
                   (tc_slot == 0 || ck(cudaMalloc(&m_tc, (size_t) kTc * tc_slot), "m_tc"));
             if (cok) {
-                mmq::iota(m_iota, kMr, cs[0]);
+                mmq::iota(m_iota, kMr + kMmqIdSlack, cs[0]);
                 m_ctx = new mmq::Context();
             }
         }
