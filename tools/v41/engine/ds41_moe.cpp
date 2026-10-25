@@ -4994,8 +4994,13 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         ck(cudaMalloc(&gp.c_xq, (size_t) n * strata::kernels::native_q8_1_bytes((int) H, 1)), "c_xq");   // its ncols <= 8
         ck(cudaMalloc(&gp.c_parts, (size_t) ne * (size_t) H * 4), "c_parts");
         ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(ne, im.g.n_ff)), "c_scratch");
-        ck(cudaMalloc(&gp.c_dst, sizeof(int32_t) * (size_t) ne), "c_dst");
-        ck(cudaMalloc(&gp.c_tokv, sizeof(int32_t) * (size_t) ne), "c_tok");
+        // c_dst + r0 is the MMQ down product's `ids`, and MMQ reads up to 127 ids past a run's last entry: for the run
+        // ending at entry ne that read went past the allocation - an MMU fault ("chunk sync: an illegal memory access",
+        // Xid 31 on a 2 MiB page boundary) whenever the driver had placed c_dst at the end of a mapped page.  c_tokv
+        // (the quantizers' row ids) gets the same slack.
+        const int64_t ids_slack = 128;   // = kMmqIdSlack (ds41_mmq_plan.hpp, MMQ builds only)
+        ck(cudaMalloc(&gp.c_dst, sizeof(int32_t) * (size_t) (ne + ids_slack)), "c_dst");
+        ck(cudaMalloc(&gp.c_tokv, sizeof(int32_t) * (size_t) (ne + ids_slack)), "c_tok");
         ck(cudaMalloc(&gp.c_w, sizeof(float) * (size_t) ne), "c_w");
         ck(cudaMalloc(&gp.c_out, (size_t) n * (size_t) H * 4), "c_out");
     }
@@ -5085,8 +5090,9 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             ck(cudaMalloc(&gp.m_xu, mmq::q8_bytes(cap, H)), "m_xu");
             ck(cudaMalloc(&gp.m_xd, mmq::q8_bytes(cap, FF)), "m_xd");
             ck(cudaMalloc(&gp.m_bnd, sizeof(int32_t) * (size_t) (im.g.n_experts + 1)), "m_bnd");
-            ck(cudaMalloc(&gp.m_iota, sizeof(int32_t) * (size_t) cap), "m_iota");
-            mmq::iota((int32_t*) gp.m_iota, cap, gp.s);
+            // the gate / up products' ids: MMQ reads up to kMmqIdSlack - 1 past a run's rows (a run can hold cap of them)
+            ck(cudaMalloc(&gp.m_iota, sizeof(int32_t) * (size_t) (cap + kMmqIdSlack)), "m_iota");
+            mmq::iota((int32_t*) gp.m_iota, cap + kMmqIdSlack, gp.s);
             if (!gp.m_ctx) gp.m_ctx = new mmq::Context();   // never deleted (see Gpu::m_ctx)
         }
     }

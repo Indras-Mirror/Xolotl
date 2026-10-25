@@ -16,6 +16,10 @@ namespace strata::v41 {
 // Q2_0 (ds41_transcode: same d, code = trit + 1 - every weight the same number) and multiplied as Q2_0.
 // STRATA_MMQ_PTQ1=0: classes with a PTQ1_0 matrix stay on MMVQ (the old behaviour).
 constexpr int kPtq1 = 143, kQ20 = 42;
+/// MMQ reads up to J_best - 1 (<= 127) ids past the end of a product's `ids` (ggml #29953, moe_mmq.cu Context::run): every
+/// buffer passed as Product::ids is allocated this many int32 longer.  Strata's prefill.cpp pads its id buffers the same
+/// way (+128); run_chunk's c_dst (the down product's ids) and m_iota had no slack.
+constexpr int64_t kMmqIdSlack = 128;
 inline bool mmq_ptq1() {
     static const bool on = [] { const char* e = std::getenv("STRATA_MMQ_PTQ1"); return !(e && e[0] == '0'); }();
     return on;
