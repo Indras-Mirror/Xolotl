@@ -467,6 +467,22 @@ struct Gpu {
     void *c_x = nullptr, *c_xq = nullptr, *c_parts = nullptr, *c_scratch = nullptr, *c_ptr = nullptr,
          *c_start = nullptr, *c_ng = nullptr, *c_dst = nullptr, *c_tokv = nullptr, *c_stage[2] = {};
     uint8_t* c_bounce[2] = {};
+    /// layer read-ahead (STRATA_LAYER_RA, default on; layer_ra_start): a prompt layer's WHOLE file tier - every format
+    /// class - read into the bounce halves when the layer's first class pass starts, so the reads run back to back
+    /// while the class passes compute, instead of one short read burst per class pass.  `layer` = -1: off.
+    struct LayerRA {
+        int64_t layer = -1;
+        std::vector<int32_t> idx;                     ///< expert -> its blob's index (-1 = not read ahead)
+        std::vector<int32_t> ex;                      ///< index -> expert
+        std::vector<uint8_t*> ptr;                    ///< index -> its pinned slot
+        std::unique_ptr<std::atomic<int>[]> ready, pdone;
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> th;
+        double t0 = 0;
+        std::atomic<double> t_last{0};
+        double gb = 0;
+    };
+    std::unique_ptr<LayerRA> lra;                     ///< created by the first layer_ra_start (Gpu stays movable)
     float* c_hparts = nullptr;
     cudaStream_t s_cp = nullptr;
     cudaEvent_t c_copied[2] = {}, c_used[2] = {};
@@ -528,6 +544,7 @@ struct Gpu {
         spec.reset();
         cache.reset();
         arena.close();
+        if (lra) for (auto& t : lra->th) t.join();
         *this = Gpu();
     }
 };
@@ -4582,7 +4599,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
 // MIMO_CHUNK_PROF=1: run_chunk's time split (host waits on the copy events / final sync, GPU time of the grouped
 // launches by event pairs), printed by release_chunk.  Timing only - the same work runs.
 struct ChunkProf { double file_gb = 0, rd_busy = 0; double wall = 0, file = 0, file_rd = 0, wait_copied = 0, sync = 0, kern = 0, resident_kern = 0; int64_t calls = 0, launches = 0;
-                   double tc = 0, tc_gb = 0; int64_t tc_launches = 0, mmq_subruns = 0; };   // + the PTQ1_0 -> Q2_0 transcode inside MMQ
+                   double tc = 0, tc_gb = 0; int64_t tc_launches = 0, mmq_subruns = 0;   // + the PTQ1_0 -> Q2_0 transcode inside MMQ
+                   double kern_cls[64] = {}; int64_t ent_cls[64] = {}; };   // per format class: kernel ms, routed entries
 ChunkProf g_cprof;
 bool chunk_prof() { static const bool on = [] { const char* e = std::getenv("MIMO_CHUNK_PROF"); return e && *e == '1'; }(); return on; }
 
@@ -4815,6 +4833,105 @@ bool remote_chunk_collect(Ds41MoeImpl& im, int64_t layer) {
     Ds41MoeStats s2;
     s2.remote = rc.nr;
     im.st.add(s2);
+    return true;
+}
+
+// ---- layer read-ahead (STRATA_LAYER_RA=0 = off) ----
+// A prompt layer runs one class pass per format class (~15 a layer on V4).  Each pass used to read only ITS file-tier
+// blobs: wait for the previous pass's DMAs out of the bounce, start 32 reader threads, wait for them - so NVMe idled at
+// every pass boundary and the reads came as ~600 short bursts a prompt (6.4K prompt: reader busy 9.1 s, kernels 10.2 s,
+// expert phase 19.9 s: the two barely overlapped).  Here the layer's whole file tier (all classes, the order the
+// passes take them) is read into the bounce halves from the first pass on, and each pass waits only for its own blobs.
+// Same blobs, same kernels, same order of the sums: the rows are unchanged.  A layer whose file tier does not fit the
+// bounce halves, or a pass that needs a blob the read-ahead does not have, runs the per-pass reader as before.
+static bool layer_ra_on() {
+    static const bool on = !(std::getenv("STRATA_LAYER_RA") && std::atoi(std::getenv("STRATA_LAYER_RA")) == 0);
+    return on;
+}
+
+/// Waits for the read-ahead's readers and switches it off (its slots may then be reused by the per-pass reader).
+static void layer_ra_stop(Gpu& gp) {
+    if (!gp.lra) return;
+    Gpu::LayerRA& ra = *gp.lra;
+    for (auto& t : ra.th) t.join();
+    ra.th.clear();
+    if (ra.layer >= 0 && chunk_prof() && !ra.idx.empty()) {
+        g_cprof.file_rd += now_ms() - ra.t0;
+        g_cprof.rd_busy += std::max(0.0, ra.t_last.load() - ra.t0);
+        g_cprof.file_gb += ra.gb;
+    }
+    ra.layer = -1;
+}
+
+/// Starts reading `layer`'s file-tier blobs (the routed experts of `ids` that are neither in the VRAM cache, nor in
+/// the RAM arena, nor the helper's) into the bounce halves.  False = not started (the per-pass reader runs).
+static bool layer_ra_start(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const char* rmask) {
+    Gpu& gp = *im.gpu;
+    if (!gp.lra) gp.lra.reset(new Gpu::LayerRA());
+    Gpu::LayerRA& ra = *gp.lra;
+    layer_ra_stop(gp);
+    if (!gp.c_ready || !gp.c_bounce[0] || !gp.c_bounce[1] || gp.c_bhalf <= 0 || !im.blobs) return false;
+    const int64_t NX = im.g.n_experts, NE = (int64_t) n * im.g.top_k;
+    std::vector<char> seen((size_t) NX, 0);
+    std::vector<std::pair<int, int32_t>> fe;   // (class, expert): the passes run in ascending class order
+    for (int64_t j = 0; j < NE; ++j) {
+        const int32_t e = ids[j];
+        if (e < 0 || e >= NX || seen[(size_t) e] || (rmask && rmask[e])) continue;
+        seen[(size_t) e] = 1;
+        if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
+        if (gp.arena.ptr(layer, e)) continue;
+        fe.push_back({ im.g.cls(layer, e), e });
+    }
+    if (fe.empty()) return false;
+    std::sort(fe.begin(), fe.end());
+    ra.idx.assign((size_t) NX, -1);
+    ra.ex.clear();
+    ra.ptr.clear();
+    ra.gb = 0;
+    int r = 0;
+    int64_t off = 0;
+    for (const auto& ce : fe) {   // pack the blobs into the two halves, 4 KiB aligned (O_DIRECT reads land there)
+        const int64_t bl = im.bl[(size_t) ce.first], b = (bl + 4095) & ~(int64_t) 4095;
+        if (b > gp.c_bhalf) return false;
+        if (off + b > gp.c_bhalf) {
+            if (++r == 2) return false;   // the layer's file tier does not fit: the per-pass reader takes it
+            off = 0;
+        }
+        ra.idx[(size_t) ce.second] = (int32_t) ra.ex.size();
+        ra.ex.push_back(ce.second);
+        ra.ptr.push_back(gp.c_bounce[r] + off);
+        ra.gb += (double) bl / 1e9;
+        off += b;
+    }
+    // the previous layer's DMAs (and an earlier per-pass reader's) may still read the bounce: let them finish
+    ck(cudaStreamSynchronize(gp.s_cp), "layer ra: bounce free");
+    const size_t nb = ra.ex.size();
+    static const int threads = std::getenv("STRATA_WAVE_THREADS") ? std::max(1, std::min(64, std::atoi(std::getenv("STRATA_WAVE_THREADS")))) : 32;
+    static const size_t P = (size_t) (std::getenv("STRATA_WAVE_PARTS") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_WAVE_PARTS")))) : 8);
+    ra.ready.reset(new std::atomic<int>[nb]);
+    ra.pdone.reset(new std::atomic<int>[nb]);
+    for (size_t q = 0; q < nb; ++q) {
+        ra.ready[q].store(0, std::memory_order_relaxed);
+        ra.pdone[q].store(0, std::memory_order_relaxed);
+    }
+    ra.next.store(0);
+    ra.t0 = now_ms();
+    ra.t_last.store(ra.t0);
+    ra.layer = layer;
+    const int nth = (int) std::min<size_t>((size_t) threads, nb * P);
+    for (int k = 0; k < nth; ++k)
+        ra.th.emplace_back([&im, &ra, layer, nb]() {
+            for (size_t x; (x = ra.next.fetch_add(1)) < nb * P;) {   // parts in blob order: the first pass's blobs first
+                const size_t q = x / P;
+                if (P == 1) im.blobs->read(layer, ra.ex[q], ra.ptr[q]);
+                else im.blobs->read_part(layer, ra.ex[q], (int) (x % P), (int) P, ra.ptr[q]);
+                if (P == 1 || ra.pdone[q].fetch_add(1, std::memory_order_acq_rel) + 1 == (int) P) {
+                    ra.ready[q].store(1, std::memory_order_release);
+                    ra.ready[q].notify_all();
+                    ra.t_last.store(now_ms());
+                }
+            }
+        });
     return true;
 }
 
@@ -5274,6 +5391,15 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         g_pf.dmas += (int64_t) nF;
         if (pf_slab < 0) ++g_pf.off;
     }
+    // layer read-ahead: this pass's file-tier blobs were all read (or are being read) by layer_ra_start?
+    Gpu::LayerRA* rap = gp.lra.get();
+    bool use_ra = false;
+    if (nF && pf_slab < 0 && rap && rap->layer == layer) {
+        Gpu::LayerRA& ra = *rap;
+        use_ra = true;
+        for (size_t k = 0; k < nF && use_ra; ++k) use_ra = ra.idx[(size_t) order[2][k]] >= 0;
+        if (!use_ra) layer_ra_stop(gp);   // a blob it does not have: the per-pass reader for the rest of the layer
+    }
     const int64_t per_half = std::max<int64_t>(1, gp.c_half / SL);
     const size_t slots_half = (size_t) std::max<int64_t>(1, gp.c_bhalf / BL), cap = 2 * slots_half;
     auto slot_ptr = [&](size_t k) { return gp.c_bounce[(k % cap) / slots_half] + ((k % cap) % slots_half) * (size_t) BL; };
@@ -5320,7 +5446,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                 }
             });
     };
-    if (nF && pf_slab < 0) {
+    if (nF && pf_slab < 0 && !use_ra) {
         // the bounce slots are shared by every class pass: the previous pass returned (non-last passes do not
         // sync) with its DMAs out of them possibly still queued on s_cp - the readers must not overwrite them yet
         ck(cudaStreamSynchronize(gp.s_cp), "bounce free");
@@ -5345,6 +5471,15 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                 const int32_t q = im.cstage->idx[pf_slab][(size_t) order[2][k]];
                 src = im.cstage->slab[pf_slab] + im.cstage->off[pf_slab][(size_t) q];
                 ++g_pf.used;
+            } else if (use_ra) {
+                Gpu::LayerRA& ra = *rap;
+                const int32_t q = ra.idx[(size_t) order[2][i - nA]];
+                if (!ra.ready[(size_t) q].load(std::memory_order_acquire)) {
+                    const double tw = now_ms();
+                    ra.ready[(size_t) q].wait(0, std::memory_order_acquire);
+                    t_file += now_ms() - tw;
+                }
+                src = ra.ptr[(size_t) q];
             } else {
                 const size_t k = i - nA;
                 if (k >= wave_end) {   // a new wave reuses the slots: every DMA out of them must be done first
@@ -5384,7 +5519,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     }
     for (auto& t : readers) t.join();
     const int64_t n_file = (int64_t) nF;
-    if (prof && nF && pf_slab < 0) {
+    if (prof && nF && pf_slab < 0 && !use_ra) {
         g_cprof.file_rd += now_ms() - t_rd0;
         g_cprof.rd_busy += t_rd_last.load() - t_rd0;
         g_cprof.file_gb += (double) nF * (double) BL / 1e9;
@@ -5401,7 +5536,36 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         chunk_prestage(im, nl, h_last >= 0 ? 1 - h_last : 0);
     }
 
+    // MIMO_CHUNK_PROF: every class pass's kernels, file waits and wall (a layer runs one pass per format class; only
+    // the last one reaches the weighted sum below - counting only that one under-reported the prompt's expert time)
+    auto prof_pass = [&]() {
+        if (!kev.empty()) cudaEventSynchronize(kev.back().second);
+        if (CI >= 0 && CI < 64) g_cprof.ent_cls[CI] += NEP;
+        for (size_t i = 0; i < kev.size(); ++i) {
+            float ms = 0;
+            cudaEventElapsedTime(&ms, kev[i].first, kev[i].second);
+            g_cprof.kern += ms;
+            if (CI >= 0 && CI < 64) g_cprof.kern_cls[CI] += ms;
+            if (kev_res[i]) g_cprof.resident_kern += ms;
+            cudaEventDestroy(kev[i].first);
+            cudaEventDestroy(kev[i].second);
+        }
+        kev.clear();
+        for (auto& e : tcev) {
+            float ms = 0;
+            cudaEventElapsedTime(&ms, e.first, e.second);
+            g_cprof.tc += ms;
+            cudaEventDestroy(e.first);
+            cudaEventDestroy(e.second);
+        }
+        g_cprof.tc_launches += (int64_t) tcev.size();
+        tcev.clear();
+        g_cprof.launches += (int64_t) kev_res.size();
+        g_cprof.file += t_file;
+        g_cprof.wall += now_ms() - t0;
+    };
     if (!last_pass) {   // the weighted sum waits for the last class pass
+        if (prof) prof_pass();
         st.hits = ent_hit;
         st.pcie = ent_str;
         st.file_tier = n_file;
@@ -5450,26 +5614,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     }
     if (prof) {
         g_cprof.sync += now_ms() - ts;
-        for (size_t i = 0; i < kev.size(); ++i) {
-            float ms = 0;
-            cudaEventElapsedTime(&ms, kev[i].first, kev[i].second);
-            g_cprof.kern += ms;
-            if (kev_res[i]) g_cprof.resident_kern += ms;
-            cudaEventDestroy(kev[i].first);
-            cudaEventDestroy(kev[i].second);
-        }
-        for (auto& e : tcev) {
-            float ms = 0;
-            cudaEventElapsedTime(&ms, e.first, e.second);
-            g_cprof.tc += ms;
-            cudaEventDestroy(e.first);
-            cudaEventDestroy(e.second);
-        }
-        g_cprof.tc_launches += (int64_t) tcev.size();
-        g_cprof.launches += (int64_t) kev.size();
+        prof_pass();
         g_cprof.calls += 1;
-        g_cprof.file += t_file;
-        g_cprof.wall += now_ms() - t0;
     }
     st.hits = ent_hit;
     st.pcie = ent_str;
@@ -5525,8 +5671,15 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         if (std::find(cl.begin(), cl.end(), c) == cl.end()) cl.push_back(c);
     }
     std::sort(cl.begin(), cl.end());
+    // the layer's whole file tier starts streaming now (all class passes); off with a prefetch slab or STRATA_LAYER_RA=0
+    if (layer_ra_on() && !im.cstage)
+        layer_ra_start(im, layer, n, ids, im.gpu->rchunk && im.gpu->rchunk->pending ? im.gpu->rchunk->mask_e.data() : nullptr);
     for (size_t i = 0; i < cl.size(); ++i)
-        if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev, cl[i], i == 0, i + 1 == cl.size())) return false;
+        if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev, cl[i], i == 0, i + 1 == cl.size())) {
+            layer_ra_stop(*im.gpu);
+            return false;
+        }
+    layer_ra_stop(*im.gpu);
     chunk_pstage_next(im, layer, n);
     return true;
 }
@@ -5857,6 +6010,13 @@ void Ds41MoeTier::release_chunk() {
         std::fprintf(stderr, "chunk prof MMQ: %lld sub-runs; PTQ1_0 -> Q2_0 transcode %.0f ms GPU (inside the grouped "
                              "kernels) over %lld sub-runs, %.1f GB of ternary read = %.0f GB/s\n",
                      (long long) c.mmq_subruns, c.tc, (long long) c.tc_launches, c.tc_gb, c.tc > 0 ? c.tc_gb / (c.tc / 1000.0) : 0.0);
+        // per format class: kernel time and throughput (2 * 3 * n_embd * n_ff ops per routed entry)
+        const double ops = 6.0 * (double) im_->g.n_embd * (double) im_->g.n_ff;
+        for (int k = 0; k < 64; ++k) {
+            if (c.ent_cls[k] == 0) continue;
+            std::fprintf(stderr, "chunk prof class %d: %.0f ms kernels, %lld entries, %.1f TOPS\n", k, c.kern_cls[k],
+                         (long long) c.ent_cls[k], c.kern_cls[k] > 0 ? ops * (double) c.ent_cls[k] / (c.kern_cls[k] * 1e9) : 0.0);
+        }
         g_cprof = ChunkProf{};
         if (im_->remote) remote_prof_print(*im_->remote, "prompt");
     }
