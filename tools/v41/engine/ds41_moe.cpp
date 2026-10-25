@@ -6736,6 +6736,20 @@ bool Ds41FileBlobs::read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* s
     }
     if (fd < 0 || !scratch || !n) return false;
     constexpr uint64_t A = 4096;
+    // offset, length and destination page-aligned (V4's PTQ1_0 / Q2_0 / MXFP4 spans: every expert tensor starts on a
+    // page and its per-expert spans are whole pages; the mirror's blobs too): read straight into dst.  The bounce +
+    // memcpy below doubled the RAM traffic of every NVMe byte on a RAM-bound host - 2026-10-25 s-mir39: model drive +
+    // 970 mirror read 5.06 GB/s in the prompt, the same as one drive; 9 MiB O_DIRECT microbench on both drives 8.12 GB/s
+    // straight vs 4.92 with the copy.  Same bytes either way; STRATA_READ_BOUNCE=1 = always the bounce (the old path).
+    static const bool bounce_only = std::getenv("STRATA_READ_BOUNCE") && std::getenv("STRATA_READ_BOUNCE")[0] == '1';
+    if (!bounce_only && ((off | (uint64_t) n | (uint64_t) (uintptr_t) dst) & (A - 1)) == 0) {
+        for (size_t got = 0; got < n;) {
+            const ssize_t k = ds41_sys::pread(fd, dst + got, n - got, (int64_t) (off + got));
+            if (k <= 0) return false;
+            got += (size_t) k;
+        }
+        return true;
+    }
     const uint64_t a0 = off & ~(A - 1), a1 = (off + n + A - 1) & ~(A - 1);
     const size_t span = (size_t) (a1 - a0);
     if (span > scratch_bytes) return false;
