@@ -2713,6 +2713,9 @@ int main(int argc, char ** argv) {
                 std::vector<int> spos;
                 if (bcap > 0) {   // the seed rows came off the batch (bcap_vh, its last bcap_got tokens): DSpark steps only
                     const int c0s = total - bcap_got;
+                    // the capture wrote the final batch's rows at the END of bcap_vh (row bcap_n - cn + t); a final batch
+                    // shorter than the tail fills only the last bcap_got of its bcap rows, so read from there, not from row 0
+                    const size_t vh0 = (size_t) (bcap - bcap_got);   // bcap: this request's tail width (bcap_n is cleared after the feed)
                     for (int i0 = c0s; ok && i0 < total; i0 += 16) {
                         if (stop_prefill()) { ok = false; break; }
                         const int m = std::min(16, total - i0);
@@ -2722,10 +2725,10 @@ int main(int argc, char ** argv) {
                         if (last) sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);   // the batch's last row
                         if (i0 == c0s) cur_seed_n = 0;
                         cur_seed.resize((size_t) (cur_seed_n + m) * 3 * n_embd);
-                        std::copy_n(bcap_vh.data() + (size_t) (i0 - c0s) * 3 * n_embd, (size_t) m * 3 * n_embd,
+                        std::copy_n(bcap_vh.data() + (vh0 + (size_t) (i0 - c0s)) * 3 * n_embd, (size_t) m * 3 * n_embd,
                                     cur_seed.data() + (size_t) cur_seed_n * 3 * n_embd);
                         cur_seed_n += m;
-                        if (!dsp->step(bcap_vh.data() + (size_t) (i0 - c0s) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
+                        if (!dsp->step(bcap_vh.data() + (vh0 + (size_t) (i0 - c0s)) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
                                        last ? sp_ids : sp_tmp, sp_conf)) {
                             ferr = "DSpark step: " + dsp->last_error(); ok = false; break;
                         }
