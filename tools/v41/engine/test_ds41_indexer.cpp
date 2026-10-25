@@ -84,7 +84,9 @@ static int check(ggml_backend_t be,const Fixture & f,bool cuda,bool bench) {
     auto * padded=ggml_new_tensor_4d(c,GGML_TYPE_F32,2,nq,1,v[3]->ne[3]);
     auto * nv=ggml_view_4d(c,padded,1,nq,1,padded->ne[3],padded->nb[1],padded->nb[2],padded->nb[3],4);
     auto * mask=ggml_new_tensor_4d(c,GGML_TYPE_F16,nk,nq,1,v[3]->ne[3]);
-    for(auto * t:{v[0],v[1],v[2],padded,mask}) ggml_set_input(t);
+    // These inputs are reused across backend calls. INPUT controls allocation order;
+    // OUTPUT also prevents gallocr from recycling their storage after the last reader.
+    for(auto * t:{v[0],v[1],v[2],padded,mask}) {ggml_set_input(t);ggml_set_output(t);}
     auto * old=ggml_lightning_indexer(c,v[0],v[1],v[2],mask);
     auto * fast=ggml_lightning_indexer(c,v[0],v[1],v[2],nv);
     auto * ids=ggml_cont(c,ggml_top_k(c,fast,top));
