@@ -3,7 +3,9 @@
 #include "strata/kernels/cpu/expert_layout.hpp"   // cpu_avx2_ok
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -314,12 +316,187 @@ STRATA_PTQ_AVX2_FMA void q2_rows_avx2(const uint8_t* w, size_t rb, int n, const 
         for (int t = 0; t < NT; ++t) out[t][r] = rhsum(acc[t]);
     }
 }
+// ---- rows3: 4 blocks (512 weights) per step with every SIMD lane used (2026-10-25; the rows_avx2 above decoded with
+// 16-bit multiplies and spent 4 int32 lanes of 5 on junk, ~1.6 GB/s per core short of RAM speed).
+//   decode: trit n of a byte b is [p_n >= 86] + [p_n >= 171], p_n = b * 3^n mod 256; in the sign-flipped domain
+//           (p ^ 0x80) the recurrence is still x 3 mod 256, so a digit is 2 signed compares + 2 ops per 32, the
+//           next power 2 byte adds.  Vectors of a group: A0 = bytes 0..15 of blocks 0|1, A1 = of 2|3 (5 trits each),
+//           T = bytes 16..23 of the 4 blocks (5), H = the qh bytes (4 trits, lanes 8g + 2n + h) - 16 x 32 digits.
+//   per token: maddubs(digit 0..2, q) -> madd -> cvt -> fma(d_a) on activations permuted ONCE per call into those
+//           lanes (rows3_prep); d_w per lane after each A0 / A1 / T+H part; the trits' -1 is one dot per row,
+//           sum_b d_w,b * C_b with C_b = sum_k d_a,k * sum(q_k).  Same integer sums as the scalar dot (float order
+//           differs: max |err| ~2e-6 of the rows' rms vs the scalar ref, rows_avx2 ~8e-7).  A row's last n/128 % 4
+//           blocks take rows_avx2's per-block path.  7 threads, 2.4 GB of weights, 5700X: 1 / 2 / 4 tokens
+//           17.7 / 13.9 / 9.6 -> 28.2 / 21.9 / 13.5 GB/s (5120 in), 17.9 / 13.9 / 9.2 -> 26.9 / 19.3 / 13.2 (2304 in).
+//   STRATA_PTQ1_ROWS3=0: rows_avx2.
+struct R3Group { int8_t q[16][32]; float da[16][8]; };
+struct R3Tok { std::vector<R3Group> g; std::vector<float> C; const Q8* raw = nullptr; };
+struct R3Map {
+    uint8_t g[16][32], v[16][32];
+    R3Map() {
+        for (int k = 0; k < 16; ++k)
+            for (int L = 0; L < 32; ++L) {
+                int gg, val;
+                if (k < 10) { const int n = k % 5; gg = (k < 5 ? 0 : 2) + (L >= 16); val = 16 * n + (L & 15); }
+                else if (k < 15) { gg = L / 8; val = 80 + (L % 8) + 8 * (k - 10); }
+                else { gg = L / 8; const int w = L % 8; val = 120 + (w % 2) + 2 * (w / 2); }
+                g[k][L] = (uint8_t) gg;
+                v[k][L] = (uint8_t) val;
+            }
+    }
+};
+STRATA_PTQ_AVX2_FMA void rows3_prep(const Q8* y, int n, R3Tok& p) {
+    static const R3Map M;
+    const int nb = n / kPtq1Block, ng = nb / 4;
+    p.g.resize((size_t) ng);
+    p.C.resize((size_t) nb);
+    p.raw = y;
+    for (int b = 0; b < nb; ++b) {
+        float c = 0.f;
+        for (int k = 0; k < 4; ++k) {
+            const Q8& a = y[b * 4 + k];
+            int sq = 0;
+            for (int i = 0; i < 32; ++i) sq += a.qs[i];
+            c += ptq_h2f(a.d) * (float) sq;
+        }
+        p.C[(size_t) b] = c;
+    }
+    for (int G = 0; G < ng; ++G) {
+        R3Group& o = p.g[(size_t) G];
+        for (int k = 0; k < 16; ++k) {
+            for (int L = 0; L < 32; ++L) {
+                const int b = 4 * G + M.g[k][L], val = M.v[k][L];
+                o.q[k][L] = y[b * 4 + val / 32].qs[val % 32];
+            }
+            for (int j = 0; j < 8; ++j) {
+                const int b = 4 * G + M.g[k][4 * j], val = M.v[k][4 * j];
+                o.da[k][j] = ptq_h2f(y[b * 4 + val / 32].d);
+            }
+        }
+    }
+}
+// rows3's steps (GCC does not give lambdas the enclosing function's target, hence plain functions)
+STRATA_PTQ_AVX2_FMA inline __m256i r3_digits(__m256i b) {   // sign-flipped p -> digit 0..2
+    const __m256i z = _mm256_setzero_si256();
+    return _mm256_sub_epi8(_mm256_sub_epi8(z, _mm256_cmpgt_epi8(b, _mm256_set1_epi8(-43))), _mm256_cmpgt_epi8(b, _mm256_set1_epi8(42)));
+}
+template <int NT>
+STRATA_PTQ_AVX2_FMA inline void r3_plane(__m256i dg, int k, const R3Tok* const* pt, size_t G, __m256* part) {
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    for (int t = 0; t < NT; ++t) {
+        const R3Group& g = pt[t]->g[G];
+        const __m256i s = _mm256_madd_epi16(_mm256_maddubs_epi16(dg, _mm256_load_si256((const __m256i*) g.q[k])), ones16);
+        part[t] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), _mm256_load_ps(g.da[k]), part[t]);
+    }
+}
+template <int NT>
+STRATA_PTQ_AVX2_FMA inline void r3_planes5(__m256i b, int k0, const R3Tok* const* pt, size_t G, __m256* part) {
+    for (int k = 0; k < 5; ++k) {
+        r3_plane<NT>(r3_digits(b), k0 + k, pt, G, part);
+        if (k < 4) b = _mm256_add_epi8(_mm256_add_epi8(b, b), b);
+    }
+}
+template <int NT>
+STRATA_PTQ_AVX2_FMA inline void r3_flush(__m256 D, __m256* part, __m256* acc) {
+    for (int t = 0; t < NT; ++t) { acc[t] = _mm256_fmadd_ps(part[t], D, acc[t]); part[t] = _mm256_setzero_ps(); }
+}
+template <int NT>
+STRATA_PTQ_AVX2_FMA void rows3(const uint8_t* w, size_t rb, int n, const R3Tok* const* pt, float* const* out, int r0, int r1) {
+    const int nb = n / kPtq1Block, ng = nb / 4;
+    const __m256i flip = _mm256_set1_epi8((char) 0x80), ones16 = _mm256_set1_epi16(1), ones8 = _mm256_set1_epi8(1);
+    // H: lane 8g + 2n + h <- qh byte h of block g (packed [g0h0 g0h1 g1h0 g1h1] per 128-bit half), then x 3^n
+    const __m256i hsh = _mm256_setr_epi8(0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3, 0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3);
+    const __m256i hn1 = _mm256_setr_epi8(0, 0, -1, -1, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0);
+    const __m256i hn2 = _mm256_setr_epi8(0, 0, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0);
+    const __m256i hn3 = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, -1, -1);
+    const __m256i iA0 = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1), iA1 = _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3);
+    const __m256i iT = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3);
+    std::vector<float> dwv((size_t) (4 * ng + 8));
+    float* dwrow = dwv.data();
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * rb;
+        __m256 acc[NT], part[NT];
+        for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+        for (int G = 0; G < ng; ++G) {
+            const uint8_t* B = x + (size_t) G * 4 * kPtq1Bytes;
+            uint16_t h16[4];
+            for (int i = 0; i < 4; ++i) std::memcpy(&h16[i], B + i * kPtq1Bytes + 26, 2);
+            const __m128 dw4 = _mm_cvtph_ps(_mm_setr_epi16((short) h16[0], (short) h16[1], (short) h16[2], (short) h16[3], 0, 0, 0, 0));
+            _mm_storeu_ps(dwrow + 4 * G, dw4);
+            const __m256 dw8 = _mm256_castps128_ps256(dw4);
+            for (int t = 0; t < NT; ++t) part[t] = _mm256_setzero_ps();
+            r3_planes5<NT>(_mm256_xor_si256(_mm256_loadu2_m128i((const __m128i*) (B + kPtq1Bytes), (const __m128i*) B), flip), 0, pt, (size_t) G, part);
+            r3_flush<NT>(_mm256_permutevar8x32_ps(dw8, iA0), part, acc);
+            r3_planes5<NT>(_mm256_xor_si256(_mm256_loadu2_m128i((const __m128i*) (B + 3 * kPtq1Bytes), (const __m128i*) (B + 2 * kPtq1Bytes)), flip), 5, pt, (size_t) G, part);
+            r3_flush<NT>(_mm256_permutevar8x32_ps(dw8, iA1), part, acc);
+            uint64_t tb[4];
+            for (int i = 0; i < 4; ++i) std::memcpy(&tb[i], B + i * kPtq1Bytes + 16, 8);
+            r3_planes5<NT>(_mm256_xor_si256(_mm256_setr_epi64x((long long) tb[0], (long long) tb[1], (long long) tb[2], (long long) tb[3]), flip), 10, pt, (size_t) G, part);
+            uint16_t qh[4];
+            for (int i = 0; i < 4; ++i) std::memcpy(&qh[i], B + i * kPtq1Bytes + 24, 2);
+            const __m256i c = _mm256_setr_epi32((int) (qh[0] | (uint32_t) qh[1] << 16), 0, 0, 0, (int) (qh[2] | (uint32_t) qh[3] << 16), 0, 0, 0);
+            __m256i h = _mm256_xor_si256(_mm256_shuffle_epi8(c, hsh), flip);
+            const __m256i h3 = _mm256_add_epi8(_mm256_add_epi8(h, h), h);
+            const __m256i h9 = _mm256_add_epi8(_mm256_add_epi8(h3, h3), h3);
+            const __m256i h27 = _mm256_add_epi8(_mm256_add_epi8(h9, h9), h9);
+            h = _mm256_blendv_epi8(_mm256_blendv_epi8(_mm256_blendv_epi8(h, h3, hn1), h9, hn2), h27, hn3);
+            r3_plane<NT>(r3_digits(h), 15, pt, (size_t) G, part);
+            r3_flush<NT>(_mm256_permutevar8x32_ps(dw8, iT), part, acc);
+        }
+        float rs[NT];
+        for (int t = 0; t < NT; ++t) {   // the trits' -1 over the grouped blocks
+            const float* C = pt[t]->C.data();
+            __m256 c8 = _mm256_setzero_ps();
+            int b = 0;
+            for (; b + 8 <= 4 * ng; b += 8) c8 = _mm256_fmadd_ps(_mm256_loadu_ps(dwrow + b), _mm256_loadu_ps(C + b), c8);
+            float cs = rhsum(c8);
+            for (; b < 4 * ng; ++b) cs += dwrow[b] * C[b];
+            rs[t] = rhsum(acc[t]) - cs;
+        }
+        for (int b = 4 * ng; b < nb; ++b) {   // leftover blocks: rows_avx2's per-block path
+            const uint8_t* blk = x + (size_t) b * kPtq1Bytes;
+            __m256i dg[4];
+            runpack(blk, dg);
+            uint16_t hd;
+            std::memcpy(&hd, blk + 26, 2);
+            const float dwf = ptq_h2f(hd);
+            for (int t = 0; t < NT; ++t) {
+                const Q8* a = pt[t]->raw + b * 4;
+                __m256 bs = _mm256_setzero_ps();
+                for (int k = 0; k < 4; ++k) {
+                    const __m256i sq = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*) a[k].qs), dg[k]);
+                    const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, sq), ones16);
+                    bs = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(ptq_h2f(a[k].d)), bs);
+                }
+                rs[t] += dwf * rhsum(bs);
+            }
+        }
+        for (int t = 0; t < NT; ++t) out[t][r] = rs[t];
+    }
+}
 }  // namespace
 #endif
 
 void ptq1_0_rows_q8_0(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
 #if STRATA_PTQ1_X86
     static const bool avx2 = cpu_avx2_ok();   // AVX, AVX2, FMA and F16C (expert_layout.hpp)
+    static const bool r3 = !(std::getenv("STRATA_PTQ1_ROWS3") && std::getenv("STRATA_PTQ1_ROWS3")[0] == '0');
+    if (avx2 && r3 && n >= 4 * kPtq1Block) {   // rows3 (above): tokens in groups of <= 4, activations permuted per call
+        thread_local std::vector<R3Tok> tok;
+        if (tok.size() < 4) tok.resize(4);
+        for (int t0 = 0; t0 < nt; t0 += 4) {
+            const int g = nt - t0 < 4 ? nt - t0 : 4;
+            const R3Tok* p[4];
+            for (int t = 0; t < g; ++t) { rows3_prep((const Q8*) act[t0 + t], n, tok[(size_t) t]); p[t] = &tok[(size_t) t]; }
+            switch (g) {
+                case 1: rows3<1>(w, row_bytes, n, p, out + t0, r0, r1); break;
+                case 2: rows3<2>(w, row_bytes, n, p, out + t0, r0, r1); break;
+                case 3: rows3<3>(w, row_bytes, n, p, out + t0, r0, r1); break;
+                default: rows3<4>(w, row_bytes, n, p, out + t0, r0, r1); break;
+            }
+        }
+        return;
+    }
     if (avx2) {
         // tokens in groups of <= 4 (the accumulators stay in registers)
         for (int t0 = 0; t0 < nt; t0 += 4) {
