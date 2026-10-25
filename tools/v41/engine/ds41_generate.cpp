@@ -1121,6 +1121,7 @@ int main(int argc, char ** argv) {
     // drafter loads here, before the VRAM expert cache measures the free memory, so the cache sizes around it.
     // --serve: STRATA_SERVE_DSPARK=<sidecar> (opt-in) - speculative SAMPLING (spec_accept), same output distribution
     const char * dsp_path = a.serve ? std::getenv("STRATA_SERVE_DSPARK") : std::getenv("STRATA_DSPARK");
+    if (dsp_path && !*dsp_path) dsp_path = nullptr;   // an empty value means off (issue #53)
     if (a.serve && dsp_path && (!defer_vram || S < 17)) {
         std::fprintf(stderr, "serve: STRATA_SERVE_DSPARK needs the GPU layer-major prompt path - DSpark off\n");
         dsp_path = nullptr;
@@ -1152,6 +1153,7 @@ int main(int argc, char ** argv) {
                 if (a.serve) {
                     std::fprintf(stderr, "serve: DSpark disabled (%s) — decoding without drafts\n", err.c_str());
                     dsp.reset();
+                    dsp_path = nullptr;   // off for the run: no DSpark tail to feed, no retry each request (#53)
                 } else {
                     err = "DSpark init: " + err;
                     return false;
@@ -1273,6 +1275,9 @@ int main(int argc, char ** argv) {
                 // failed" on a 21K prompt with Whisper's 2.5 GB resident).
                 Ds41Dense & batch_dense = pipe.enabled() ? pipe.dense(0) : dense;
                 for (;;) {
+                    // a DSpark batch seed is read off the final layer-major batch; a 1-token remainder would run on the
+                    // chunk path and capture nothing (prompt = batch + 1: "DSpark batch seed captured nothing", #53)
+                    if (bcap_n > 0 && n - c0 - B == 1 && B > 2) --B;
                     const auto set_cols = [&](int cols) -> bool {
                         if (!pipe.enabled()) {
                             if (cols <= dense.columns()) return true;
