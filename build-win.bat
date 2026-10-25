@@ -23,24 +23,27 @@ rem a local venv with cmake + ninja (python -m venv .venv-build && .venv-build\S
 if exist "%~dp0.venv-build\Scripts" set "PATH=%~dp0.venv-build\Scripts;%PATH%"
 set "PATH=%CUDA_PATH%\bin;%PATH%"
 set "NVCC=%CUDA_PATH:\=/%/bin/nvcc.exe"
-if /i "%~1"=="configure" (
-  cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release ^
-    -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON -DSTRATA_MMQ_KQUANTS=ON ^
-    -DCMAKE_CUDA_ARCHITECTURES=%CUDA_ARCH% "-DCMAKE_CUDA_COMPILER=%NVCC%" ^
-    -DSTRATA_GGML_DIR=%~dp0third_party/llama.cpp ^
-    -DSTRATA_DSV41_FQ_OP=ON -DSTRATA_DSV41_HC_MIX=ON
-  exit /b %errorlevel%
-)
+rem cl.exe prints its /showIncludes notes in the console code page, and CMake writes the localized prefix that Ninja
+rem matches them against into rules.ninja in the code page it generates under. Generated or built under another code
+rem page (936 on Chinese Windows), nothing matches, Ninja records no header dependencies, and a changed header leaves
+rem stale objects. Configure and build under UTF-8, then restore the caller's code page.
+for /f "tokens=2 delims=:." %%c in ('chcp') do set "OLDCP=%%c"
+chcp 65001 >nul
+if /i "%~1"=="configure" goto :configure
 set "TARGETS=%*"
 if "%TARGETS%"=="" set "TARGETS=ds41_generate"
 rem Cap the parallel jobs: each nvcc job can take several GB of RAM, and the default (cores + 2) froze a 128 GB PC.
 if "%JOBS%"=="" set "JOBS=6"
-rem cl.exe prints its /showIncludes notes in the console code page, but CMake stored the localized prefix that Ninja
-rem matches them against in UTF-8 (rules.ninja). Under another code page (936 on Chinese Windows) nothing matches,
-rem Ninja records no header dependencies, and a changed header leaves stale objects. Build under UTF-8, then restore.
-for /f "tokens=2 delims=:." %%c in ('chcp') do set "OLDCP=%%c"
-chcp 65001 >nul
 ninja -C build-win -k 0 -j %JOBS% %TARGETS%
 set "RC=%errorlevel%"
+goto :done
+:configure
+cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+  -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON -DSTRATA_MMQ_KQUANTS=ON ^
+  -DCMAKE_CUDA_ARCHITECTURES=%CUDA_ARCH% "-DCMAKE_CUDA_COMPILER=%NVCC%" ^
+  -DSTRATA_GGML_DIR=%~dp0third_party/llama.cpp ^
+  -DSTRATA_DSV41_FQ_OP=ON -DSTRATA_DSV41_HC_MIX=ON
+set "RC=%errorlevel%"
+:done
 if defined OLDCP chcp %OLDCP: =% >nul
 exit /b %RC%
