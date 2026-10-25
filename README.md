@@ -26,10 +26,12 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 > `hf download IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored v4/rank-1017-v4.bin --local-dir V41-XQ-1017`, then
 > point `--rank` at it and pull the latest Xolotl.
 >
-> Heads up though, right now V4 is slower than V3 because those hot experts are bigger, so fewer fit in VRAM. Served
-> with DSpark it's at 17.5 / 19.6 tok/s decode after 8K / 20K-token prompts with the new rank and
-> `--tier-batch-pcie 0.25` (from 15.6 / 16.8 at release; V3 does ~22). I'm working on it in the engine now (the Q2_0
-> CPU rows already went 5-9x) and the numbers go on the HF card as they land. Needs Xolotl from 21 Oct or newer.
+> **V4 speed update (25 Oct evening): it's caught up.** Served with DSpark on my PC it now does **21.9-22.4 / 21.8-23.8
+> tok/s** decode after 8K / 20K-token prompts with the dense half at Q8_0, and 22.7-23.3 / 24.2-24.3 with the default
+> Q6_K re-quant (this morning 17.5 / 19.6, at release 15.6 / 16.8; V3 does ~22). Prefill is 237-250 / 309-321 tok/s at
+> Q8 (Q6: 237-243 / 364-383). It's all engine work, none of it costs quality: the route bias refreshing as you go,
+> zero-copy NVMe reads, read-ahead per layer, MMQ for the prestaged RAM experts on big prompts and faster CPU kernels.
+> Pull the latest Xolotl (25 Oct or newer) and use `--rank v4/rank-1017-v4.bin --tier-batch-pcie 0.25`.
 
 > **ISTA-DASLab's GGUFs work too.** Xolotl loads [ISTA-DASLab](https://huggingface.co/ISTA-DASLab)'s
 > [GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) of DeepSeek-V4.1-Flash-1017
