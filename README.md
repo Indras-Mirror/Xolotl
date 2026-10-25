@@ -27,13 +27,14 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 > point `--rank` at it and pull the latest Xolotl.
 >
 > **V4 speed update (25 Oct, late): it's caught up, and prefill is way up.** On the coding tasks below (21 HumanEval, 10
-> tool calls, 3 agentic loops) V4 solved **21/21, 10/10, 3/3** and decoded at **25.7 tok/s**. Prefill on a fresh prompt is
-> **263-276 tok/s at 8K and 354-404 at 20K** (dense half at Q8_0; the 20K figure depends on whether the prompt fits two
-> sweeps or needs three), up from 192 / 271 this morning. Short follow-up messages got a lot quicker too: a 32-token
-> message now takes ~3.9 s instead of ~7.4. With the default Q6_K re-quant prefill is 284-296 / 386-388 and decode 22.6-24.5
-> on the probe. It's all engine work, none of it costs quality: the route bias refreshing as you go, zero-copy NVMe reads,
+> tool calls, 3 agentic loops) V4 solved **21/21, 10/10, 3/3** and decoded at **25.7 tok/s** (29.0 with the newer
+> conversation-seeded VRAM cache). Prefill on a fresh prompt is **289-297 tok/s at 8K and 395-409 at 20K** (dense half at
+> Q8_0), up from 192 / 271 this morning, and decode is 21.7-21.8 / 22.6-24.5 tok/s after 8K / 20K prompts. Short follow-up messages got a lot quicker too: a 32-token
+> message now takes ~3.9 s instead of ~7.4. With the default Q6_K re-quant prefill is 298-300 / 385-388 and decode
+> 23.5-23.9 / 25.3-25.6. It's all engine work, none of it costs quality: the route bias refreshing as you go, zero-copy NVMe reads,
 > read-ahead per layer, MMQ for the experts staged from RAM, DSpark staying loaded when the prompt fits anyway, and short
-> turns going through the prompt batch. Pull the latest Xolotl (25 Oct or newer) and use
+> turns going through the prompt batch, and the VRAM cache reloading with this conversation's experts after each
+> prompt. Pull the latest Xolotl (25 Oct or newer) and use
 > `--rank v4/rank-1017-v4.bin --tier-batch-pcie 0.25`.
 
 > **ISTA-DASLab's GGUFs work too.** Xolotl loads [ISTA-DASLab](https://huggingface.co/ISTA-DASLab)'s
@@ -54,7 +55,7 @@ loops), greedy, thinking on with a 32K-token thinking budget.
 | Model | Size | Prefill | Decode | HumanEval | Tool calls | Agentic | Context |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | **[DeepSeek-V4.1-Flash](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)** | 552B MoE | **180-320 tok/s** | **26.8 tok/s** | 21/21 | 10/10 | 3/3 | 512K |
-| **[DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)** (XQ) | 552B MoE | **263-404 tok/s** | **25.7 tok/s** | 21/21 | 10/10 | 3/3 | 512K |
+| **[DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)** (XQ) | 552B MoE | **289-409 tok/s** | **25.7 tok/s** | 21/21 | 10/10 | 3/3 | 512K |
 | **GLM-5.3-Flash** | 320B MoE | **290-375 tok/s** | **25.3 tok/s** | 19/21 | 10/10 | 3/3 | 512K |
 | **Qwen3.8-Flash-Next** | 125B MoE | **3,000-3,430 tok/s** | **127.8 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
 | **Qwen3.8-27B** (dense) | 27B | **1,240-1,390 tok/s** | **98.5 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
@@ -67,7 +68,7 @@ DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts
 187 / 317 tok/s at 6.4K / 16.7K. GLM-5.3-Flash: soft prune + `--route-bias 0.25`
 (`tools/glm/serve/strata-glm-maya-abl-512k-bias.json`), prefill 301 / 374 tok/s at 6.1K / 15.6K and 368-376 on fresh
 30K / 44K prompts. DeepSeek-V4.1-Flash-1017 V4 (25 Oct): dense half Q8_0, `rank-1017-v4.bin` + `--tier-batch-pcie 0.25`,
-prefill 263-276 / 354-404 tok/s at 6.5K / 16.4-16.8K. How close the DeepSeek quant gets to DeepSeek's own API on the same tasks:
+prefill 289-297 / 395-409 tok/s at 6.1K / 16.5K. How close the DeepSeek quant gets to DeepSeek's own API on the same tasks:
 [docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md#deepseek-v41-quant-vs-the-deepseek-api).</sub>
 
 **What that means in practice:**
