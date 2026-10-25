@@ -28,7 +28,8 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 >
 > **V4 speed update (25 Oct, late): it's caught up, and prefill is way up.** On the coding tasks below (21 HumanEval, 10
 > tool calls, 3 agentic loops) V4 solved **21/21, 10/10, 3/3** and decoded at **25.7 tok/s** (29.0 with the newer
-> conversation-seeded VRAM cache). Prefill on a fresh prompt is **289-297 tok/s at 8K and 395-409 at 20K** (dense half at
+> conversation-seeded VRAM cache). On the **full HumanEval (all 164)** it got **162/164** (98.8%, greedy, 32K thinking budget,
+> decoding at 40 tok/s across the run). Prefill on a fresh prompt is **289-297 tok/s at 8K and 395-409 at 20K** (dense half at
 > Q8_0), up from 192 / 271 this morning, and decode is 21.7-21.8 / 22.6-24.5 tok/s after 8K / 20K prompts. Short follow-up messages got a lot quicker too: a 32-token
 > message now takes ~3.9 s instead of ~7.4. With the default Q6_K re-quant prefill is 298-300 / 385-388 and decode
 > 23.5-23.9 / 25.3-25.6. It's all engine work, none of it costs quality: the route bias refreshing as you go, zero-copy NVMe reads,
@@ -68,7 +69,7 @@ DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts
 187 / 317 tok/s at 6.4K / 16.7K. GLM-5.3-Flash: soft prune + `--route-bias 0.25`
 (`tools/glm/serve/strata-glm-maya-abl-512k-bias.json`), prefill 301 / 374 tok/s at 6.1K / 15.6K and 368-376 on fresh
 30K / 44K prompts. DeepSeek-V4.1-Flash-1017 V4 (25 Oct): dense half Q8_0, `rank-1017-v4.bin` + `--tier-batch-pcie 0.25`,
-prefill 289-297 / 395-409 tok/s at 6.1K / 16.5K. How close the DeepSeek quant gets to DeepSeek's own API on the same tasks:
+prefill 289-297 / 395-409 tok/s at 6.1K / 16.5K; full HumanEval (164) 162/164. How close the DeepSeek quant gets to DeepSeek's own API on the same tasks:
 [docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md#deepseek-v41-quant-vs-the-deepseek-api).</sub>
 
 **What that means in practice:**
