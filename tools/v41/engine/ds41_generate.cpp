@@ -3099,9 +3099,14 @@ int main(int argc, char ** argv) {
     // the DSpark window needs per-position main_hidden, which the layer-major prompt does not produce: the last
     // min(128, L-1) prompt tokens run through pass_v (chunks of <= 16) after the VRAM cache opens
     const int sp_tail = spec ? std::min<int>(128, (int) prompt.size() - 1) : 0;
+    // STRATA_PROFILE_PROMPT=1: nsys --capture-range=cudaProfilerApi captures exactly the layer-major prompt (as
+    // STRATA_PROFILE_DECODE does the decode)
+    static const bool prof_prompt = std::getenv("STRATA_PROFILE_PROMPT") != nullptr;
+    if (prof_prompt) Ds41MoeTier::profiler(true);
     const bool ok = feed(prompt.data(), (int) prompt.size() - dm_tail - sp_tail, 0, [&](int done) {
         if (!a.quiet) std::fprintf(stderr, "\rprompt %d/%zu", done, prompt.size());
     }, a.ppl || !a.dump_logits.empty() ? &all : nullptr);
+    if (prof_prompt) Ds41MoeTier::profiler(false);
     if (!ok) { std::fprintf(stderr, "\nds41_generate: prefill: %s\n", ferr.c_str()); return 1; }
     if (dm_tail > 0 && defer_vram && !open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
     for (int i = (int) prompt.size() - dm_tail; i < (int) prompt.size(); ++i)
