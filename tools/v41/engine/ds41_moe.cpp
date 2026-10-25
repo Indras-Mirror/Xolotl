@@ -461,6 +461,7 @@ struct Gpu {
     /// Cleared wherever p_layer is reset by a release.
     int p_lazy_layer = -1;
     bool p_off = false, p_used_rec = false;
+    bool p_packed = false;   ///< the region holds each class at its MMQ stride (chunk_pstage_fill; eager fills only)
     std::vector<unsigned long long> p_ptr;
     cudaEvent_t p_copied = nullptr, p_used = nullptr;
     void *c_w = nullptr, *c_out = nullptr;   ///< run_chunk: the top-k weights and the summed rows on the card
@@ -4676,6 +4677,9 @@ bool chunk_pstage_alloc(Ds41MoeImpl& im) {
             gp.p_off = true;
             return false;
         }
+        // zeroed once: MMQ reads up to 4 KiB past a matrix, and the bytes past a blob in its stride slot then hold
+        // zeros or an earlier layer's blob - finite either way (as the stage halves)
+        ck(cudaMemset(gp.p_buf, 0, gp.p_cap), "pstage zero");
         ck(cudaEventCreateWithFlags(&gp.p_copied, cudaEventDisableTiming), "ev");
         ck(cudaEventCreateWithFlags(&gp.p_used, cudaEventDisableTiming), "ev");
         static bool said = false;
@@ -4695,18 +4699,44 @@ int chunk_pstage_fill(Ds41MoeImpl& im, int64_t layer, const int32_t* routed) {
     gp.p_ptr.assign((size_t) NX, 0ull);
     size_t off = 0;
     int nput = 0;
-    for (int64_t e = 0; e < NX; ++e) {
-        if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
-        const uint8_t* src = gp.arena.ptr(layer, e);
-        if (!src) continue;
-        const size_t bl = (size_t) im.bl[(size_t) (im.g.per_expert() ? im.g.cls(layer, (int32_t) e) : layer)];
-        if (off + bl > gp.p_cap) break;
-        if (!routed || routed[e]) {
+    // Per format class, ascending ids, each blob at its class's run_chunk stride (chunk_stride = gpu_run_chunk's SL):
+    // a run of one class's adjacent experts is then ONE strided MMQ launch.  Packed by id with the classes interleaved
+    // at 256 B (the old layout), no run was strided and every prestaged arena expert ran on MMVQ - on V4 the 6.4K
+    // prompt's grouped kernels took 10.3 s (Q3_K/Q3_K 4.7 TOPS) against 1.5 s with the prestage off (109 TOPS).
+    // EAGER fills only (routed == null: calls >= STRATA_PRESTAGE_MIN rows, ~16+ rows an expert): a lazy fill serves a
+    // short turn (~3 rows an expert on V4), where the grouped MMVQ beats MMQ (+172-token turn 5.06 s MMVQ vs 5.61 MMQ),
+    // so it keeps the old layout.  STRATA_PSTAGE_PACK=0: the old layout for every fill.
+    static const bool pack_env = !(std::getenv("STRATA_PSTAGE_PACK") && std::atoi(std::getenv("STRATA_PSTAGE_PACK")) == 0);
+    const bool by_class = pack_env && !routed;
+    gp.p_packed = by_class;
+    const size_t tail = (size_t) 1 << 20;   // MMQ reads up to 4 KiB past a matrix: never against the region's end
+    const int64_t NC = by_class && im.g.per_expert() ? im.g.n_classes() : 1;
+    bool full = false;
+    for (int64_t c = 0; c < NC && !full; ++c) {
+        for (int64_t e = 0; e < NX; ++e) {
+            if (NC > 1 && im.g.cls(layer, (int32_t) e) != (int) c) continue;
+            if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
+            const uint8_t* src = gp.arena.ptr(layer, e);
+            if (!src) continue;
+            const int64_t ci = im.g.per_expert() ? im.g.cls(layer, (int32_t) e) : layer;
+            const size_t bl = (size_t) im.bl[(size_t) ci];
+            if (!by_class) {
+                if (off + bl > gp.p_cap) { full = true; break; }
+                if (!routed || routed[e]) {
+                    ck(cudaMemcpyAsync((uint8_t*) gp.p_buf + off, src, bl, cudaMemcpyHostToDevice, gp.s_cp), "pstage dma");
+                    gp.p_ptr[(size_t) e] = (unsigned long long) gp.p_buf + off;
+                    ++nput;
+                }
+                off = (off + bl + 255) & ~(size_t) 255;
+                continue;
+            }
+            const size_t sl = (size_t) chunk_stride(im, ci);
+            if (off + sl + tail > gp.p_cap) { full = true; break; }
             ck(cudaMemcpyAsync((uint8_t*) gp.p_buf + off, src, bl, cudaMemcpyHostToDevice, gp.s_cp), "pstage dma");
             gp.p_ptr[(size_t) e] = (unsigned long long) gp.p_buf + off;
             ++nput;
+            off += sl;
         }
-        off = (off + bl + 255) & ~(size_t) 255;
     }
     if (std::getenv("STRATA_PSTAGE_TRACE")) {   // diagnostic: which layers fill, how many, and the region's packing
         static int said = 0;
@@ -5323,7 +5353,10 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             std::vector<int32_t> re;
             std::vector<unsigned long long> rp;
             for (size_t q = 0; q < es.size(); ++q) {
-                if (!re.empty() && first[(size_t) re.back()] + cnt[(size_t) re.back()] != first[(size_t) es[q]]) {
+                // a run = adjacent in the entry order AND one stride apart in the region (one strided MMQ launch;
+                // the eager prestage holds unrouted experts between routed ones; the old layout: entry order only)
+                if (!re.empty() && (first[(size_t) re.back()] + cnt[(size_t) re.back()] != first[(size_t) es[q]] ||
+                                    (gp.p_packed && rp.back() + (unsigned long long) SL != ps[q]))) {
                     launch(re, rp);
                     re.clear();
                     rp.clear();
