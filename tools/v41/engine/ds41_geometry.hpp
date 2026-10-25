@@ -58,6 +58,9 @@ struct Ds41Geometry {
     std::vector<uint32_t> engram_token_map;          ///< [vocab] compressed id
     std::vector<uint64_t> engram_primes;             ///< [n_engram_layers * (ngram-1) * heads]
     std::vector<int64_t> engram_mult;                ///< [n_engram_layers * ngram]
+    /// deepseek41.engram.encoding: "q6_k_gguf" = the tables are a llama.cpp GGUF's per_layer_token_embd.weight (Q6_K,
+    /// every slot's rows in one tensor); anything else (DwarfStar's "e4m3_e8m0_32_row264", or no key) = the HF shards
+    std::string engram_encoding;
     int64_t bos = -1, eos = -1;
     std::vector<Ds41ExpertMap> experts;              ///< [n_layer]
 
@@ -536,6 +539,10 @@ inline std::string ds41_read_geometry(const GgufModel & model, Ds41Geometry & G)
     if (!(e = detail::u64(g, P + "engram.compressed_vocab_size", G.engram_cvocab)).empty()) return e;
     if (!(e = detail::arr(g, P + "engram.layer_ids", G.engram_layers)).empty()) return e;
     if (!(e = detail::arr(g, P + "engram.rows", G.engram_rows)).empty()) return e;
+    {   // optional, and only "q6_k_gguf" changes the reader: every other file reads the FP8 shards as before
+        const MetaValue * enc = g.get(P + "engram.encoding");
+        G.engram_encoding = enc && enc->type == MetaType::STRING ? enc->s : "e4m3_e8m0_32_row264";
+    }
     const std::string & path = g.path();
     std::vector<int64_t> tm, pr;
     if (!(e = ds41_read_int_array(path, P + "engram.token_map", tm)).empty()) return e;

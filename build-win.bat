@@ -35,4 +35,12 @@ set "TARGETS=%*"
 if "%TARGETS%"=="" set "TARGETS=ds41_generate"
 rem Cap the parallel jobs: each nvcc job can take several GB of RAM, and the default (cores + 2) froze a 128 GB PC.
 if "%JOBS%"=="" set "JOBS=6"
+rem cl.exe prints its /showIncludes notes in the console code page, but CMake stored the localized prefix that Ninja
+rem matches them against in UTF-8 (rules.ninja). Under another code page (936 on Chinese Windows) nothing matches,
+rem Ninja records no header dependencies, and a changed header leaves stale objects. Build under UTF-8, then restore.
+for /f "tokens=2 delims=:." %%c in ('chcp') do set "OLDCP=%%c"
+chcp 65001 >nul
 ninja -C build-win -k 0 -j %JOBS% %TARGETS%
+set "RC=%errorlevel%"
+if defined OLDCP chcp %OLDCP: =% >nul
+exit /b %RC%

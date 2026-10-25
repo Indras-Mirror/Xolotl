@@ -266,6 +266,12 @@ public:
     /// geometry is uniform across its format classes; a mixed-geometry batch falls back to one call per job).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
+    /// run_split_multi_native in two halves (xolotl, STRATA_CPU_OVERLAP=3: an expert's gate/up rows run while its down
+    /// rows are still being read): half 0 = the gate/up rows and the SwiGLU row's quantization, half 1 = the down rows,
+    /// of the SAME job objects (a LoRA's a . h stays in the job); job e keeps its intermediate in split slot slots[e]
+    /// (< kMaxSplitMulti) between the two.  Each row's arithmetic and the quantization are the one call's, so the
+    /// outputs are its bits.  A batch of mixed n_embd/n_ff runs one job at a time, like the one call.
+    void run_split_multi_native_half(const NativeFmt& f, ExpertJobMulti* jobs, int n, int half, const int* slots);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -389,6 +395,7 @@ private:
     };
     const NativeFmt* nfmt_ = nullptr;
     NativeArithmetic narithmetic_ = NativeArithmetic::Default;
+    const int* mslots_ = nullptr;   // run_split_multi_native_half: job e's split slot (null: slot e)
     std::vector<SplitBufMulti> split_multi_;
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the

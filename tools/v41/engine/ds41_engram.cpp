@@ -102,6 +102,44 @@ float fp16_to_f32(uint16_t h) {
     return f;
 }
 
+// Q6_K (ggml block_q6_K, 210 bytes per 256 weights): Unsloth's / llama.cpp #30817's per_layer_token_embd.weight
+constexpr int kQ6k = 14;
+
+// k Q6_K values (ggml's block_q6_K, 210 bytes per 256: ql[128] qh[64] scales[16] d) -> floats.  The arithmetic of
+// ggml's dequantize_row_q6_K, term for term, so a row comes out as llama.cpp's get_rows gives it on the CPU; kept here
+// instead of linking ggml because bench_ds41_engram / ds41_engram_hot build this file without it.
+void q6k_dequant(const uint8_t * x, float * y, int64_t k) {
+    for (int64_t i = 0; i < k / 256; ++i, x += 210) {
+        const uint8_t * ql = x;
+        const uint8_t * qh = x + 128;
+        const int8_t * sc = (const int8_t *) (x + 192);
+        uint16_t dh;
+        std::memcpy(&dh, x + 208, 2);
+        const float d = fp16_to_f32(dh);
+        for (int n = 0; n < 256; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                const int is = l / 16;
+                const int8_t q1 = (int8_t) ((ql[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int8_t q2 = (int8_t) ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int8_t q3 = (int8_t) ((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int8_t q4 = (int8_t) ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l + 0] = d * sc[is + 0] * q1;
+                y[l + 32] = d * sc[is + 2] * q2;
+                y[l + 64] = d * sc[is + 4] * q3;
+                y[l + 96] = d * sc[is + 6] * q4;
+            }
+            y += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+// does the GGUF at `path` hold a tensor `name`?  (a file that does not parse: no)
+bool gguf_has(const std::string & path, const char * name) {
+    try { return GgufFile(path).find(name) != nullptr; } catch (const std::exception &) { return false; }
+}
 }  // namespace
 
 // ---- raw block-device reads for a fragmented table file ----------------------------------------------------------
@@ -239,6 +277,7 @@ void Ds41Engram::deq_row(const uint8_t * w, const uint8_t * s, float * o) const 
         }
         return;
     }
+    if (qtype_ == kQ6k) { q6k_dequant(w, o, dim_); return; }
     if (qtype_ == kIq4nl) {
         for (int64_t b = 0; b < dim_ / 32; ++b) {
             const uint8_t * blk = w + b * kIq4nlBlock;
@@ -413,6 +452,62 @@ bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
     return true;
 }
 
+// The Q6_K tables: one llama.cpp tensor per_layer_token_embd.weight [dim, rows of every slot] holds slot 0's rows, then
+// slot 1's (its hash ids are offset by slot 0's rows: llama.cpp's head_offsets run across both), so slot e's table
+// starts at the rows of the slots before it.  Each slot gets its own descriptor (the destructor closes every one).
+bool Ds41Engram::open_q6k(const std::vector<std::string> & paths, std::string & err) {
+    const char * name = "per_layer_token_embd.weight";
+    int64_t total = 0;
+    for (int64_t r : g_->engram_rows) total += r;
+    if (dim_ % 256) { err = "engram: Q6_K rows need a dim that is a multiple of 256"; return false; }
+    qtype_ = kQ6k;
+    wrow_ = dim_ / 256 * 210;
+    srow_ = 0;
+    std::string path;
+    uint64_t off = 0;
+    for (const auto & p : paths) {
+        std::vector<std::string> cand;
+        std::error_code ec;
+        if (std::filesystem::is_directory(p, ec)) {
+            for (const auto & de : std::filesystem::directory_iterator(p, ec))
+                if (de.path().extension() == ".gguf") cand.push_back(de.path().string());
+            std::sort(cand.begin(), cand.end());
+        } else if (exists(p)) {
+            cand.push_back(p);
+        }
+        for (const auto & c : cand) {
+            std::unique_ptr<GgufFile> f;
+            try { f = std::make_unique<GgufFile>(c); } catch (const std::exception &) { continue; }
+            const TensorInfo * t = f->find(name);
+            if (!t) continue;
+            if (t->type != 14 || t->shape.size() != 2 || t->shape[0] != (uint64_t) dim_ || t->shape[1] != (uint64_t) total) {
+                err = "engram: " + c + ": " + name + " is not Q6_K [" + std::to_string(dim_) + ", " + std::to_string(total) + "]";
+                return false;
+            }
+            path = c;
+            off = f->data_start() + t->offset;
+            break;
+        }
+        if (!path.empty()) break;
+    }
+    if (path.empty()) { err = std::string("engram: no GGUF with ") + name + " in the given paths"; return false; }
+    uint64_t row0 = 0;
+    for (int64_t e = 0; e < (int64_t) g_->engram_rows.size(); ++e) {
+        Table t;
+        t.fd_w = ds41_sys::open(path.c_str(), O_RDONLY);
+        if (t.fd_w < 0) { err = "engram: cannot open " + path; return false; }
+        ds41_sys::posix_fadvise(t.fd_w, 0, 0, POSIX_FADV_RANDOM);
+        t.off_w = off + row0 * (uint64_t) wrow_;
+        t.rm_w = raw_map(path, t.fd_w);
+        t.rows = g_->engram_rows[(size_t) e];
+        row0 += (uint64_t) t.rows;
+        tables_.push_back(t);
+    }
+    std::fprintf(stderr, "engram: Q6_K tables from %s (%lld rows, %lld bytes each)\n", path.c_str(), (long long) total,
+                 (long long) wrow_);
+    return true;
+}
+
 bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & dirs, int threads, std::string & err) {
     setup_hash(g);
     const int64_t nel = (int64_t) g.engram_layers.size();
@@ -422,15 +517,21 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
     std::string gguf;
     for (const auto & d : dirs)
         if (d.size() > 5 && d.compare(d.size() - 5, 5, ".gguf") == 0) { gguf = d; break; }
+    // Q6_K tables (Unsloth's / llama.cpp #30817's per_layer_token_embd.weight): a converted GGUF says so
+    // (deepseek41.engram.encoding = "q6_k_gguf"), and a .gguf entry holding that tensor is read the same way under any
+    // backbone of the checkpoint (ISTA-DASLab's GSQ-RCO GGUFs: their own Engram GGUF is IQ4_NL, blk.<l>.engram_embd)
+    const bool q6k = g.engram_encoding == "q6_k_gguf" || (!gguf.empty() && gguf_has(gguf, "per_layer_token_embd.weight"));
     std::string index;
-    if (gguf.empty()) {
+    if (q6k) {
+        if (!open_q6k(dirs, err)) return false;
+    } else if (gguf.empty()) {
         for (const auto & d : dirs) {
             index = slurp(d + "/model.safetensors.index.json");
             if (!index.empty()) break;
         }
         if (index.empty()) { err = "engram: no model.safetensors.index.json in the given dirs (and no .gguf entry)"; return false; }
     } else if (!open_gguf(gguf, err)) return false;
-    for (int64_t e = 0; gguf.empty() && e < nel; ++e) {
+    for (int64_t e = 0; gguf.empty() && !q6k && e < nel; ++e) {
         const std::string base = "layers." + std::to_string(g.engram_layers[(size_t) e]) + ".engram.embed.";
         Table t;
         for (int k = 0; k < 2; ++k) {

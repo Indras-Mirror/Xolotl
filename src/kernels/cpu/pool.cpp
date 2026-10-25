@@ -1214,7 +1214,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int e = (int) (g / h), l0 = (int) (g % h);
                 const int l1 = (int) std::min<int64_t>(h, l0 + (g1 - g));
                 const int r0 = row0 + l0, r1 = row0 + l1;
-                SplitBufMulti& sb = split_multi_[(size_t) e];
+                SplitBufMulti& sb = split_multi_[(size_t) (mslots_ ? mslots_[e] : e)];   // _half: job e's slot
                 const NativeFmt* const nfmt = mjobs_[e].fmt != nullptr ? mjobs_[e].fmt : nfmt_;   // 149-cold: same types and rows
                 if (mode_ == 5 && q2_native_kernels(nfmt->gu_type)) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
@@ -1423,6 +1423,62 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
     }
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
+    mode_ = 0;
+    ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void ExpertPool::run_split_multi_native_half(const NativeFmt& f, ExpertJobMulti* jobs, int n, int half, const int* slots) {
+    if (n <= 0) return;
+    for (int e = 1; e < n; ++e)   // the one call's rule: one geometry per row partition
+        if (jobs[e].fmt && (jobs[e].fmt->n_embd != f.n_embd || jobs[e].fmt->n_ff != f.n_ff)) {
+            for (int j = 0; j < n; ++j) run_split_multi_native_half(jobs[j].fmt ? *jobs[j].fmt : f, jobs + j, 1, half, slots + j);
+            mode_ = 0;
+            return;
+        }
+    const auto t0 = std::chrono::steady_clock::now();
+    mjobs_ = jobs;
+    nfmt_ = &f;
+    mslots_ = slots;
+    narithmetic_ = NativeArithmetic::Default;
+    if (half == 0) {   // run_split_multi_native's phase 5 and the quantization after it
+        mper_ = f.n_ff;
+        mrows_ = (int64_t) n * f.n_ff;
+        mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, n) : phase_tasks(mrows_);
+        run_phase(5, mtasks_);
+        const auto b = std::chrono::steady_clock::now();
+        for (int e = 0; e < n; ++e) {
+            SplitBufMulti& sb = split_multi_[(size_t) slots[e]];
+            const NativeFmt& fd = mjobs_[e].fmt ? *mjobs_[e].fmt : f;
+            for (int t = 0; t < mjobs_[e].nt; ++t) {
+                if (mjobs_[e].lora_a) {
+                    const float* la = mjobs_[e].lora_a;
+                    float s = 0.f;
+                    for (int64_t i = 0; i < fd.n_ff; ++i) s += la[i] * sb.ff[t][i];
+                    mjobs_[e].lora_s[t] = s;
+                }
+                if (q2_native_kernels(fd.d_type)) act_quant_any(sb.ff[t], (int) fd.n_ff, sb.a2[t]);
+                else native_quant_h(fd, sb.ff[t], sb.hq[t]);
+            }
+        }
+        ms_multi_gu += std::chrono::duration<double, std::milli>(b - t0).count();
+        ms_multi_q += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b).count();
+    } else {           // its phase 6 and the LoRA's down delta
+        mper_ = f.n_embd;
+        mrows_ = (int64_t) n * f.n_embd;
+        mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_embd, n) : phase_tasks(mrows_);
+        run_phase(6, mtasks_);
+        for (int e = 0; e < n; ++e)
+            if (mjobs_[e].lora_a && mjobs_[e].lora_b)
+                for (int t = 0; t < mjobs_[e].nt; ++t) {
+                    float* o = mjobs_[e].out[t];
+                    const float s = mjobs_[e].lora_s[t];
+                    const float* lb = mjobs_[e].lora_b;
+                    if (o) for (int64_t j = 0; j < f.n_embd; ++j) o[j] += s * lb[j];
+                }
+        ms_multi_down += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        multi_bytes += (int64_t) n * (int64_t) f.bytes;
+    }
+    mslots_ = nullptr;
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }

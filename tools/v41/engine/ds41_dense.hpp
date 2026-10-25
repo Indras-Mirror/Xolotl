@@ -210,6 +210,17 @@ public:
     /// layer reads the state finish just wrote, so the result is identical to finish() then predict(), with one graph
     /// launch / sync / readback less per layer.  top_ids gets the next layer's top n_top (<= 16) predicted experts.
     bool finish_predict(int il, const float * routed_sum, int next_il, int * top_ids, int n_top);
+    /// STRATA_ATTN_AHEAD (decode, opt-in): finish_predict(), with next_il's attention graph and its readbacks queued
+    /// right behind it on the same stream; returns once the prediction has landed, while that attention runs on, and
+    /// the caller's attn_router(next_il) then only waits for it.  The same graphs in the same order: the same bits.
+    /// Nothing else may run on this object between the two calls.  Falls back to finish_predict() when the setup has
+    /// no pinned readbacks (can_attn_ahead) or a graph is not cached yet.
+    bool finish_predict_attn(int il, const float * routed_sum, int next_il, int * top_ids, int n_top);
+    bool can_attn_ahead() const;   // STRATA_PIN_RB's pinned packet + STRATA_DENSE_ASYNC, a one-token pass
+    /// STRATA_ATTN_TAIL=2: queue layer il's tail graph (the FFN hc mixes + the shared expert that attn_router left
+    /// out) if it is still owed; the decode loop calls it from the tier's after-card-side hook.  finish / predict
+    /// queue an owed tail themselves, so a missed call only costs the overlap.  True when there is nothing to do.
+    bool queue_tail(int il);
     /// finish_predict + the routing predictions of the `ahead` layers after next_il, from the same state, in the same
     /// graph: ahead_ids[a * 16 ..] = layer next_il + 1 + a's top 16 (-1 past the last layer).  For speculative
     /// file-tier reads; a hint only.

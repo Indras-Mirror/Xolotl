@@ -60,10 +60,12 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "strata/kernels/cpu/pool.hpp"
 
 #ifdef STRATA_ENABLE_CUDA
 #include <cuda_runtime.h>
 #include "ggml-cuda.h"
+#include "strata/platform/memory.hpp"
 #endif
 
 #include <algorithm>
@@ -509,6 +511,17 @@ int main(int argc, char ** argv) {
         if (!src.build_shadow(a.build_shadow, from, to, to, th, err, skip.empty() ? nullptr : &skip)) { std::fprintf(stderr, "ds41_generate: build-shadow: %s\n", err.c_str()); return 1; }
         return 0;
     }
+    // STRATA_HOST_PIN=1 (opt-in): this thread - the decode loop, which also joins the expert pool's drains - on the
+    // pool's reserved core, as Strata's own session loop does (src/core/session.cpp).  The pool pins its workers to
+    // the other physical cores; left to the OS this thread can land on a worker's core or its SMT sibling.  A CPU Set
+    // (a placement preference, never a hard mask): the same jobs, rows and bits.  STRATA_HOST_PIN=2: the reserved core
+    // is the LAST physical core instead of the first (Strata's --host-core last; the pool then takes the first).
+    if (const char* hp = std::getenv("STRATA_HOST_PIN"); hp && (hp[0] == '1' || hp[0] == '2')) {
+        if (hp[0] == '2') strata::kernels::cpu::set_host_core(strata::kernels::cpu::HostCore::Last);
+        const int hc = strata::kernels::cpu::planned_host_core();
+        const bool ok = strata::kernels::cpu::pin_current_thread(hc).valid;
+        std::fprintf(stderr, "ds41_generate: STRATA_HOST_PIN: decode thread on processor %d%s\n", hc, ok ? "" : " FAILED");
+    }
     if (!a.build_mirror.empty()) {   // the second-drive blob mirror (STRATA_BLOB_MIRROR): coldest experts first
         std::string err;
         if (a.mirror_gib < 0) {   // --check-mirror F: open it with every blob compared against the model file
@@ -902,6 +915,20 @@ int main(int argc, char ** argv) {
     std::vector<float> dm_x, dm_pre, dm_row;
     int dm_tok = 0, dm_pos = 0;
     const bool file_pred = std::getenv("STRATA_FILE_PRED") != nullptr;
+    // STRATA_ATTN_AHEAD=1 (decode, opt-in; needs STRATA_PIN_RB=1 + STRATA_DENSE_ASYNC=1): layer l's finish + predict
+    // graph and layer l+1's attention graph go out back to back (Ds41Dense::finish_predict_attn), so the card does not
+    // idle for the prediction's round trip and the next graph's launch.  Only when nothing else runs on the dense
+    // object between finish(l) and attn_router(l+1): no diagnostic predictions, state dumps or stage handoffs.
+    const bool attn_ahead = std::getenv("STRATA_ATTN_AHEAD") && std::getenv("STRATA_ATTN_AHEAD")[0] == '1' &&
+                            !file_pred && advise_ahead <= 0 && !dump_main && !pipe.enabled() && !mc.cpu_only;
+    // STRATA_ATTN_TAIL=2 (Ds41Dense::queue_tail): the tail graph queued by the tier's after-card-side hook
+    const bool attn_tail2 = std::getenv("STRATA_ATTN_TAIL") && std::string(std::getenv("STRATA_ATTN_TAIL")) == "2";
+    // STRATA_DEC_ROUTE_LOG=F (diagnostic, off by default): the decode steps' routing in token order, for offline
+    // cache-policy simulation (the batch passes' STRATA_ROUTE_LOG has no token order).  Before the first step one
+    // "S <layer> <expert> <where>" line per cached expert (1 VRAM, 2 RAM arena, 3 both); then per step "T <pos>" and
+    // per layer "<layer> <expert>:<tier> x top_k" with the tier each routed expert was in (0 VRAM, 1 arena, 2 file).
+    static std::FILE * dec_rlog = std::getenv("STRATA_DEC_ROUTE_LOG") ? std::fopen(std::getenv("STRATA_DEC_ROUTE_LOG"), "w") : nullptr;
+    bool dec_rlog_census = dec_rlog != nullptr;
     constexpr int kFP = 4;
     std::vector<int> fp_ids(file_pred ? (size_t) kFP * (size_t) n_layer * 16 : 0, -1);
     long long fp_miss[kFP + 1] = {0}, fp_hit[kFP + 1][3] = {{0}}, fp_cand[kFP + 1][3] = {{0}};
@@ -917,6 +944,19 @@ int main(int argc, char ** argv) {
             dm_tok = tok;
             dm_pos = pos;
             dm_row.assign((size_t) 3 * n_embd, 0.0f);
+        }
+        if (dec_rlog) {
+            if (dec_rlog_census) {
+                for (int l = 0; l < n_layer; ++l) {
+                    const Ds41MoeTier & t = ds41_tier_for(pipe, l);
+                    for (int64_t e = 0; e < TG.n_experts; ++e) {
+                        const int w = (t.resident(l, e) ? 1 : 0) | (t.in_arena(l, e) ? 2 : 0);
+                        if (w) std::fprintf(dec_rlog, "S %d %lld %d\n", l, (long long) e, w);
+                    }
+                }
+                dec_rlog_census = false;
+            }
+            std::fprintf(dec_rlog, "T %d\n", pos);
         }
         if (!pipe.dense(0).begin(&tok, 1, pos)) { ferr = pipe.dense(0).last_error(); return false; }
         if (dprof) { const double t = dp_now(); dp[0] += t - ta; ta = t; }
@@ -954,6 +994,15 @@ int main(int argc, char ** argv) {
             const float * fn = nullptr;
             if (!d.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = d.last_error(); return false; }
             if (dprof) { const double t1 = dp_now(); dp[2] += t1 - ta; ta = t1; }
+            if (dec_rlog) {
+                std::fprintf(dec_rlog, "%d", l);
+                for (int j = 0; j < top_k; ++j) {
+                    const int e = ids1[(size_t) j];
+                    std::fprintf(dec_rlog, " %d:%d", e, e < 0 ? 9 : t.resident(l, e) ? 0 : t.in_arena(l, e) ? 1 : 2);
+                }
+                std::fputc('\n', dec_rlog);
+                if (l + 1 == n_layer) std::fflush(dec_rlog);
+            }
             if (file_pred) {
                 for (int j = 0; j < top_k; ++j) {
                     const int e = ids1[(size_t) j];
@@ -972,8 +1021,11 @@ int main(int argc, char ** argv) {
                 }
             }
             if (g_imat.on()) g_imat.add(l, 1, top_k, n_embd, fn, ids1.data(), TG);   // STRATA_IMATRIX_OUT
+            // STRATA_ATTN_TAIL=2: the dense half's tail graph goes out from inside the tier, right after its card side
+            if (attn_tail2 && rdev) t.set_after_gpu([&d, l] { d.queue_tail(l); });
             const bool tok_ok = rdev ? t.run_to_dev(l, ids1.data(), w1.data(), fn, rdev)
                                      : t.run(l, ids1.data(), w1.data(), fn, routed1.data());
+            if (attn_tail2 && rdev) t.set_after_gpu(nullptr);
             if (!tok_ok) { ferr = "tier.run failed"; return false; }
             if (dprof) { const double t1 = dp_now(); dp[3] += t1 - ta; ta = t1; }
             const float * rsum = rdev ? nullptr : routed1.data();
@@ -988,7 +1040,17 @@ int main(int argc, char ** argv) {
                     for (int ai = 0; ai < na; ++ai)
                         if (l + 2 + ai < stage_end) t.spec_read(l + 2 + ai, ahead + ai * 16, std::min(spec_top, 16));
                     if (dprof) { const double t1 = dp_now(); dp[5] += t1 - ta; ta = t1; }
-                } else if (!d.finish_predict(l, rsum, l + 1, t16, 16)) { ferr = d.last_error(); return false; }
+                } else {
+                    const bool ahead = attn_ahead && !spec_l1 && d.can_attn_ahead();
+                    if (!(ahead ? d.finish_predict_attn(l, rsum, l + 1, t16, 16) : d.finish_predict(l, rsum, l + 1, t16, 16))) {
+                        ferr = d.last_error();
+                        return false;
+                    }
+                    // STRATA_SPEC_L1=1 with STRATA_SPEC_AHEAD=0: the next layer's predicted file-tier experts straight
+                    // from this graph's own prediction - no wider graph; the reads start now, after this layer's
+                    // reads, and the next call cancels the guesses it does not route (STRATA_SPEC_CANCEL)
+                    if (spec_l1 && spec_top > 0) t.spec_read(l + 1, t16, std::min(spec_top, 16));
+                }
                 for (int i = 0; i < 16; ++i) top16[i] = t16[i];
                 have_pred = true;
             } else if (!d.finish(l, rsum)) { ferr = d.last_error(); return false; }
@@ -1345,6 +1407,7 @@ int main(int argc, char ** argv) {
     // the deferred VRAM seed after a prompt: the prompt's buffers go back, the cache opens into the free space, and the
     // decode biases (route bias + file penalty) switch on.  Returns the free GiB measured (for the log).
     double seed_free = 0, seed_gib = 0, seed_s = 0;
+    double seed_budget = -1, seed_used = 0;   // stage 0's WDDM local-memory budget / this process's use (GiB; -1 = unknown)
     // STRATA_DSPARK=<sidecar> (one-shot, greedy): DSpark speculative decoding - the checkpoint's mtp.0-2 draft stack
     // (ds41_dspark) drafts STRATA_DSPARK_DEPTH (default 4, <= 5) tokens, one dense pass verifies them (pass_v).  The
     // drafter loads here, before the VRAM expert cache measures the free memory, so the cache sizes around it.
@@ -1406,6 +1469,26 @@ int main(int argc, char ** argv) {
             const double free_gib = fr / 1073741824.0;
             seed_gib = std::max(0.0, ((double) fr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
             if (st == 0) seed_free = free_gib;
+#ifdef STRATA_ENABLE_CUDA
+            // Windows, STRATA_SEED_LOG: also the budget WDDM gives this process (DXGI, local segment).  It is NOT a safe
+            // cap: 2026-10-22 (RTX 5090, desktop apps holding ~2 GiB) it read 30.68 GiB with 9.18 GiB used, and a margin-1
+            // seed (20.50 GiB of slots, inside that budget) still had 320-384 MiB of the engine's allocations (and
+            // ~600 MiB of other programs') moved to system memory - every GPU phase ran 18-37 % slower than with
+            // --vram-margin 2 or 3, and two equal runs differed by 8 %.  A budget cap of budget - used - 0.25 GiB did not
+            // shrink the cache; the free-VRAM margin is what keeps it in the card.
+            static const bool want_budget = std::getenv("STRATA_SEED_LOG") != nullptr;
+            if (want_budget) {
+                cudaDeviceProp dp{};
+                uint64_t bud = 0, use = 0;
+                std::string why;
+                if (cudaGetDeviceProperties(&dp, pipe.stages[(size_t) st].cuda_device) == cudaSuccess &&
+                    strata::platform::gpu_local_memory_budget(dp.luid, bud, use, why)) {
+                    if (st == 0) { seed_budget = bud / 1073741824.0; seed_used = use / 1073741824.0; }
+                } else {
+                    (void) cudaGetLastError();
+                }
+            }
+#endif
             const bool cache_room = explicit_slots || seed_gib >= min_gib;
             Ds41MoeTier & stier = pipe.tier(st);
             stier.set_cache_enabled(cache_room);
@@ -1425,9 +1508,13 @@ int main(int argc, char ** argv) {
         seed_s = (now_ms() - ts) / 1000.0;
         // every seed (the DSpark tail opens the cache silently otherwise): what another process on the card - the
         // image encoder - costs the decode is the slot count here
-        if (std::getenv("STRATA_SEED_LOG"))
+        if (std::getenv("STRATA_SEED_LOG")) {
             std::fprintf(stderr, "seed: %.2f GiB free (margin %.2f) -> %.2f GiB of slots: %lld experts in VRAM (%.2f s)\n",
                          seed_free, a.vram_margin_gib, seed_gib, (long long) tier.resident(), seed_s);
+            if (seed_budget >= 0)
+                std::fprintf(stderr, "seed: WDDM local budget %.2f GiB, this process used %.2f GiB before the cache\n",
+                             seed_budget, seed_used);
+        }
         proxy_res.clear();   // the real VRAM set from here on
         bias_now = true;     // decode: route bias + file penalty on
         apply_bias();
@@ -3808,11 +3895,32 @@ int main(int argc, char ** argv) {
             }
 #endif
             int last_tok = -1;   // (an admission's first token: its slot feeds it first)
+            // STRATA_SERVE_TRACE=<file> (diagnostic, off by default): per decode step "S <request> <step> <pos> <token>
+            // <top1 id> <top1> <top2 id> <top2> <hash of all logits>" - two runs of the same requests then show the
+            // first step whose logits differ at all (the hash) and how close the top two were where the text parted
+            static std::FILE * strace = std::getenv("STRATA_SERVE_TRACE") ? std::fopen(std::getenv("STRATA_SERVE_TRACE"), "a") : nullptr;
+            static long strace_req = 0;
+            if (strace) std::fprintf(strace, "R %ld pos %d\n", ++strace_req, pos);
             while (sp_t < 0 && (gen < max_new || max_new <= 0)) {
                 if (stop_pending()) { finish = "cancel"; break; }
                 const int tok = grammar_sample(grammar, lg.data(), nv, temp, tk, top_p, min_p, rng);
                 if (tok < 0) { finish = tok == -2 ? "nonfinite" : "grammar"; break; }
                 grammar.accept(tok);
+                if (strace) {
+                    int i1 = 0, i2 = -1;
+                    uint64_t h = 1469598103934665603ULL;   // FNV-1a style, over the logits' 32-bit words
+                    for (int i = 0; i < nv; ++i) {
+                        uint32_t b;
+                        std::memcpy(&b, &lg[(size_t) i], 4);
+                        h = (h ^ b) * 1099511628211ULL;
+                        if (i == 0) continue;
+                        if (lg[(size_t) i] > lg[(size_t) i1]) { i2 = i1; i1 = i; }
+                        else if (i2 < 0 || lg[(size_t) i] > lg[(size_t) i2]) i2 = i;
+                    }
+                    std::fprintf(strace, "S %ld %d %d %d %d %.6f %d %.6f %016llx\n", strace_req, gen, pos, tok, i1,
+                                 lg[(size_t) i1], i2, i2 >= 0 ? lg[(size_t) i2] : 0.0f, (unsigned long long) h);
+                    std::fflush(strace);
+                }
                 last_tok = tok;
                 std::printf("T %d\n", tok);
                 std::fflush(stdout);
@@ -3851,7 +3959,16 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "; file tier %lld staged, %lld recurring (%.0f%%), blocked %.1f ms of %.1f ms",
                              (long long) st.fileg, (long long) st.fileg_recurring,
                              100.0 * (double) st.fileg_recurring / (double) st.fileg, st.fwait_ms, st.file_ms);
-            std::fprintf(stderr, "\n");
+            std::fprintf(stderr, " (read wall %.2f s, spec %lld issued / %lld used)\n", st.file_ms / 1000.0,
+                         (long long) st.spec_issued, (long long) st.spec_hits);
+            if (file_pred) {   // STRATA_FILE_PRED's totals so far (a served engine is killed, never reaches the end)
+                std::fprintf(stderr, "file-pred: %lld file-tier routes", fp_miss[0]);
+                for (int k = 1; k <= kFP; ++k)
+                    std::fprintf(stderr, " | k=%d: top4 %.1f%% top8 %.1f%% top16 %.1f%%", k,
+                                 100.0 * fp_hit[k][0] / std::max(1LL, fp_miss[k]), 100.0 * fp_hit[k][1] / std::max(1LL, fp_miss[k]),
+                                 100.0 * fp_hit[k][2] / std::max(1LL, fp_miss[k]));
+                std::fprintf(stderr, "\n");
+            }
             if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
                 size_t tf = 0, tt = 0;
                 ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
@@ -3964,10 +4081,25 @@ int main(int argc, char ** argv) {
     if (spec) { std::fprintf(stderr, "ds41_generate: STRATA_DSPARK: built without ds41_dspark\n"); return 2; }
 #endif
     const int spec_depth = std::getenv("STRATA_DSPARK_DEPTH") ? std::atoi(std::getenv("STRATA_DSPARK_DEPTH")) : 4;
-    if (spec && (!defer_vram || S < 17 || dump_main || spec_depth < 0 || spec_depth > 5 || std::getenv("STRATA_FORCE_IDS"))) {
+    if (spec && (!defer_vram || S < 17 || dump_main || spec_depth < 0 || spec_depth > 5)) {
         std::fprintf(stderr, "ds41_generate: STRATA_DSPARK needs the GPU layer-major prompt path (S >= 17), depth 1..5, and no "
-                             "STRATA_DUMP_MAIN / STRATA_FORCE_IDS\n");
+                             "STRATA_DUMP_MAIN\n");
         return 2;
+    }
+    // STRATA_FORCE_IDS=<file>: decode this token sequence (one id per line - a previous run's stdout) in place of the
+    // sampled tokens, so kernel A/Bs whose variants round differently still do the same work (greedy decoding flips on
+    // near-ties, and a different text means different experts and a different VRAM hit rate).  Under STRATA_DSPARK the
+    // trunk's verdict rows are replaced by these tokens: a draft is accepted when it equals the forced token, so every
+    // DSpark variant decodes the same text as plain decode with the same forcing.
+    std::vector<int> forced;
+    if (const char * fp = std::getenv("STRATA_FORCE_IDS")) {   // lines that are not a bare id (a memguard banner) skipped
+        std::ifstream f(fp);
+        for (std::string line; std::getline(f, line);) {
+            char * end = nullptr;
+            const long t = std::strtol(line.c_str(), &end, 10);
+            if (end != line.c_str() && *end == '\0') forced.push_back((int) t);
+        }
+        std::fprintf(stderr, "STRATA_FORCE_IDS: %zu forced tokens from %s\n", forced.size(), fp);
     }
     if (spec && a.temp > 0) std::fprintf(stderr, "note: STRATA_DSPARK decodes greedily (temp ignored)\n");
     // the DSpark window needs per-position main_hidden, which the layer-major prompt does not produce: the last
@@ -4006,6 +4138,7 @@ int main(int argc, char ** argv) {
             if (last) {
                 std::copy(vlog.end() - nv, vlog.end(), last_logits.begin());
                 sp_bonus = (int) (std::max_element(last_logits.begin(), last_logits.end()) - last_logits.begin());
+                if (!forced.empty()) sp_bonus = forced[0];
             }
             if (!dsp->step(vh.data(), spos.data(), m, last ? sp_bonus : -1, last ? sp_ids : sp_tmp, sp_conf)) {
                 std::fprintf(stderr, "ds41_generate: DSpark seed step: %s\n", dsp->last_error().c_str());
@@ -4053,20 +4186,14 @@ int main(int argc, char ** argv) {
     static const bool prof_decode = std::getenv("STRATA_PROFILE_DECODE") != nullptr;
     if (prof_decode) Ds41MoeTier::profiler(true);
     const double td0 = now_ms();
+    double dec_head_ms = 0;   // STRATA_DEC_PROF: the one-shot decode's head_logits (outside step())
     std::vector<float> lg = last_logits;
     int pos = (int) prompt.size(), gen = 0;
-    // STRATA_FORCE_IDS=<file>: decode this token sequence (one id per line - a previous run's stdout) in place of the
-    // sampled tokens, so kernel A/Bs whose variants round differently still do the same work (greedy decoding flips on
-    // near-ties, and a different text means different experts and a different VRAM hit rate)
-    std::vector<int> forced;
-    if (const char * fp = std::getenv("STRATA_FORCE_IDS")) {   // lines that are not a bare id (a memguard banner) skipped
-        std::ifstream f(fp);
-        for (std::string line; std::getline(f, line);) {
-            char * end = nullptr;
-            const long t = std::strtol(line.c_str(), &end, 10);
-            if (end != line.c_str() && *end == '\0') forced.push_back((int) t);
-        }
-        std::fprintf(stderr, "STRATA_FORCE_IDS: %zu forced tokens from %s\n", forced.size(), fp);
+    if (std::getenv("STRATA_DEC_REPORT")) {   // the census the decode starts from (see dec-report below)
+        int64_t cv = 0, ca = 0, cb = 0;
+        tier.cache_census(cv, ca, cb);
+        std::fprintf(stderr, "dec-report: start | vram %lld arena %lld both %lld\n", (long long) cv, (long long) ca,
+                     (long long) cb);
     }
 #if defined(DS41_HAVE_DSPARK)
     // ---- DSpark: P = the last fed position, t = the trunk's token for P+1 (not fed yet), d = drafts for P+2..
@@ -4100,6 +4227,23 @@ int main(int argc, char ** argv) {
         static const float conf_tau = std::getenv("STRATA_DSPARK_CONF") ? (float) std::atof(std::getenv("STRATA_DSPARK_CONF")) : -1.0f;
         static FILE * conf_log = std::getenv("STRATA_DSPARK_CONFLOG") ? std::fopen(std::getenv("STRATA_DSPARK_CONFLOG"), "w") : nullptr;
         auto sig = [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
+        // STRATA_DSPARK_SCHED=1: the verify width is chosen per pass the way DeepInfer's MTPVarlen::schedule chooses it -
+        // the k (0..depth) with the most expected tokens per expected ms.  Expected tokens = 1 + sum over j <= k of the
+        // product of c_0..c_(j-1), c_i = sigmoid(conf_i) (DeepInfer multiplies its confidence head's per-token rates the
+        // same way).  Expected ms = the median of the last 16 passes of that width, verify + draft step: measured here,
+        // since this PC's cost is the drafts' expert misses, not a GPU launch curve.  The first passes measure every width
+        // (4 each), and every 24th pass re-measures the stalest one.  Without STRATA_DSPARK_CONF.
+        static const bool sched = std::getenv("STRATA_DSPARK_SCHED") && std::getenv("STRATA_DSPARK_SCHED")[0] == '1';
+        std::vector<std::deque<double>> sk_ms(6);
+        std::vector<long> sk_last(6, -1);
+        long sk_pick[6] = { 0, 0, 0, 0, 0, 0 };
+        auto med = [](const std::deque<double> & q) {
+            std::vector<double> v(q.begin(), q.end());
+            std::nth_element(v.begin(), v.begin() + (long) (v.size() / 2), v.end());
+            return v[v.size() / 2];
+        };
+        static const int dec_report_s = std::getenv("STRATA_DEC_REPORT") ? std::atoi(std::getenv("STRATA_DEC_REPORT")) : 0;
+        int rep_mark = 0;
         while (emit(t)) {
             int k = std::min(spec_depth, a.n_predict - gen);   // drafts past the budget are never emitted
             if (conf_tau >= 0) {
@@ -4113,6 +4257,27 @@ int main(int argc, char ** argv) {
                 int kk = 0;
                 while (kk < k && (pc *= sig(sp_conf[kk])) >= cum) ++kk;
                 k = kk;
+            }
+            if (sched) {
+                const int kmax = k;
+                int pick = -1;
+                for (int w = 0; w <= kmax && pick < 0; ++w)
+                    if (sk_ms[(size_t) w].size() < 4) pick = w;
+                if (pick < 0 && sp_pass % 24 == 23) {
+                    long oldest = sp_pass;
+                    for (int w = 0; w <= kmax; ++w)
+                        if (sk_last[(size_t) w] < oldest) { oldest = sk_last[(size_t) w]; pick = w; }
+                }
+                if (pick < 0) {
+                    double best = -1, e = 1, cp = 1;
+                    for (int w = 0; w <= kmax; ++w) {
+                        if (w > 0) { cp *= sig(sp_conf[w - 1]); e += cp; }
+                        const double tput = e / med(sk_ms[(size_t) w]);
+                        if (tput > best) { best = tput; pick = w; }
+                    }
+                }
+                k = pick;
+                ++sk_pick[k];
             }
             const bool refeed = dirty && ((P + 1) & 1);
             vt.clear();
@@ -4138,7 +4303,9 @@ int main(int argc, char ** argv) {
             for (int i = 0; i <= k; ++i) {
                 const float * row = vlog.data() + (size_t) (r0 + i) * nv;
                 g[i] = (int) (std::max_element(row, row + nv) - row);
+                if (gen + i < (int) forced.size()) g[i] = forced[(size_t) (gen + i)];   // STRATA_FORCE_IDS: the forced verdict
             }
+            const double pass_ms = now_ms() - tv;
             int acc = 0;
             while (acc < k && sp_ids[acc] == g[acc]) ++acc;
             if (sp_noacc) acc = 0;   // bisect tap: every draft rejected (the stream must stay plain greedy)
@@ -4164,8 +4331,25 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             sp_dms += now_ms() - td;
+            if (sched) {
+                std::deque<double> & q = sk_ms[(size_t) k];
+                q.push_back(pass_ms + (now_ms() - td));
+                if (q.size() > 16) q.pop_front();
+                sk_last[(size_t) k] = sp_pass;
+            }
             bool more = true;
             for (int i = 0; i < acc && more; ++i) more = emit(drafts[i]);
+            if (dec_report_s > 0 && gen / dec_report_s != rep_mark) {   // as the plain loop's dec-report (at the pass that crosses k)
+                rep_mark = gen / dec_report_s;
+                const Ds41MoeStats s = tier.stats();
+                int64_t cv = 0, ca = 0, cb = 0;
+                tier.cache_census(cv, ca, cb);
+                std::fprintf(stderr, "dec-report: %d tokens %.0f ms | hit %lld cpu %lld pcie %lld file %lld | read %.0f ms | "
+                             "arena swaps %lld vram swaps %lld demotes %lld | vram %lld arena %lld both %lld | passes %ld acc %ld\n",
+                             gen, now_ms() - td0, (long long) s.hits, (long long) s.cpu, (long long) s.pcie,
+                             (long long) s.file_tier, s.file_ms, (long long) s.arena_swaps, (long long) s.vram_swaps,
+                             (long long) s.vram_demotes, (long long) cv, (long long) ca, (long long) cb, sp_pass, sp_acc);
+            }
             if (!more) break;
             prev = acc == 0 ? t : drafts[acc - 1];
             dirty = acc < k;
@@ -4181,6 +4365,12 @@ int main(int argc, char ** argv) {
         if (dprof && sp_pass > 0)
             std::fprintf(stderr, "DSpark totals: verify %.2f ms/pass draft %.2f ms/pass acc %.2f (%ld passes, %ld tokens)\n",
                          sp_vms / sp_pass, sp_dms / sp_pass, (double) sp_acc / sp_pass, sp_pass, gen);
+        if (sched) {
+            std::fprintf(stderr, "DSpark sched: passes by width");
+            for (int w = 0; w <= spec_depth; ++w)
+                std::fprintf(stderr, " k%d %ld (%.0f ms)", w, sk_pick[w], sk_ms[(size_t) w].empty() ? 0.0 : med(sk_ms[(size_t) w]));
+            std::fprintf(stderr, "\n");
+        }
     }
 #endif
     for (; !spec && gen < a.n_predict; ++gen) {
@@ -4194,12 +4384,53 @@ int main(int argc, char ** argv) {
                              forced[(size_t) gen], lg[(size_t) forced[(size_t) gen]], lg[(size_t) tok] - lg[(size_t) forced[(size_t) gen]]);
             tok = forced[(size_t) gen];
         }
+        // STRATA_DEC_TOPK=<file> (measurement): per step {int32 step, int32 token, f32 logsumexp, f32 token's logit,
+        // kTopK x {int32 id, f32 logit}} of the logits that chose `tok` - for teacher-forced logprob / top-K comparisons
+        // (DeepInfer's yoco_equiv method) between engine variants that decode the same STRATA_FORCE_IDS tokens
+        static std::FILE * topk_f = std::getenv("STRATA_DEC_TOPK") ? std::fopen(std::getenv("STRATA_DEC_TOPK"), "wb") : nullptr;
+        if (topk_f) {
+            constexpr int kTopK = 32;
+            double mx = -INFINITY, se = 0;
+            for (int i = 0; i < nv; ++i) mx = std::max(mx, (double) lg[(size_t) i]);
+            for (int i = 0; i < nv; ++i) se += std::exp((double) lg[(size_t) i] - mx);
+            static std::vector<int> ix;
+            ix.resize((size_t) nv);
+            for (int i = 0; i < nv; ++i) ix[(size_t) i] = i;
+            auto by = [&](int x, int y) { return lg[(size_t) x] > lg[(size_t) y] || (lg[(size_t) x] == lg[(size_t) y] && x < y); };
+            std::nth_element(ix.begin(), ix.begin() + kTopK, ix.end(), by);
+            std::sort(ix.begin(), ix.begin() + kTopK, by);
+            const int32_t hd[2] = { gen, tok };
+            const float hf[2] = { (float) (mx + std::log(se)), lg[(size_t) tok] };
+            std::fwrite(hd, 4, 2, topk_f);
+            std::fwrite(hf, 4, 2, topk_f);
+            for (int i = 0; i < kTopK; ++i) {
+                const int32_t id = ix[(size_t) i];
+                std::fwrite(&id, 4, 1, topk_f);
+                std::fwrite(&lg[(size_t) id], 4, 1, topk_f);
+            }
+            std::fflush(topk_f);
+        }
         std::printf("%d\n", tok);
         std::fflush(stdout);
         if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end() || tok == (int) G.eos) { ++gen; break; }
         if (gen + 1 == a.n_predict) { ++gen; break; }
-        if (!step(tok, pos) || !head_logits(0, 1, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
+        if (!step(tok, pos)) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
+        const double th0 = dprof ? now_ms() : 0;
+        if (!head_logits(0, 1, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
+        if (dprof) dec_head_ms += now_ms() - th0;
         ++pos;
+        // STRATA_DEC_REPORT=<k> (diagnostic): every k tokens the cumulative tier counters and the VRAM / arena census
+        static const int dec_report = std::getenv("STRATA_DEC_REPORT") ? std::atoi(std::getenv("STRATA_DEC_REPORT")) : 0;
+        if (dec_report > 0 && (gen + 1) % dec_report == 0) {
+            const Ds41MoeStats s = tier.stats();
+            int64_t cv = 0, ca = 0, cb = 0;
+            tier.cache_census(cv, ca, cb);
+            std::fprintf(stderr, "dec-report: %d tokens %.0f ms | hit %lld cpu %lld pcie %lld file %lld | read %.0f ms | "
+                         "arena swaps %lld vram swaps %lld demotes %lld | vram %lld arena %lld both %lld\n",
+                         gen + 1, now_ms() - td0, (long long) s.hits, (long long) s.cpu, (long long) s.pcie,
+                         (long long) s.file_tier, s.file_ms, (long long) s.arena_swaps, (long long) s.vram_swaps,
+                         (long long) s.vram_demotes, (long long) cv, (long long) ca, (long long) cb);
+        }
     }
     const double dec_ms = now_ms() - td0;
     if (prof_decode) Ds41MoeTier::profiler(false);
@@ -4212,6 +4443,9 @@ int main(int argc, char ** argv) {
                  100.0 * st.hits / std::max<int64_t>(1, st.lookups()), st.cpu_ms, st.file_ms,
                  (long long) st.spec_issued, (long long) st.spec_hits, (long long) st.prefetch_issued,
                  (long long) st.prefetch_dummy, (long long) st.prefetched_useful);
+    if (dprof && !spec)
+        std::fprintf(stderr, "decode head: %.2f ms/token (%.0f ms over %d tokens)\n", dec_head_ms / std::max(1, gen - 1),
+                     dec_head_ms, gen);
     if (spec)
         std::fprintf(stderr, "DSpark: %ld verify passes, %.3f accepted drafts/pass = %.3f tokens/pass, %.1f%% full, %ld re-fed; "
                      "verify %.1f ms/pass, draft %.2f ms/pass (depth %d)\n", sp_pass, (double) sp_acc / std::max(1L, sp_pass),

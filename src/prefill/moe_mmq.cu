@@ -323,6 +323,8 @@ bool tab_has_type(int) { return false; }
 void run_nvfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
 // the same unit's MXFP4: Q8_1 activations on every card (its FP4 x FP4 instance wants FP4 rows, see there)
 void run_mxfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
+// mmq_mxfp4_w4a8.cu: that int8 instance's tile width from the int8 config table (this unit sees the FP4 MMA's table)
+int64_t mxfp4_w4a8_j_best(int64_t max_rows, int64_t w_rows);
 // mmq_nvfp4_w4a4.cu (the one unit built for 12xa): FP4 x FP4 and its activation quantizer, if this card runs it
 bool w4a4_available();
 void run_nvfp4_w4a4(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
@@ -549,6 +551,12 @@ void Context::run(const Product& p, void* stream) {
         }
         if (J_best <= 0) throw std::runtime_error("moe_mmq: no MMQ tile fits");
     }
+#if !defined(GGML_USE_HIP)
+    if (t == GGML_TYPE_MXFP4) {   // the int8 unit's own tile table (it hides Blackwell's FP4 MMA from mmq.cuh)
+        J_best = mxfp4_w4a8_j_best(p.max_rows, p.w_rows);
+        if (J_best <= 0) throw std::runtime_error("moe_mmq: no MMQ tile fits");
+    }
+#endif
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, p.y_scale,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, p.tab ? 0 : (int64_t) (p.expert_bytes / type_bytes((int) t)), 0, 0,
@@ -575,6 +583,13 @@ void Context::run(const Product& p, void* stream) {
         ck(cudaGetLastError(), "mul_mat_q (pointer table)");
         return;
     }
+#if !defined(GGML_USE_HIP)
+    if (t == GGML_TYPE_MXFP4) {   // before the generated cases: their MXFP4 instance is the FP4 x FP4 one on 12xa
+        run_mxfp4_w4a8(ctx, a, s);
+        ck(cudaGetLastError(), "mul_mat_q");
+        return;
+    }
+#endif
     switch (t) {
         // UNION (xolotl): the same generated list that drives supported() above drives this dispatch - see the note
         // there.  The hand-written cases the dense lineage's refactor left behind are gone with the duplicate case

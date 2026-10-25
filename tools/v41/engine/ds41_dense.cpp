@@ -332,6 +332,23 @@ struct Ds41Dense::Impl {
     std::vector<int32_t> host_ids;
     std::vector<int32_t> host_xids;       // route meter: o_xids / o_xwts readbacks, and the counters since route_meter(true)
     std::vector<float> host_xwts;
+    // STRATA_PIN_RB=1 (opt-in): a single-token pass's attn_router / predict / finish_predict read back into this pinned
+    // packet (ggml's CUDA host buffer = cudaMallocHost).  The vectors above are pageable - their register calls are
+    // no-ops unless GGML_CUDA_REGISTER_HOST is set - and a D2H into pageable memory returns only once its copy has
+    // landed, so each of those readbacks was a wait of its own.  The same bytes.
+    ggml_backend_buffer_t rb_buf = nullptr;
+    float * rb_fn = nullptr, * rb_wts = nullptr;
+    int32_t * rb_ids = nullptr, * rb_pred = nullptr;
+    // STRATA_ATTN_AHEAD: finish_predict_attn queued layer ahead_il's attention graph + readbacks (-1 = none); ev_pred
+    // marks its prediction readback
+    int ahead_il = -1;
+    ggml_backend_event_t ev_pred = nullptr;
+    // STRATA_ATTN_TAIL: the single-token attention graphs leave the FFN hc mixes + the shared expert to a tail graph
+    // (build_attn_tail) queued behind the routing readbacks; ev_route marks those readbacks.  tail_pending: a tail may
+    // still run (drop_ahead syncs it)
+    bool tail_on = false, tail_pending = false;
+    ggml_backend_event_t ev_route = nullptr;
+    int tail_need = -1;   // STRATA_ATTN_TAIL=2: the layer whose tail is not queued yet (queue_tail / tail_flush)
     long long rm_slots = 0, rm_swaps = 0, rm_rows = 0;
     double rm_kept = 0;
     const uint8_t * embd = nullptr;       // token_embd rows on the mmap (embd_type: F16 ours, Q5_K ISTA's)
@@ -380,6 +397,9 @@ struct Ds41Dense::Impl {
     std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead; // finish_predict_ahead extra outputs
 
     ~Impl() {
+        if (ev_pred) ggml_backend_event_free(ev_pred);
+        if (ev_route) ggml_backend_event_free(ev_route);
+        if (rb_buf) ggml_backend_buffer_free(rb_buf);
         if (nbuf) ggml_backend_buffer_free(nbuf);
         if (nctx) ggml_free(nctx);
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -404,6 +424,12 @@ struct Ds41Dense::Impl {
         return it != w.t.end() ? it->second : BL(il, "ffn_gate_inp.weight");
     }
     bool compute(ggml_cgraph * gf, bool cached, bool async = false);
+    // STRATA_ATTN_AHEAD: a pass that starts (or a state change) while a layer is queued ahead drops it - a decode
+    // step that failed between finish_predict_attn and its attn_router must not leave it to the next request
+    void drop_ahead() {
+        tail_need = -1;   // a layer abandoned between attn_router and finish: its tail would only feed that finish
+        if (ahead_il >= 0 || tail_pending) { ggml_backend_synchronize(backend); ahead_il = -1; tail_pending = false; }
+    }
     bool upload_inputs(const int * tids, int n, int pos0);
 };
 
@@ -749,6 +775,34 @@ static double g_dprof[8] = {};   // build, alloc, compute, engram, readback, fin
 static double dprof_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 static int g_dprof_slot = -1;    // which of build/alloc/compute buckets compute() charges: set by the span callers
 
+// STRATA_DENSE_ASYNC=1 (decode, opt-in): attn_router / predict / finish_predict launch their graph without the
+// stream sync ggml_backend_graph_compute ends with and queue the readbacks on the same stream behind it, so ONE sync
+// covers the graph and its readbacks (it was two: the graph's, then the readback's - and ggml_backend_tensor_get
+// copies on cudaStreamPerThread, which is why it needed the first).  Same graphs, same stream order: same bytes.
+static bool dense_async() {
+    static const bool on = std::getenv("STRATA_DENSE_ASYNC") && std::getenv("STRATA_DENSE_ASYNC")[0] == '1';
+    return on;
+}
+
+static bool pin_rb() {
+    static const bool on = std::getenv("STRATA_PIN_RB") && std::getenv("STRATA_PIN_RB")[0] == '1';
+    return on;
+}
+
+// STRATA_ATTN_TAIL=1 (decode, opt-in; needs STRATA_PIN_RB + STRATA_DENSE_ASYNC): a single-token attention graph ends at
+// the routing (fn / ids / wts) and the rest of it - the FFN hc mixes (post_f, comb_f, the next pre_state) and the
+// shared expert, ~40 us of a ~210 us graph that the routing never reads - runs as a tail graph queued behind the
+// routing readbacks, so the host starts the layer's expert work (reads, cache, pool) that much earlier and the card
+// runs the tail meanwhile.  The tail reads hap / o_fn, the attention graph's copies of the same tensors: same ops.
+// STRATA_ATTN_TAIL=2: the tail is queued by the tier (Ds41Dense::queue_tail from Ds41MoeTier::set_after_gpu) right
+// after the layer's own card-side expert work, so it does not hold up the hits kernels; finish / predict queue it
+// themselves if nothing did.
+static int attn_tail_mode() {
+    static const int m = std::getenv("STRATA_ATTN_TAIL") ? std::atoi(std::getenv("STRATA_ATTN_TAIL")) : 0;
+    return m == 1 || m == 2 ? m : 0;
+}
+static bool attn_tail() { return attn_tail_mode() > 0; }
+
 bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool async) {
     Allo & a = cached ? allo_dec : allo_pass;
     // DS41_GRAPH_OPS=1 (diagnostic): the op mix of the first 200 distinct one-token graphs (count per op; matmul weight MiB)
@@ -786,6 +840,7 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool async) {
     }
     // Opt-in input fixtures, one per indexer layer. No model outputs are changed.
     if (const char * dir = std::getenv("STRATA_INDEXER_DUMP")) {
+        if (!sync) ggml_backend_synchronize(backend);   // xolotl: an async compute (STRATA_DENSE_ASYNC) is still running
         static std::set<std::string> saved;
         const int64_t min_kv = std::getenv("STRATA_INDEXER_DUMP_MIN_KV") ?
             std::atoll(std::getenv("STRATA_INDEXER_DUMP_MIN_KV")) : 65536;
@@ -1048,7 +1103,9 @@ static bool la_next_ok(const Ds41Dense::Impl & im, int il) {
 }
 
 static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0,
-                                bool late_shexp = false) {
+                                bool late_shexp = false, bool tail = false) {
+    // tail (STRATA_ATTN_TAIL): build_attn without the FFN hc mixes, the shared expert and their writes (post_f /
+    // comb_f / shexp / pre_state) - its single-token graphs, completed by build_attn_tail
     using L_t = Ds41Dense::Impl::Layer;
     L_t & L = im.ly[(size_t) il];
     const Ds41Geometry & G = im.g;
@@ -1360,8 +1417,9 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // ---- hc_post(attention) -> FFN hc: its mixes give the next layer's pre-mix; its input uses the attention's
     ggml_tensor * h = ggml_dsv4_hc_post(gc, attn, x, a_post, a_comb);                       // [D, HC, n]
     ggml_tensor * f_pre = nullptr, * f_post = nullptr, * f_comb = nullptr;
-    b.hc_mixes(h, im.BL(il, "hc_ffn_fn.weight"), im.BL(il, "hc_ffn_scale.weight"), im.BL(il, "hc_ffn_base.weight"),
-               &f_pre, &f_post, &f_comb);
+    if (!tail)
+        b.hc_mixes(h, im.BL(il, "hc_ffn_fn.weight"), im.BL(il, "hc_ffn_scale.weight"), im.BL(il, "hc_ffn_base.weight"),
+                   &f_pre, &f_post, &f_comb);
     ggml_tensor * xffn = ggml_dsv4_hc_pre(gc, h, a_pre);                                        // [D, n] before its norm
     ggml_tensor * fn = b.rms_w(xffn, im.BL(il, "ffn_norm.weight"));                             // [D, n]
 
@@ -1463,15 +1521,17 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     }
 
     // ---- shared expert (model.py Expert, clamped SwiGLU); late_shexp: its own graph (build_shexp_late)
-    ggml_tensor * se = late_shexp ? nullptr : shexp_ffn(im, gc, il, fn);
+    ggml_tensor * se = (late_shexp || tail) ? nullptr : shexp_ffn(im, gc, il, fn);
 
     // the layer's state writes.  -DSTRATA_DSV41_COPIES_OP=ON (the op is in
     // tools/xolotl/ggml/xolotl-ggml.patch): batched into GGML_OP_DSV41_COPIES (up to 5 per launch, the same bytes; they stay
     // where the ggml_cpy's were, after every read of the buffers).  STRATA_COPIES_SPLIT=1: one ggml_cpy each.
     std::vector<std::pair<ggml_tensor *, ggml_tensor *>> cps;
     cps.emplace_back(h, b.cols3(im.hap, D, HC, n, col0));
-    cps.emplace_back(f_post, b.cols2(im.post_f, HC, n, col0));
-    cps.emplace_back(ggml_reshape_3d(gc, f_comb, HC, HC, n), b.cols3(im.comb_f, HC, HC, n, col0));
+    if (!tail) {
+        cps.emplace_back(f_post, b.cols2(im.post_f, HC, n, col0));
+        cps.emplace_back(ggml_reshape_3d(gc, f_comb, HC, HC, n), b.cols3(im.comb_f, HC, HC, n, col0));
+    }
     if (se) cps.emplace_back(se, b.cols2(im.shexp, D, n, col0));
     cps.emplace_back(fn, b.cols2(im.o_fn, D, n, col0));
     cps.emplace_back(ids, b.cols2(im.o_ids, im.NU, n, col0));
@@ -1493,7 +1553,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         cps.emplace_back(xids, b.cols2(im.o_xids, im.NU, n, col0));
         cps.emplace_back(xw, b.cols2(im.o_xwts, im.NU, n, col0));
     }
-    cps.emplace_back(f_pre, b.cols2(im.pre_state, HC, n, col0));   // reads of pre_state happen above
+    if (!tail) cps.emplace_back(f_pre, b.cols2(im.pre_state, HC, n, col0));   // reads of pre_state happen above
 #if defined(STRATA_DSV41_COPIES_OP)
     static const bool copies_split = std::getenv("STRATA_COPIES_SPLIT") != nullptr;
     if (!copies_split) {
@@ -1509,6 +1569,23 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     for (const auto & cp : cps) outs.push_back(ggml_cpy(gc, cp.first, cp.second));
     for (ggml_tensor * t : outs) ggml_build_forward_expand(gf, t);
     for (ggml_tensor * t : late) ggml_build_forward_expand(gf, t);
+    return gf;
+}
+
+// STRATA_ATTN_TAIL: what build_attn(tail) leaves out, for one token: the FFN hc mixes of hap (= h) and the shared
+// expert on o_fn (= fn), written as build_attn writes them.  Queued behind the attention graph and its readbacks.
+static ggml_cgraph * build_attn_tail(Ds41Dense::Impl & im, ggml_context * gc, int il) {
+    B b { &im, gc, &im.g };
+    ggml_cgraph * gf = ggml_new_graph_custom(gc, 256, false);
+    const int64_t D = im.D, HC = im.HC;
+    ggml_tensor * f_pre = nullptr, * f_post = nullptr, * f_comb = nullptr;
+    b.hc_mixes(b.cols3(im.hap, D, HC, 1, 0), im.BL(il, "hc_ffn_fn.weight"), im.BL(il, "hc_ffn_scale.weight"),
+               im.BL(il, "hc_ffn_base.weight"), &f_pre, &f_post, &f_comb);
+    ggml_tensor * se = shexp_ffn(im, gc, il, b.cols2(im.o_fn, D, 1, 0));
+    ggml_build_forward_expand(gf, ggml_cpy(gc, f_post, b.cols2(im.post_f, HC, 1, 0)));
+    ggml_build_forward_expand(gf, ggml_cpy(gc, ggml_reshape_3d(gc, f_comb, HC, HC, 1), b.cols3(im.comb_f, HC, HC, 1, 0)));
+    ggml_build_forward_expand(gf, ggml_cpy(gc, se, b.cols2(im.shexp, D, 1, 0)));
+    ggml_build_forward_expand(gf, ggml_cpy(gc, f_pre, b.cols2(im.pre_state, HC, 1, 0)));
     return gf;
 }
 
@@ -1844,6 +1921,7 @@ bool Ds41Dense::set_columns(int nc) {
 }
 
 void Ds41Dense::Impl::reset_graphs() {
+    drop_ahead();
     Impl & im = *this;
     if (shexp_late_on() && im.backend) ggml_backend_synchronize(im.backend);   // STRATA_DS41_SHEXP_LATE: nothing queued
     im.graphs.clear();
@@ -2003,6 +2081,11 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     }
     im.cpu = ggml_backend_is_cpu(im.backend);
     if (!load_weights(im, err)) return false;
+    // STRATA_DROP_MMAP=1 (opt-in): the weights are on the card now - the GGUF pages their copies read (~8 GiB of the
+    // engine's working set on the 1017 UD-IQ3_XXS) go back to the OS as standby (available) memory; the per-token
+    // token_embd rows fault back in from there.  No byte the model computes with changes.
+    if (!im.cpu && env_on("STRATA_DROP_MMAP", false))
+        for (size_t s = 0; s < im.model->size(); ++s) im.model->shard(s).release_resident();
     im.engram.set_hot_path(cfg.engram_hot);
     im.vision = cfg.vision;
     if (im.vision) {
@@ -2206,6 +2289,30 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
                 ggml_backend_cuda_register_host_buffer(im.host_xwts.data(), im.host_xwts.size() * 4);
             }
         }
+        if (!im.cpu && pin_rb()) {   // fn | ids | wts | 16 predicted ids, 256-byte aligned
+            auto up = [](size_t b) { return (b + 255) & ~(size_t) 255; };
+            const size_t o_ids = up((size_t) D * 4), o_wts = o_ids + up((size_t) im.NU * 4), o_pred = o_wts + up((size_t) im.NU * 4);
+            im.rb_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), o_pred + up(16 * 4));
+            if (im.rb_buf && ggml_backend_buffer_get_type(im.rb_buf) != ggml_backend_cuda_host_buffer_type()) {
+                ggml_backend_buffer_free(im.rb_buf);   // ggml fell back to a plain CPU buffer: no pinned memory
+                im.rb_buf = nullptr;
+            }
+            if (im.rb_buf) {
+                char * b = (char *) ggml_backend_buffer_get_base(im.rb_buf);
+                im.rb_fn = (float *) b;
+                im.rb_ids = (int32_t *) (b + o_ids);
+                im.rb_wts = (float *) (b + o_wts);
+                im.rb_pred = (int32_t *) (b + o_pred);
+            }
+            std::fprintf(stderr, "ds41_dense: STRATA_PIN_RB: %s\n", im.rb_buf ? "single-token readbacks into pinned memory"
+                                                                              : "no pinned memory - pageable readbacks");
+        }
+        // STRATA_ATTN_TAIL: only with the pinned readbacks (a pageable one would wait the tail too) on async graphs
+        im.tail_on = attn_tail() && !im.cpu && im.rb_fn && dense_async() && !im.o_xids;
+        if (attn_tail())
+            std::fprintf(stderr, "ds41_dense: STRATA_ATTN_TAIL: %s\n",
+                         im.tail_on ? "shared expert + FFN hc mixes behind the routing readback"
+                                    : "OFF (needs STRATA_PIN_RB=1 and STRATA_DENSE_ASYNC=1, no route meter)");
 #endif
     }
     return true;
@@ -2454,7 +2561,10 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             if (!img.empty() && img[(size_t) t] > 0.0f) im.engram.set_dead(pos0 + t);   // an image span: n-grams never span it
             else im.engram.set_token(pos0 + t, tids[t]);
         }
-        if (n <= 64) {   // decode / verify: the rows are needed at layer 1 - read them now (synchronously)
+        // STRATA_ENG_ASYNC=1: decode / verify passes start their reads here too and wait at layer 1 (engram_ready), so
+        // the ~2 ms of small random reads (the 990 EVO Plus on this PC) overlap layer 0.  Default: synchronous.
+        static const bool eng_async = std::getenv("STRATA_ENG_ASYNC") && std::getenv("STRATA_ENG_ASYNC")[0] == '1';
+        if (n <= 64 && !eng_async) {   // decode / verify: the rows are needed at layer 1 - read them now (synchronously)
             static const bool eprof = std::getenv("STRATA_ENG_PROF") != nullptr;
             static double eng_ms = 0; static long eng_n = 0;
             const auto te = std::chrono::steady_clock::now();
@@ -2485,6 +2595,7 @@ void Ds41Dense::engram_next(const int * tids, int n, int pos0) {
 
 bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     Impl & im = *p_;
+    im.drop_ahead();
     if (n < 1 || n > im.NC || pos0 < 0 || pos0 + n > im.cfg.ctx_max) { im.err = "bad pass"; return false; }
     im.pos0 = pos0;
     im.n = n;
@@ -2624,6 +2735,7 @@ bool Ds41Dense::Impl::upload_rows(const Ds41Dense::Row * rows, int n) {
 
 bool Ds41Dense::begin_rows(const Row * rows, int n) {
     Impl & im = *p_;
+    im.drop_ahead();
     if (n < 1 || n > kMaxRows || n > im.NC) { im.err = "begin_rows: 1.." + std::to_string(std::min<int64_t>(kMaxRows, im.NC)) + " rows"; return false; }
     if (im.eng_batch) { im.err = "begin_rows: a pass's Engram reads are pending"; return false; }
     im.rgroups.clear();
@@ -2681,6 +2793,7 @@ bool Ds41Dense::begin_rows(const Row * rows, int n) {
 
 bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
     Impl & im = *p_;
+    im.drop_ahead();
     if (B < 1 || B > im.cfg.prompt_batch || B > im.NC || pos0 < 0 || pos0 + B > im.cfg.ctx_max) { im.err = "bad batch"; return false; }
     if (!im.upload_inputs(tids, B, pos0)) return false;
     im.pos0 = pos0; im.batch_pos0 = pos0; im.batch = B; im.n = B; im.col0 = 0;
@@ -2900,9 +3013,61 @@ const int32_t * Ds41Dense::batch_ids() const { return p_->host_ids.data(); }
 const float * Ds41Dense::batch_wts() const { return p_->host_wts.data(); }
 const float * Ds41Dense::batch_fn() const { return p_->host_fn.data(); }
 
+// STRATA_ATTN_TAIL: ev_route recorded behind the routing readbacks (the event made on first use)
+static bool route_event(Ds41Dense::Impl & im) {
+    if (!im.ev_route) im.ev_route = ggml_backend_event_new(ggml_backend_get_device(im.backend));
+    if (!im.ev_route) { im.err = "attn_router: no backend event"; return false; }
+    ggml_backend_event_record(im.ev_route, im.backend);
+    return true;
+}
+
+// STRATA_ATTN_TAIL: queue layer il's tail graph (cached with its attention graph) behind what the stream holds
+static bool attn_tail_queue(Ds41Dense::Impl & im, int il) {
+    const auto it = im.graphs.find(Ds41Dense::Impl::GKey { il, 11, 0, 1 });
+    if (it == im.graphs.end()) { im.err = "attn_router: no tail graph for layer " + std::to_string(il); return false; }
+    if (!im.compute(it->second, true, true)) return false;
+    im.tail_pending = true;
+    return true;
+}
+
+// STRATA_ATTN_TAIL=2: queue the tail that is still owed (before anything that reads what it writes)
+static bool tail_flush(Ds41Dense::Impl & im) {
+    if (im.tail_need < 0) return true;
+    const int l = im.tail_need;
+    if (!attn_tail_queue(im, l)) return false;
+    im.tail_need = -1;
+    return true;
+}
+
+bool Ds41Dense::queue_tail(int il) {
+    Impl & im = *p_;
+    return im.tail_need != il || tail_flush(im);
+}
+
 bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev) {
     Impl & im = *p_;
     const int64_t n = im.n;
+    if (!tail_flush(im)) return false;   // (STRATA_ATTN_TAIL=2: a previous layer's tail never queued - not on the decode path)
+    if (im.ahead_il >= 0) {   // STRATA_ATTN_AHEAD: finish_predict_attn already queued a layer's graph + readbacks
+        const int a = im.ahead_il;
+        im.ahead_il = -1;
+        if (a == il && n == 1 && im.tail_on) {   // STRATA_ATTN_TAIL: its tail goes behind them; wait the readbacks only
+            if (attn_tail_mode() == 2) im.tail_need = il;   // the tier queues it (queue_tail) after its card side
+            else if (!attn_tail_queue(im, il)) return false;
+            ggml_backend_event_synchronize(im.ev_route);
+        } else {
+            ggml_backend_synchronize(im.backend);
+        }
+        if (a == il && n == 1) {
+            std::memcpy(ids, im.rb_ids, (size_t) im.NU * 4);
+            std::memcpy(wts, im.rb_wts, (size_t) im.NU * 4);
+            *fn_host = im.rb_fn;
+            if (fn_dev) *fn_dev = im.o_fn;
+            return true;
+        }
+        static bool warned = false;   // a caller ran another layer in between: that graph's results are dropped
+        if (!warned) { warned = true; std::fprintf(stderr, "ds41_dense: STRATA_ATTN_AHEAD: layer %d queued, %d asked - dropped\n", a, il); }
+    }
     // Engram layer: wait the pass's reads (started in upload_inputs) before the graph that reads i_eng runs.  For the
     // chunk path this is the first Engram layer too, so the layers below it ran while the disk was reading.
     if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;
@@ -2916,12 +3081,17 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     // a single sequence's DSpark verify widths (1 < n <= 8): their own cache, keyed by the bound slot (the graph reads
     // that slot's rings / caches; swap_slots / bind_slot reset_graphs() drops it with the rest)
     const bool mcached = !im.rows_mode && pass_graphs_on(n);
+    const bool tail = im.tail_on && n == 1 && !im.rows_mode;   // STRATA_ATTN_TAIL (the cached single-token graphs)
     if (cached) {
         const Impl::GKey key = im.rows_mode ? Impl::GKey { il, 8, im.rows_sig, n, -1 } : Impl::GKey { il, 1, cap, 1, im.cur_slot };
         auto it = im.graphs.find(key);
-        if (it == im.graphs.end()) {
+        if (it == im.graphs.end() || (tail && !im.graphs.count(Impl::GKey { il, 11, 0, 1 }))) {
             if (!im.gctx_room()) im.reset_graphs();   // many slots' decode graphs: start the cache over (rebuilt lazily)
-            it = im.graphs.emplace(key, build_attn(im, im.gctx, il, n, 0, late)).first;
+            it = im.graphs.find(key);
+            if (it == im.graphs.end()) it = im.graphs.emplace(key, build_attn(im, im.gctx, il, n, 0, late && !tail, tail)).first;
+            // the tail is built with its attention graph (before anything is queued: a reset here frees the buffers)
+            if (tail && !im.graphs.count(Impl::GKey { il, 11, 0, 1 }))
+                im.graphs.emplace(Impl::GKey { il, 11, 0, 1 }, build_attn_tail(im, im.gctx, il));
         }
         gf = it->second;
     } else if (mcached) {
@@ -2932,28 +3102,41 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
         gc = ggml_init(p);
         gf = build_attn(im, gc, il, n, 0, late);
     }
-    const bool ok = im.compute(gf, cached || mcached);
+    // STRATA_DENSE_ASYNC: the readbacks below queue behind the graph and their sync covers both (a per-pass graph keeps
+    // the old sync: its node structs are freed right after)
+    const bool ok = im.compute(gf, cached || mcached, dense_async() && (cached || mcached));
     if (gc) ggml_free(gc);
     if (!ok) return false;
     // one sync for the three readbacks (was one per tensor_get: 3 x 40 stream syncs per decode token)
-    ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data(), 0, (size_t) (im.D * n) * 4);
-    ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data(), 0, (size_t) (im.NU * n) * 4);
-    ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data(), 0, (size_t) (im.NU * n) * 4);
+    const bool pin = im.rb_fn && n == 1 && !im.o_xids;   // STRATA_PIN_RB (the route meter reads the vectors)
+    float * h_fn = pin ? im.rb_fn : im.host_fn.data(), * h_wts = pin ? im.rb_wts : im.host_wts.data();
+    int32_t * h_ids = pin ? im.rb_ids : im.host_ids.data();
+    ggml_backend_tensor_get_async(im.backend, im.o_fn, h_fn, 0, (size_t) (im.D * n) * 4);
+    ggml_backend_tensor_get_async(im.backend, im.o_ids, h_ids, 0, (size_t) (im.NU * n) * 4);
+    ggml_backend_tensor_get_async(im.backend, im.o_wts, h_wts, 0, (size_t) (im.NU * n) * 4);
     im.la_ok = im.o_la && n <= kLaMaxCols && la_next_ok(im, il);
     if (im.la_ok) ggml_backend_tensor_get_async(im.backend, im.o_la, im.host_la.data(), 0, (size_t) (16 * n) * 4);
     if (im.o_xids) {
         ggml_backend_tensor_get_async(im.backend, im.o_xids, im.host_xids.data(), 0, (size_t) (im.NU * n) * 4);
         ggml_backend_tensor_get_async(im.backend, im.o_xwts, im.host_xwts.data(), 0, (size_t) (im.NU * n) * 4);
     }
-    ggml_backend_synchronize(im.backend);
-    if (late) {   // queued behind the readback; the caller's tier work runs beside it, the finish graph behind it
+    if (tail) {   // STRATA_ATTN_TAIL: mark the readbacks, queue the tail behind them, wait the readbacks only
+        if (!route_event(im)) return false;
+        if (attn_tail_mode() == 2) im.tail_need = il;   // the tier queues it (queue_tail) after its card side
+        else if (!attn_tail_queue(im, il)) return false;
+        ggml_backend_event_synchronize(im.ev_route);
+    } else {
+        ggml_backend_synchronize(im.backend);
+        ggml_backend_synchronize(im.backend);
+    }
+    if (late && !tail) {   // queued behind the readback; the caller's tier work runs beside it, the finish graph behind it
         ggml_cgraph * gs = pass_graph(im, Impl::GKey { il, 21, 0, n, -1 }, [&](ggml_context * c) { return build_shexp_late(im, c, il, n); });
         if (!im.compute(gs, true, true)) return false;
     }
     if (im.o_xids) meter_add(im, 0, n);
-    std::memcpy(ids, im.host_ids.data(), (size_t) (im.NU * n) * 4);
-    std::memcpy(wts, im.host_wts.data(), (size_t) (im.NU * n) * 4);
-    *fn_host = im.host_fn.data();
+    std::memcpy(ids, h_ids, (size_t) (im.NU * n) * 4);
+    std::memcpy(wts, h_wts, (size_t) (im.NU * n) * 4);
+    *fn_host = h_fn;
     if (fn_dev) *fn_dev = im.o_fn;
     return true;
 }
@@ -2962,6 +3145,7 @@ const int * Ds41Dense::lookahead_ids() const { return p_->la_ok ? p_->host_la.da
 
 bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
     Impl & im = *p_;
+    if (!tail_flush(im)) return false;   // STRATA_ATTN_TAIL=2: the layer's tail first (it writes what this reads)
     if (im.n != 1 || n_top < 1 || n_top > 16) return false;
     const Impl::GKey key { il, 3, 0, 1 };
     auto it = im.graphs.find(key);
@@ -2971,15 +3155,23 @@ bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
         it = im.graphs.emplace(key, gf).first;
         im.predict_out[il] = o;
     }
-    if (!im.compute(it->second, true)) return false;
+    if (!im.compute(it->second, true, dense_async())) return false;
     int32_t buf[16];
-    ggml_backend_tensor_get(im.predict_out[il], buf, 0, sizeof(buf));
+    if (dense_async()) {   // the readback behind the graph on its stream: one sync for both
+        int32_t * dst = im.rb_pred ? im.rb_pred : buf;   // STRATA_PIN_RB: pinned
+        ggml_backend_tensor_get_async(im.backend, im.predict_out[il], dst, 0, sizeof(buf));
+        ggml_backend_synchronize(im.backend);
+        if (dst != buf) std::memcpy(buf, dst, sizeof(buf));
+    } else {
+        ggml_backend_tensor_get(im.predict_out[il], buf, 0, sizeof(buf));
+    }
     for (int i = 0; i < n_top; ++i) top_ids[i] = buf[i];
     return true;
 }
 
 bool Ds41Dense::predict_multi(int il, int * top_ids) {
     Impl & im = *p_;
+    if (!tail_flush(im)) return false;   // STRATA_ATTN_TAIL=2: the layer's tail first (it writes what this reads)
     const int64_t n = im.n;
     if (n < 1) return false;
     if (n == 1) return predict(il, top_ids, 16);
@@ -2999,6 +3191,7 @@ bool Ds41Dense::predict_multi(int il, int * top_ids) {
 
 bool Ds41Dense::finish(int il, const float * routed_sum) {
     Impl & im = *p_;
+    if (!tail_flush(im)) return false;   // STRATA_ATTN_TAIL=2: the layer's tail first (it writes what this reads)
     (void) il;
     const int64_t n = im.n;
     if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) (im.D * n) * 4);
@@ -3030,6 +3223,7 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
 
 bool Ds41Dense::finish_predict(int il, const float * routed_sum, int next_il, int * top_ids, int n_top) {
     Impl & im = *p_;
+    if (!tail_flush(im)) return false;   // STRATA_ATTN_TAIL=2: the layer's tail first (it writes what this reads)
     (void) il;
     if (im.n != 1 || n_top < 1 || n_top > 16 || next_il < 0 || next_il >= (int) im.ly.size()) return false;
     if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) im.D * 4);
@@ -3041,16 +3235,61 @@ bool Ds41Dense::finish_predict(int il, const float * routed_sum, int next_il, in
         it = im.graphs.emplace(key, gf).first;
         im.fpredict_out[next_il] = o;
     }
-    if (!im.compute(it->second, true)) return false;
+    if (!im.compute(it->second, true, dense_async())) return false;
     int32_t buf[16];
-    ggml_backend_tensor_get(im.fpredict_out[next_il], buf, 0, sizeof(buf));
+    if (dense_async()) {   // the readback behind the graph on its stream: one sync for both
+        int32_t * dst = im.rb_pred ? im.rb_pred : buf;   // STRATA_PIN_RB: pinned
+        ggml_backend_tensor_get_async(im.backend, im.fpredict_out[next_il], dst, 0, sizeof(buf));
+        ggml_backend_synchronize(im.backend);
+        if (dst != buf) std::memcpy(buf, dst, sizeof(buf));
+    } else {
+        ggml_backend_tensor_get(im.fpredict_out[next_il], buf, 0, sizeof(buf));
+    }
     for (int i = 0; i < n_top; ++i) top_ids[i] = buf[i];
+    return true;
+}
+
+bool Ds41Dense::can_attn_ahead() const {
+    const Impl & im = *p_;
+    return im.rb_fn && dense_async() && im.n == 1 && !im.rows_mode && !im.o_xids;
+}
+
+bool Ds41Dense::finish_predict_attn(int il, const float * routed_sum, int next_il, int * top_ids, int n_top) {
+    Impl & im = *p_;
+    if (!tail_flush(im)) return false;   // STRATA_ATTN_TAIL=2: the layer's tail first (it writes what this reads)
+    if (!can_attn_ahead() || im.ahead_il >= 0 || n_top < 1 || n_top > 16 || next_il < 0 || next_il >= (int) im.ly.size())
+        return finish_predict(il, routed_sum, next_il, top_ids, n_top);
+    // next_il's attention graph as its attn_router would take it from the cache (built there on its first call: a
+    // graph missing here goes the plain way)
+    const int64_t r = im.ly[(size_t) next_il].ratio;
+    const auto ga = im.graphs.find(Impl::GKey { next_il, 1, r ? im.pass_cap[r] : 0, 1, im.cur_slot });
+    const auto gp = im.graphs.find(Impl::GKey { next_il, 5, 0, 1 });
+    if (ga == im.graphs.end() || gp == im.graphs.end() || (im.tail_on && !im.graphs.count(Impl::GKey { next_il, 11, 0, 1 })))
+        return finish_predict(il, routed_sum, next_il, top_ids, n_top);
+    if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) im.D * 4);
+    if (!im.compute(gp->second, true, true)) return false;
+    ggml_backend_tensor_get_async(im.backend, im.fpredict_out[next_il], im.rb_pred, 0, 16 * 4);
+    if (!im.ev_pred) im.ev_pred = ggml_backend_event_new(ggml_backend_get_device(im.backend));
+    if (!im.ev_pred) { im.err = "finish_predict_attn: no backend event"; return false; }
+    ggml_backend_event_record(im.ev_pred, im.backend);
+    // the next layer, queued behind it (an Engram layer's rows are uploaded first, as attn_router does)
+    if (im.ly[(size_t) next_il].eslot >= 0 && !engram_ready(im)) return false;
+    if (!im.compute(ga->second, true, true)) return false;
+    ggml_backend_tensor_get_async(im.backend, im.o_fn, im.rb_fn, 0, (size_t) im.D * 4);
+    ggml_backend_tensor_get_async(im.backend, im.o_ids, im.rb_ids, 0, (size_t) im.NU * 4);
+    ggml_backend_tensor_get_async(im.backend, im.o_wts, im.rb_wts, 0, (size_t) im.NU * 4);
+    // STRATA_ATTN_TAIL: next_il's graph has no tail; attn_router queues it behind these readbacks and waits ev_route
+    if (im.tail_on && !route_event(im)) return false;
+    im.ahead_il = next_il;
+    ggml_backend_event_synchronize(im.ev_pred);   // the prediction has landed; next_il's attention runs on
+    for (int i = 0; i < n_top; ++i) top_ids[i] = im.rb_pred[i];
     return true;
 }
 
 bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_il, int * top_ids, int n_top, int ahead,
                                      int * ahead_ids) {
     Impl & im = *p_;
+    if (!tail_flush(im)) return false;   // STRATA_ATTN_TAIL=2: the layer's tail first (it writes what this reads)
     (void) il;
     if (ahead <= 0 || !ahead_ids) return finish_predict(il, routed_sum, next_il, top_ids, n_top);
     if (im.n != 1 || n_top < 1 || n_top > 16 || next_il < 0 || next_il >= (int) im.ly.size()) return false;
@@ -3065,14 +3304,19 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
         ao.insert(ao.begin(), o);   // [0] = next_il's prediction, [1 + a] = next_il + 1 + a's
         im.fpredict_ahead[{ next_il, ahead }] = ao;
     }
-    if (!im.compute(it->second, true)) return false;
+    if (!im.compute(it->second, true, dense_async())) return false;
     const auto & ao = im.fpredict_ahead[{ next_il, ahead }];   // [0] = the output, then one entry per extra row
     // argsort_top_k is a VIEW of the full argsort: row r starts at r * nb[1] (NE ids apart), not r * 16 - one copy of
     // the span covering every row's first 16
     const int rows = (int) ao.size();
     const size_t rs = ao[0]->nb[1] / 4;
     std::vector<int32_t> buf(rs * (size_t) (rows - 1) + 16);
-    ggml_backend_tensor_get(ao[0], buf.data(), 0, buf.size() * 4);
+    if (dense_async()) {   // STRATA_DENSE_ASYNC: the readback behind the graph on its stream, one sync for both (as finish_predict)
+        ggml_backend_tensor_get_async(im.backend, ao[0], buf.data(), 0, buf.size() * 4);
+        ggml_backend_synchronize(im.backend);
+    } else {
+        ggml_backend_tensor_get(ao[0], buf.data(), 0, buf.size() * 4);
+    }
     for (int i = 0; i < n_top; ++i) top_ids[i] = buf[(size_t) i];
     for (int a = 0; a < ahead; ++a) {
         if (a + 1 < rows) std::copy(buf.begin() + (ptrdiff_t) (rs * (size_t) (a + 1)), buf.begin() + (ptrdiff_t) (rs * (size_t) (a + 1) + 16),
@@ -3144,6 +3388,7 @@ bool Ds41Dense::snapshot(int pos) {
 
 bool Ds41Dense::restore() {
     Impl & im = *p_;
+    im.drop_ahead();
     if (im.snap_pos < 0) return false;
     for (auto & L : im.ly) {
         if (!L.raw || !L.raw_snap) continue;   // another stage's layer (layer split, #98): no state here
@@ -3533,6 +3778,7 @@ bool Ds41Dense::import_handoff_from(const Ds41Dense & src, int src_cuda_device, 
 
 bool Ds41Dense::begin_continued(const int * tids, int n, int pos0) {
     Impl & im = *p_;
+    im.drop_ahead();
     if (n < 1 || n > im.NC || pos0 < 0 || pos0 + n > im.cfg.ctx_max) { im.err = "bad pass"; return false; }
     im.pos0 = pos0;
     im.n = n;
@@ -3543,6 +3789,7 @@ bool Ds41Dense::begin_continued(const int * tids, int n, int pos0) {
 
 bool Ds41Dense::begin_batch_continued(const int * tids, int B, int pos0) {
     Impl & im = *p_;
+    im.drop_ahead();
     if (B < 1 || B > im.cfg.prompt_batch || B > im.NC || pos0 < 0 || pos0 + B > im.cfg.ctx_max) {
         im.err = "bad batch";
         return false;
@@ -3603,6 +3850,7 @@ bool Ds41Dense::capture_conversation(int64_t positions, std::vector<uint8_t> & o
 bool Ds41Dense::restore_conversation(const std::vector<uint8_t> & in) {
     if (in.size() < 8 + 4 * sizeof(int64_t) || std::memcmp(in.data(), kConvMagic, 8) != 0) return false;
     Impl & im = *p_;
+    im.drop_ahead();
     size_t o = 8;
     int64_t lo = 0, hi = 0, positions = 0, snap = 0;
     std::memcpy(&lo, in.data() + o, sizeof lo); o += sizeof lo;

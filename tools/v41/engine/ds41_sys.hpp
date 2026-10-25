@@ -109,7 +109,13 @@ inline int close(int fd) { return _close(fd); }
 inline ssize_t xfer(int fd, void* buf, size_t n, int64_t off, bool write) {
     HANDLE h = handle_of(fd);
     if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
-    thread_local HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    // closed when the thread exits: a raw thread_local HANDLE leaked one event per short-lived reader thread
+    struct ThreadEvent {
+        HANDLE h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        ~ThreadEvent() { if (h) CloseHandle(h); }
+    };
+    thread_local ThreadEvent tev;
+    const HANDLE ev = tev.h;
     size_t done = 0;
     while (done < n) {
         const DWORD want = (DWORD) ((n - done) > (size_t) (1u << 30) ? (1u << 30) : (n - done));

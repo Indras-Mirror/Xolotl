@@ -433,6 +433,15 @@ public:
     uint64_t file_size() const { return size_; }
     uint64_t alignment() const { return alignment_; }
     const std::string& path() const { return path_; }
+    /// The view's pages this process touched leave its working set (xolotl, DeepSeek-V4.1's STRATA_DROP_MMAP: once the
+    /// dense weights are on the card, the ~8 GiB of file pages their copies read need not count as the process's
+    /// memory).  Windows: VirtualUnlock on the unlocked view removes them from the working set; they stay cached as
+    /// standby (available) memory and a later read faults them back.  Elsewhere a no-op (the page cache reclaims them).
+    void release_resident() const {
+#ifdef _WIN32
+        if (base_) VirtualUnlock((LPVOID) base_, (SIZE_T) size_);
+#endif
+    }
 
     const TensorInfo* find(const std::string& name) const {
         for (const auto& t : tensors_)

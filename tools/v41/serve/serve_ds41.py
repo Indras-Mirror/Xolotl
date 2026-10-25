@@ -559,10 +559,14 @@ def _note_ds41(self, n, evs, st=None, rate=None):
 
 
 # a model name ending in one of these (a config alias) = that routing for the request, for the strata_tune keys the
-# request doesn't name: -exact = no decode biases (quality mode), -fast = the stronger 0.5 / 0.3 nudge (speed mode); the
-# plain name gets the config's --route-bias / --route-bias-file
+# request doesn't name: -exact = no decode biases (quality mode), -light = the 0.25 / 0.15 nudge (V41_START_HERE.md
+# section 5c: ~1 pt API top-1 under exact), -fast = the stronger 0.5 / 0.3 nudge (speed mode), -max = the engine's own
+# default 1.0 / 0.6 nudge (strongest; local 1093-token forced test: top-1 868/1093 vs exact); the plain name gets the
+# config's --route-bias / --route-bias-file
 ROUTE_SUFFIXES = {"-exact": {"route_bias": 0.0, "route_bias_file": 0.0, "route_bias_remote": 0.0},
-                  "-fast": {"route_bias": 0.5, "route_bias_file": 0.3}}
+                  "-light": {"route_bias": 0.25, "route_bias_file": 0.15},
+                  "-fast": {"route_bias": 0.5, "route_bias_file": 0.3},
+                  "-max": {"route_bias": 1.0, "route_bias_file": 0.6}}
 
 
 def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # **kw: the server's newer keywords (0.1.44: force=)

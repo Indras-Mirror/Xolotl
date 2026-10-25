@@ -44,3 +44,26 @@ void decode_rows_sum(const float* parts, const float* w, int K, int64_t H, float
     decode_rows_sum_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(parts, w, K, H, out);
     check("decode_rows_sum");
 }
+
+// decode_rows_sum_kernel with row k taken from host_rows (pinned host memory, read over PCIe) when sel[k] != 0: the same
+// values summed in the same order with the same double operations, so the same bits; w and sel are launch parameters.
+__global__ void decode_rows_sum_sel_kernel(const float* __restrict__ parts, const float* __restrict__ host_rows,
+                                           const RowsSumSel ws, int K, int64_t H, float* __restrict__ out) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < H; i += (int64_t) gridDim.x * blockDim.x) {
+        double s = 0.0;
+        for (int k = 0; k < K; ++k) {
+            const float wk = ws.w[k];
+            if (wk == 0.0f) continue;
+            const float v = ws.sel[k] ? host_rows[(int64_t) k * H + i] : parts[(int64_t) k * H + i];
+            s = __dadd_rn(s, __dmul_rn((double) wk, (double) v));
+        }
+        out[i] = (float) s;
+    }
+}
+
+void decode_rows_sum_sel(const float* parts, const float* host_rows, const RowsSumSel& ws, int K, int64_t H, float* out,
+                         void* stream) {
+    const unsigned blocks = (unsigned) std::min<int64_t>((H + 255) / 256, 1024);
+    decode_rows_sum_sel_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(parts, host_rows, ws, K, H, out);
+    check("decode_rows_sum_sel");
+}

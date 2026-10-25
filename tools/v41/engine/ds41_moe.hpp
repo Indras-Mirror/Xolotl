@@ -48,6 +48,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <map>
 #include <memory>
 #include <limits>
@@ -143,6 +144,21 @@ public:
         if (part == 0) read(layer, expert, dst);
         (void) nparts;
     }
+    /// read_part into a destination that has `cap` bytes from dst: a source with 4 KiB-aligned blobs may then read a
+    /// part straight into a 4 KiB-aligned dst + part offset (O_DIRECT, no bounce copy) when the 4 KiB-rounded end still
+    /// fits in `cap`.  cap 0 = unknown.  Default: read_part.
+    virtual void read_part_cap(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst, size_t cap) const {
+        (void) cap;
+        read_part(layer, expert, part, nparts, dst);
+    }
+    /// Whether read_range_cap works (else only whole read_part parts).
+    virtual bool has_range_reads() const { return false; }
+    /// Bytes [lo, hi) of the blob into dst + lo (lo 4 KiB-aligned; hi too unless it is the blob's end), read_part_cap's
+    /// way: `part` of `nparts` only stands for the fixed mirror share's choice of drive (STRATA_MIRROR_POLICY 0).
+    virtual void read_range_cap(int64_t layer, int64_t expert, uint64_t lo, uint64_t hi, int part, int nparts, uint8_t* dst,
+                                size_t cap) const {
+        (void) layer; (void) expert; (void) lo; (void) hi; (void) part; (void) nparts; (void) dst; (void) cap;
+    }
     /// The chunk-prefetch reader pool's read: the same bytes as `read`, through the fastest path the source has.  A
     /// source with a raw file layout overrides this to pread through an `O_DIRECT` twin fd via the aligned `scratch`
     /// bounce (`read_staged_scratch()` bytes per thread, 4096-aligned).  Measured on the V41-GSQ GGUF: the scattered
@@ -222,7 +238,13 @@ public:
     size_t blob_bytes() const override { return max_; }
     size_t blob_bytes(int64_t l) const override;
     void read(int64_t layer, int64_t expert, uint8_t* dst) const override;
-    void read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const override;
+    void read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const override {
+        read_part_cap(layer, expert, part, nparts, dst, 0);
+    }
+    void read_part_cap(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst, size_t cap) const override;
+    bool has_range_reads() const override { return true; }
+    void read_range_cap(int64_t layer, int64_t expert, uint64_t lo, uint64_t hi, int part, int nparts, uint8_t* dst,
+                        size_t cap) const override;
     void read_staged(int64_t layer, int64_t expert, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes) const override;
     size_t read_staged_scratch() const override { return scratch_; }
     void advise(int64_t layer, int64_t expert) const override;
@@ -256,11 +278,13 @@ private:
     /// One 4096-aligned `pread` of [off, off+n) through the O_DIRECT twin fd, sliced out of `scratch`.  False when
     /// there is no twin fd or the bounce is too small (the caller then falls back to the buffered `read`).
     bool read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes, int fd = -1) const;
-    bool open_mirror(const char* path, std::string& err);
+    bool open_mirror(const char* path, std::string& err, bool primary = false);
     /// read_staged (whole blobs): does this mirrored blob come from the mirror?  mshare_ per mille, by a fixed hash.
     bool mirror_pick(int64_t layer, int64_t expert) const;
     int mfd_ = -1;                        ///< the mirror (O_DIRECT), -1 = none
     std::vector<uint64_t> moff_;          ///< per (layer, expert): the blob's offset in the mirror, ~0 = not mirrored
+    int pfd_ = -1;                        ///< STRATA_BLOB_PRIMARY: an aligned copy on the model's drive (O_DIRECT), -1 = none
+    std::vector<uint64_t> poff_;          ///< per (layer, expert): the blob's offset in that copy, ~0 = not in it
     int64_t mirrored_ = 0;
     int mshare_ = 280;                    ///< per mille of a mirrored blob's parts read from the mirror
     int mpshare_ = 280;                   ///< the same for read_part (decode misses) only
@@ -484,6 +508,10 @@ public:
     /// the dense half's routed tensor): the same bits as `run`'s host sum, without its parts readback and upload.
     /// GPU tier only (false in cpu_only).
     bool run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev);
+    /// STRATA_ATTN_TAIL=2: `f` runs once, inside the next GPU-path layer call, right after that call has launched its
+    /// card-side work (hits, PCIe share, vram_lru copies) - the dense half queues its tail graph there, behind the
+    /// tier's kernels.  Cleared when it runs; a call that never gets there leaves it set (clear it with nullptr).
+    void set_after_gpu(std::function<void()> f);
     /// The same with `x` already on the device (the engine's attention output).  CUDA modes only.
     bool run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out);
 
@@ -499,6 +527,8 @@ public:
     const char* mode() const;          ///< "cpu-only" | "gpu" | "uninitialised"
     int64_t resident() const;          ///< experts admitted to the VRAM cache
     int64_t arena_experts() const;     ///< blobs the host arena holds
+    /// (layer, expert) pairs in the VRAM cache, in the host arena, and in both (diagnostic: STRATA_DEC_REPORT)
+    void cache_census(int64_t& vram, int64_t& arena, int64_t& both) const;
     int64_t file_tier() const;         ///< blobs the arena could not take
     double arena_gib() const;
     int64_t blob_bytes(int64_t layer) const;   ///< one expert's gate+up+down bytes in `layer` (0 if not routed)

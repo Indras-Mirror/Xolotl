@@ -322,6 +322,7 @@ int main(int argc, char ** argv) {
         ::setenv("STRATA_ENGRAM_CACHE_ROWS", "0", 1);   // no row cache / hot set in the reader we pack from
         ::setenv("STRATA_ENGRAM_HOT", "0", 1);
         if (!eng.open(G, dirs, 1, e)) { std::fprintf(stderr, "hot: engram open: %s\n", e.c_str()); return 1; }
+        if (eng.raw_row_bytes() != kRowBytes) { std::fprintf(stderr, "hot: packs hold FP8 rows; these tables are %s\n", G.engram_encoding.c_str()); return 1; }
         return cmd_pack(eng, rank, gib, out, threads);
     }
     eng.setup_hash(G);

@@ -91,6 +91,16 @@ void weighted_rows_sum(const float* parts, const float* w, int K, int64_t H, int
 /// One decode token's top-k mix on the card: out[i] = sum_k w[k] * parts[k * H + i] in double, k in order (== the
 /// tier's host loop bit for bit); w[k] == 0 skips row k.
 void decode_rows_sum(const float* parts, const float* w, int K, int64_t H, float* out, void* stream);
+/// decode_rows_sum with the pool's rows read where the host wrote them: row k comes from `host_rows` (pinned host
+/// memory under UVA, read by the kernel over PCIe - no H2D copy per row) when sel[k] != 0, else from `parts`; the
+/// weights and selectors travel with the launch.  The same values in the same k-order double sum: the same bits.
+constexpr int kRowsSumSelMax = 16;
+struct RowsSumSel {
+    float w[kRowsSumSelMax];
+    int32_t sel[kRowsSumSelMax];
+};
+void decode_rows_sum_sel(const float* parts, const float* host_rows, const RowsSumSel& ws, int K, int64_t H, float* out,
+                         void* stream);
 
 /// A770 port (STRATA_PF_XMX=2): up to kXmxGroupMax experts' products in one XMX launch, the weights decoded from the
 /// quantized rows into local memory.  Expert i: Y_i[cnt[i]][N] = X_i . W_i^T (X FP16, Y FP32, rows back to back).
