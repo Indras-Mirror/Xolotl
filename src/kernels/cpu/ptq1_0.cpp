@@ -328,7 +328,7 @@ STRATA_PTQ_AVX2_FMA void q2_rows_avx2(const uint8_t* w, size_t rb, int n, const 
 //           differs: max |err| ~2e-6 of the rows' rms vs the scalar ref, rows_avx2 ~8e-7).  A row's last n/128 % 4
 //           blocks take rows_avx2's per-block path.  7 threads, 2.4 GB of weights, 5700X: 1 / 2 / 4 tokens
 //           17.7 / 13.9 / 9.6 -> 28.2 / 21.9 / 13.5 GB/s (5120 in), 17.9 / 13.9 / 9.2 -> 26.9 / 19.3 / 13.2 (2304 in).
-//   STRATA_PTQ1_ROWS3=0: rows_avx2.
+//   STRATA_PTQ1_ROWS3=1 turns it on (default off: see ptq1_0_rows_q8_0).
 struct R3Group { int8_t q[16][32]; float da[16][8]; };
 struct R3Tok { std::vector<R3Group> g; std::vector<float> C; const Q8* raw = nullptr; };
 struct R3Map {
@@ -480,14 +480,36 @@ STRATA_PTQ_AVX2_FMA void rows3(const uint8_t* w, size_t rb, int n, const R3Tok* 
 void ptq1_0_rows_q8_0(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
 #if STRATA_PTQ1_X86
     static const bool avx2 = cpu_avx2_ok();   // AVX, AVX2, FMA and F16C (expert_layout.hpp)
-    static const bool r3 = !(std::getenv("STRATA_PTQ1_ROWS3") && std::getenv("STRATA_PTQ1_ROWS3")[0] == '0');
+    // OPT-IN (STRATA_PTQ1_ROWS3=1): 1.4-1.6x rows_avx2 alone, but served V4 decode (2026-10-25, same binary, 8K, 6 runs)
+    // averaged ~142 ms/pass on vs ~128 off - the CPU pool shares the host-RAM bus with the PCIe/NVMe traffic and the
+    // faster kernel only competed harder for it (the GPU's dense step slowed too).  Worth re-testing with more RAM
+    // bandwidth (2666+ MT/s) or where the pool runs alone.
+    static const bool r3 = std::getenv("STRATA_PTQ1_ROWS3") && std::getenv("STRATA_PTQ1_ROWS3")[0] == '1';
     if (avx2 && r3 && n >= 4 * kPtq1Block) {   // rows3 (above): tokens in groups of <= 4, activations permuted per call
-        thread_local std::vector<R3Tok> tok;
-        if (tok.size() < 4) tok.resize(4);
+        // the prepared activations are kept per thread and reused while the same bytes come back (memcmp, exact): the
+        // pool hands a thread 50-100-row slices of one or two experts, all against the same token rows in a gate/up
+        // phase, and a fresh prep per call (~6.5 us at 5120) made 8-row slices 2.4x SLOWER than rows_avx2
+        struct Slot { std::vector<uint8_t> raw; int n = 0; uint64_t used = 0; R3Tok tok; };
+        thread_local Slot slots[8];
+        thread_local uint64_t clock = 0;
+        const size_t ab = (size_t) (n / 32) * sizeof(Q8);
+        auto prepared = [&](const void* a) -> const R3Tok* {
+            ++clock;
+            Slot* lru = &slots[0];
+            for (Slot& s : slots) {
+                if (s.n == n && std::memcmp(s.raw.data(), a, ab) == 0) { s.used = clock; s.tok.raw = (const Q8*) a; return &s.tok; }
+                if (s.used < lru->used) lru = &s;
+            }
+            lru->raw.assign((const uint8_t*) a, (const uint8_t*) a + ab);
+            lru->n = n;
+            lru->used = clock;
+            rows3_prep((const Q8*) a, n, lru->tok);
+            return &lru->tok;
+        };
         for (int t0 = 0; t0 < nt; t0 += 4) {
             const int g = nt - t0 < 4 ? nt - t0 : 4;
             const R3Tok* p[4];
-            for (int t = 0; t < g; ++t) { rows3_prep((const Q8*) act[t0 + t], n, tok[(size_t) t]); p[t] = &tok[(size_t) t]; }
+            for (int t = 0; t < g; ++t) p[t] = prepared(act[t0 + t]);
             switch (g) {
                 case 1: rows3<1>(w, row_bytes, n, p, out + t0, r0, r1); break;
                 case 2: rows3<2>(w, row_bytes, n, p, out + t0, r0, r1); break;
