@@ -1129,7 +1129,9 @@ int main(int argc, char ** argv) {
     std::unique_ptr<Ds41DSpark> dsp;
 #endif
     auto open_cache = [&]() -> bool {
+        const double toc = now_ms();
         for (int st = 0; st < pipe.n_stages(); ++st) pipe.dense(st).release_pass();
+        if (std::getenv("STRATA_SEED_LOG")) std::fprintf(stderr, "seed: release_pass %.0f ms\n", now_ms() - toc);
 #if defined(DS41_HAVE_DSPARK)
         if (dsp_path && !dsp) {
             Ds41DSparkConfig sc;

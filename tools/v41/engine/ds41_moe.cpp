@@ -464,6 +464,7 @@ struct Gpu {
     /// Cleared wherever p_layer is reset by a release.
     int p_lazy_layer = -1;
     bool p_off = false, p_used_rec = false;
+    std::vector<uint8_t*> regrow_pin;   ///< regrow_cache's file-reader pinned buffers (one per reader, kept)
     bool p_packed = false;   ///< the region holds each class at its MMQ stride (chunk_pstage_fill; calls of >= 8 rows an expert)
     std::vector<unsigned long long> p_ptr;
     cudaEvent_t p_copied = nullptr, p_used = nullptr;
@@ -539,6 +540,8 @@ struct Gpu {
         for (uint8_t* p : c_bounce)
             if (p) cudaFreeHost(p);
         if (c_hparts) cudaFreeHost(c_hparts);
+        for (uint8_t* p : regrow_pin)
+            if (p) cudaFreeHost(p);
         for (int i = 0; i < 2; ++i) {
             if (c_copied[i]) cudaEventDestroy(c_copied[i]);
             if (c_used[i]) cudaEventDestroy(c_used[i]);
@@ -2537,7 +2540,9 @@ void Ds41MoeTier::set_cache_enabled(bool on) {
 }
 
 bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
-    if (im_->cfg.cpu_only) return true;   // a CPU-only tier has neither a cache nor an arena to seed
+    if (im_->cfg.cpu_only) return true;
+    static const bool seed_log = std::getenv("STRATA_SEED_LOG") != nullptr;   // the seed's phases (stderr)
+    const double tsa = now_ms();   // a CPU-only tier has neither a cache nor an arena to seed
     if (!remote_build(*im_, drop_excluded(*im_, ranked_all), err)) return false;
     const std::vector<std::pair<int32_t, int32_t>> ranked = drop_remote(*im_, drop_excluded(*im_, ranked_all));
     if (!build_arena(arena_order_remote(*im_, arena_order(*im_, ranked)), err)) return false;
@@ -2666,6 +2671,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
             return false;
         }
         std::vector<std::array<int64_t, 3>> fjobs;   // slot, layer, expert
+        const double tsb = now_ms();
         for (const auto& le : fill_order) {
             if (filled >= want) break;
             if (!im_->g.routed(le.first) || le.second < 0 || le.second >= im_->g.n_experts) continue;
@@ -2685,6 +2691,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         std::string terr;
         std::vector<std::thread> th;
         const double t0 = now_ms();
+        const double tsc = t0;
         const int nth = (int) std::min<size_t>(8, fjobs.size());
         const int seed_dev = im_->cfg.cuda_device;
         for (int k = 0; k < nth; ++k)
@@ -2719,6 +2726,9 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         }
         im_->st.file_tier += (int64_t) fjobs.size();
         im_->st.file_ms += now_ms() - t0;
+        if (seed_log)
+            std::fprintf(stderr, "seed phases: open + order %.0f ms, queue %lld arena copies %.0f ms, %zu file reads + sync %.0f ms\n",
+                         tsb - tsa, (long long) (filled - (int64_t) fjobs.size()), tsc - tsb, fjobs.size(), now_ms() - tsc);
         lru_seed_order(filled);
         if (bad) {
             err = terr.empty() ? "seed: pinned buffer allocation failed" : terr;
@@ -6107,7 +6117,11 @@ void Ds41MoeTier::release_cache() {
 }
 
 bool Ds41MoeTier::keep_cache_mode() {
-    static const bool on = std::getenv("STRATA_SERVE_KEEP_CACHE") && std::getenv("STRATA_SERVE_KEEP_CACHE")[0] == '1';
+    // DEFAULT ON (STRATA_SERVE_KEEP_CACHE=0 = off): a short batch turn lends the cache's tail to the batch instead of the
+    // whole cache, and regrow_cache refills only that tail.  V4, Mal's serve config, turnprobe, 2 reps interleaved
+    // (2026-10-26): +32 / +50 / +85-token turns 4.68 4.44 / 4.83 4.38 / 5.62 5.20 s -> 3.92 4.05 / 4.05 4.44 / 4.77
+    // 4.99 s, decode after them mostly faster (hot experts stay); refilled slots byte-checked (DS41_CHECK_ARENA: 0 bad).
+    static const bool on = !(std::getenv("STRATA_SERVE_KEEP_CACHE") && std::getenv("STRATA_SERVE_KEEP_CACHE")[0] == '0');
     return on;
 }
 
@@ -6119,12 +6133,15 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     // The layer-major path does not perform LRU admission. Keep its live slot
     // mapping, remove the tail, and restore those exact (slot, layer, expert)
     // records after the batch. Opt-in until real-model byte/quality gates pass.
-    static const bool keep_lru = [] {
+    static const bool keep_lru = [] {   // default on with keep mode (STRATA_SERVE_KEEP_LRU=0 = refuse under --vram-lru)
         const char * value = std::getenv("STRATA_SERVE_KEEP_LRU");
-        return value && value[0] == '1';
+        return !(value && value[0] == '0');
     }();
-    if (im_->cfg.vram_lru && (!keep_lru || im_->mixed_sizes)) {
-        err = "--vram-lru (uniform cache needs STRATA_SERVE_KEEP_LRU=1)";
+    // Mixed sizes (V4's per-expert formats): the sized cache is segmented in keep mode too, LRU replaces only within a
+    // class (a slot keeps its blob size), and regrow_cache refills each slot with its own class's bytes (byte-checked
+    // with DS41_CHECK_ARENA=1 on V4, 2026-10-25: 325 refilled slots, 0 bad).
+    if (im_->cfg.vram_lru && !keep_lru) {
+        err = "--vram-lru (needs STRATA_SERVE_KEEP_LRU=1)";
         return -1;
     }
     if (!im_->shrunk.empty()) { err = "still shrunk from the last batch (regrow_cache did not run)"; return -1; }
@@ -6214,17 +6231,38 @@ int64_t Ds41MoeTier::regrow_cache(std::string& err) {
         }
         ++added;
     }
-    uint8_t* buf = nullptr;
-    if (!fjobs.empty() && cudaMallocHost((void**) &buf, (size_t) im_->blob) != cudaSuccess) {
-        err = "regrow_cache: pinned buffer"; im_->shrunk.clear(); return -1;
-    }
-    for (const auto& j : fjobs) {   // few: the evicted tail is mostly arena-resident (arena_skip_resident aside)
-        im_->blobs->read(j[1], j[2], buf);
-        if (!c.fill_slot_blocking((int32_t) j[0], buf, err, im_->bl[(size_t) im_->g.cls(j[1], j[2])])) {
-            cudaFreeHost(buf); im_->shrunk.clear(); return -1;
+    // the file-tier part, read by up to 8 threads as the seed does (one blocking reader made a V4 regrow of 325 experts,
+    // 57 of them from the file, take 1.3 s - more than re-seeding the whole cache)
+    if (!fjobs.empty()) {
+        const int nth = (int) std::min<size_t>(8, fjobs.size());
+        std::vector<uint8_t*>& pin = im_->gpu->regrow_pin;
+        while ((int) pin.size() < nth) {
+            uint8_t* b = nullptr;
+            if (cudaMallocHost((void**) &b, (size_t) im_->blob) != cudaSuccess) { (void) cudaGetLastError(); break; }
+            pin.push_back(b);
         }
+        if ((int) pin.size() < nth) { err = "regrow_cache: pinned buffer"; im_->shrunk.clear(); return -1; }
+        std::atomic<size_t> nx{0};
+        std::atomic<bool> bad{false};
+        std::mutex mu;
+        std::string terr;
+        const int dev = im_->cfg.cuda_device;
+        std::vector<std::thread> th;
+        for (int k = 0; k < nth; ++k)
+            th.emplace_back([&, k, dev]() {
+                if (dev >= 0 && cudaSetDevice(dev) != cudaSuccess) { bad = true; return; }
+                uint8_t* b = pin[(size_t) k];
+                for (size_t q; !bad && (q = nx.fetch_add(1)) < fjobs.size();) {
+                    const auto& j = fjobs[q];
+                    im_->blobs->read(j[1], j[2], b);
+                    std::lock_guard<std::mutex> lk(mu);
+                    std::string e;
+                    if (!c.fill_slot_blocking((int32_t) j[0], b, e, im_->bl[(size_t) im_->g.cls(j[1], j[2])])) { terr = e; bad = true; }
+                }
+            });
+        for (auto& t : th) t.join();
+        if (bad) { err = terr.empty() ? "regrow_cache: file fill failed" : terr; im_->shrunk.clear(); return -1; }
     }
-    if (buf) cudaFreeHost(buf);
     if (cudaStreamSynchronize((cudaStream_t) 0) != cudaSuccess) { err = "regrow_cache: queued fills failed"; im_->shrunk.clear(); return -1; }
     static const bool check = std::getenv("DS41_CHECK_ARENA") != nullptr;
     if (check) {   // every refilled slot against the file, byte for byte
