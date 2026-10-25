@@ -151,6 +151,7 @@ struct Arena {
     void* own_map = nullptr;        ///< STRATA_ARENA_PIN_AFTER: the mapping build_arena made (munmap in close)
     uint64_t own_bytes = 0;
     bool own_reg = false;           ///< ... and it is cudaHostRegister'ed
+    std::vector<uint64_t> reg_offs; ///< STRATA_ARENA_PIPE: own_map is registered in pieces starting at these offsets
     std::vector<int32_t> slot_of;   ///< (layer, expert) -> arena index, or -1
     std::vector<uint64_t> off;      ///< arena index -> byte offset (blobs differ in size per layer; used + 1 entries)
     int64_t used = 0, blob = 0, file_tier = 0;
@@ -167,13 +168,15 @@ struct Arena {
         owner.reset();
 #ifndef _WIN32
         if (own_map) {
-            if (own_reg) cudaHostUnregister(own_map);
+            if (own_reg && reg_offs.empty()) cudaHostUnregister(own_map);
+            for (const uint64_t o : reg_offs) cudaHostUnregister((uint8_t*) own_map + o);
             munmap(own_map, (size_t) own_bytes);
         }
 #endif
         own_map = nullptr;
         own_bytes = 0;
         own_reg = false;
+        reg_offs.clear();
         base = nullptr;
         bytes = 0;
         built = false;
@@ -2105,6 +2108,151 @@ std::vector<std::pair<int32_t, int32_t>> arena_order_remote(const Ds41MoeImpl& i
     return ranked;
 }
 
+#if defined(DS4_MOE_CUDA)
+/// DS41_CHECK_ARENA_FILL=1 (debug): after the arena is built, every blob is read again from the source and compared with
+/// its arena copy (the fill paths - one registration after the fill, or STRATA_ARENA_PIPE - must leave identical bytes).
+void arena_check_fill(const Arena& ar, const Ds41BlobSource& blobs, const std::vector<std::pair<int32_t, int32_t>>& first, int nt) {
+    if (!std::getenv("DS41_CHECK_ARENA_FILL")) return;
+    const double t0 = now_ms();
+    std::atomic<int64_t> next{0}, bad{0};
+    std::vector<std::thread> th;
+    for (int c = 0; c < nt; ++c)
+        th.emplace_back([&]() {
+            std::vector<uint8_t> ref;
+            for (;;) {
+                const int64_t i = next.fetch_add(1);
+                if (i >= ar.used) break;
+                const size_t len = (size_t) (ar.off[(size_t) i + 1] - ar.off[(size_t) i]);
+                ref.assign(len, 0);
+                blobs.read(first[(size_t) i].first, first[(size_t) i].second, ref.data());
+                if (std::memcmp((const uint8_t*) ar.base + (size_t) ar.off[(size_t) i], ref.data(), len) != 0) bad.fetch_add(1);
+            }
+        });
+    for (auto& t : th) t.join();
+    std::fprintf(stderr, "arena check: %lld of %lld blobs match the source (%.1f s)\n", (long long) (ar.used - bad.load()),
+                 (long long) ar.used, (now_ms() - t0) / 1000.0);
+}
+#endif
+
+#if defined(DS4_MOE_CUDA) && !defined(_WIN32)
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23   // Linux 5.14
+#endif
+struct ArenaPipeStats {
+    int pieces = 0, failed = 0;
+    double fill_s = 0.0;        ///< wall clock of the readers
+    double tail_s = 0.0;        ///< from the end of the fill to the last registration done (what the load still waits)
+    double reg_sum_s = 0.0;     ///< the registrations' own time, summed over the registrars
+};
+
+/// STRATA_ARENA_PIPE=N (opt-in, needs STRATA_ARENA_PIN_AFTER=1): the fill and the registration as a pipeline.  The arena
+/// is cut into pieces of ~`piece` bytes at blob starts that fall on a page (the mapping is page-aligned, so no page is in
+/// two registrations and no blob spans two: every DMA out of the arena copies one blob and stays inside one registered
+/// range).  `n_fill` readers fill blobs in arena order as before; the reader that completes a piece queues it, and `n_reg`
+/// registrars cudaHostRegister the queued pieces while the readers go on.  `n_pre` threads (STRATA_ARENA_PREFAULT, 0 =
+/// none) MADV_POPULATE_WRITE the pieces in order ahead of the readers, so the page faults and the zeroing leave the
+/// readers.  Registered pieces are recorded in `ar.reg_offs` (Arena::close unregisters each).  A refused registration
+/// stops the rest and unregisters what was done: the arena is then unpinned, as when the single registration fails.
+bool arena_fill_pipelined(Arena& ar, const Ds41BlobSource& blobs, const std::vector<std::pair<int32_t, int32_t>>& first,
+                          int n_fill, int n_reg, int n_pre, uint64_t piece, ArenaPipeStats& ps) {
+    uint8_t* const base = (uint8_t*) ar.base;
+    const int64_t n = ar.used;
+    std::vector<uint64_t> cut{0};
+    std::vector<int32_t> pob((size_t) n, 0);   // blob index -> piece
+    for (int64_t i = 1; i < n; ++i) {
+        const uint64_t o = ar.off[(size_t) i];
+        if (o - cut.back() >= piece && (o & 4095) == 0) cut.push_back(o);
+        pob[(size_t) i] = (int32_t) cut.size() - 1;
+    }
+    cut.push_back(ar.bytes);
+    const int np = (int) cut.size() - 1;
+    ps.pieces = np;
+    std::unique_ptr<std::atomic<int64_t>[]> left(new std::atomic<int64_t>[(size_t) np]);
+    for (int c = 0; c < np; ++c) left[(size_t) c].store(0, std::memory_order_relaxed);
+    for (int64_t i = 0; i < n; ++i) left[(size_t) pob[(size_t) i]].fetch_add(1, std::memory_order_relaxed);
+    std::vector<char> ok((size_t) np, 0);
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<int> q;
+    bool fill_done = false;
+    std::atomic<bool> failed{false};
+    int dev = 0;
+    (void) cudaGetDevice(&dev);
+    const double t0 = now_ms();
+    std::vector<double> rsum((size_t) n_reg, 0.0);
+    std::vector<std::thread> reg, pre, rd;
+    for (int r = 0; r < n_reg; ++r)
+        reg.emplace_back([&, r]() {
+            (void) cudaSetDevice(dev);
+            for (;;) {
+                int c;
+                {
+                    std::unique_lock<std::mutex> l(mu);
+                    cv.wait(l, [&] { return !q.empty() || fill_done; });
+                    if (q.empty()) return;
+                    c = q.front();
+                    q.pop_front();
+                }
+                if (failed.load(std::memory_order_relaxed)) continue;
+                const double s = now_ms();
+                if (cudaHostRegister(base + cut[(size_t) c], (size_t) (cut[(size_t) c + 1] - cut[(size_t) c]),
+                                     cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess) {
+                    ok[(size_t) c] = 1;
+                } else {
+                    (void) cudaGetLastError();
+                    failed.store(true);
+                }
+                rsum[(size_t) r] += now_ms() - s;
+            }
+        });
+    std::atomic<int> pre_next{0};
+    for (int p = 0; p < n_pre; ++p)
+        pre.emplace_back([&]() {
+            for (;;) {
+                const int c = pre_next.fetch_add(1);
+                if (c >= np) break;
+                (void) madvise(base + cut[(size_t) c], (size_t) (cut[(size_t) c + 1] - cut[(size_t) c]), MADV_POPULATE_WRITE);
+            }
+        });
+    std::atomic<int64_t> next{0};
+    for (int f = 0; f < n_fill; ++f)
+        rd.emplace_back([&]() {
+            for (;;) {
+                const int64_t i = next.fetch_add(1);
+                if (i >= n) break;
+                blobs.read(first[(size_t) i].first, first[(size_t) i].second, base + (size_t) ar.off[(size_t) i]);
+                const int c = pob[(size_t) i];
+                if (left[(size_t) c].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    std::lock_guard<std::mutex> l(mu);
+                    q.push_back(c);
+                    cv.notify_one();
+                }
+            }
+        });
+    for (auto& t : rd) t.join();
+    const double tf = now_ms();
+    ps.fill_s = (tf - t0) / 1000.0;
+    {
+        std::lock_guard<std::mutex> l(mu);
+        fill_done = true;
+    }
+    cv.notify_all();
+    for (auto& t : pre) t.join();
+    for (auto& t : reg) t.join();
+    ps.tail_s = (now_ms() - tf) / 1000.0;
+    for (const double s : rsum) ps.reg_sum_s += s / 1000.0;
+    for (int c = 0; c < np; ++c) ps.failed += !ok[(size_t) c];
+    if (ps.failed) {   // some piece refused: unpinned, as when the one registration fails
+        for (int c = 0; c < np; ++c)
+            if (ok[(size_t) c]) cudaHostUnregister(base + cut[(size_t) c]);
+        (void) cudaGetLastError();
+        return false;
+    }
+    ar.reg_offs.assign(cut.begin(), cut.end() - 1);
+    return true;
+}
+#endif
+
 bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err) {
 #if !defined(DS4_MOE_CUDA)
     (void) ranked;
@@ -2242,7 +2390,37 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
     }
     int nt = im_->cfg.threads > 0 ? im_->cfg.threads : 8;
     nt = std::min<int>(nt, 16);
+    // STRATA_ARENA_FILL_THREADS=N (opt-in): the readers, instead of min(--threads, 16)
+    if (const char* ft = std::getenv("STRATA_ARENA_FILL_THREADS"); ft && std::atoi(ft) > 0) nt = std::min(128, std::atoi(ft));
     const double t0 = now_ms();
+#ifndef _WIN32
+    // STRATA_ARENA_PIPE=N (opt-in, with STRATA_ARENA_PIN_AFTER=1): N threads register the arena in pieces while it is
+    // filled (arena_fill_pipelined); STRATA_ARENA_PIPE_MIB the piece (default 1024), STRATA_ARENA_PREFAULT=K threads
+    // populate the pieces ahead of the readers (default 0).  Unset or 0: fill, then one registration, as before.
+    const int pipe_reg = pin_after && std::getenv("STRATA_ARENA_PIPE") ? std::max(0, std::min(64, std::atoi(std::getenv("STRATA_ARENA_PIPE")))) : 0;
+    if (pipe_reg > 0) {
+        const char* pm = std::getenv("STRATA_ARENA_PIPE_MIB");
+        const uint64_t piece = (uint64_t) (pm && std::atoi(pm) > 0 ? std::atoi(pm) : 1024) << 20;
+        const char* pf = std::getenv("STRATA_ARENA_PREFAULT");
+        const int n_pre = pf ? std::max(0, std::min(64, std::atoi(pf))) : 0;
+        ArenaPipeStats ps;
+        if (arena_fill_pipelined(gp.arena, *im_->blobs, first, nt, pipe_reg, n_pre, piece, ps)) {
+            gp.arena.own_reg = true;
+            gp.arena.pinned = true;
+            gp.arena.backing = "pinned while filled (STRATA_ARENA_PIPE: " + std::to_string(ps.pieces) + " pieces of ~" +
+                               std::to_string(piece >> 20) + " MiB, " + std::to_string(nt) + " readers, " +
+                               std::to_string(pipe_reg) + " registrars, " + std::to_string(n_pre) + " prefault, 4 KB pages)";
+        } else {
+            gp.arena.backing = "anonymous (cudaHostRegister of " + std::to_string(ps.failed) + " of " +
+                               std::to_string(ps.pieces) + " pieces FAILED: the PCIe DMAs stage through the driver)";
+        }
+        std::fprintf(stderr, "arena: %s, filled in %.1f s, registered in %.1f s after the fill (registrations %.1f s summed)\n",
+                     gp.arena.backing.c_str(), ps.fill_s, ps.tail_s, ps.reg_sum_s);
+        gp.arena.seconds = (now_ms() - t0) / 1000.0;
+        arena_check_fill(gp.arena, *im_->blobs, first, nt);
+        return true;
+    }
+#endif
     std::atomic<int64_t> next{0};
     std::vector<std::thread> th;
     for (int c = 0; c < nt; ++c)
@@ -2270,6 +2448,7 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
                      (tr - t0) / 1000.0, (now_ms() - tr) / 1000.0);
     }
     gp.arena.seconds = (now_ms() - t0) / 1000.0;
+    arena_check_fill(gp.arena, *im_->blobs, first, nt);
     return true;
 #endif
 }
