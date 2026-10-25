@@ -2449,7 +2449,32 @@ int main(int argc, char ** argv) {
                     // (s6: 8731 columns before DSpark loads, 5434 after), so a long prompt takes fewer expert sweeps.
                     // open_cache() re-creates it for the tail (~1-4 s); the window is re-seeded by the tail as always.
                     static const int dsp_evict = std::getenv("STRATA_SERVE_DSPARK_EVICT") ? std::atoi(std::getenv("STRATA_SERVE_DSPARK_EVICT")) : 0;
-                    if (dsp && dsp_evict > 0 && dh >= dsp_evict) {
+                    // ... but only when the batch would NOT already take the whole turn in one sweep with DSpark loaded
+                    // (the width line below, on the VRAM free now): a 6.4K V4 prompt fits 7165 columns either way, and
+                    // the eviction then only cost the 2.5 s reload.  STRATA_SERVE_DSPARK_EVICT_FIT=0: always evict.
+                    static const bool evict_fit = !(std::getenv("STRATA_SERVE_DSPARK_EVICT_FIT") && std::atoi(std::getenv("STRATA_SERVE_DSPARK_EVICT_FIT")) == 0);
+                    auto one_sweep_now = [&]() -> bool {
+                        if (!evict_fit || mc.cpu_only || PB <= 1) return false;
+                        size_t frb = std::numeric_limits<size_t>::max();
+                        for (int st = 0; st < pipe.n_stages(); ++st) {
+#ifdef STRATA_ENABLE_CUDA
+                            cudaSetDevice(pipe.stages[(size_t) st].cuda_device);
+#endif
+                            size_t fr = 0, tot = 0;
+                            ggml_backend_dev_memory(ggml_backend_get_device(pipe.stages[(size_t) st].backend), &fr, &tot);
+                            frb = std::min(frb, fr);
+                        }
+                        if (frb == std::numeric_limits<size_t>::max()) return false;
+                        const double g_need = (double) dense.span_graph_bytes(total, SB);
+                        const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - 4.3 * 1073741824.0;
+                        const double room_g = (double) frb - a.vram_margin_gib * 1073741824.0 - 2.5 * 1073741824.0 - g_need;
+                        const int64_t fit = std::min<int64_t>((int64_t) (room / (0.95 * 1048576.0)), (int64_t) (room_g / (0.78 * 1048576.0)));
+                        const bool one = fit >= dh && PB >= dh;
+                        if (one) std::fprintf(stderr, "serve: DSpark kept for a %d-token batch (%lld columns fit with it loaded)\n",
+                                              dh, (long long) fit);
+                        return one;
+                    };
+                    if (dsp && dsp_evict > 0 && dh >= dsp_evict && !one_sweep_now()) {
                         dsp.reset();
                         std::fprintf(stderr, "serve: DSpark weights freed for a %d-token batch\n", dh);
                     }
