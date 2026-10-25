@@ -17,10 +17,10 @@ index 1cd81eeae..516aaccd5 100644
  // device buffer
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
  
-diff --git i/ggml/include/ggml.h w/ggml/include/ggml.h
-index 224bdef92..3af3fd72c 100644
---- i/ggml/include/ggml.h
-+++ w/ggml/include/ggml.h
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 224bdef92..3eec1413a 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
 @@ -585,6 +585,8 @@ extern "C" {
          GGML_OP_DSV4_HC_COMB,
          GGML_OP_DSV4_HC_PRE,
@@ -30,7 +30,17 @@ index 224bdef92..3af3fd72c 100644
  
          GGML_OP_UNARY,
  
-@@ -2726,6 +2728,29 @@ extern "C" {
+@@ -2664,7 +2666,8 @@ extern "C" {
+     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
+     // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
+     // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
+-    // mask:    [n_kv,       n_batch,    1,       ne33] !! f16 !!
++    // mask:    [n_kv,       n_batch,    1,       ne33] f16 additive mask, or
++    //          [1,          n_batch,    1,       ne33] f32 visible-key counts (key i visible iff i < count)
+     // res:     [n_kv,       n_batch,    1,       ne3 ]
+     //
+     // broadcast:
+@@ -2726,6 +2729,29 @@ extern "C" {
              struct ggml_tensor  * post,
              struct ggml_tensor  * comb);
  
@@ -103,11 +113,39 @@ index 8bb0ff7bc..dd97d59a3 100644
              {
                  n_tasks = n_threads;
              } break;
-diff --git i/ggml/src/ggml-cpu/ops.cpp w/ggml/src/ggml-cpu/ops.cpp
-index ba00a0a73..c1404693f 100644
---- i/ggml/src/ggml-cpu/ops.cpp
-+++ w/ggml/src/ggml-cpu/ops.cpp
-@@ -12204,3 +12204,92 @@ void ggml_compute_forward_lightning_indexer(
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index ba00a0a73..1078b52d0 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12135,7 +12135,7 @@ void ggml_compute_forward_lightning_indexer(
+     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(   q->type == GGML_TYPE_F32);
+     GGML_ASSERT(   w->type == GGML_TYPE_F32);
+-    GGML_ASSERT(   m->type == GGML_TYPE_F16);
++    GGML_ASSERT(   m->type == GGML_TYPE_F16 || m->type == GGML_TYPE_F32);
+ 
+     GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
+@@ -12182,7 +12182,12 @@ void ggml_compute_forward_lightning_indexer(
+             const float       *   w_row =       (float *) ((char *)   w->data + t*nbw1 +        s*nbw3);
+             const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
+             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
++            const float nvis = m->type == GGML_TYPE_F32 ? *(const float *) m_row : INFINITY;
+             for (int ik = ir0; ik < ir1; ++ik) {
++                if (!(ik < nvis)) {
++                    dst_row[ik] = -INFINITY;
++                    continue;
++                }
+                 char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
+                 if (k_to_float) {
+                     k_to_float(k_row, k_row_f32, n_embd);
+@@ -12199,8 +12204,97 @@ void ggml_compute_forward_lightning_indexer(
+                     score += MAX(qk, 0.0f) * w_row[h];
+                 }
+                 // apply mask
+-                dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
++                dst_row[ik] = score + (m->type == GGML_TYPE_F32 ? 0.0f : GGML_CPU_FP16_TO_FP32(m_row[ik]));
+             }
          }
      }
  }
@@ -824,24 +862,299 @@ index a9038f1f4..a462357be 100644
          case GGML_OP_FLASH_ATTN_EXT:
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_CROSS_ENTROPY_LOSS:
-diff --git i/ggml/src/ggml-cuda/lightning-indexer.cu w/ggml/src/ggml-cuda/lightning-indexer.cu
-index 5edc967e0..e56bb13ea 100644
---- i/ggml/src/ggml-cuda/lightning-indexer.cu
-+++ w/ggml/src/ggml-cuda/lightning-indexer.cu
-@@ -448,7 +448,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
+index 5edc967e0..24c2a4e18 100644
+--- a/ggml/src/ggml-cuda/lightning-indexer.cu
++++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+@@ -3,6 +3,18 @@
+ #include "fattn-common.cuh"
+ #include "convert.cuh"
+ 
++template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
++static __device__ __forceinline__ void lightning_indexer_vec(
++        const float * Q, const char * K, const float * W, const half * M, float * dst,
++        int64_t n_stream, int64_t n_batch, int64_t n_kv,
++        size_t nb1, size_t nb2, size_t nb3,
++        size_t nbq1, size_t nbq2, size_t nbq3,
++        size_t nbk1, size_t nbk2, size_t nbk3,
++        size_t nbw1, size_t nbw2, size_t nbw3,
++        size_t nbm1, size_t nbm2, size_t nbm3,
++        int64_t nem3, const float * NV
++    );
++
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+ #if defined(TURING_MMA_AVAILABLE)
+ 
+@@ -24,7 +36,7 @@ static __global__ void lightning_indexer_kernel_wmma(
+         size_t nbk1, size_t nbk2, size_t nbk3,
+         size_t nbw1, size_t nbw2, size_t nbw3,
+         size_t nbm1, size_t nbm2, size_t nbm3,
+-        int64_t nem3
++        int64_t nem3, const float * NV
+     ) {
+ 
+     constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
+@@ -40,10 +52,48 @@ static __global__ void lightning_indexer_kernel_wmma(
+ 
+     // each block processes K_VECS_PER_BLOCK K vectors
+     const int start_kv = blockIdx.x * K_VECS_PER_BLOCK;
++    const float nvis = NV ? *(const float *) ((const char *) NV + i_batch*nbm1 + (i_stream%nem3)*nbm3) : INFINITY;
++    if (!(start_kv < nvis)) { // uniform across the block; no Q/K reads or barriers
++        if (tid < K_VECS_PER_BLOCK && start_kv + tid < n_kv) {
++            float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
++            dst_base[start_kv + tid] = -INFINITY;
++        }
++        return;
++    }
+ 
+     const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
+     const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
+ 
++    if constexpr (TYPE_K == GGML_TYPE_MXFP4) {
++        // e2m1 * 2^(e-127) is exactly representable as normal half for e in [114, 140]:
++        // the smallest nonzero is 2^-14, the largest is 6 * 2^13 = 49152.
++        // Q is F32 at the API: check its actual values, rather than assume fake quant was enabled.
++        // PTX leaves subnormal MMA inputs unspecified, so use vec for those too.
++        int unsafe = 0;
++        for (int i = tid; i < N_HEAD * (N_EMBD / 4); i += THREADS_PER_BLOCK) {
++            const float4 v = *(const float4 *) (q_base + (i / (N_EMBD / 4))*nbq1 + (i % (N_EMBD / 4))*sizeof(float4));
++            unsafe |= !isfinite(v.x) || __half2float(__float2half_rn(v.x)) != v.x || (v.x != 0.0f && fabsf(v.x) < 0x1p-14f);
++            unsafe |= !isfinite(v.y) || __half2float(__float2half_rn(v.y)) != v.y || (v.y != 0.0f && fabsf(v.y) < 0x1p-14f);
++            unsafe |= !isfinite(v.z) || __half2float(__float2half_rn(v.z)) != v.z || (v.z != 0.0f && fabsf(v.z) < 0x1p-14f);
++            unsafe |= !isfinite(v.w) || __half2float(__float2half_rn(v.w)) != v.w || (v.w != 0.0f && fabsf(v.w) < 0x1p-14f);
++        }
++        for (int i = tid; i < K_VECS_PER_BLOCK * (N_EMBD / QK_MXFP4); i += THREADS_PER_BLOCK) {
++            const int row = start_kv + i / (N_EMBD / QK_MXFP4);
++            if (row < n_kv && row < nvis) {
++                const block_mxfp4 * kr = (const block_mxfp4 *) (K + row*nbk2 + i_stream*nbk3);
++                const uint8_t e = kr[i % (N_EMBD / QK_MXFP4)].e;
++                unsafe |= e < 114 || e > 140;
++            }
++        }
++        if (__syncthreads_or(unsafe)) {
++            lightning_indexer_vec<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, N_EMBD, N_HEAD, TYPE_K>(
++                Q, K, W, M, dst, n_stream, n_batch, n_kv,
++                nb1, nb2, nb3, nbq1, nbq2, nbq3, nbk1, nbk2, nbk3, nbw1, nbw2, nbw3,
++                nbm1, nbm2, nbm3, nem3, NV);
++            return;
++        }
++    }
++
+     // phase 1 - load weights and first Q tile to shared memory
+ 
+     __shared__ float w_shared[N_HEAD];
+@@ -81,7 +131,7 @@ static __global__ void lightning_indexer_kernel_wmma(
+             const int i_k_vec = i_k / (N_EMBD / 4);
+             const int i_embd = i_k % (N_EMBD / 4);
+             const int i_kv = start_kv + i_k_vec;
+-            if (i_kv < n_kv) {
++            if (i_kv < n_kv && i_kv < nvis) {
+                 const int2 * k_base = (const int2 *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
+                 *(int2*) &k_shared_h[i_k_vec][i_embd] = k_base[i_embd];
+             } else {
+@@ -95,7 +145,7 @@ static __global__ void lightning_indexer_kernel_wmma(
+             const int i_k_vec = i_k / (N_EMBD / 4);
+             const int i_embd = i_k % (N_EMBD / 4);
+             const int i_kv = start_kv + i_k_vec;
+-            if (i_kv < n_kv) {
++            if (i_kv < n_kv && i_kv < nvis) {
+                 const void * k_base = (const void *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
+                 dequantize_k(k_base, &k_shared_h[i_k_vec][i_embd][0], i_embd * 4);
+             } else {
+@@ -175,7 +225,7 @@ static __global__ void lightning_indexer_kernel_wmma(
+ 
+         // ReLU, weight
+         sum = sum > 0.0f ? sum : 0.0f;
+-        sum *= w_val;
++        if constexpr (TYPE_K != GGML_TYPE_MXFP4) sum *= w_val;
+ 
+         // wait until qk_shared[0] is no longer used
+         __syncthreads();
+@@ -190,7 +240,11 @@ static __global__ void lightning_indexer_kernel_wmma(
+         if (tid < K_VECS_PER_BLOCK) {
+ #pragma unroll
+             for (int i_head = 0; i_head < HEADS_PER_INNER_LOOP; ++i_head) {
+-                score_k += qk_shared[0][i_head][tid];
++                if constexpr (TYPE_K == GGML_TYPE_MXFP4) {
++                    score_k += qk_shared[0][i_head][tid] * w_shared[i_head_0 + i_head];
++                } else {
++                    score_k += qk_shared[0][i_head][tid];
++                }
+             }
+         }
+ 
+@@ -203,9 +257,9 @@ static __global__ void lightning_indexer_kernel_wmma(
+     if (tid < K_VECS_PER_BLOCK) {
+         const int i_kv = start_kv + tid;
+         if (i_kv < n_kv) {
+-            const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
++            const half * m_base = M ? (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3) : nullptr;
+             float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
+-            dst_base[i_kv] = score_k + __half2float(m_base[i_kv]);
++            dst_base[i_kv] = i_kv < nvis ? score_k + (NV ? 0.0f : __half2float(m_base[i_kv])) : -INFINITY;
+         }
+     }
+ }
+@@ -221,7 +275,7 @@ static __global__ void lightning_indexer_kernel_wmma(
+         size_t nbk1, size_t nbk2, size_t nbk3,
+         size_t nbw1, size_t nbw2, size_t nbw3,
+         size_t nbm1, size_t nbm2, size_t nbm3,
+-        int64_t nem3
++        int64_t nem3, const float * NV
+     ) {
+     GGML_UNUSED_VARS(Q, K, W, M, dst,
+         n_stream, n_batch, n_kv,
+@@ -229,7 +283,7 @@ static __global__ void lightning_indexer_kernel_wmma(
+         nbq1, nbq2, nbq3,
+         nbk1, nbk2, nbk3,
+         nbw1, nbw2, nbw3,
+-        nem3);
++        nem3, NV);
+     NO_DEVICE_CODE;
+ }
+ 
+@@ -241,7 +295,7 @@ static __global__ void lightning_indexer_kernel_wmma(
+ // 32 * 4 = 128 (N_EMBD)
+ 
+ template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
+-static __global__ void lightning_indexer_kernel_vec(
++static __device__ __forceinline__ void lightning_indexer_vec(
+         const float * Q, const char * K, const float * W, const half * M, float * dst,
+         int64_t n_stream, int64_t n_batch, int64_t n_kv,
+         size_t nb1, size_t nb2, size_t nb3,
+@@ -249,7 +303,7 @@ static __global__ void lightning_indexer_kernel_vec(
+         size_t nbk1, size_t nbk2, size_t nbk3,
+         size_t nbw1, size_t nbw2, size_t nbw3,
+         size_t nbm1, size_t nbm2, size_t nbm3,
+-        int64_t nem3
++        int64_t nem3, const float * NV
+     ) {
+ 
+     constexpr int K_VECS_PER_WARP = K_VECS_PER_BLOCK / WARPS_PER_BLOCK;
+@@ -264,6 +318,14 @@ static __global__ void lightning_indexer_kernel_vec(
+     // each warp processes K_VECS_PER_WARP K vectors
+     const int start_kv_block = blockIdx.x * K_VECS_PER_BLOCK;
+     const int start_kv = start_kv_block + i_warp * K_VECS_PER_WARP;
++    const float nvis = NV ? *(const float *) ((const char *) NV + i_batch*nbm1 + (i_stream%nem3)*nbm3) : INFINITY;
++    if (!(start_kv_block < nvis)) { // uniform across the block; no Q/K reads or barriers
++        if (tid < K_VECS_PER_BLOCK && start_kv_block + tid < n_kv) {
++            float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
++            dst_base[start_kv_block + tid] = -INFINITY;
++        }
++        return;
++    }
+ 
+     const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
+     const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
+@@ -277,7 +339,7 @@ static __global__ void lightning_indexer_kernel_vec(
+ #pragma unroll
+         for (int k = 0; k < K_VECS_PER_WARP; ++k) {
+             int i_kv = start_kv + k;
+-            if (i_kv < n_kv) {
++            if (i_kv < n_kv && i_kv < nvis) {
+                 const float4 * k_base = (const float4 *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
+                 k_reg_f[k] = k_base[i_lane];
+             } else {
+@@ -290,7 +352,7 @@ static __global__ void lightning_indexer_kernel_vec(
+ #pragma unroll
+         for (int k = 0; k < K_VECS_PER_WARP; ++k) {
+             int i_kv = start_kv + k;
+-            if (i_kv < n_kv) {
++            if (i_kv < n_kv && i_kv < nvis) {
+                 const void * k_base = (const void *) ((const char *) K + i_kv*nbk2 + i_stream*nbk3);
+                 dequantize_k(k_base, &k_reg_f[k], i_lane * 4);
+             } else {
+@@ -375,13 +437,34 @@ static __global__ void lightning_indexer_kernel_vec(
+     if (tid < K_VECS_PER_BLOCK) {
+         int i_kv = start_kv_block + tid;
+         if (i_kv < n_kv) {
+-            const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
++            const half * m_base = M ? (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3) : nullptr;
+             float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
+-            dst_base[i_kv] = dst_shared[tid] + __half2float(m_base[i_kv]);
++            dst_base[i_kv] = i_kv < nvis ? dst_shared[tid] + (NV ? 0.0f : __half2float(m_base[i_kv])) : -INFINITY;
+         }
+     }
+ }
+ 
++// TODO there is one ugly assumption used in this kernel - that WARP_SIZE is equal to 32
++// thanks to that one warp operating on float4 processes whole indexer K/Q vectors
++// 32 * 4 = 128 (N_EMBD)
++
++template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
++static __global__ void lightning_indexer_kernel_vec(
++        const float * Q, const char * K, const float * W, const half * M, float * dst,
++        int64_t n_stream, int64_t n_batch, int64_t n_kv,
++        size_t nb1, size_t nb2, size_t nb3,
++        size_t nbq1, size_t nbq2, size_t nbq3,
++        size_t nbk1, size_t nbk2, size_t nbk3,
++        size_t nbw1, size_t nbw2, size_t nbw3,
++        size_t nbm1, size_t nbm2, size_t nbm3,
++        int64_t nem3, const float * NV
++    ) {
++    lightning_indexer_vec<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, N_EMBD, N_HEAD, TYPE_K>(
++        Q, K, W, M, dst, n_stream, n_batch, n_kv,
++        nb1, nb2, nb3, nbq1, nbq2, nbq3, nbk1, nbk2, nbk3, nbw1, nbw2, nbw3,
++        nbm1, nbm2, nbm3, nem3, NV);
++}
++
+ #define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)         \
+     if (K->type == (type_K)) {                                                              \
+         lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
+@@ -393,7 +476,7 @@ static __global__ void lightning_indexer_kernel_vec(
+             nbk1, nbk2, nbk3,                                                               \
+             nbw1, nbw2, nbw3,                                                               \
+             nbm1, nbm2, nbm3,                                                               \
+-            nem3                                                                            \
++            nem3, nv_d                                                                      \
+         );                                                                                  \
+     } else
+ 
+@@ -406,7 +489,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+     GGML_ASSERT(  q->type == GGML_TYPE_F32);
+     GGML_ASSERT(  w->type == GGML_TYPE_F32);
+-    GGML_ASSERT(  m->type == GGML_TYPE_F16);
++    GGML_ASSERT(  m->type == GGML_TYPE_F16 || m->type == GGML_TYPE_F32);
+ 
+     GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
+@@ -440,15 +523,20 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+     const float *   q_d = (const float *)   q->data;
+     const char  *   k_d = (const char  *)   k->data;
+     const float *   w_d = (const float *)   w->data;
+-    const half  *   m_d = (const half  *)   m->data;
++    const half  *   m_d = m->type == GGML_TYPE_F16 ? (const half *) m->data : nullptr;
++    const float * nv_d = m->type == GGML_TYPE_F32 ? (const float *) m->data : nullptr;
+     float       * dst_d = (      float *) dst->data;
+ 
+     const int device = ggml_cuda_get_device();
+     const int cc     = ggml_cuda_info().devices[device].cc;
++    // Opt-in until other NVIDIA generations have the same accuracy/performance gate.
++    const char * mx_env = std::getenv("GGML_CUDA_MXFP4_WMMA");
++    const bool mx_wmma = mx_env && std::atoi(mx_env) != 0;
++    const bool force_vec = std::getenv("GGML_CUDA_INDEXER_VEC") != nullptr;
  
      if (n_embd == 128 && n_head == 64) {
  #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 -        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
-+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_MXFP4) {
++        if (!force_vec && GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16 && (k->type != GGML_TYPE_MXFP4 || mx_wmma)) {
              // use wmma kernel
              constexpr int K_VECS_PER_BLOCK = 32;
              constexpr int WARPS_PER_BLOCK = 8;
-@@ -484,12 +484,14 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -463,6 +551,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 64, k, GGML_TYPE_Q5_0)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 64, k, GGML_TYPE_Q5_1)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 64, k, GGML_TYPE_Q8_0)
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 64, k, GGML_TYPE_MXFP4)
+             GGML_ABORT("fatal error");
+         } else {
+ #else // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+@@ -484,12 +573,14 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q5_1)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q8_0)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_BF16)
-+            // Strata DS4.1 --kv-fp4: MXFP4 keys on the fp32 vec kernel (as BF16) - the wmma kernel computes in fp16
++            // MXFP4 defaults to vec; GGML_CUDA_MXFP4_WMMA=1 enables the checked fp16 path.
 +            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_MXFP4)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_F32)
              GGML_ABORT("fatal error");
@@ -849,20 +1162,28 @@ index 5edc967e0..e56bb13ea 100644
      } else if (n_embd == 128 && n_head == 32) {
  #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 -        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
-+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_MXFP4) {
++        if (!force_vec && GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16 && (k->type != GGML_TYPE_MXFP4 || mx_wmma)) {
              // use wmma kernel
              constexpr int K_VECS_PER_BLOCK = 32;
              constexpr int WARPS_PER_BLOCK = 8;
-@@ -525,6 +527,8 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -504,6 +595,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 32, k, GGML_TYPE_Q5_0)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 32, k, GGML_TYPE_Q5_1)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 32, k, GGML_TYPE_Q8_0)
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 32, k, GGML_TYPE_MXFP4)
+             GGML_ABORT("fatal error");
+         } else {
+ #else // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+@@ -525,6 +617,8 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q5_1)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q8_0)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_BF16)
-+            // Strata DS4.1 --kv-fp4: MXFP4 keys on the fp32 vec kernel (as BF16) - the wmma kernel computes in fp16
++            // MXFP4 defaults to vec; GGML_CUDA_MXFP4_WMMA=1 enables the checked fp16 path.
 +            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_MXFP4)
              LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F32)
              GGML_ABORT("fatal error");
          }
-@@ -581,6 +585,7 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst)
+@@ -581,6 +675,7 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst)
          case GGML_TYPE_Q5_0:
          case GGML_TYPE_Q4_1:
          case GGML_TYPE_Q4_0:
@@ -1147,10 +1468,10 @@ index 465997065..57cdad285 100644
      } else {
          GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
      }
-diff --git i/ggml/src/ggml.c w/ggml/src/ggml.c
-index 175281409..e0176016b 100644
---- i/ggml/src/ggml.c
-+++ w/ggml/src/ggml.c
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 175281409..d05702f7b 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
 @@ -1084,6 +1084,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "DSV4_HC_COMB",
      "DSV4_HC_PRE",
@@ -1197,6 +1518,18 @@ index 175281409..e0176016b 100644
  
      result = ggml_view_4d(ctx, result,
                  k, result->ne[1], result->ne[2], result->ne[3],
+@@ -6429,9 +6436,9 @@ struct ggml_tensor * ggml_lightning_indexer(
+ 
+     GGML_ASSERT(       q->type == GGML_TYPE_F32);
+     GGML_ASSERT( weights->type == GGML_TYPE_F32);
+-    GGML_ASSERT(    mask->type == GGML_TYPE_F16);
++    GGML_ASSERT(    mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+     GGML_ASSERT(      q->ne[0] == k->ne[0]);
+-    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
++    GGML_ASSERT(   mask->ne[0] == (mask->type == GGML_TYPE_F32 ? 1 : k->ne[2]));
+     GGML_ASSERT(      q->ne[1] == weights->ne[0]);
+     GGML_ASSERT(      k->ne[1] == 1);
+     GGML_ASSERT(   mask->ne[1] == q->ne[2]);
 @@ -6545,6 +6552,42 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
      return result;
  }
@@ -1240,3 +1573,16 @@ index 175281409..e0176016b 100644
  struct ggml_tensor * ggml_dsv4_hc_pre(
          struct ggml_context * ctx,
          struct ggml_tensor  * x,
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index da0e24fcd..50eda05e2 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -15403,7 +15403,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+ 
+                 // the q/w/m types and the shape relationships between q, k, w, m and dst
+                 // are already asserted in ggml_lightning_indexer()
+-                if (!ggml_vk_lightning_indexer_k_type_supported(k->type) || !device->fp16) {
++                if (m->type != GGML_TYPE_F16 || !ggml_vk_lightning_indexer_k_type_supported(k->type) || !device->fp16) {
+                     return false;
+                 }
+ 
