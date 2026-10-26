@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REF = os.path.expanduser("~/AI/gsq-rco/dsv41-inference")
+REF = os.path.expanduser(os.environ.get("V41_REF", "~/AI/gsq-rco/dsv41-inference"))
 sys.path[:0] = [os.path.join(HERE, "torch_kernels"), REF, HERE]
 import model as M  # noqa: E402
 import kernel as K  # noqa: E402  (our torch stand-in)
@@ -457,6 +457,9 @@ def screen_expert(exp, xe, ge, fit, lim, min_fit, damps=(0.01,), layer=None, exp
 
 
 def cmd_layer(a):
+    if getattr(a, "defer_teacher", False) and not (
+            getattr(a, "no_gptq", False) and getattr(a, "expert_hook", None) and getattr(a, "moe_done_hook", None)):
+        raise ValueError("defer_teacher requires expert_hook, moe_done_hook and no_gptq")
     L = a.layer
     meta = json.load(open(wpath("meta.json")))
     tokens = np.load(wpath("tokens.npy"))
@@ -528,6 +531,9 @@ def cmd_layer(a):
         if getattr(a, "want_ctx", False):   # v41_repair: the hooks see the layer's MoE input and routing
             a.moe_ctx = (X, wts, idx)
         Y = torch.zeros((T, D), dtype=torch.float32, device=dev)
+        defer = getattr(a, "defer_teacher", False)   # lite_calib: the hook's workers compute the teacher, added at moe_done
+        if defer:
+            a.moe_Y = Y
         stats, lim = {}, args.swiglu_limit
         hook = getattr(a, "expert_hook", None)
         for ex in range(NE):
@@ -537,20 +543,30 @@ def cmd_layer(a):
                 continue
             xe, ge = X[tok], wts[tok, slot, None]
             # chunked: a hot expert (88K tokens at layer 6) OOMs the 24 GB card in one call; rows are independent
-            out = torch.cat([blk.ffn.experts[ex](xe[c:c + ROWS], ge[c:c + ROWS]) for c in range(0, len(tok), ROWS)])
-            st = {"n": len(tok), "gsum": float(ge.sum()), "reap": float(out.float().norm(dim=-1).mean())}
+            if defer:
+                out = None
+                st = {"n": len(tok), "gsum": float(ge.sum())}
+            else:
+                out = torch.cat([blk.ffn.experts[ex](xe[c:c + ROWS], ge[c:c + ROWS]) for c in range(0, len(tok), ROWS)])
+                st = {"n": len(tok), "gsum": float(ge.sum()), "reap": float(out.float().norm(dim=-1).mean())}
+            if defer:
+                a.cur_tok = tok
             if hook is not None:        # v41_quant: quantize this expert; its output replaces the teacher's
                 out, extra = hook(L, ex, blk.ffn.experts[ex], xe, ge, ~is_eval_tok[tok], lim, out)
                 st.update(extra)
-            Y.index_add_(0, tok, out.float())
+            if out is not None:
+                Y.index_add_(0, tok, out.float())
             if not a.no_gptq and ex < a.gptq_experts and ex % a.expert_stride == 0:
                 st.update(screen_expert(blk.ffn.experts[ex], xe, ge, ~is_eval_tok[tok], lim, a.min_fit, a.damps))
             stats[ex] = st
             if ex % 64 == 63:
                 log(f"layer {L}: experts {ex + 1}/{NE} ({time.time() - t2:.0f} s)")
-        routed_energy = float(Y.square().sum())
+        if not defer:
+            routed_energy = float(Y.square().sum())
         if getattr(a, "moe_done_hook", None) is not None:   # v41_quant: experts no token reached, write the layer
             a.moe_done_hook(L, blk, stats)
+        if defer:
+            routed_energy = float(Y.square().sum())
         for c in range(0, T, 65536):
             Y[c:c + 65536] += blk.ffn.shared_experts(X[c:c + 65536])
         log(f"layer {L}: MoE{'' if a.no_gptq else ' + GPTQ screening'} in {time.time() - t2:.0f} s")
