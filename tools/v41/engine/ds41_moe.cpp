@@ -2326,10 +2326,15 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
     // of resident pages is ~20 GB/s (pinbench, 16 GiB: register-then-fill 5.73 s, fill-then-register 2.58 s)
     bool pin_after = false;
 #ifndef _WIN32
+    // STRATA_ARENA_THP=1 (opt-in experiment): back the CPU-lane arena with transparent huge pages.  Off by default
+    // because THP makes cudaHostRegister slow at load (~0.16 GB/s, ds41-engine.sh's note); the decode question is
+    // whether 2 MiB pages cut the TLB cost of the ~10k CPU-lane expert reads per 256 tokens.
+    const bool arena_thp = std::getenv("STRATA_ARENA_THP") && std::getenv("STRATA_ARENA_THP")[0] == '1';
     if (im_->cfg.pin && std::getenv("STRATA_ARENA_PIN_AFTER") && std::getenv("STRATA_ARENA_PIN_AFTER")[0] == '1') {
         void* m = mmap(nullptr, (size_t) gp.arena.bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (m != MAP_FAILED) {
-            madvise(m, (size_t) gp.arena.bytes, MADV_NOHUGEPAGE);   // THP pins at ~0.16 GB/s (ds41-engine.sh's note)
+            madvise(m, (size_t) gp.arena.bytes, arena_thp ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+            std::fprintf(stderr, "arena: transparent huge pages %s (STRATA_ARENA_THP)\n", arena_thp ? "requested" : "off");
             gp.arena.own_map = m;
             gp.arena.own_bytes = gp.arena.bytes;
             gp.arena.base = m;
@@ -2388,6 +2393,12 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
             gp.arena.close();
             return false;
         }
+#ifndef _WIN32
+        if (arena_thp) {
+            madvise(p, (size_t) gp.arena.bytes, MADV_HUGEPAGE);   // opt-in, see the note above the mmap path
+            std::fprintf(stderr, "arena: transparent huge pages requested (STRATA_ARENA_THP)\n");
+        }
+#endif
         gp.arena.base = p;
         gp.arena.backing = "anonymous (pageable: the PCIe DMAs stage through the driver)";
     }
