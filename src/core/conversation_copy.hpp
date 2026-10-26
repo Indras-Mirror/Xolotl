@@ -14,6 +14,14 @@
 
 namespace strata::core::conversation_detail {
 
+/// #57: the per-device streams belong to the thread that first copied on them.  With a layer split, prefill hands
+/// each prompt chunk to the next stage on a new std::async thread, so a stream left behind by an exited thread is
+/// leaked VRAM (~550 KiB per chunk) with no handle left to it.  Destroy them when the thread ends.
+struct thread_streams {
+    std::vector<cudaStream_t> v;
+    ~thread_streams() { for (cudaStream_t s : v) if (s) cudaStreamDestroy(s); }
+};
+
 /// Conversation snapshot / checkpoint copies go through a private non-blocking stream of the current device
 /// instead of the legacy (null) stream.  A plain cudaMemcpy is ordered against every blocking stream of the
 /// device, and while another thread captures a graph on one (a drafter or a stage worker), HIP refuses it with
@@ -23,14 +31,14 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes) {
     int dev = 0;
     cudaError_t e = cudaGetDevice(&dev);
     if (e != cudaSuccess) return e;
-    thread_local std::vector<cudaStream_t> streams;
+    thread_local thread_streams streams;
     if (dev < 0) dev = 0;
-    if ((size_t) dev >= streams.size()) streams.resize((size_t) dev + 1, nullptr);   // never destroyed: process lifetime
-    if (!streams[(size_t) dev]) {
-        e = cudaStreamCreateWithFlags(&streams[(size_t) dev], cudaStreamNonBlocking);
-        if (e != cudaSuccess) { streams[(size_t) dev] = nullptr; return e; }
+    if ((size_t) dev >= streams.v.size()) streams.v.resize((size_t) dev + 1, nullptr);
+    if (!streams.v[(size_t) dev]) {
+        e = cudaStreamCreateWithFlags(&streams.v[(size_t) dev], cudaStreamNonBlocking);
+        if (e != cudaSuccess) { streams.v[(size_t) dev] = nullptr; return e; }
     }
-    cudaStream_t s = streams[(size_t) dev];
+    cudaStream_t s = streams.v[(size_t) dev];
     e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s);
     if (e != cudaSuccess) return e;
     e = cudaStreamSynchronize(s);
