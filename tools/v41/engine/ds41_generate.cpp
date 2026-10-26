@@ -1654,6 +1654,15 @@ int main(int argc, char ** argv) {
         const int cfg_rprot = env_rank("STRATA_RB_PROTECT"), cfg_rpool = env_rank("STRATA_RB_POOL");
         int cur_rprot = cfg_rprot, cur_rpool = cfg_rpool;
         static const bool rewind1 = std::getenv("STRATA_SERVE_REWIND1") && std::getenv("STRATA_SERVE_REWIND1")[0] == '1';
+        // STRATA_SERVE_REWIND_GAP (tokens; default 16, 0 = off): a request that continues the live conversation but
+        // is a FEW tokens shorter than the live history.  That is what an aborted turn leaves behind: the harness
+        // cancels the in-flight request (ctrl+x / chat:sendNow) and drops its partial assistant turn, so the next
+        // template render differs by a few tokens (DeepSeek's thinking re-render / an empty assistant turn) and
+        // lcp sits just under hist.size() - every exact reuse branch above misses and with pool_on the whole
+        // conversation is parked as "unrelated" and re-read.  Positional caches make a short rewind safe inside the
+        // window ring (RAW - SWA = 16); the forward pass re-feeds from the common prefix and overwrites the stale
+        // tail.  Same rule as the partial unpark, which is why 16 is the ceiling.
+        static const int rewind_gap = std::getenv("STRATA_SERVE_REWIND_GAP") ? std::atoi(std::getenv("STRATA_SERVE_REWIND_GAP")) : 16;
         std::string line;
         bool previous_vision = false;
         // ---- batch slots (--batch-slots N; the protocol is at the top of this file).  Slot s's conversation is a Conv
@@ -2321,6 +2330,20 @@ int main(int argc, char ** argv) {
                 reused = (int) lcp;
                 std::fprintf(stderr, "serve: rewound the snapshot one token (%d -> %zu)\n", snap_len, lcp);
                 snap_len = -1;
+            } else if (rewind_gap > 0 && !unparked && !hist.empty() && lcp > 0 && lcp < hist.size() &&
+                       lcp < ids.size() && hist.size() - lcp <= (size_t) rewind_gap) {
+                // STRATA_SERVE_REWIND_GAP: the live state continues this prompt but overshoots it by a few tokens
+                // (an aborted turn's dropped assistant turn).  Keep the state and re-feed from the common prefix;
+                // round down to an even position so the ratio-2 compressor's group partner is re-fed too.
+                const size_t gap = hist.size() - lcp;
+                size_t rs = lcp & ~(size_t) 1;
+                if (rs < 1) rs = lcp;
+                hist.resize(rs);
+                if (live_id.size() > rs) live_id.resize(rs);
+                snap_len = -1;   // the end state belonged to the dropped turn
+                reused = (int) rs;
+                std::fprintf(stderr, "serve: rewound the live state to %zu (gap %zu <= %d, STRATA_SERVE_REWIND_GAP)\n",
+                             rs, gap, rewind_gap);
             } else if (pool_on) {
                 // an unrelated request: the conversation it overwrites goes to the pool
                 save_live("unrelated");
@@ -2402,7 +2425,25 @@ int main(int argc, char ** argv) {
             // V4 (2026-10-25, Mal's serve config, warm cache, turnprobe.py x3 interleaved): 16 is the default now - the
             // batch won at every size, decode after it no slower: +32 tokens 7.37 -> 3.94 s, +50 5.62 -> 4.40 s,
             // +85 9.41 -> 5.27 s (decode after 16.7 / 21.3 / 18.4 -> 17.7 / 21.0 / 20.8 tok/s).
-            static const int batch_min = std::getenv("STRATA_SERVE_BATCH_MIN") ? std::atoi(std::getenv("STRATA_SERVE_BATCH_MIN")) : 16;
+            // #59: the pass/batch crossover is a property of the BOX, not of the engine.  When the RAM arena holds
+            // every routed expert (file tier 0) a short turn's passes have no disk reads and win up to ~128-152 new
+            // tokens (5090/EPYC report, 2026-10-26); when an arena misses to the file tier the layer-major batch wins
+            // even at 16 (bm_ab.txt, 4090/DDR4, this config: 32 new 3.94 s batch vs 7.37 s passes; 50 4.40 vs 5.62;
+            // 85 5.27 vs 9.41).  So the default follows the arena: 128 when it took everything, else 16.  The env
+            // (STRATA_SERVE_BATCH_MIN, 0 = off) still wins on any box; the cost-based selector the issue proposes is
+            // the next step, this is the safe default until it is measured.
+            static const int bm_env = std::getenv("STRATA_SERVE_BATCH_MIN") ? std::atoi(std::getenv("STRATA_SERVE_BATCH_MIN")) : -1;
+            int64_t ft_all = 0;
+            for (int st = 0; st < pipe.n_stages(); ++st) ft_all += pipe.tier(st).file_tier();
+            static const int batch_min = bm_env >= 0 ? bm_env : (ft_all == 0 ? 128 : 16);
+            static bool bm_logged = false;
+            if (!bm_logged) {
+                bm_logged = true;
+                std::fprintf(stderr, "serve: batch path threshold %d new tokens (%s; file-tier experts %lld)\n", batch_min,
+                             bm_env >= 0 ? "STRATA_SERVE_BATCH_MIN"
+                                         : (ft_all == 0 ? "the arena holds every expert" : "a file tier is present"),
+                             (long long) ft_all);
+            }
             bool force_batch = false;
             if (batch_min > 0 && batch_tail && sp_tail > 0 && bcap == 0 && delta >= batch_min && PB > 1 && delta >= 2) {
                 bcap = sp_tail; dh = delta; force_batch = true; by_step = false;
