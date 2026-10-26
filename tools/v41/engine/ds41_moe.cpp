@@ -2868,8 +2868,46 @@ void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
         nb = (int) std::lround(im_->cfg.pf_b);
     }
     nb = std::min(nb, (int) Ds41MoeConfig::kMaxPf);
+    // STRATA_PF_ORDER=arena|usage (opt-in experiment, default off = the predicted order exactly as before).
+    // The predicted list is probability-ordered, but only an ARENA expert can actually be staged here: a file-tier
+    // guess is recorded as a dummy slot (and by default not even DMA'd), so when the budget is smaller than the
+    // number of usable candidates the plain loop spends slots on guesses it cannot stage.  arena: stageable
+    // candidates first, predicted order within each class.  usage: the same, then the expert this layer used most
+    // recently first (arena_adapt's last_use; falls back to predicted order while that history is empty).
+    static const char* pf_order = std::getenv("STRATA_PF_ORDER");
+    const bool pf_usage = pf_order && std::strcmp(pf_order, "usage") == 0;
+    const bool pf_reorder = pf_usage || (pf_order && std::strcmp(pf_order, "arena") == 0);
+    int ord[Ds41MoeConfig::kPredW];
+    for (int i = 0; i < n; ++i) ord[i] = i;
+    if (pf_reorder) {
+        const int64_t NX = im_->g.n_experts;
+        auto stageable = [&](int32_t e) { return e >= 0 && e < NX && gp.arena.ptr(layer, e) != nullptr; };
+        auto last_use_of = [&](int32_t e) -> int64_t {
+            if (!pf_usage || im_->last_use.empty() || e < 0 || e >= NX) return -1;
+            return im_->last_use[(size_t) (layer * NX + e)];
+        };
+        for (int i = 1; i < n; ++i) {   // insertion sort, n <= kPredW
+            const int key = ord[i];
+            const int32_t ke = top16[key];
+            const bool ka = stageable(ke);
+            const int64_t ku = last_use_of(ke);
+            int j = i - 1;
+            while (j >= 0) {
+                const int32_t je = top16[ord[j]];
+                const bool ja = stageable(je);
+                bool key_first;
+                if (ka != ja) key_first = ka;
+                else if (pf_usage && ku != last_use_of(je)) key_first = ku > last_use_of(je);
+                else key_first = key < ord[j];
+                if (!key_first) break;
+                ord[j + 1] = ord[j];
+                --j;
+            }
+            ord[j + 1] = key;
+        }
+    }
     for (int i = 0; i < n && im_->pf_n < nb; ++i) {
-        const int32_t e = top16[i];
+        const int32_t e = top16[ord[i]];
         if (e < 0 || e >= im_->g.n_experts) continue;
         if (gp.cache->slot_of(layer, e) >= 0) continue;
         bool dup = false;
