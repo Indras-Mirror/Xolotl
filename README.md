@@ -193,6 +193,12 @@ Built on **[Strata](https://github.com/Niko1221/Strata)** by Niko1221 (its engin
 and the unification are Indras Mirror's. Model weights: DeepSeek, Zhipu AI, Qwen, with quants and fine-tunes by
 peasantsmith, ukisai, d0xin and gcsa-abliterix.
 
+Contributors, with thanks: [NektoDron](https://github.com/NektoDron) (MMQ id slack, forced tool calls, the arena pipe
+and indexer WMMA opt-ins, #48-#52; checked #55; the Q3_K + GPTQ Q2_0 lite calibration and allocation tooling, #58),
+[paul123637-lab](https://github.com/paul123637-lab) (the DSpark seed fixes, #54 and #56; RTX 5080 and 5060 Ti helper
+numbers), [kelheor](https://github.com/kelheor) (the vision `pread` fix, #51), [exye137](https://github.com/exye137)
+(the thread-local CUDA stream leak, #57) and [penink-WH](https://github.com/penink-WH) (AC922 rig).
+
 *Xolotl* is Quetzalcoatl's dark twin, who carries the dead up from the underworld - as the engine carries experts up
 from RAM and NVMe. Research code from one developer, measured on one PC; reports from other hardware welcome. MIT.
 

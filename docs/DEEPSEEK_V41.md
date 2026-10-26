@@ -159,6 +159,16 @@ and check `build-ds4-gpu/test_ds41_fq --cuda` says bit for bit (it adds one op t
 --chunk 64` checks the expert tier against a dequantised F32 reference. Full engineering log, every measurement and
 the next steps: [docs/ds4/V41_RESUME_PROMPT.md](ds4/V41_RESUME_PROMPT.md).
 
+Two engines on one box share the same cores: the pool pins its workers to physical cores in order (core 0 is the main
+thread, `--threads` only sets the pool size), so two independent servers land on the same cores and each drops to about
+40 tok/s. Start each under its own core half instead (`taskset -c 0-11,24-35 python3 serve/server.py ...` and
+`taskset -c 12-23,36-47 ...` on a 24-core/48-thread part, #47); the engine picks cores inside the allowed set. The
+automatic partition in `serve/cpu_affinity.py` only covers `--replicas`, not two separate servers.
+
+The serve config's `gpu` becomes `--gpu`, which sets `CUDA_VISIBLE_DEVICES` itself in PCI order and overrides what the
+launcher set (the engine warns when it does). With two cards, use the config's own numbering: `CUDA_VISIBLE_DEVICES=1`
+with `"gpu": [0]` still runs on physical GPU 0; set `"gpu": [1]` (#47).
+
 ### Serving it (OpenAI + Anthropic API, tool calls)
 
 ```bash
