@@ -593,8 +593,10 @@ public:
     /// Xolotl s6 (STRATA_SERVE_KEEP_CACHE=1; the cache opens segmented then): give back only the VRAM a small batch
     /// prompt needs instead of the whole cache.  Evicts the cache's TAIL slots (the lowest-ranked seeds) until
     /// `need_bytes` are free, remembering slot -> expert; returns the number evicted (0: it already fits), or -1 when
-    /// the cache is not segmented (the caller then falls back to release_cache).
-    int64_t shrink_cache_for(int64_t need_bytes, std::string& err);
+    /// the cache is not segmented (the caller then falls back to release_cache).  `more`: the cache may already be
+    /// shrunk for this batch - evict further tail slots (the batch's width came up short of the turn), regrow_cache
+    /// then refills both rounds.
+    int64_t shrink_cache_for(int64_t need_bytes, std::string& err, bool more = false);
     /// After that prompt: map the tail back and refill exactly the evicted experts into exactly their slots (from the
     /// RAM arena, else the file).  Returns the number refilled, or -1 with `err`.
     int64_t regrow_cache(std::string& err);

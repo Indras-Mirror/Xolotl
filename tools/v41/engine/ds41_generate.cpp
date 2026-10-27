@@ -3223,8 +3223,10 @@ int main(int argc, char ** argv) {
             if (!by_step && defer_vram && cache_open && dh >= 2) {
                 static const int keep_max = std::getenv("STRATA_SERVE_KEEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_KEEP_MAX")) : 4096;
                 if (Ds41MoeTier::keep_cache_mode() && dh <= keep_max && !mc.cpu_only) {
+                    // STRATA_SERVE_KEEP_SHORT_MIB (diagnostic): borrow that much less, to exercise the top-up below
+                    static const double keep_short = std::getenv("STRATA_SERVE_KEEP_SHORT_MIB") ? std::atof(std::getenv("STRATA_SERVE_KEEP_SHORT_MIB")) : 0.0;
                     const double need = (4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
-                                        a.vram_margin_gib * 1073741824.0;
+                                        a.vram_margin_gib * 1073741824.0 - keep_short * 1048576.0;
                     std::string kerr;
                     int64_t g = 0; bool shrink_ok = true;
                     for (int st = 0; st < pipe.n_stages(); ++st) {
@@ -3380,17 +3382,19 @@ int main(int argc, char ** argv) {
             // runs.  This is what lets a big --prompt-batch stay OPT-IN: the engine takes what is actually free.
             pb_cap = PB;
             if (!by_step && dh >= 2 && PB > 1 && !mc.cpu_only) {
-                size_t frb = std::numeric_limits<size_t>::max(), totb = 0;
-                for (int st = 0; st < pipe.n_stages(); ++st) {
+                auto free_now = [&]() -> size_t {
+                    size_t fb = std::numeric_limits<size_t>::max();
+                    for (int st = 0; st < pipe.n_stages(); ++st) {
 #ifdef STRATA_ENABLE_CUDA
-                    cudaSetDevice(pipe.stages[(size_t) st].cuda_device);
+                        cudaSetDevice(pipe.stages[(size_t) st].cuda_device);
 #endif
-                    size_t fr = 0, tot = 0;
-                    ggml_backend_dev_memory(ggml_backend_get_device(pipe.stages[(size_t) st].backend), &fr, &tot);
-                    frb = std::min(frb, fr);
-                    totb = std::max(totb, tot);
-                }
-                if (frb == std::numeric_limits<size_t>::max()) frb = 0;
+                        size_t fr = 0, tot = 0;
+                        ggml_backend_dev_memory(ggml_backend_get_device(pipe.stages[(size_t) st].backend), &fr, &tot);
+                        fb = std::min(fb, fr);
+                    }
+                    return fb == std::numeric_limits<size_t>::max() ? 0 : fb;
+                };
+                size_t frb = free_now();
                 // The layer-major batch's own VRAM, CALIBRATED on four traced points (STRATA_VRAM_TRACE=1, s13
                 // run9/run13/run14, a 4 GiB foreign process): free 9.28 GiB with B=8192 failed, free 9.26 with
                 // B=5210 passed, free 5.92 with B=2411 failed, a free card with B=8192 passed - all four fit
@@ -3422,12 +3426,37 @@ int main(int argc, char ** argv) {
                 // STRATA_PB_GRAPH=0: the line alone (diagnostics).
                 static const bool pb_graph = !(std::getenv("STRATA_PB_GRAPH") && std::atoi(std::getenv("STRATA_PB_GRAPH")) == 0);
                 const double g_need = pb_graph ? (double) dense.span_graph_bytes(total, SB) : 0.0;   // memoized per row count
-                const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - 4.3 * 1073741824.0;
-                const double room_g = (double) frb - a.vram_margin_gib * 1073741824.0 - 2.5 * 1073741824.0 - g_need;
-                const int fit_line = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
-                const int fit_g = pb_graph ? (int) std::max<int64_t>(2, (int64_t) (room_g / (0.78 * 1048576.0))) : fit_line;
-                const int fit = std::min(fit_line, fit_g);
-                pb_cap = std::min(PB, std::max(SB, fit));
+                double room = 0;
+                int fit_line = 0, fit_g = 0;
+                auto fit_cap = [&](size_t fb) {
+                    room = (double) fb - a.vram_margin_gib * 1073741824.0 - 4.3 * 1073741824.0;
+                    const double room_g = (double) fb - a.vram_margin_gib * 1073741824.0 - 2.5 * 1073741824.0 - g_need;
+                    fit_line = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
+                    fit_g = pb_graph ? (int) std::max<int64_t>(2, (int64_t) (room_g / (0.78 * 1048576.0))) : fit_line;
+                    return std::min(PB, std::max(SB, std::min(fit_line, fit_g)));
+                };
+                pb_cap = fit_cap(frb);
+                // keep-cache's borrow (need, above) can come up short by the time the width is taken: free VRAM moves
+                // with the desktop and the driver's own frees (2026-10-27: a 1421-token turn split 1143 + 278 and paid a
+                // second sweep of the expert tier, +4.1 s).  Borrow the rest once - both terms here, + one segment.
+                if (kept && pb_cap < dh && pb_cap < PB) {
+                    const double need2 = a.vram_margin_gib * 1073741824.0 + 64.0 * 1048576.0 +
+                                         std::max(4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) dh,
+                                                  2.5 * 1073741824.0 + 0.78 * 1048576.0 * (double) dh + g_need);
+                    int64_t more = 0;
+                    std::string me;
+                    for (int st = 0; st < pipe.n_stages(); ++st) {
+                        const int64_t gs = pipe.tier(st).shrink_cache_for((int64_t) need2, me, true);
+                        if (gs < 0) break;
+                        more += gs;
+                    }
+                    const size_t fr0 = frb;
+                    const int cap0 = pb_cap;
+                    if (more > 0) pb_cap = fit_cap(frb = free_now());
+                    std::fprintf(stderr, "serve: keep-cache: the %d-token batch fit %d columns at %.2f GiB free - %lld more tail "
+                                         "slots out%s -> %.2f GiB, prompt batch %d\n", dh, cap0, fr0 / 1073741824.0,
+                                 (long long) more, me.empty() ? "" : (" (" + me + ")").c_str(), frb / 1073741824.0, pb_cap);
+                }
                 if (vram_trace) std::fprintf(stderr, "vram trace: cap free %.2f GiB room %.2f GiB fit %d, graph %.2f GiB fit %d -> pb_cap %d\n",
                                              frb / 1073741824.0, room / 1073741824.0, fit_line, g_need / 1073741824.0, fit_g, pb_cap);
                 if (fit_g < fit_line && fit_g < PB)

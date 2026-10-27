@@ -7507,7 +7507,7 @@ bool Ds41MoeTier::keep_cache_mode() {
     return on;
 }
 
-int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
+int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err, bool more) {
 #if defined(DS4_MOE_CUDA)
     // every refusal says why (s6: the first A/B never kept the cache and logged nothing)
     if (!im_->gpu || !im_->gpu->cache) { err = "no VRAM cache"; return -1; }
@@ -7526,7 +7526,7 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
         err = "--vram-lru (needs STRATA_SERVE_KEEP_LRU=1)";
         return -1;
     }
-    if (!im_->shrunk.empty()) { err = "still shrunk from the last batch (regrow_cache did not run)"; return -1; }
+    if (!more && !im_->shrunk.empty()) { err = "still shrunk from the last batch (regrow_cache did not run)"; return -1; }
     if (im_->cfg.cuda_device >= 0 && cudaSetDevice(im_->cfg.cuda_device) != cudaSuccess) {
         err = "shrink_cache_for: cudaSetDevice failed"; return -1;
     }
@@ -7560,6 +7560,10 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err) {
     if (!c.shrink(keep_boundary, err)) return -1;
     im_->admitted = im_->admitted > n ? im_->admitted - n : 0;
     im_->pf_n = 0;   // staged prefetches may point at evicted experts' slots
+    if (more && !im_->shrunk.empty()) {   // a second round: its slots lie below the first round's
+        gone.insert(gone.end(), im_->shrunk.begin(), im_->shrunk.end());
+        std::sort(gone.begin(), gone.end());
+    }
     im_->shrunk = std::move(gone);
     return n;
 #else
