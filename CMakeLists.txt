@@ -1923,3 +1923,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/fork.cmake OPTIONAL)
 
 # the GLM-5.3-Flash engine (GlmDense + the shared Ds4MoeTier) - needs the ds4 slices above
 include(${CMAKE_CURRENT_SOURCE_DIR}/tools/glm/cmake/glm.cmake OPTIONAL)
+
+# the MiniMax-M3.1-Flash engine (community port, issue #62) - opt-in (-DSTRATA_M31=ON) and does nothing until the
+# port's own sources are in tools/m31/, so a default configure is unchanged
+include(${CMAKE_CURRENT_SOURCE_DIR}/tools/m31/cmake/m31.cmake OPTIONAL)
