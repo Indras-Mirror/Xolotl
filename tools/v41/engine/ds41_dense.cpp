@@ -1532,6 +1532,18 @@ static ggml_cgraph * build_init(Ds41Dense::Impl & im, ggml_context * gc, int64_t
 static constexpr int64_t kPassGraphN = 8;
 static constexpr size_t kPassGraphCtx = (size_t) 256 << 20;
 
+/// DS41_PASS_GRAPH_MIB (default 256): the arena the cached pass graphs are built in.  This - not a graph count -
+/// is what "pass graph cache full" means: when the next graph does not fit, the cache is dropped and rebuilt.
+/// A box whose launch overhead dominates (Volta sm_70, #60) can trade memory for fewer rebuilds.
+static size_t pass_graph_ctx_bytes() {
+    static const size_t v = [] {
+        const char * e = std::getenv("DS41_PASS_GRAPH_MIB");
+        const long mib = e ? std::atol(e) : 0;
+        return (size_t) (mib > 0 ? mib : 256) << 20;
+    }();
+    return v;
+}
+
 static bool pass_graphs_on(int64_t n) {
     static const bool on = env_on("DS41_PASS_GRAPHS", true);
     return on && n > 1 && n <= kPassGraphN;
@@ -1551,7 +1563,7 @@ static ggml_cgraph * pass_graph(Ds41Dense::Impl & im, const Ds41Dense::Impl::GKe
             ggml_free(im.gctx_m);
             ++im.mgraph_resets;
         }
-        ggml_init_params gp = { kPassGraphCtx, nullptr, true };
+        ggml_init_params gp = { pass_graph_ctx_bytes(), nullptr, true };
         im.gctx_m = ggml_init(gp);
     }
     return im.mgraphs.emplace(key, build(im.gctx_m)).first->second;

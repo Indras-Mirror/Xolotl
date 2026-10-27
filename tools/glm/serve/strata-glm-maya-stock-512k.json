@@ -2,7 +2,7 @@
   "exe": "/home/mal/AI/Xolotl/tools/glm/serve/glm-engine.sh",
   "args": [
     "-m",
-    "/media/mal/SSD NVME/Models/GLM-5.3-Flash-Maya-S-v2/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf",
+    "/media/mal/NVME1TB/Models/GLM-5.3-Flash-Maya-S-v2/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf",
     "--backend",
     "cuda",
     "--experts",

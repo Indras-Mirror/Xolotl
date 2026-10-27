@@ -3896,7 +3896,22 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     }
 
     mark(7);
-    if (prof) ++g_prof_n;
+    if (prof) {
+        // A serve engine is usually killed (SIGTERM) rather than closed, and close() is the only place the
+        // profile used to print - so a server stop showed nothing (#60).  Print every 640 layer calls as well.
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            std::fprintf(stderr, "tier profile: DS4_TIER_PROF active - printing every 640 layer calls, and at close\n");
+        }
+        if (++g_prof_n % 640 == 0) {
+            double tot = 0;
+            for (double v : g_prof) tot += v;
+            std::fprintf(stderr, "tier profile (%lld layer calls, %.3f ms/call):", (long long) g_prof_n, tot / g_prof_n);
+            for (int i = 0; i < 9; ++i) std::fprintf(stderr, " %s %.3f", g_prof_name[i], g_prof[i] / g_prof_n);
+            std::fprintf(stderr, "\n");
+        }
+    }
     st.hits = nh;
     st.pcie = np + nfg;   // file-tier misses run on the card count with the PCIe share (DMA'd too)
     st.cpu = nk;
@@ -4217,7 +4232,27 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         // (FreeToken's BY_RECENCY rule; the admission filter is our recency signal).  STRATA_TIER_QSTAR_RECENCY=0: the
         // old order (the last-seen misses first).
         static const bool qs_recency = !(std::getenv("STRATA_TIER_QSTAR_RECENCY") && std::getenv("STRATA_TIER_QSTAR_RECENCY")[0] == '0');
-        if (qs_recency && budget < eligible && !im.vmiss.empty() && !im.lcalls.empty()) {
+        // STRATA_TIER_ORDER=load (opt-in, Apex's rule): when the PCIe budget is short of the eligible misses, cross
+        // PCIe with the experts carrying the MOST tokens first.  A DMA's cost does not grow with the pass's token
+        // count, the CPU pool computes every routed token - so the highest-load experts are the ones where the
+        // transfer buys the most.  The math is exact either way (same experts, same weights; only the path moves).
+        static const char* tier_order = std::getenv("STRATA_TIER_ORDER");
+        static const bool load_order = tier_order && std::strcmp(tier_order, "load") == 0;
+        if (load_order && budget < eligible) {
+            int tok_load[kMaxEnt] = {};
+            for (int j = 0; j < NE; ++j) ++tok_load[ent_u[j]];
+            while (np < budget) {
+                int best_u = -1, best = -1;
+                for (int i = 0; i < nmiss; ++i) {
+                    const int u = miss[i];
+                    if (cls[u] == PCIE || !gp.arena.ptr(layer, ue[u])) continue;
+                    if (tok_load[u] > best) { best = tok_load[u]; best_u = u; }
+                }
+                if (best_u < 0) break;
+                cls[best_u] = PCIE;
+                ++np;
+            }
+        } else if (qs_recency && budget < eligible && !im.vmiss.empty() && !im.lcalls.empty()) {
             static const int64_t win = std::getenv("STRATA_LRU_WIN") ? std::atoll(std::getenv("STRATA_LRU_WIN")) : 4;
             const int64_t lc_next = im.lcalls[(size_t) layer] + 1;
             for (int pass = 0; pass < 2 && np < budget; ++pass)
