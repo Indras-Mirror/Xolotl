@@ -121,6 +121,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 43:   // llama.cpp PR #30817 (DeepSeek-V4.1): MXFP8, gather-only (never reaches ggml here)
+        return "MXFP8";
     // Agention's llama.cpp fork: the APR trellis expert types (docs/GYRO.md)
     case 143:   // (Strata-DS4 fork: PTQ1_0, V4.1 routed experts - the same id upstream reads as APR's PTQ1_0)
         return "PTQ1_0";
@@ -261,6 +263,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 42:
         elems = 64;
         bytes = 18;
+        return true;
+    case 43:   // MXFP8: one E8M0 scale + 32 E4M3 codes (the Engram tables of Unsloth's DeepSeek-V4.1 UD-Q8_K_XL)
+        elems = 32;
+        bytes = 33;
         return true;
     // APR trellis types: 128 values = fp16 scale + 32 steps of K bits (K = 8 TQ2_T, 6 TQK6, 7 TQK7);
     // PTQ1_0 = 26 B of base-3 digits + fp16 scale

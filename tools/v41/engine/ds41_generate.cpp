@@ -4174,8 +4174,15 @@ int main(int argc, char ** argv) {
                     (double) top1 / std::max(1, n));
     }
     if (!a.dump_logits.empty()) {
+        // STRATA_DUMP_ROWS=<from>:<to> (measurement): only rows from..to-1 (llama-perplexity's scored half of a chunk)
+        size_t r0 = 0, r1 = all.size() / (size_t) nv;
+        if (const char * dr = std::getenv("STRATA_DUMP_ROWS")) {
+            const char * c = std::strchr(dr, ':');
+            r0 = std::min(r1, (size_t) std::atoll(dr));
+            if (c) r1 = std::min(r1, std::max(r0, (size_t) std::atoll(c + 1)));
+        }
         std::ofstream f(a.dump_logits, std::ios::binary);
-        f.write((const char *) all.data(), (std::streamsize) (all.size() * 4));
+        f.write((const char *) (all.data() + r0 * (size_t) nv), (std::streamsize) ((r1 - r0) * (size_t) nv * 4));
     }
     if (!a.dump_last.empty()) {   // the last row's logits - the one row enc-skip still computes exactly
         std::ofstream f(a.dump_last, std::ios::binary);
@@ -4409,6 +4416,13 @@ int main(int argc, char ** argv) {
                 std::fwrite(&lg[(size_t) id], 4, 1, topk_f);
             }
             std::fflush(topk_f);
+        }
+        // STRATA_DEC_LOGITS=<file> (measurement): per step the full f32 logits that chose `tok` (nv floats, no header) -
+        // with a one-token prompt, row `gen` lines up with row `gen` of a --dump-logits prefill of the same stream
+        static std::FILE * lg_f = std::getenv("STRATA_DEC_LOGITS") ? std::fopen(std::getenv("STRATA_DEC_LOGITS"), "wb") : nullptr;
+        if (lg_f) {
+            std::fwrite(lg.data(), 4, (size_t) nv, lg_f);
+            std::fflush(lg_f);
         }
         std::printf("%d\n", tok);
         std::fflush(stdout);

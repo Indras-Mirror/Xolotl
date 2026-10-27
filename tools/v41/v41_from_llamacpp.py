@@ -37,9 +37,10 @@ F32, F16, Q8_0, Q6_K, BF16, I32 = 0, 1, 8, 14, 30, 26
 # bytes per block, elements per block
 BLOCK = {0: (4, 1), 1: (2, 1), 30: (2, 1), 8: (34, 32), 14: (210, 256), 39: (17, 32), 10: (84, 256), 11: (110, 256),
          12: (144, 256), 13: (176, 256), 16: (66, 256), 17: (74, 256), 18: (98, 256), 21: (110, 256), 22: (82, 256),
-         23: (136, 256), 26: (4, 1)}
+         23: (136, 256), 26: (4, 1), 43: (33, 32)}
 TYPE_NAME = {0: "F32", 1: "F16", 30: "BF16", 8: "Q8_0", 14: "Q6_K", 39: "MXFP4", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K",
-             13: "Q5_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 26: "I32"}
+             13: "Q5_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 26: "I32",
+             43: "MXFP8"}
 SCALAR = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
 
 
@@ -163,7 +164,27 @@ def to_f16(v, name):
     return h
 
 
+def bf16_f32(raw):
+    return (np.frombuffer(raw, np.uint16).astype(np.uint32) << 16).view(np.float32)
+
+
+def q8_0(v):
+    """floats -> Q8_0 blocks, ggml's quantize_row_q8_0_ref: d = amax / 127 and id = 1 / d in float32, d stored as F16,
+    q = roundf(x * id) (half away from zero; decided in float64, where |x * id| + 0.5 is exact)"""
+    x = v.astype(np.float32).reshape(-1, 32)
+    d = np.abs(x).max(1) / np.float32(127)
+    idv = np.zeros_like(d)
+    np.divide(np.float32(1), d, out=idv, where=d != 0)
+    x0 = (x * idv[:, None]).astype(np.float64)
+    out = np.empty((x.shape[0], 34), np.uint8)
+    out[:, :2] = d.astype(np.float16).view(np.uint8).reshape(-1, 2)
+    out[:, 2:] = (np.sign(x0) * np.floor(np.abs(x0) + 0.5)).astype(np.int8).view(np.uint8)
+    return out.tobytes()
+
+
 def convert(kind, raw, name):
+    if kind == "bf16>q8_0":   # Unsloth's UD-Q8_K_XL keeps the dense matrices in BF16
+        return q8_0(bf16_f32(raw))
     if kind == "q8_0>f16":
         return to_f16(deq_q8_0(raw), name).tobytes()
     if kind == "q6_k>f16":
@@ -284,7 +305,7 @@ def plan_tensors(src_t, text):
             raise SystemExit(f"{src_name or name}: shape {sdims}, expected {dims}")
         if kind is None:
             kind = "copy" if st == want else {(Q8_0, F16): "q8_0>f16", (Q6_K, F16): "q6_k>f16", (F32, F16): "f32>f16",
-                                              (BF16, F16): "bf16>f16"}.get((st, want))
+                                              (BF16, F16): "bf16>f16", (BF16, Q8_0): "bf16>q8_0"}.get((st, want))
             if kind is None:
                 raise SystemExit(f"{src_name or name}: {TYPE_NAME.get(st, st)} cannot become {TYPE_NAME[want]}")
         used.add(src_name or name)
@@ -382,8 +403,8 @@ def build(args):
     if len(token_map) != text["vocab_size"] or max(token_map) + 1 != cvocab:
         raise SystemExit("engram.token_map does not cover the vocabulary / compressed vocabulary")
     pet = src_t["per_layer_token_embd.weight"]
-    if pet[2] != Q6_K or pet[1] != [text["engram_head_dim"], sum(rows)]:
-        raise SystemExit(f"per_layer_token_embd.weight is {TYPE_NAME.get(pet[2])} {pet[1]}, the reader takes Q6_K "
+    if pet[2] not in (Q6_K, 43) or pet[1] != [text["engram_head_dim"], sum(rows)]:   # 43: MXFP8 (UD-Q8_K_XL)
+        raise SystemExit(f"per_layer_token_embd.weight is {TYPE_NAME.get(pet[2])} {pet[1]}, the reader takes Q6_K / MXFP8 "
                          f"[{text['engram_head_dim']}, {sum(rows)}]")
 
     plan = plan_tensors(src_t, text)

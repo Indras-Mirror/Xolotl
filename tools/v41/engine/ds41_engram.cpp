@@ -105,6 +105,24 @@ float fp16_to_f32(uint16_t h) {
 // Q6_K (ggml block_q6_K, 210 bytes per 256 weights): Unsloth's / llama.cpp #30817's per_layer_token_embd.weight
 constexpr int kQ6k = 14;
 
+// MXFP8 (llama.cpp #30817's GGML_TYPE_MXFP8 = 43, 33 bytes per 32 weights: one E8M0 scale e, then 32 E4M3 (fn) codes,
+// value = e4m3(q) * 2^(e - 127)): Unsloth's UD-Q8_K_XL per_layer_token_embd.weight.  The arithmetic of that branch's
+// dequantize_row_mxfp8 (exact in fp32 for every code and scale).
+constexpr int kMxfp8 = 43;
+
+float e4m3_to_f32(uint8_t x) {
+    const int e = (x >> 3) & 0xF, m = x & 0x7;
+    const float v = e == 0xF && m == 0x7 ? NAN : e == 0 ? std::ldexp((float) m, -9) : std::ldexp((float) (8 + m), e - 10);
+    return (x & 0x80) ? -v : v;
+}
+
+void mxfp8_dequant(const uint8_t * x, float * y, int64_t k) {
+    for (int64_t i = 0; i < k / 32; ++i, x += 33, y += 32) {
+        const float d = x[0] == 0xFF ? NAN : x[0] == 0 ? std::ldexp(1.0f, -127) : std::ldexp(1.0f, (int) x[0] - 127);
+        for (int j = 0; j < 32; ++j) y[j] = e4m3_to_f32(x[1 + j]) * d;
+    }
+}
+
 // k Q6_K values (ggml's block_q6_K, 210 bytes per 256: ql[128] qh[64] scales[16] d) -> floats.  The arithmetic of
 // ggml's dequantize_row_q6_K, term for term, so a row comes out as llama.cpp's get_rows gives it on the CPU; kept here
 // instead of linking ggml because bench_ds41_engram / ds41_engram_hot build this file without it.
@@ -278,6 +296,7 @@ void Ds41Engram::deq_row(const uint8_t * w, const uint8_t * s, float * o) const 
         return;
     }
     if (qtype_ == kQ6k) { q6k_dequant(w, o, dim_); return; }
+    if (qtype_ == kMxfp8) { mxfp8_dequant(w, o, dim_); return; }
     if (qtype_ == kIq4nl) {
         for (int64_t b = 0; b < dim_ / 32; ++b) {
             const uint8_t * blk = w + b * kIq4nlBlock;
@@ -456,12 +475,11 @@ bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
 // slot 1's (its hash ids are offset by slot 0's rows: llama.cpp's head_offsets run across both), so slot e's table
 // starts at the rows of the slots before it.  Each slot gets its own descriptor (the destructor closes every one).
 bool Ds41Engram::open_q6k(const std::vector<std::string> & paths, std::string & err) {
+    // (the same layout in MXFP8 - Unsloth's UD-Q8_K_XL: the row size follows the file's type)
     const char * name = "per_layer_token_embd.weight";
     int64_t total = 0;
     for (int64_t r : g_->engram_rows) total += r;
     if (dim_ % 256) { err = "engram: Q6_K rows need a dim that is a multiple of 256"; return false; }
-    qtype_ = kQ6k;
-    wrow_ = dim_ / 256 * 210;
     srow_ = 0;
     std::string path;
     uint64_t off = 0;
@@ -480,10 +498,13 @@ bool Ds41Engram::open_q6k(const std::vector<std::string> & paths, std::string & 
             try { f = std::make_unique<GgufFile>(c); } catch (const std::exception &) { continue; }
             const TensorInfo * t = f->find(name);
             if (!t) continue;
-            if (t->type != 14 || t->shape.size() != 2 || t->shape[0] != (uint64_t) dim_ || t->shape[1] != (uint64_t) total) {
-                err = "engram: " + c + ": " + name + " is not Q6_K [" + std::to_string(dim_) + ", " + std::to_string(total) + "]";
+            if ((t->type != (uint32_t) kQ6k && t->type != (uint32_t) kMxfp8) || t->shape.size() != 2 || t->shape[0] != (uint64_t) dim_ ||
+                t->shape[1] != (uint64_t) total) {
+                err = "engram: " + c + ": " + name + " is not Q6_K / MXFP8 [" + std::to_string(dim_) + ", " + std::to_string(total) + "]";
                 return false;
             }
+            qtype_ = (int) t->type;
+            wrow_ = qtype_ == kQ6k ? dim_ / 256 * 210 : dim_ / 32 * 33;
             path = c;
             off = f->data_start() + t->offset;
             break;
@@ -503,8 +524,8 @@ bool Ds41Engram::open_q6k(const std::vector<std::string> & paths, std::string & 
         row0 += (uint64_t) t.rows;
         tables_.push_back(t);
     }
-    std::fprintf(stderr, "engram: Q6_K tables from %s (%lld rows, %lld bytes each)\n", path.c_str(), (long long) total,
-                 (long long) wrow_);
+    std::fprintf(stderr, "engram: %s tables from %s (%lld rows, %lld bytes each)\n", qtype_ == kQ6k ? "Q6_K" : "MXFP8",
+                 path.c_str(), (long long) total, (long long) wrow_);
     return true;
 }
 
