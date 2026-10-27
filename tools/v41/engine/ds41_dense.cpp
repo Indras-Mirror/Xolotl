@@ -1066,6 +1066,15 @@ static ggml_tensor * attn_core_slab(Ds41Dense::Impl & im, ggml_context * gc, con
 // the shared expert (model.py Expert, clamped SwiGLU) of layer il on fn [D, n]
 static ggml_tensor * shexp_ffn(Ds41Dense::Impl & im, ggml_context * gc, int il, ggml_tensor * fn) {
     const float lim = (float) im.g.swiglu_limit;
+    // STRATA_SHEXP_GLU=1 (opt-in, one token): the same clamped SwiGLU (gate <= lim, up in [-lim, lim], silu(gate) * up)
+    // as ONE ggml_swiglu_clamp node, gate's matmul first - the {MUL_MAT, MUL_MAT, GLU} pattern ggml-cuda fuses into one
+    // MMVQ launch for gate and up (the two clamps below keep it from matching).  Batches keep the old graph.
+    static const bool shexp_glu = env_on("STRATA_SHEXP_GLU", false);
+    if (shexp_glu && lim > 0 && fn->ne[1] == 1) {
+        ggml_tensor * gt1 = ggml_mul_mat(gc, im.BL(il, "ffn_gate_shexp.weight"), fn);
+        ggml_tensor * up1 = ggml_mul_mat(gc, im.BL(il, "ffn_up_shexp.weight"), fn);
+        return ggml_mul_mat(gc, im.BL(il, "ffn_down_shexp.weight"), ggml_swiglu_clamp(gc, gt1, up1, lim));
+    }
     ggml_tensor * up = ggml_mul_mat(gc, im.BL(il, "ffn_up_shexp.weight"), fn);
     ggml_tensor * gt = ggml_mul_mat(gc, im.BL(il, "ffn_gate_shexp.weight"), fn);
     if (lim > 0) {
