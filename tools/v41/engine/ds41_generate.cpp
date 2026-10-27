@@ -47,6 +47,7 @@
 #include "ds41_moe.hpp"
 #include "ds41_conv_reuse.hpp"
 #include "ds41_persistent_state.hpp"
+#include "ds41_session_file.hpp"
 #include "ds41_batch_slots.hpp"
 #include "ds41_batch.hpp"
 #include "../../../src/qwen35/q36_grammar.hpp"
@@ -2535,6 +2536,76 @@ int main(int argc, char ** argv) {
 #else
                     std::printf("ERR %s: CUDA checkpoint is unsupported in this build\n", line.c_str());
 #endif
+                }
+                std::fflush(stdout);
+                continue;
+            }
+            // (local) disk sessions: SAVE <path> | RESTORE <path> between requests - the live conversation at its turn
+            // boundary, the state a pool record holds (ds41_session_file.hpp).  Answers SAVED / RESTORED <tokens> <bytes>
+            // <ms>, or SERR <invalid|storage|memory|io> 0 <reason> with the live state unchanged.
+            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+                const bool save = line[0] == 'S';
+                const std::string path = line.substr(save ? 5 : 8);
+                const double t0 = now_ms();
+                auto serr = [&](const char * kind, std::string why) {
+                    for (char & c : why) if (c == '\n' || c == '\r') c = ' ';
+                    std::fprintf(stderr, "strata serve: session %s %s: %s\n", save ? "save" : "restore", path.c_str(), why.c_str());
+                    std::printf("SERR %s 0 %s\n", kind, why.c_str());
+                    std::fflush(stdout);
+                };
+                if (path.empty()) { serr("invalid", "missing path"); continue; }
+                if (NS > 0 || pipe.n_stages() > 1) { serr("invalid", "session files need one stage and no batch slots"); continue; }
+                std::vector<std::string> fp_files = strata::gguf_split_paths(a.model);
+                for (const auto & e : a.engram) fp_files.push_back(e);
+                const uint64_t fp = ds41_session_fingerprint(fp_files, G.n_layer, ctx);
+                std::string serr_msg;
+                const char * kind = "io";
+                size_t bytes = 0;
+                if (save) {
+                    if (snap_len < 1 || hist.size() < (size_t) snap_len || dense.parked()) {
+                        serr("invalid", "no complete session to save");
+                        continue;
+                    }
+                    if (pool_on) {   // a queued pool save may still be reading the device state
+                        std::string ferr2;
+                        pool.fence(&ferr2);
+                    }
+                    if (!ds41_session_save(path, dense, fp, hist.data(), live_id.data(), live_id.size(), snap_len, snap_logits,
+                                           bytes, serr_msg, kind)) {
+                        serr(kind, serr_msg);
+                        continue;
+                    }
+                    std::fprintf(stderr, "strata serve: session saved %d tokens, %zu bytes to %s in %.1f ms\n", snap_len, bytes,
+                                 path.c_str(), now_ms() - t0);
+                    std::printf("SAVED %d %zu %.1f\n", snap_len, bytes, now_ms() - t0);
+                } else {
+                    Ds41SessionImage img;
+                    if (!ds41_session_read(path, dense, fp, img, bytes, serr_msg, kind)) {
+                        serr(kind, serr_msg);
+                        continue;
+                    }
+                    save_live("session restore");   // the outgoing conversation stays reachable from the pool
+                    if (pool_on) {
+                        std::string ferr2;
+                        pool.fence(&ferr2);
+                    }
+                    if (dense.parked()) dense.drop_park();
+                    ds41_session_apply(dense, img);
+                    dense.rearm((int) img.n);
+                    dense.restore();
+                    hist = img.tokens;
+                    live_id = img.ident;
+                    snap_len = (int) img.n;
+                    snap_logits = img.logits;
+                    snap_seed_n = 0;
+                    live_dirty = false;
+                    previous_vision = !img.ident.empty();
+#if defined(DS41_HAVE_DSPARK)
+                    dsp_next = -1;
+#endif
+                    std::fprintf(stderr, "strata serve: session restored %lld tokens, %zu bytes from %s in %.1f ms\n",
+                                 (long long) img.n, bytes, path.c_str(), now_ms() - t0);
+                    std::printf("RESTORED %lld %zu %.1f\n", (long long) img.n, bytes, now_ms() - t0);
                 }
                 std::fflush(stdout);
                 continue;

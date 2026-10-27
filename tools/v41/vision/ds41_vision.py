@@ -317,8 +317,10 @@ class MmprojWeights:
     def __init__(self, path):
         self.kv, tensors, self.data_start = read_gguf_header(path)
         self.path = path
-        if self.kv.get("clip.projector_type") != "deepseek41v":
-            raise ValueError(f"{path}: clip.projector_type {self.kv.get('clip.projector_type')!r}, expected deepseek41v")
+        # llama.cpp's merged DeepSeek V4 vision support names the projector "deepseek4v" (Unsloth's 1017 mmproj-BF16.gguf,
+        # 2026-10); the earlier PR builds wrote "deepseek41v".  Same tensor names and layout.
+        if self.kv.get("clip.projector_type") not in ("deepseek41v", "deepseek4v"):
+            raise ValueError(f"{path}: clip.projector_type {self.kv.get('clip.projector_type')!r}, expected deepseek41v / deepseek4v")
         self.src = {n: (s, t, o) for n, s, t, o in tensors}
         self.fd = _open_ro(path)
         self.map = {}                                  # checkpoint name -> list of mmproj names (concatenated on dim 0)
