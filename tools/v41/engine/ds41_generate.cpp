@@ -2200,14 +2200,25 @@ int main(int argc, char ** argv) {
                 if (!hist.empty() && lcp == hist.size() && lcp < ids.size()) live = (int) lcp;
                 else if (cont_last) live = (int) lcp - 1;
                 else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len <= ids.size()) live = snap_len;
-                const ConvMatch m = pool.best_prefix(ids.data(), rid.data(), rid.size(), (int64_t) ids.size());
-                int64_t pr = m.resume();
-                const bool exact = m.pos > 0 && m.pos == (int64_t) ids.size();
-                if (exact && !m.has_logits) pr = 0;                      // nothing to sample the first token from
-                if (!exact && pr >= (int64_t) ids.size()) pr = 0;        // a partial resume must feed something
-                lp_show = (size_t) m.lcp;
+                ConvMatch m;
+                int64_t pr = 0;
+                bool exact = false;
+                auto match = [&]() {
+                    m = pool.best_prefix(ids.data(), rid.data(), rid.size(), (int64_t) ids.size());
+                    pr = m.resume();
+                    exact = m.pos > 0 && m.pos == (int64_t) ids.size();
+                    if (exact && !m.has_logits) pr = 0;                      // nothing to sample the first token from
+                    if (!exact && pr >= (int64_t) ids.size()) pr = 0;        // a partial resume must feed something
+                    lp_show = (size_t) m.lcp;
+                };
+                match();
                 if (pr > live) {
+                    // the live conversation's save may continue (and supersede) the very record matched - a turn of
+                    // the same chat, with its boundaries carried over - so match again against what the pool holds now
                     save_live("switch");
+                    match();
+                }
+                if (pr > live) {
                     ConvRestore rs;
                     std::string perr;
                     const double t0 = now_ms();
@@ -2289,6 +2300,14 @@ int main(int argc, char ** argv) {
             bool regen = false;   // the snapshot's own prompt again: nothing new to feed
             if (reuse_override >= 0) { reused = reuse_override; regen = pool_regen; }   // a partial unpark / a pool record
             else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) {
+                // STRATA_SERVE_TURN_SAVE (default on): the turn boundary this request moves past goes to the pool as
+                // it would on a switch.  The live snapshot is the only state a resume below the last boundary could
+                // come from (the window ring and the ratio-2 state rewind at most kConvPartialMax), so a client that
+                // later edits the history (opencode's tool-output pruning) found no boundary <= the common prefix and
+                // re-read the whole prompt: "reuse lcp=10484 ... snap=-1 -> reused=0".  Records continue each other,
+                // so this is incremental: the new chunks and one boundary's regions (the fence below orders it)
+                static const bool turn_save = !(std::getenv("STRATA_SERVE_TURN_SAVE") && std::getenv("STRATA_SERVE_TURN_SAVE")[0] == '0');
+                if (turn_save && pool_on) save_live("turn");
                 reused = (int) lcp;
                 if (live_dirty && (reused & 1)) {   // re-feed the last accepted token (its group's ratio-2 state)
                     --reused;
