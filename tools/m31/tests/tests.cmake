@@ -31,6 +31,9 @@ if(NOT TARGET m31_grammar_api_check)
   set_tests_properties(m31_grammar_api PROPERTIES LABELS "m31;cpu;unit" TIMEOUT 30)
 endif()
 
+add_test(NAME m31_bench COMMAND "${Python3_EXECUTABLE}" "${_m31_dir}/tests/test_bench.py" -v)
+set_tests_properties(m31_bench PROPERTIES LABELS "m31;cpu;unit" TIMEOUT 60)
+
 add_executable(m31_protocol_fixture "${_m31_dir}/tests/protocol_fixture.cpp")
 target_include_directories(m31_protocol_fixture PRIVATE "${_m31_dir}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(m31_protocol_fixture PRIVATE ggml-base Threads::Threads)
