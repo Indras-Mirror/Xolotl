@@ -125,6 +125,20 @@ bool read_prof_on() {
     static const bool on = std::getenv("STRATA_READ_PROF") != nullptr;
     return on;
 }
+
+/// The whole-blob reads of the prompt readers, the arena fill, the VRAM seed and regrow_cache go through read_part_cap
+/// (one part): O_DIRECT, the mirror policy's drive (STRATA_BLOB_MIRROR / _PRIMARY) and, into a 4 KiB-aligned slot of
+/// `cap` bytes, no bounce copy.  read() is the model file's three buffered spans - one drive, through the file cache:
+/// on this PC 7.2 GB/s for every prompt batch (2026-10-27, agent turns +110 / +307 / +1421), against ~14 GB/s here
+/// (a fresh 307-token prompt 16.3 -> 6.9 s).  STRATA_WAVE_BUFFERED=1: read() as before.  Same bytes either way.
+static bool wave_buffered() {
+    static const bool on = std::getenv("STRATA_WAVE_BUFFERED") && std::atoi(std::getenv("STRATA_WAVE_BUFFERED")) == 1;
+    return on;
+}
+static void read_blob(const Ds41BlobSource& b, int64_t l, int64_t e, uint8_t* dst, size_t cap) {
+    if (wave_buffered()) b.read(l, e, dst);
+    else b.read_part_cap(l, e, 0, 1, dst, cap);
+}
 [[maybe_unused]] void read_prof_print() {
     if (!read_prof_on() || g_rp.batches == 0) return;
     std::fprintf(stderr, "read profile (%lld batches, wall %.3f ms/batch, start lag %.3f ms/batch, both drives in %lld):",
@@ -764,6 +778,7 @@ struct Gpu {
         std::vector<int32_t> idx;                     ///< expert -> its blob's index (-1 = not read ahead)
         std::vector<int32_t> ex;                      ///< index -> expert
         std::vector<uint8_t*> ptr;                    ///< index -> its pinned slot
+        std::vector<size_t> cap;                      ///< index -> its slot's bytes (the blob, 4 KiB rounded)
         std::unique_ptr<std::atomic<int>[]> ready, pdone;
         std::atomic<size_t> next{0};
         std::vector<std::thread> th;
@@ -2768,8 +2783,9 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
             for (;;) {
                 const int64_t i = next.fetch_add(1);
                 if (i >= gp.arena.used) break;
-                im_->blobs->read(first[(size_t) i].first, first[(size_t) i].second,
-                                 (uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) i]);
+                read_blob(*im_->blobs, first[(size_t) i].first, first[(size_t) i].second,
+                          (uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) i],
+                          (size_t) (gp.arena.off[(size_t) i + 1] - gp.arena.off[(size_t) i]));
             }
         });
     for (auto& t : th) t.join();
@@ -3045,7 +3061,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
                 }
                 for (size_t q; !bad && (q = nx.fetch_add(1)) < fjobs.size();) {
                     const auto& j = fjobs[q];
-                    im_->blobs->read(j[1], j[2], buf);
+                    read_blob(*im_->blobs, j[1], j[2], buf, (size_t) im_->blob);
                     std::lock_guard<std::mutex> lk(mu);   // the cache's counters; the copy is ~0.4 ms of a ~2 ms read
                     std::string e;
                     if (!cache.fill_slot_blocking((int32_t) j[0], buf, e, im_->bl[(size_t) im_->g.cls(j[1], j[2])])) {
@@ -6080,8 +6096,13 @@ bool chunk_pstage_alloc(Ds41MoeImpl& im) {
             return false;
         }
         // zeroed once: MMQ reads up to 4 KiB past a matrix, and the bytes past a blob in its stride slot then hold
-        // zeros or an earlier layer's blob - finite either way (as the stage halves)
-        ck(cudaMemset(gp.p_buf, 0, gp.p_cap), "pstage zero");
+        // zeros or an earlier layer's blob - finite either way (as the stage halves).  On s_cp, ahead of the fill's
+        // DMAs: a cudaMemset on the legacy stream has no order against the NonBlocking s_cp, and it waits for the work
+        // queued on gp.s (a blocking stream), so it could land AFTER the first fill's blobs and zero them.
+        // STRATA_PSTAGE_ZERO=1: the old legacy-stream memset; =0: not zeroed (build54).
+        static const int zmode = std::getenv("STRATA_PSTAGE_ZERO") ? std::atoi(std::getenv("STRATA_PSTAGE_ZERO")) : 2;
+        if (zmode == 1) ck(cudaMemset(gp.p_buf, 0, gp.p_cap), "pstage zero");
+        else if (zmode >= 2) ck(cudaMemsetAsync(gp.p_buf, 0, gp.p_cap, gp.s_cp), "pstage zero");
         ck(cudaEventCreateWithFlags(&gp.p_copied, cudaEventDisableTiming), "ev");
         ck(cudaEventCreateWithFlags(&gp.p_used, cudaEventDisableTiming), "ev");
         static bool said = false;
@@ -6157,6 +6178,32 @@ int chunk_pstage_fill(Ds41MoeImpl& im, int64_t layer, const int32_t* routed, int
     if (!nput) return 0;
     ck(cudaEventRecord(gp.p_copied, gp.s_cp), "pstage copied");
     gp.p_layer = (int) layer;
+    // STRATA_PSTAGE_VERIFY=n (diagnostic): the first n fills wait for the device, read every placed blob back and
+    // compare it with its arena source (the check for the region's zeroing landing on top of a fill)
+    static const int nverify = std::getenv("STRATA_PSTAGE_VERIFY") ? std::atoi(std::getenv("STRATA_PSTAGE_VERIFY")) : 0;
+    static int verified = 0;
+    if (verified < nverify) {
+        ++verified;
+        ck(cudaDeviceSynchronize(), "pstage verify sync");
+        std::vector<uint8_t> hb;
+        int bad = 0;
+        size_t nb = 0, badb = 0, zerob = 0;
+        for (int64_t e = 0; e < NX; ++e) {
+            if (!gp.p_ptr[(size_t) e]) continue;
+            const int64_t ci = im.g.per_expert() ? im.g.cls(layer, (int32_t) e) : layer;
+            const size_t bl = (size_t) im.bl[(size_t) ci];
+            const uint8_t* src = gp.arena.ptr(layer, e);
+            hb.resize(bl);
+            ck(cudaMemcpy(hb.data(), (const void*) gp.p_ptr[(size_t) e], bl, cudaMemcpyDeviceToHost), "pstage verify read");
+            nb += bl;
+            if (!std::memcmp(hb.data(), src, bl)) continue;
+            ++bad;
+            for (size_t i = 0; i < bl; ++i)
+                if (hb[i] != src[i]) { ++badb; zerob += hb[i] == 0; }
+        }
+        std::fprintf(stderr, "pstage verify L%lld %s: %d blobs (%.1f MiB), %d differ from the arena (%zu bytes, %zu of them 0)\n",
+                     (long long) layer, routed ? "lazy" : "eager", nput, nb / 1048576.0, bad, badb, zerob);
+    }
     return nput;
 }
 
@@ -6476,6 +6523,7 @@ static bool layer_ra_start(Ds41MoeImpl& im, int64_t layer, int n, const int32_t*
     ra.idx.assign((size_t) NX, -1);
     ra.ex.clear();
     ra.ptr.clear();
+    ra.cap.clear();
     ra.gb = 0;
     int r = 0;
     int64_t off = 0;
@@ -6489,6 +6537,7 @@ static bool layer_ra_start(Ds41MoeImpl& im, int64_t layer, int n, const int32_t*
         ra.idx[(size_t) ce.second] = (int32_t) ra.ex.size();
         ra.ex.push_back(ce.second);
         ra.ptr.push_back(gp.c_bounce[r] + off);
+        ra.cap.push_back((size_t) b);
         ra.gb += (double) bl / 1e9;
         off += b;
     }
@@ -6512,8 +6561,8 @@ static bool layer_ra_start(Ds41MoeImpl& im, int64_t layer, int n, const int32_t*
         ra.th.emplace_back([&im, &ra, layer, nb]() {
             for (size_t x; (x = ra.next.fetch_add(1)) < nb * P;) {   // parts in blob order: the first pass's blobs first
                 const size_t q = x / P;
-                if (P == 1) im.blobs->read(layer, ra.ex[q], ra.ptr[q]);
-                else im.blobs->read_part(layer, ra.ex[q], (int) (x % P), (int) P, ra.ptr[q]);
+                if (wave_buffered() && P == 1) im.blobs->read(layer, ra.ex[q], ra.ptr[q]);
+                else im.blobs->read_part_cap(layer, ra.ex[q], (int) (x % P), (int) P, ra.ptr[q], ra.cap[q]);
                 if (P == 1 || ra.pdone[q].fetch_add(1, std::memory_order_acq_rel) + 1 == (int) P) {
                     ra.ready[q].store(1, std::memory_order_release);
                     ra.ready[q].notify_all();
@@ -7001,8 +7050,10 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         if (!use_ra) layer_ra_stop(gp);   // a blob it does not have: the per-pass reader for the rest of the layer
     }
     const int64_t per_half = std::max<int64_t>(1, gp.c_half / SL);
-    const size_t slots_half = (size_t) std::max<int64_t>(1, gp.c_bhalf / BL), cap = 2 * slots_half;
-    auto slot_ptr = [&](size_t k) { return gp.c_bounce[(k % cap) / slots_half] + ((k % cap) % slots_half) * (size_t) BL; };
+    // bounce slots 4 KiB apart (the halves are page-aligned): a whole-blob or part read lands in place (wave_buffered)
+    const int64_t BLA = (BL + 4095) & ~(int64_t) 4095;
+    const size_t slots_half = (size_t) std::max<int64_t>(1, gp.c_bhalf / BLA), cap = 2 * slots_half;
+    auto slot_ptr = [&](size_t k) { return gp.c_bounce[(k % cap) / slots_half] + ((k % cap) % slots_half) * (size_t) BLA; };
     std::vector<std::atomic<int>> ready(nF), pdone(nF);   // pdone: parts of a blob read (STRATA_WAVE_PARTS)
     for (auto& r : ready) r.store(0, std::memory_order_relaxed);
     for (auto& r : pdone) r.store(0, std::memory_order_relaxed);
@@ -7036,8 +7087,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             readers.emplace_back([&, w1]() {
                 for (size_t x; (x = rnext.fetch_add(1)) < w1 * P;) {
                     const size_t q = x / P;
-                    if (P == 1) im.blobs->read(layer, order[2][q], slot_ptr(q));
-                    else im.blobs->read_part(layer, order[2][q], (int) (x % P), (int) P, slot_ptr(q));
+                    if (wave_buffered() && P == 1) im.blobs->read(layer, order[2][q], slot_ptr(q));
+                    else im.blobs->read_part_cap(layer, order[2][q], (int) (x % P), (int) P, slot_ptr(q), (size_t) BLA);
                     if (P == 1 || pdone[q].fetch_add(1, std::memory_order_acq_rel) + 1 == (int) P) {   // the blob's last part
                         ready[q].store(1, std::memory_order_release);
                         ready[q].notify_one();
@@ -7585,7 +7636,7 @@ int64_t Ds41MoeTier::regrow_cache(std::string& err) {
                 uint8_t* b = pin[(size_t) k];
                 for (size_t q; !bad && (q = nx.fetch_add(1)) < fjobs.size();) {
                     const auto& j = fjobs[q];
-                    im_->blobs->read(j[1], j[2], b);
+                    read_blob(*im_->blobs, j[1], j[2], b, (size_t) im_->blob);
                     std::lock_guard<std::mutex> lk(mu);
                     std::string e;
                     if (!c.fill_slot_blocking((int32_t) j[0], b, e, im_->bl[(size_t) im_->g.cls(j[1], j[2])])) { terr = e; bad = true; }
@@ -7978,7 +8029,8 @@ void Ds41MoeTier::rebalance_begin_prompt() {
                     j = r.todo.front();
                     r.todo.pop_front();
                 }
-                imp->blobs->read(j->layer, j->e, (uint8_t*) gp.arena.base + gp.arena.off[(size_t) j->slot]);
+                read_blob(*imp->blobs, j->layer, j->e, (uint8_t*) gp.arena.base + gp.arena.off[(size_t) j->slot],
+                          (size_t) (gp.arena.off[(size_t) j->slot + 1] - gp.arena.off[(size_t) j->slot]));
                 j->done.store(1, std::memory_order_release);
             }
         });

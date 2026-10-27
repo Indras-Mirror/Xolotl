@@ -2434,7 +2434,21 @@ static bool engram_ahead_on() {
 
 static bool engram_ready(Ds41Dense::Impl & im) {
     if (!im.eng_batch) return true;
+    // STRATA_ENG_PROF: how long the first Engram layer waits here for the pass's reads (STRATA_ENG_ASYNC's decode wait)
+    static const bool eprof = std::getenv("STRATA_ENG_PROF") != nullptr;
+    const auto tw = eprof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!im.engram.wait(im.eng_batch, im.err)) { im.eng_batch.reset(); return false; }
+    if (eprof) {
+        static double w_ms = 0, w_max = 0;
+        static long w_n = 0, w_hit = 0;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
+        w_ms += ms;
+        w_max = std::max(w_max, ms);
+        w_hit += ms > 0.05;
+        if (++w_n % 256 == 0)
+            std::fprintf(stderr, "engram wait at its first layer: %.3f ms/pass over %ld passes (%ld waited > 0.05 ms, max %.2f)\n",
+                         w_ms / (double) w_n, w_n, w_hit, w_max);
+    }
     im.eng_batch.reset();
     for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
         ggml_backend_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
