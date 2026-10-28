@@ -345,8 +345,12 @@ print(f"{len(d)} layers, {len(bad)} groups with mixed tiers")
 raise SystemExit(1 if bad else 0)
 PY
     mkdir -p "$(dirname "$QOUT")"
-    PRED=$(python3 "$T/predict_size.py" --types "$TT" --gguf "$MODEL" --ftype Q8_0 --json)
-    say "  predicted: $(echo "$PRED" | python3 -c 'import json,sys; print(f"{json.load(sys.stdin)[\"gib\"]:.2f} GiB")')"
+    PRED=$("$PY" "$T/predict_size.py" --types "$TT" --gguf "$MODEL" --ftype Q8_0 --json) \
+        || die "predict_size --json failed"
+    # No nested quotes: inside a single-quoted shell string \" stays a literal backslash, which
+    # made this line a SyntaxError at 02:49 and printed an empty size (the size gate below was
+    # left to speak for itself). % formatting keeps the quote levels flat.
+    say "  predicted: $(printf '%s' "$PRED" | "$PY" -c 'import json,sys; print("%.2f GiB" % json.load(sys.stdin)["gib"])')"
     python3 "$T/predict_size.py" --types "$TT" --gguf "$MODEL" --ftype Q8_0 \
         --ceiling-gib "${CEILING_GIB:-90}" >"$STATE/step6-predict.log" 2>&1 \
         || { cat "$STATE/step6-predict.log"; die "predicted size exceeds the ceiling"; }
@@ -360,17 +364,38 @@ PY
 fi
 
 # ---------------------------------------------------------------- 7. ternary payloads
-if [ -f "$STATE/stage7.done" ] && [ -f "$QOUT.ptq1" ]; then
-    say "STEP7 skip (ternary output present)"
+if [ -f "$STATE/stage7.done" ]; then
+    say "STEP7 skip (ternary pass already decided)"
 else
     say "STEP7 replace PTQ1_0 chosen gate/up payloads"
-    python3 "$T/apply_ternary.py" --input "$QOUT" --source "$MODEL" --alloc "$ALLOC" \
-        --edit-report "$EDIT_REPORT" --importance "$IMP" \
-        --out "$STATE/apply-ternary.json" >"$STATE/step7.log" 2>&1 \
-        || { tail -25 "$STATE/step7.log"; die "apply_ternary failed"; }
-    touch "$STATE/stage7.done"
-    ok "STEP7 ternary done"
-    say "STEP7 done: $(du -h "$QOUT.ptq1" | cut -f1)"
+    # Is there anything to replace? At the 1.20x budget the DP buys IQ2_S / IQ3_XXS / IQ3_S for
+    # gate+up and IQ4_NL for down - no PTQ1_0 at all (measured 2026-10-29: 8173 iq3_xxs, 24523
+    # iq4_nl, 1013 iq3_s, 14835 iq2_s, 502 iq2_xxs, 0 ptq1). apply_ternary would then rewrite
+    # the whole file with zero changed payloads, i.e. copy ~78 GiB to produce a byte-identical
+    # twin and leave two files that look like alternatives. Skip it and say what the deliverable
+    # actually is, instead of leaving that discovery to whoever opens the directory.
+    NPTQ1=$("$PY" - "$ALLOC" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))["map"]
+print(sum(1 for L in d for e in d[L].values() for k in ("gu", "dn") if e.get(k) == "ptq1"))
+PY
+)
+    if [ "${NPTQ1:-0}" -eq 0 ]; then
+        say "  no PTQ1_0 tensors in the allocation ($NPTQ1) - nothing to replace; no copy made"
+        touch "$STATE/stage7.done"
+        ok "STEP7 ternary done (no-op: no PTQ1_0 allocated)"
+        say "STEP7 done: delivery is $QOUT (no .ptq1 twin)"
+    else
+        say "  PTQ1_0 tensors to replace: $NPTQ1"
+        "$PY" "$T/apply_ternary.py" --input "$QOUT" --source "$MODEL" --alloc "$ALLOC" \
+            --edit-report "$EDIT_REPORT" --importance "$IMP" \
+            --out "$STATE/apply-ternary.json" >"$STATE/step7.log" 2>&1 \
+            || { tail -25 "$STATE/step7.log"; die "apply_ternary failed"; }
+        [ -s "$QOUT.ptq1" ] || die "apply_ternary reported success but wrote no .ptq1"
+        touch "$STATE/stage7.done"
+        ok "STEP7 ternary done"
+        say "STEP7 done: $(du -h "$QOUT.ptq1" | cut -f1)"
+    fi
 fi
 
 say "=== ablated chain complete: $QOUT.ptq1 ==="
