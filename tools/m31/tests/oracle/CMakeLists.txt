@@ -63,3 +63,13 @@ target_include_directories(m31_cache_oracle PRIVATE "${M31_LLAMA_SOURCE}/include
   "${M31_LLAMA_SOURCE}/vendor" "${M31_LLAMA_SOURCE}/vendor/nlohmann")
 target_compile_definitions(m31_cache_oracle PRIVATE M31_CACHE_ORACLE_REFERENCE_SHA="${_m31_pr_sha}")
 target_link_libraries(m31_cache_oracle PRIVATE m31_ref)
+
+# This executable consumes prepared mtmd F32 rows; no mtmd ABI enters Xolotl.
+option(M31_BUILD_VISION_ORACLE "Build the separate mixed-input vision oracle" OFF)
+if(M31_BUILD_VISION_ORACLE)
+  add_executable(m31_vision_oracle m31_vision_oracle.cpp)
+  target_include_directories(m31_vision_oracle PRIVATE "${M31_LLAMA_SOURCE}/include"
+    "${M31_LLAMA_SOURCE}/ggml/include" "${M31_LLAMA_SOURCE}/src"
+    "${M31_LLAMA_SOURCE}/vendor/nlohmann")
+  target_link_libraries(m31_vision_oracle PRIVATE m31_ref)
+endif()
