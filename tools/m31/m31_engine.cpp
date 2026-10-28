@@ -1104,6 +1104,25 @@ struct Engine::Impl {
             ggml_backend_tensor_set(cell_blocks, blocks.data(), 0, ggml_nbytes(cell_blocks));
         }
     }
+
+    // This is scratch/cache reclamation only: logical KV rows and position
+    // remain valid. The previous head is invalidated before the next append.
+    bool release_prefill_workspace(std::string & error) {
+        try {
+            require(ready && !poisoned, "workspace release requires valid state");
+            poisoned = true;
+            clear_dense_decode_cache(true);
+            if (gpu_experts) gpu_experts->release_prefill_workspace();
+            attention_inputs.reset(); dense_workspace.reset();
+            if (cfg.reuse_allocations) dense_workspace = std::make_unique<Workspace>(backend);
+            prefill_hidden.reset();
+            if (gpu_prefill_chain) prefill_hidden = std::make_unique<GpuPrefillHidden>();
+            hidden.clear(); last_n = 0;
+            decode_chain_active = prefill_chain_active = false;
+            poisoned = false;
+            return true;
+        } catch (const std::exception & e) { error = e.what(); return false; }
+    }
 };
 
 Engine::Engine() : p_(new Impl) {}
@@ -1227,7 +1246,7 @@ bool Engine::init(const std::string & path, const Config & requested, std::strin
 
 const Geometry & Engine::geometry() const { return p_->g; }
 int64_t Engine::position() const { return p_->pos; }
-int Engine::prefill_chunk(int requested, std::string & error) {
+int Engine::prefill_chunk(int requested, std::string & error) const {
     try {
         require(p_->ready && !p_->poisoned && requested > 0 && p_->pos < p_->cfg.context, "invalid prefill planning state");
         const int requested_limit = int(std::min<int64_t>({requested, p_->cfg.max_chunk, p_->cfg.context - p_->pos}));
@@ -1274,7 +1293,7 @@ int Engine::prefill_chunk(int requested, std::string & error) {
             return memory;
         }, [&] {
             std::string release_error;
-            const bool released = release_prefill_workspace(release_error);
+            const bool released = p_->release_prefill_workspace(release_error);
             require(released, "vision VRAM scratch release failed: " + release_error);
         });
         if (vision_plan.reclaimed || vision_plan.budget.free_after_resident != budget.free_after_resident)
@@ -1317,20 +1336,7 @@ bool Engine::rewind(int64_t position, std::string & error) {
 }
 
 bool Engine::release_prefill_workspace(std::string & error) {
-    try {
-        require(p_->ready && !p_->poisoned, "workspace release requires valid state");
-        p_->poisoned = true;
-        p_->clear_dense_decode_cache(true);
-        if (p_->gpu_experts) p_->gpu_experts->release_prefill_workspace();
-        p_->attention_inputs.reset(); p_->dense_workspace.reset();
-        if (p_->cfg.reuse_allocations) p_->dense_workspace = std::make_unique<Workspace>(p_->backend);
-        p_->prefill_hidden.reset();
-        if (p_->gpu_prefill_chain) p_->prefill_hidden = std::make_unique<GpuPrefillHidden>();
-        p_->hidden.clear(); p_->last_n = 0;
-        p_->decode_chain_active = p_->prefill_chain_active = false;
-        p_->poisoned = false;
-        return true;
-    } catch (const std::exception & e) { error = e.what(); return false; }
+    return p_->release_prefill_workspace(error);
 }
 
 size_t Engine::prefix_checkpoint_bytes() const {

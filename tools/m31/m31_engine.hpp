@@ -69,7 +69,7 @@ public:
     // KV/position survive, but the previous chunk's logits are invalidated.
     // Consume that head before planning the next append. No new rows run here.
     // Returns 0 with error on invalid state/insufficient budget; forward never changes n.
-    int prefill_chunk(int requested, std::string & error);
+    int prefill_chunk(int requested, std::string & error) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> p_;
