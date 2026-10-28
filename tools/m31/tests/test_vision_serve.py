@@ -317,7 +317,6 @@ class ServiceTests(unittest.TestCase):
         self.vision.failure = True
         server = S.serve(self.service, port=0)
         self.addCleanup(server.server_close)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.shutdown)
         url = "http://127.0.0.1:" + str(server.server_address[1]) + "/v1/chat/completions"
         def post(content):
