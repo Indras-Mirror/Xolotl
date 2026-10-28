@@ -7,6 +7,9 @@
 #include "cpu/fused_decode.hpp"
 #include "cpu/threadpool_config.hpp"
 #include "prefill/plan.hpp"
+#ifdef M31_ENGINE_VISION
+#include "prefill/vision_budget.hpp"
+#endif
 #include "prefill/chunk_limit.hpp"
 #include "gpu/prefill_hidden.hpp"
 
@@ -1224,7 +1227,7 @@ bool Engine::init(const std::string & path, const Config & requested, std::strin
 
 const Geometry & Engine::geometry() const { return p_->g; }
 int64_t Engine::position() const { return p_->pos; }
-int Engine::prefill_chunk(int requested, std::string & error) const {
+int Engine::prefill_chunk(int requested, std::string & error) {
     try {
         require(p_->ready && !p_->poisoned && requested > 0 && p_->pos < p_->cfg.context, "invalid prefill planning state");
         const int requested_limit = int(std::min<int64_t>({requested, p_->cfg.max_chunk, p_->cfg.context - p_->pos}));
@@ -1254,7 +1257,39 @@ int Engine::prefill_chunk(int requested, std::string & error) const {
             const auto & stats = p_->gpu_experts->stats();
             budget.streaming_slots = stats.slot_count;
         }
+#ifdef M31_ENGINE_VISION
+        const auto vision_plan = plan_vision_prefill(p_->g, budget, [&] {
+            VisionPrefillMemory memory;
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(p_->backend), &free_bytes, &total_bytes);
+            memory.free_bytes = free_bytes; memory.total_bytes = total_bytes;
+            // The owners below are disjoint. Borrowed tensor views and the
+            // backend's private caches are deliberately not separate credits.
+            if (p_->dense_workspace)
+                memory.dense_bytes = ggml_gallocr_get_buffer_size(p_->dense_workspace->allocator, 0);
+            if (p_->gpu_experts) memory.routed_bytes = p_->gpu_experts->retained_workspace_bytes();
+            if (p_->prefill_hidden) memory.hidden_bytes = p_->prefill_hidden->bytes();
+            if (p_->attention_inputs && p_->attention_inputs->buffer)
+                memory.attention_bytes = ggml_backend_buffer_get_size(p_->attention_inputs->buffer);
+            return memory;
+        }, [&] {
+            std::string release_error;
+            const bool released = release_prefill_workspace(release_error);
+            require(released, "vision VRAM scratch release failed: " + release_error);
+        });
+        if (vision_plan.reclaimed || vision_plan.budget.free_after_resident != budget.free_after_resident)
+            std::fprintf(stderr,
+                "M31 vision VRAM plan pos=%lld requested=%d planned=%d initial_free=%llu live_free=%llu owned_scratch=%llu budget_free=%llu reclaimed=%d\n",
+                (long long)p_->pos, requested, vision_plan.plan.chunk,
+                (unsigned long long)budget.free_after_resident,
+                (unsigned long long)vision_plan.memory.free_bytes,
+                (unsigned long long)vision_plan.memory.owned_bytes(),
+                (unsigned long long)vision_plan.budget.free_after_resident, int(vision_plan.reclaimed));
+        budget = vision_plan.budget;
+        const auto & plan = vision_plan.plan;
+#else
         const auto plan = plan_prefill(p_->g, budget);
+#endif
         require(plan.chunk > 0, "adaptive prefill refused: " + plan.reason);
         if (p_->cfg.profile) std::fprintf(stderr,
             "M31 prefill-plan pos=%lld requested=%d planned=%d keys=%lld initial_free=%llu scratch=%llu headroom=%llu\n",

@@ -69,6 +69,11 @@ public:
     void print_profile(const char * label = "live") const;
     bool native_gpu_math() const;
     size_t workspace_bytes() const;
+#ifdef M31_ENGINE_VISION
+    // Actual current gallocr allocation, including a failed-growth shrink.
+    // workspace_bytes()/stats retain their existing observational contract.
+    size_t retained_workspace_bytes() const;
+#endif
     void release_prefill_workspace();
     const Stats & stats() const;
     void reset_stats(); // Keeps warm cache entries; counters restart at current residency.

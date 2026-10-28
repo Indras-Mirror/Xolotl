@@ -684,6 +684,11 @@ bool GpuExperts::native_gpu_math() const {
     return true;
 }
 size_t GpuExperts::workspace_bytes() const {return p_->stat.scratch_bytes;}
+#ifdef M31_ENGINE_VISION
+size_t GpuExperts::retained_workspace_bytes() const {
+    return p_->allocator ? ggml_gallocr_get_buffer_size(p_->allocator, 0) : 0;
+}
+#endif
 
 
 

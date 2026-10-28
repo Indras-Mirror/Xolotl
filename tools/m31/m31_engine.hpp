@@ -64,8 +64,12 @@ public:
     int64_t position() const;
     // Cap every backend at the MSA int32 limit. CUDA also applies a
     // conservative scratch-memory plan to the remaining prompt chunk.
-    // Returns0 with error on invalid state/insufficient budget; forward never changes n.
-    int prefill_chunk(int requested, std::string & error) const;
+    // In vision-enabled CUDA builds, cap by live VRAM to account for the helper.
+    // If retained scratch prevents any chunk, release it and plan once again:
+    // KV/position survive, but the previous chunk's logits are invalidated.
+    // Consume that head before planning the next append. No new rows run here.
+    // Returns 0 with error on invalid state/insufficient budget; forward never changes n.
+    int prefill_chunk(int requested, std::string & error);
 private:
     struct Impl;
     std::unique_ptr<Impl> p_;

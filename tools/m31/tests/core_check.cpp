@@ -136,6 +136,17 @@ int main(int argc, char ** argv) {
         check(engine.restore_prefix(mixed_checkpoint, error), error);
         forward(engine, mixed_suffix);
         check(head(engine, 0, 3) == mixed_extended, "mixed checkpoint restore changed logits");
+        const auto after_release_suffix = tokens(2, 9);
+        forward(engine, after_release_suffix); const auto after_release_expected = head(engine, 0, 2);
+        check(engine.restore_prefix(mixed_checkpoint, error), error);
+        forward(engine, mixed_suffix); // A live head exists when planning discards scratch.
+        const auto before_release = engine.position();
+        check(engine.release_prefill_workspace(error), error);
+        check(engine.position() == before_release, "scratch release changed mixed KV position");
+        std::vector<float> released_head;
+        check(!engine.logits(0, 1, released_head, error), "scratch release exposed a stale head");
+        forward(engine, after_release_suffix);
+        check(head(engine, 0, 2) == after_release_expected, "scratch release changed restored mixed KV rows");
 #endif
 
         // Independently exercise decode topology; NumPy checks the batch below.
