@@ -13,6 +13,15 @@
 #   screen_parallel.sh [JOBS]     (default 14; one BLAS thread each so JOBS <= cores)
 set -uo pipefail
 
+# SINGLE INSTANCE. Two launchers would each pick up the same unfinished layer and both write
+# L<NN>.json / .npz for it - a corrupt artifact that the skip check would then treat as done.
+# The lock is held for the life of the process, so a second invocation exits immediately.
+exec 9>"${STATE_LOCK:-/home/mal/.quetza-data/qwen38-screen.lock}"
+if ! flock -n 9; then
+    echo "another screen_parallel.sh holds the lock; not starting a second one" >&2
+    exit 0
+fi
+
 XOLOTL=/home/mal/AI/Xolotl
 T=$XOLOTL/tools/qwen38
 NVME=/media/mal/NVME1TB/qwen38
