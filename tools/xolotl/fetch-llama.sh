@@ -5,7 +5,7 @@
 #   bash tools/xolotl/fetch-llama.sh            (from the repo root)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-PIN=3cf03257f219afbe7334045ff7c6a06ac68c627d
+PIN=6050b467
 PATCH="$PWD/tools/xolotl/ggml/xolotl-ggml.patch"
 DST=third_party/llama.cpp
 if [ -d "$DST/.git" ]; then
