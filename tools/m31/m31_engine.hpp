@@ -12,8 +12,8 @@
 
 namespace strata::m31 {
 
-// MSA engine with optional mixed text/vision input. CUDA prefill uses stock grouped MMQ; single-token
-// decode uses the original CPU quantization traits and ordered rank reduction.
+// MiniMax-M3.1 MSA engine. See docs/MINIMAX_M31.md for prefill and numerical
+// contracts. Single-token decode preserves the original ordered rank reduction.
 class Engine {
 public:
     Engine();
