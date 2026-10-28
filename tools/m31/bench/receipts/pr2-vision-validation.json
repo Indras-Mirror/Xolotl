@@ -24,7 +24,52 @@
     "total_bytes": 175450454084,
     "weight_identity_receipt": "tools/m31/bench/receipts/pr1-text.json",
     "weight_hashes_recomputed_in_this_receipt": false,
-    "mmproj": "mmproj-BF16.gguf from the matching model revision"
+    "mmproj": {
+      "repository": "unsloth/MiniMax-M3.1-Flash-GGUF",
+      "revision": "b17b7f5459c0b8f127ea12ee774409b282521d6a",
+      "filename": "mmproj-BF16.gguf",
+      "llm_weights_revision": "02c81e41305bf8b718ad2e288f4e52a1cd49f55f",
+      "projector_and_llm_use_distinct_repository_revisions": true,
+      "expected_bytes": 1735294720,
+      "expected_sha256": "8aae10398d53fa7a726199877a07f04f3d371274ae4ce7a1a639af3f0d5124ca",
+      "expected_identity_source": {
+        "kind": "Hugging Face pinned-revision file metadata and Git LFS SHA256",
+        "metadata_url": "https://huggingface.co/api/models/unsloth/MiniMax-M3.1-Flash-GGUF/revision/b17b7f5459c0b8f127ea12ee774409b282521d6a?blobs=true",
+        "metadata_fetched_at_utc": "2026-10-28T20:37:25.310887+00:00",
+        "metadata_response_sha256": "d096e8b0c5305e647e5f2623b52f5e713f916e7a482dcc1612ecde12732e01bf",
+        "metadata_response_bytes": 25447,
+        "git_blob_id": "761551b6437d3f97d8cf78dbdf90f7bd3513717c",
+        "metadata_receipt_sha256": "1446d485fa0209433a6ba7054a09fea061cb1c73d56fa839d847d0c941783150",
+        "projector_downloaded_for_this_metadata_check": false
+      },
+      "historical_local_integrity": {
+        "receipt_label": "reference integrity.json",
+        "receipt_sha256": "7533e8de519a9309f04d5a273a73d0cd9371f8f33c5ee7f627796dcbdd00e9fb",
+        "filename": "mmproj-BF16.gguf",
+        "measured_sha256": "8aae10398d53fa7a726199877a07f04f3d371274ae4ce7a1a639af3f0d5124ca",
+        "recorded_hugging_face_sha256": "8aae10398d53fa7a726199877a07f04f3d371274ae4ce7a1a639af3f0d5124ca",
+        "matches_pinned_expected_sha256": true,
+        "scope": "Historical local hash identity; this record is not a fresh hash of the current local file."
+      },
+      "fresh_local_rehash": {
+        "status": "pending",
+        "completed": false,
+        "sha256": null,
+        "matches_expected": null,
+        "scope": "No fresh local projector hash is claimed here; the queued check will run after GPU quality measurements."
+      },
+      "runtime_validation_scope": {
+        "model_architecture": "minimax-m3",
+        "projector_architecture": "clip",
+        "projector_type": "minimax_m3",
+        "embedding_dimension": 6144,
+        "proves_family_and_output_width": true,
+        "proves_repository_revision": false,
+        "automatic_weight_hash_check": false,
+        "description": "Runtime metadata guards establish model family and output width only. They do not identify or automatically prove the projector/model repository revisions."
+      }
+    },
+    "projector_provenance_note": "The LLM and projector are pinned separately. Matching repository revisions are not asserted; the projector expected identity comes from its own pinned LFS metadata and the historical integrity record."
   },
   "hardware": {
     "gpu": "NVIDIA GeForce RTX 5090",
