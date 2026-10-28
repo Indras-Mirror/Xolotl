@@ -274,6 +274,12 @@ public:
         return p->lm_mid_;
     }
 
+    /// Set the stream-all threshold from the probed host->device link and the non-resident experts' bytes
+    /// (stream_all.hpp).  0 leaves it at the constant.  It only ever RAISES the threshold - the constant is this
+    /// engine's measured floor - and it is ignored while the CPU share is armed, which decides where staged chunks
+    /// end.  Before any `bytes_needed`: the ring is sized from it.
+    static void set_stream_all_min_priced(int64_t tokens);
+
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);

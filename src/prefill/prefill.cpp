@@ -219,10 +219,15 @@ constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_s
 // (Prefill::arm_cpu_share) it is the share's own limit instead: the share applies to staged chunks only.
 constexpr int64_t kStreamAllMinDefault = 1024;   // the default above (and the CPU share's default limit)
 int64_t g_stream_min_share = 0;
+// Priced from the probed host->device link and the non-resident experts' bytes (stream_all.hpp): set by the serve
+// path once the tiers are placed.  0 = no price, use the constant.  It only ever raises the threshold; see below.
+int64_t g_stream_min_priced = 0;
 inline int64_t stream_all_min() {
     static const int64_t env = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) -1; }();
     if (env >= 0) return env;
-    return g_stream_min_share > 0 ? g_stream_min_share : kStreamAllMinDefault;
+    // The share's own limit wins when armed: the share is defined on staged chunks, so it decides where they end.
+    if (g_stream_min_share > 0) return g_stream_min_share;
+    return g_stream_min_priced > 0 ? g_stream_min_priced : kStreamAllMinDefault;
 }
 // STRATA_PREFILL_CPU_SHARE (opt-in; set_cpu_pool): a chunk below stream_all_min() hands the decode CPU pool - idle
 // while a prompt is read - the non-resident experts few of its tokens route to, instead of streaming them over PCIe.
@@ -2653,6 +2658,8 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
 #endif
     if (applies && cpu_share_on()) g_stream_min_share = cpu_share_max();
 }
+
+void Prefill::set_stream_all_min_priced(int64_t tokens) { g_stream_min_priced = tokens > 0 ? tokens : 0; }
 
 bool Prefill::ring_bytes_enabled() { return ring_bytes_on(); }
 size_t Prefill::slot_guard_bytes() { return mmq::direct_slot_guard(); }

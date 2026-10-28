@@ -470,6 +470,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(share_rules_test PRIVATE include)
   add_test(NAME share_rules_test COMMAND share_rules_test)
 
+  # the stream-all threshold priced from the link and the non-resident bytes (Basalt #107): header-only, no GPU
+  add_executable(stream_all_test tests/prefill/stream_all_test.cpp)
+  target_include_directories(stream_all_test PRIVATE include)
+  add_test(NAME stream_all_test COMMAND stream_all_test)
+
   # the Windows HIP auto prefill chunk cap (#1630) and the commit-limit verdict (#1607): header-only, no GPU
   add_executable(host_limits_test tests/platform/host_limits_test.cpp)
   target_include_directories(host_limits_test PRIVATE include)

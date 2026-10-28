@@ -95,6 +95,7 @@
 #include "strata/program/stage_reserve.hpp"
 #include "strata/program/gpu_report.hpp"
 #include "strata/prefill/share_rules.hpp"
+#include "strata/prefill/stream_all.hpp"
 #include "strata/platform/host_limits.hpp"
 #include "strata/program/split_ring.hpp"
 #include "strata/program/prefill_plan.hpp"
@@ -18138,6 +18139,24 @@ int main(int argc, char** argv) {
         !multi_gpu && !o.no_pool && o.batch <= 0 &&
         strata::prefill::share_rules::default_share_has_work((int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert)) &&
         share_default_ok());   // H11   // before the chunk below sizes the loan
+    // STRATA_PREFILL_STREAM_PRICED=1 (opt-in until kRoutedExtraMs is calibrated here - see stream_all.hpp): price the
+    // stream-all threshold from this card's probed host->device link and the experts that would have to be copied.
+    // Only for one GPU with CUDA up; a price of 0 leaves the constant in place, and an armed CPU share overrides it.
+    if (std::getenv("STRATA_PREFILL_STREAM_PRICED") != nullptr && !multi_gpu) {
+        std::string bursts;
+        const double bw = probe_pcie_h2d_gbps(&bursts);
+        const int64_t n_all = g.n_layers * g.n_expert;
+        const int64_t n_nonres = std::max<int64_t>(0, n_all - (int64_t) xcache.slots());
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        uint64_t blob_sum = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l) blob_sum += (uint64_t) lay.blob_bytes(l);
+        const uint64_t nonres_bytes = g.n_layers > 0 ? blob_sum * (uint64_t) n_nonres / (uint64_t) g.n_layers : 0;
+        const int64_t priced = strata::prefill::stream_all_min_for(nonres_bytes, bw);
+        strata::prefill::Prefill::set_stream_all_min_priced(priced);
+        std::fprintf(stderr, "strata generate: prompt path: stream-all priced %lld tokens (%.1f GiB non-resident of %lld "
+                             "experts, link %.1f GB/s)\n",
+                     (long long) priced, (double) nonres_bytes / 1073741824.0, (long long) n_nonres, bw);
+    }
     bool kvg_started = false;   // the elastic K/V took this run's cells
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
