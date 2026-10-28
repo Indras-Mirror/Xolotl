@@ -12,8 +12,9 @@
 
 namespace strata::m31 {
 
-// Text-only MSA engine. CUDA prefill uses stock grouped MMQ; single-token
-// decode uses the original CPU quantization traits and ordered rank reduction.
+// Text-only MSA engine. Short CUDA chunks split complete experts across CPU
+// and GPU with native CUDA activation math; long chunks use grouped MMQ.
+// Single-token decode retains CPU quantization and ordered rank reduction.
 class Engine {
 public:
     Engine();
@@ -56,6 +57,13 @@ public:
     bool logits(int row, int count, std::vector<float> & out, std::string & error);
     void reset();
     int64_t position() const;
+    struct PrefillStats {
+        uint64_t hybrid_layers = 0, cpu_routes = 0, gpu_routes = 0, cold_gpu_bytes = 0;
+        uint64_t quant_calls = 0, quant_runtime_allocations = 0;
+        size_t quant_device_bytes = 0;
+    };
+    // Cumulative counters; requesting them performs no allocation or model work.
+    PrefillStats prefill_stats() const;
     // Cap every backend at the MSA int32 limit. CUDA also applies a
     // conservative scratch-memory plan to the remaining prompt chunk.
     // Returns0 with error on invalid state/insufficient budget; forward never changes n.

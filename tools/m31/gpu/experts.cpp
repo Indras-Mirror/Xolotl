@@ -4,6 +4,8 @@
 #include "pack_spans.hpp"
 #include "../prefill/slot_leases.hpp"
 #include "../prefill/expert_budget.hpp"
+#include "../prefill/short/shortprefill_cost.hpp"
+#include "../prefill/short/shortprefill_cpu_lane.hpp"
 
 #include "ggml-alloc.h"
 #ifdef M31_ENGINE_CUDA
@@ -106,6 +108,8 @@ struct GpuExperts::Impl {
     uint64_t clock = 0;
     int max_chunk = 0;
     bool ready = false;
+    bool suppress_prefetch = false;
+    std::unique_ptr<ShortPrefillCpuLane> short_cpu_lane;
     bool profile = false;
     bool compact_uploads = false;
     size_t prefetch_limit = 0;
@@ -115,9 +119,32 @@ struct GpuExperts::Impl {
     const GpuRegisteredArena * registered_arena=nullptr;
 #endif
 
+    // Called only after all borrowed CPU jobs and GPU readers have joined.
+    // Discard any partly published upload metadata; a reset may then retry.
+    void recover_uploads() noexcept {
+        if(background)background->drain();
+        pending_prefetch.clear();
+        if(!uploads)return;
+        try {
+            uploads.reset();
+            ggml_backend_synchronize(backend);
+            entries.clear();active_read_keys.clear();
+            leases.reset(stat.slot_count);foreground_writes.clear();
+            free_slots.clear();
+            for(size_t slot=0;slot<stat.slot_count;++slot)
+                free_slots.push_back(stat.slot_count-slot-1);
+            stat.occupied_slots=0;
+            uploads=std::make_unique<PrefillUploads>(backend,stat.slot_stride,upload_depth,
+                true,256*1024*1024,copier,upload_streams,profile);
+        } catch (...) {
+            ready=false; // Re-creating the resources failed; reuse is unsafe.
+        }
+    }
+
     ~Impl() {
         // A worker borrows arena role spans and destination pool metadata.
         // Join it before any of those can be freed, including failure shutdown.
+        short_cpu_lane.reset();
         background.reset();
         if (uploads) {
             const auto & u = uploads->stats();
@@ -167,7 +194,7 @@ struct GpuExperts::Impl {
 
         // Speculative full-next-layer work is worthwhile only for a substantial
         // layer batch. Router/histogram/compute shape of the current layer is unchanged.
-        if (!background || n<128 || layer+1>=g.layers || !g.routed(layer+1)) return;
+        if (suppress_prefetch || !background || n<128 || layer+1>=g.layers || !g.routed(layer+1)) return;
         check(pending_prefetch.empty() && !background->active(), "uncollected prefetch");
         const int next=layer+1;
         const auto & source=layers[size_t(next)];
@@ -625,28 +652,7 @@ void GpuExperts::forward_into(int layer, int n, const std::vector<float> & x,
         ++p_->stat.forwards;
         return;
     } catch (...) {
-        if (p_->background) p_->background->drain();
-        p_->pending_prefetch.clear();
-        if (p_->uploads) {
-            // A failed enqueue may already have evicted a slot or queued a DMA.
-            // Drain first, then discard ALL metadata; no pending bytes become hits.
-            p_->uploads.reset();
-            p_->entries.clear();
-            p_->leases.reset(p_->stat.slot_count);p_->foreground_writes.clear();
-
-
-            p_->free_slots.clear();
-            for (size_t slot = 0; slot < p_->stat.slot_count; ++slot)
-                p_->free_slots.push_back(p_->stat.slot_count-slot-1);
-            p_->stat.occupied_slots = 0;
-            try {
-                // Restore the configured upload depth/stream count rather than
-                // silently reverting to the historical two-stage fallback.
-                p_->uploads = std::make_unique<PrefillUploads>(p_->backend, p_->stat.slot_stride, p_->upload_depth,true,256*1024*1024,p_->copier,p_->upload_streams,p_->profile);
-            } catch (...) {
-                p_->ready = false; // Failed recovery is terminal; forward refuses reuse.
-            }
-        }
+        p_->recover_uploads();
         throw;
     }
 }
@@ -686,6 +692,16 @@ bool GpuExperts::native_gpu_math() const {
 size_t GpuExperts::workspace_bytes() const {return p_->stat.scratch_bytes;}
 
 
+
+void GpuExperts::forward_device_no_prefetch(int layer,int n,ggml_tensor *normalized,
+    const std::vector<int32_t> &ids,const std::vector<float> &weights,
+    ggml_tensor *shared,ggml_tensor *residual,ggml_tensor *destination){
+    struct Restore {Impl *p;bool old;~Restore(){p->suppress_prefetch=old;}}restore{p_.get(),p_->suppress_prefetch};
+    p_->suppress_prefetch=true;
+    forward_device(layer,n,normalized,ids,weights,shared,residual,destination);
+}
+
+#include "hybrid_forward.hpp"
 
 void GpuExperts::release_prefill_workspace() {
     check(p_->ready && p_->active_read_keys.empty(), "cannot release active expert workspace");

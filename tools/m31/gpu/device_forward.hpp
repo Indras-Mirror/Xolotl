@@ -57,18 +57,7 @@ void GpuExperts::forward_device(int layer,int n,ggml_tensor *normalized,
         if(p_->profile)p_->stat.execute_seconds+=Impl::elapsed(start);
         ++p_->stat.forwards;
     }catch(...){
-        if(p_->background)p_->background->drain();
-        p_->pending_prefetch.clear();
-        if(p_->uploads){
-            p_->uploads.reset();
-            p_->entries.clear();
-            p_->leases.reset(p_->stat.slot_count);p_->foreground_writes.clear();
-            p_->free_slots.clear();
-            for(size_t slot=0;slot<p_->stat.slot_count;++slot)p_->free_slots.push_back(p_->stat.slot_count-slot-1);
-            p_->stat.occupied_slots=0;
-            try{p_->uploads=std::make_unique<PrefillUploads>(p_->backend,p_->stat.slot_stride,p_->upload_depth,true,256*1024*1024,p_->copier,p_->upload_streams,p_->profile);}
-            catch(...){p_->ready=false;}
-        }
+        p_->recover_uploads();
         throw;
     }
 }

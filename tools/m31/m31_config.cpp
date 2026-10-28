@@ -180,7 +180,7 @@ void validate_config(const Config & c, bool initializing_cuda) {
     require(c.max_chunk > 0 && c.max_chunk <= 32768, "chunk must be 1..32768");
     require(std::isfinite(c.arena_gib) && c.arena_gib >= 0 && c.arena_gib <= 4096, "invalid RAM arena budget");
     require(std::isfinite(c.gpu_experts_gib) && c.gpu_experts_gib >= 0 && c.gpu_experts_gib <= 512, "invalid GPU expert budget");
-    require(c.gpu_experts_min_tokens == 32, "the accepted v8 path requires gpu-experts-min-tokens=32");
+    require(c.gpu_experts_min_tokens == 32, "the accepted prefill policy requires gpu-experts-min-tokens=32");
     require(c.reuse_allocations && c.persistent_cpu_pool && c.cpu_residual && c.cpu_decode_cache && c.dense_decode_cache,
         "the accepted path requires allocation reuse, persistent CPU pool, CPU residual and decode caches");
     require(c.cpu_poll >= -1 && c.cpu_poll <= 100, "CPU poll must be -1 or 0..100");
@@ -212,7 +212,7 @@ void prepare_engine_environment() {
 }
 std::string effective_config(const Config & c) {
     std::ostringstream s;
-    s << "v8 native; CPU fused=" << c.cpu_fused << "; context=" << c.context << " chunk=" << c.max_chunk
+    s << "native batch/adaptive short chunks; CPU fused=" << c.cpu_fused << "; context=" << c.context << " chunk=" << c.max_chunk
       << " threads=" << c.threads << " arena_gib=" << c.arena_gib << " expert_gib=" << c.gpu_experts_gib
       << " registered=" << c.register_arena << " pin_budget=" << c.register_limit_bytes
       << " upload_depth=" << c.upload_depth << " copy_streams=" << c.upload_streams

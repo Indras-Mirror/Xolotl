@@ -9,6 +9,8 @@
 #include "prefill/plan.hpp"
 #include "prefill/chunk_limit.hpp"
 #include "gpu/prefill_hidden.hpp"
+#include "prefill/short/policy.hpp"
+#include "prefill/short/shortprefill_cuda_executor.hpp"
 
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
@@ -361,6 +363,8 @@ struct Engine::Impl {
     std::unique_ptr<AttentionInputs> attention_inputs;
     std::unique_ptr<GpuPrefillHidden> prefill_hidden;
     bool gpu_prefill_chain = false, prefill_chain_active = false;
+    bool short_hybrid_active = false;
+    std::unique_ptr<ShortPrefillCudaExecutor> short_cpu_executor;
     struct RoutedGraph {
         std::unique_ptr<Graph> graph;
         ggml_tensor * input = nullptr, * ids = nullptr, * weights = nullptr, * output = nullptr;
@@ -451,6 +455,7 @@ struct Engine::Impl {
                          (unsigned long long)s.upload_bytes, s.resident_bytes, s.peak_resident_bytes, s.scratch_bytes, s.pinned_staging);
         }
         gpu_experts.reset();
+        short_cpu_executor.reset();
         cpu_fused.reset();
         cpu_decode_graphs.clear();
         shared_decode_graphs.clear();
@@ -747,6 +752,31 @@ struct Engine::Impl {
         storage.output = result;
     }
 
+    bool short_cpu_layer_supported(int layer) const {
+        const auto prefix = "blk." + std::to_string(layer) + ".ffn_";
+        for (const char * role : {"gate", "up", "down"}) {
+            const auto type = host.get(prefix + role + "_exps.weight")->type;
+            if (!cuda_math_cpu::supported(type)) return false;
+        }
+        return true;
+    }
+
+    void short_cpu_routes(int layer,int n,const std::vector<float> & input,
+        const std::vector<int32_t> & ids,const std::vector<float> & weights,
+        const std::vector<int32_t> & routes,std::vector<float> & output) {
+        require(short_cpu_executor && n > 1, "hybrid CPU executor is unavailable");
+        const auto prefix = "blk." + std::to_string(layer) + ".ffn_";
+        auto scale = [&](const char * role) {
+            auto * tensor = host.maybe(prefix + role + "_exps.scale");
+            return tensor ? static_cast<const float *>(tensor->data) : nullptr;
+        };
+        const std::vector<size_t> indices(routes.begin(), routes.end());
+        short_cpu_executor->forward(host.get(prefix + "gate_exps.weight"),
+            host.get(prefix + "up_exps.weight"), host.get(prefix + "down_exps.weight"),
+            scale("gate"), scale("up"), scale("down"), input, ids, weights,
+            indices, size_t(g.used), output);
+    }
+
     void drain_shared() noexcept {
         if (shared_inflight) {
             ggml_backend_synchronize(backend);
@@ -954,8 +984,20 @@ struct Engine::Impl {
                 require(gpu_experts && gpu_experts->native_gpu_math(), "GPU prefill chain lost its device expert executor");
                 if (cfg.route_observer) cfg.route_observer(l,n,ids,route_weights);
                 const auto routed_start = cfg.profile ? Clock::now() : Clock::time_point{};
-                gpu_experts->forward_device(l,n,storage->norm,ids,route_weights,
-                    storage->shared,storage->residual,prefill_hidden->next());
+                if (short_hybrid_active && short_cpu_layer_supported(l)) {
+                    gpu_experts->forward_device_hybrid(l,n,storage->norm,ids,route_weights,
+                        storage->shared,storage->residual,prefill_hidden->next(),
+                        [&](int layer,int rows,const auto & input,const auto & selected_ids,
+                            const auto & weights,const auto & routes,auto & output) {
+                            short_cpu_routes(layer,rows,input,selected_ids,weights,routes,output);
+                        });
+                } else if (short_hybrid_active) {
+                    gpu_experts->forward_device_no_prefetch(l,n,storage->norm,ids,route_weights,
+                        storage->shared,storage->residual,prefill_hidden->next());
+                } else {
+                    gpu_experts->forward_device(l,n,storage->norm,ids,route_weights,
+                        storage->shared,storage->residual,prefill_hidden->next());
+                }
                 if (cfg.profile) { routed_seconds = elapsed(routed_start); timings.routed_compute += routed_seconds; }
                 prefill_hidden->advance();
             }
@@ -1210,6 +1252,13 @@ bool Engine::init(const std::string & path, const Config & requested, std::strin
                 "GPU prefill chain requires reuse/cpu-residual/no-taps and native or fast GPU experts");
             p_->prefill_hidden = std::make_unique<GpuPrefillHidden>();
         }
+        if (p_->gpu_prefill_chain && p_->cpu_pool) {
+            p_->short_cpu_executor = std::make_unique<ShortPrefillCudaExecutor>(
+                p_->cpu,p_->cpu_pool,unsigned(cfg.threads),true);
+            const size_t rows = size_t(std::min<int64_t>({1024,cfg.max_chunk,cfg.context}));
+            if (rows >= 32) p_->short_cpu_executor->prepare_gpu_quant(rows,
+                size_t(g.embd),size_t(g.used),size_t(g.expert_ff));
+        }
         if (p_->adaptive_prefill) {
             size_t free_bytes = 0, total_bytes = 0;
             ggml_backend_dev_memory(ggml_backend_get_device(p_->backend), &free_bytes, &total_bytes);
@@ -1224,6 +1273,24 @@ bool Engine::init(const std::string & path, const Config & requested, std::strin
 
 const Geometry & Engine::geometry() const { return p_->g; }
 int64_t Engine::position() const { return p_->pos; }
+Engine::PrefillStats Engine::prefill_stats() const {
+    PrefillStats result;
+    if (p_->gpu_experts) {
+        const auto & stats = p_->gpu_experts->stats();
+        result.hybrid_layers = stats.short_hybrid_forwards;
+        result.cpu_routes = stats.short_cpu_routes;
+        result.gpu_routes = stats.short_gpu_routes;
+        result.cold_gpu_bytes = stats.short_cold_gpu_bytes;
+    }
+    if (p_->short_cpu_executor) {
+        const auto & stats = p_->short_cpu_executor->stats();
+        result.quant_calls = stats.gpu_quant_calls;
+        result.quant_runtime_allocations = stats.gpu_quant_runtime_allocations;
+        result.quant_device_bytes = p_->short_cpu_executor->gpu_auxiliary_bytes();
+    }
+    return result;
+}
+
 int Engine::prefill_chunk(int requested, std::string & error) const {
     try {
         require(p_->ready && !p_->poisoned && requested > 0 && p_->pos < p_->cfg.context, "invalid prefill planning state");
@@ -1404,6 +1471,8 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
         p_->poisoned = true;
         p_->decode_chain_active = p_->gpu_decode_chain && n == 1;
         p_->prefill_chain_active = p_->gpu_prefill_chain && n > 1 && n >= p_->cfg.gpu_experts_min_tokens;
+        p_->short_hybrid_active = p_->prefill_chain_active && p_->short_cpu_executor &&
+            shortprefill::select(n) == shortprefill::Path::hybrid;
         auto emb = p_->host.get("token_embd.weight");
         p_->hidden.resize(size_t(g.embd * n));
         const auto * traits = ggml_get_type_traits(emb->type);
@@ -1485,6 +1554,13 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
                 1000*p_->timings.shared_enqueue, 1000*p_->timings.shared_wait, 1000*p_->timings.shared_read);
         }
         if (p_->gpu_experts && p_->cfg.profile) p_->gpu_experts->print_profile("forward");
+        if (p_->cfg.profile && p_->short_hybrid_active) {
+            const auto stats = prefill_stats();
+            std::fprintf(stderr,"M31 shortprefill totals hybrid_layers=%llu cpu_routes=%llu gpu_routes=%llu quant_calls=%llu quant_runtime_allocations=%llu quant_device_bytes=%zu\n",
+                (unsigned long long)stats.hybrid_layers,(unsigned long long)stats.cpu_routes,
+                (unsigned long long)stats.gpu_routes,(unsigned long long)stats.quant_calls,
+                (unsigned long long)stats.quant_runtime_allocations,stats.quant_device_bytes);
+        }
         p_->pos += n;
         p_->last_n = n;
         p_->poisoned = false;
