@@ -398,5 +398,13 @@ PY
     fi
 fi
 
-say "=== ablated chain complete: $QOUT.ptq1 ==="
+# Name the file that ACTUALLY exists. This line said "$QOUT.ptq1" unconditionally and so announced
+# a .ptq1 twin that STEP7 had just decided not to make - the same class of defect as a status file
+# that describes a state the run is not in. A reader checking the directory finds no .ptq1 and has
+# to decide whether the run failed or the message lied.
+if [ -s "$QOUT.ptq1" ]; then
+    say "=== ablated chain complete: $QOUT.ptq1 ($(du -h "$QOUT.ptq1" | cut -f1)) ==="
+else
+    say "=== ablated chain complete: $QOUT ($(du -h "$QOUT" | cut -f1)), no .ptq1 (none allocated) ==="
+fi
 ok "CHAIN_COMPLETE"
