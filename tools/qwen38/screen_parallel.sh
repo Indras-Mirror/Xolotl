@@ -46,6 +46,16 @@ screen_one() {
         echo "L$L skip (present)"
         return 0
     fi
+    # ANOTHER PROCESS MAY ALREADY BE SCREENING THIS LAYER. Two workers on one layer write the
+    # same L<NN>.json / .npz; whichever finishes second wins, and a reader can catch a torn file
+    # in between. That happened on 2026-10-28 (a stray launch started layer 0 while an orphaned
+    # worker was already on it). Absence of an artifact does NOT mean absence of a worker, so
+    # check for the worker itself. The bracket keeps this pattern from matching its own command
+    # line, which is the failure mode `pkill -f` has already caused twice in this run.
+    if ps -eo args= | grep -q -- "python3 .*[s]creen\.py .*--layer $L "; then
+        echo "L$L skip (a worker for this layer is already running)"
+        return 0
+    fi
     ionice -c3 nice -n 10 python3 "$T/screen.py" \
         --model-dir "$MODEL" --dump "$DUMPS" --layer "$L" \
         --tiers ptq1,iq2_xxs,iq2_xs,iq2_s,iq3_xxs,iq3_s,iq4_nl,q8_0 \
