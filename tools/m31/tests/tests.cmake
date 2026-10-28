@@ -37,6 +37,10 @@ set_tests_properties(m31_bench PROPERTIES LABELS "m31;cpu;unit" TIMEOUT 60)
 add_executable(m31_protocol_fixture "${_m31_dir}/tests/protocol_fixture.cpp")
 target_include_directories(m31_protocol_fixture PRIVATE "${_m31_dir}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(m31_protocol_fixture PRIVATE ggml-base Threads::Threads)
+if(STRATA_M31_VISION)
+  target_compile_definitions(m31_protocol_check PRIVATE M31_ENGINE_VISION=1)
+  target_compile_definitions(m31_protocol_fixture PRIVATE M31_ENGINE_VISION=1)
+endif()
 add_test(NAME m31_protocol_loop COMMAND "${Python3_EXECUTABLE}" "${_m31_dir}/tests/test_protocol.py"
   --fixture $<TARGET_FILE:m31_protocol_fixture>)
 set_tests_properties(m31_protocol_loop PROPERTIES LABELS "m31;cpu;protocol" TIMEOUT 90)
@@ -51,6 +55,18 @@ target_link_libraries(m31_grammar_model_check PRIVATE m31_grammar)
 
 add_test(NAME m31_import_isolation COMMAND "${Python3_EXECUTABLE}" "${_m31_dir}/tests/test_isolation.py")
 set_tests_properties(m31_import_isolation PROPERTIES LABELS "m31;cpu;unit" TIMEOUT 30)
+
+if(STRATA_M31_VISION)
+  add_test(NAME m31_vision_helper COMMAND "${Python3_EXECUTABLE}"
+    "${_m31_dir}/tests/test_vision_helper.py" -v)
+  set_tests_properties(m31_vision_helper PROPERTIES LABELS "m31;cpu;protocol" TIMEOUT 45)
+  add_test(NAME m31_vision_serve COMMAND "${Python3_EXECUTABLE}"
+    "${_m31_dir}/tests/test_vision_serve.py" -v)
+  set_tests_properties(m31_vision_serve PROPERTIES LABELS "m31;cpu;protocol" TIMEOUT 120)
+  add_test(NAME m31_mixed_bench COMMAND "${Python3_EXECUTABLE}"
+    "${_m31_dir}/tests/test_mixed_bench.py" -v)
+  set_tests_properties(m31_mixed_bench PROPERTIES LABELS "m31;cpu;unit" TIMEOUT 60)
+endif()
 
 add_custom_target(m31_checks DEPENDS m31_core_check m31_resource_checks
   m31_protocol_check m31_protocol_fixture m31_grammar_api_check)
