@@ -2,6 +2,7 @@
 import base64
 import copy
 import json
+import os
 from pathlib import Path
 import struct
 import sys
@@ -335,6 +336,52 @@ class ServiceTests(unittest.TestCase):
         status, result = post("still text")
         self.assertEqual(status, 200, result)
         self.assertFalse(self.service.fifo.locked())
+
+    def test_explicit_helper_fusion_zero_returns_http_503_and_preserves_text_and_parent_env(self):
+        from PIL import Image
+        parent_environment = dict(os.environ)
+        directory = Path(self.temp.name)
+        image = directory / "actual-image.png"
+        Image.new("RGB", (2, 2), "red").save(image)
+        for name in ("model.gguf", "mmproj.gguf"):
+            (directory / name).write_bytes(b"model-free metadata placeholder")
+        child = dict(parent_environment, GGML_CUDA_DISABLE_FUSION="0")
+        vision = M.M31Vision({"exe": str(directory / "absent-helper"),
+                              "model": str(directory / "model.gguf"),
+                              "mmproj": str(directory / "mmproj.gguf"),
+                              "cache_dir": str(directory / "isolated-cache")}, env=child)
+        self.addCleanup(vision.shutdown)
+        # The actual helper client must reject its explicit environment before
+        # trying to spawn anything. Media reading/validation and the common HTTP
+        # handler remain real; no encode or exception path is stubbed.
+        service = M.M31Service(self.engine, S.ByteTokenizer(), Template(), vision=vision)
+        self.addCleanup(service.drop_embeddings)
+        server = S.serve(service, port=0)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        endpoint = "http://127.0.0.1:" + str(server.server_address[1]) + "/v1/chat/completions"
+        def post(content):
+            body = {"messages": [{"role": "user", "content": content}], "max_tokens": 2}
+            request = urllib.request.Request(endpoint, json.dumps(body).encode(),
+                                             {"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    return response.status, json.load(response)
+            except urllib.error.HTTPError as exc:
+                with exc:
+                    return exc.code, json.load(exc)
+        status, result = post([{"type": "image_url", "image_url": {"url": str(image)}}])
+        self.assertEqual(status, 503, result)
+        self.assertIn("vision unavailable", result["error"]["message"])
+        self.assertIn("requires GGML_CUDA_DISABLE_FUSION=1", result["error"]["message"])
+        self.assertIsNone(vision.client.process)
+        self.assertFalse(service.fifo.locked())
+        self.assertEqual(vision.media.references, {})
+        self.assertEqual(dict(os.environ), parent_environment)
+        status, result = post("still text")
+        self.assertEqual(status, 200, result)
+        self.assertFalse(service.fifo.locked())
+        self.assertEqual(dict(os.environ), parent_environment)
 
 
 if __name__ == "__main__":
