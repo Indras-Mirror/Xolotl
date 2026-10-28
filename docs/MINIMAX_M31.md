@@ -1,9 +1,9 @@
-# MiniMax-M3.1-Flash text engine
+# MiniMax-M3.1-Flash
 
-This is the text slice of the community port discussed in [issue #62](https://github.com/Indras-Mirror/Xolotl/issues/62).
-It adds an opt-in engine in `tools/m31` and a shim to Strata's common HTTP server.
-Images, video, DSpark and adaptive short prefill are outside this slice.
-`GENI` and `BGENI` return `ERR vision unavailable`.
+This page documents the opt-in MiniMax-M3.1 engine in `tools/m31` and its shim
+to Strata's common HTTP server, developed in [issue #62](https://github.com/Indras-Mirror/Xolotl/issues/62).
+Feature-specific build options, numerical contracts and measured results are described below.
+DSpark is outside this contribution series.
 
 The tested model is the unmodified Unsloth UD-IQ3_S, revision
 [`02c81e41305bf8b718ad2e288f4e52a1cd49f55f`](https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/tree/02c81e41305bf8b718ad2e288f4e52a1cd49f55f).
@@ -58,6 +58,15 @@ build is a useful correctness path; its outputs are not the numeric oracle for
 the accepted CUDA arithmetic. No claim of HIP or SYCL build coverage is made here.
 
 ## Default-build comparison
+
+The vision and short-prefill follow-ups independently repeated the OFF comparison
+against upstream `4499fcbc` on 2026-10-28. CPU and CUDA target lists, normalized
+compile commands and the named raw artifact hashes matched on each branch.
+The feature sections identify their receipts. The deterministic NVCC metadata
+controls and Qwen executable limitation below still apply. This is build
+isolation evidence; it does not claim other-model inference coverage.
+
+The following comparison is the original PR1 evidence:
 
 With GCC 14.3, CUDA 13.1.115 and `sm_120a`, base `41c46c2f` with M31 OFF,
 the candidate with M31 OFF, and a fresh candidate build with M31 ON produced
@@ -161,6 +170,359 @@ limits and `-1` use the context left; positive limits are clipped to that space.
 `n_predict` takes precedence, then `max_completion_tokens`, then `max_tokens`.
 Boolean, fractional, and less-than-`-1` limits are rejected. The Responses API
 keeps the common server's positive-or-omitted `max_output_tokens` contract.
+
+## Vision (separate opt-in)
+
+Build the M31 engine with `-DSTRATA_M31=ON -DSTRATA_M31_VISION=ON` in addition
+to the CUDA options above. Vision is off by default. There is no `mtmd` target
+in this tree: the encoder runs as a separate process with its own llama.cpp
+and ggml libraries. The text engine does not link those libraries.
+
+Build the helper against unmodified llama.cpp PR #31192 at
+`6b95a9908d2c7b242817a447708aec38e937e2c0`:
+
+```sh
+git clone https://github.com/ggml-org/llama.cpp.git llama-m31
+git -C llama-m31 fetch origin refs/pull/31192/head
+git -C llama-m31 checkout --detach 6b95a9908d2c7b242817a447708aec38e937e2c0
+cmake -S tools/m31/vision -B build-m31-vision \
+  -DM31_LLAMA_SOURCE_DIR="$PWD/llama-m31" -DGGML_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-m31-vision --target m31_vision_adapter -j 8
+```
+
+Choose your GPU architecture and compiler as for the engine. `-DGGML_CUDA=OFF`
+builds a CPU encoder. Image input requires Pillow; video input requires
+`ffmpeg` and `ffprobe` in `PATH`. The helper checks `minimax-m3` model metadata,
+`clip`/`minimax_m3` projector metadata and projection width 6144. This checks the
+model family, not weight-revision identity: use the projector supplied with
+your GGUF revision and record both hashes.
+
+Add a `vision` object to the engine JSON shown above:
+
+```json
+{
+  "vision": {
+    "exe": "/path/to/Xolotl/build-m31-vision/m31_vision_adapter",
+    "model": "/path/to/model-00001-of-00005.gguf",
+    "mmproj": "/path/to/matching-mmproj.gguf",
+    "backend": "cuda",
+    "threads": 16,
+    "cache_dir": "/path/to/writable/vision-cache",
+    "startup_timeout": 180,
+    "timeout": 180,
+    "embedding_cache_mb": 0,
+    "video_fps": 1.0
+  }
+}
+```
+
+The backend defaults to CPU; CUDA is explicit. Set the same GPU visibility for
+helper and engine. Leave enough VRAM for both. `embedding_cache_mb=0` forces real
+encoding on repeats; the default is a bounded 256 MiB memory cache. Temporary
+media sources, helper request files and combined embedding files are released
+after use. The shim modifies only its own process's frontend hooks; the shared
+server files are unchanged.
+
+The helper starts on the first image/video request. A missing executable,
+model or mmproj, failed startup, helper death, malformed reply or startup/reply
+timeout produces `vision unavailable: ...` (HTTP 503). The request deadline also
+covers a blocked stdin write and an incomplete reply line. The helper is reaped;
+a later vision request can restart it. Text requests do not require the helper.
+Without the engine's vision build option, GENI/BGENI return
+`ERR vision unavailable` and text GEN/BGEN remains available. Pipe cancellation
+is checked at most every 100 ms; LLM cancellation keeps the PR1 boundaries.
+
+Use the common server's image content parts. The M31 launcher also accepts
+`video_url` and `video_file`, with an optional `fps`. For example:
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":[{"type":"text","text":"Describe this picture."},{"type":"image_url","image_url":{"url":"/path/to/picture.png"}}]}],"reasoning_effort":"low","max_tokens":1200,"cache_prompt":false}'
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":[{"type":"text","text":"Describe the stages in order."},{"type":"video_url","video_url":{"url":"/path/to/video.mp4","fps":1}}]}],"video_fps":1,"reasoning_effort":"low","max_tokens":1200,"cache_prompt":false}'
+```
+
+Data URLs work for both. Limits default to 32 MiB per media item, 128 MiB total,
+32 media items, 16 million pixels, 120 seconds and 120 sampled video frames.
+Use `allow_http=false` or `allow_local=false` in the vision object to restrict
+sources. `video_fps=1` must also be supplied to llama.cpp when comparing video:
+its default differs. Timestamp insertion is every 5000 ms by default.
+
+All text, images and video-frame embeddings form one ordered row stream and one
+LLM prefill. Each visual row has token ID `-1` and an ordinary linear position;
+MiniMax uses no multi-axis image RoPE. A mixed prompt must fit the configured
+chunk and the VRAM planner's single-prefill budget; otherwise it fails explicitly.
+Prefix reuse compares the actual F32 visual rows, including changed bytes at the
+same filename, rather than trusting placeholder IDs. Reuse keeps the numerical
+history described in the cache section; different chunk histories need not
+produce equal logits.
+
+For the wire format, GENI is
+`GENI <max_new> [key=value ...] <SVE1-file> <ids csv>`; BGENI inserts the slot
+before `max_new`. This matches the common server's actual serializer. The file
+contains consecutive little-endian records: five int32 values
+`0x31455653, rows, rows, 1, 6144`, then `rows * 6144` F32 values. Records occur in
+visual-span order among the `-1` IDs. The engine validates counts, width, finite
+values and complete coverage before changing KV state.
+
+### Vision memory and final-build checks
+
+The encoder remains resident after a request. A one-time free-VRAM snapshot
+before its startup overestimated the later prefill budget: the first candidate
+passed 16K text after an image but failed at 32K with `compute reservation failed`.
+The following short text request recovered in the same worker. That failed
+window is retained; it is not a passing result for the corrected worker.
+
+With vision compiled in, the existing memory planner now caps its initial
+budget by live device free memory plus four disjoint, currently allocated native
+scratch owners: dense gallocr, routed gallocr, hidden buffers and attention inputs.
+It credits actual allocations, never high-water statistics, weights, KV,
+expert slots or the backend's private pools. The existing two GiB of reserves
+remain. If no chunk fits because of retained scratch, it releases that scratch
+before executing new rows and replans once. KV and position remain intact;
+the previous head must be consumed before planning the next append. There is
+no retry after a partly executed forward. This is VRAM accounting for an
+external encoder; the short-chunk CPU/GPU policy is a separate contribution.
+
+The final native worker is
+`3416d20e3bce8d932cd86b902840c71319050457755a89812454c0f124a1067e`;
+the final CUDA helper is
+`bc65d376581afd425ded8dfc9febffe209d6ae9478ba88adb8b0165e01d934d8`.
+Both were built with GCC 14.3 / CUDA 13.1.115 / sm_120a on Linux, and tested on
+one RTX 5090, EPYC 9654 (96 cores / 192 threads), 624 GiB RAM and PCIe 5.0 x16.
+GPU1's vLLM-omni workload, ffmpeg and the neighbouring VM remained running.
+
+The corrected co-residency check kept the original native and helper PIDs:
+image → 16K text → short text → 32K text → short text → image → video all passed.
+The final image/video still used one prefill each. NVML v1 memory queries every
+0.3 s recorded a 30,325.75 MiB used peak and 2,281.25 MiB minimum free, out of
+32,607 MiB reported by that API. This is the long-text-plus-encoder diagnostic,
+not the separate vision-only TTFT peak. Driver-reserved memory makes this API's
+total differ from `nvidia-smi`'s usable total; sub-poll transient peaks may be missed.
+The resources were context 40,000, F16 K/V, CPU80, arena170 GiB, expert cache7 GiB,
+registration budget176 GiB and maximum chunk32,768.
+
+The helper also sets `GGML_CUDA_DISABLE_FUSION=1` in its own process before
+backend initialization. An absent variable selects the measured default;
+an explicit value other than `1` fails at lazy encoder startup, leaving text
+service available. This does not alter the Python server's environment.
+`m31_vision_adapter --check-environment` checks this policy without a model or
+backend initialization.
+
+CPU and CUDA passed 13/13 model-free ctest groups with vision ON, and 10/10 with
+vision OFF. The helper fault suite passed 12/12 and the server adapter suite
+18/18. The live final-build HTTP suite passed 16 checks: real image/video GENI
+with native grammar, missing binary/mmproj, startup/reply deadlines, helper death,
+invalid helper fusion environment, text success after every failure and image
+recovery. The worker stayed alive and the FIFO was released.
+Default-build isolation against `4499fcbc` is recorded in
+[`pr2-default-build-isolation.json`](../tools/m31/bench/receipts/pr2-default-build-isolation.json).
+Build provenance is in
+[`pr2-vision-build.json`](../tools/m31/bench/receipts/pr2-vision-build.json).
+These OFF hashes cover `STRATA_M31=OFF` default targets. Vision-disabled M31
+workers are tested for behavior; whole-worker ELF identity is not claimed.
+HIP, SYCL, Windows, other GPUs and two-GPU placement were not tested.
+
+### Final vision numerical and HTTP results
+
+On 2026-10-28 the final native/helper binaries above reproduced every F32 logit
+from the pinned CUDA GPU-offload oracle: image **515 rows**, 12-frame video
+**3,863 rows**, code **128 rows**, and unchanged text gate20 **28,723 rows**.
+Every selected row includes all 200,064 vocabulary entries: top-1 100%, KL 0,
+maximum absolute difference 0. Image and video each used exactly one prefill.
+Fresh final-helper arrays matched an independent helper execution, and the
+image encoder also matched stock `llama-mtmd-cli` embedding bytes. The final
+worker was compared with sealed, freshly generated same-day oracle outputs
+from the earlier window; all 98 oracle/input reference files were hashed before
+and after the final run. The oracle, input IDs, visual rows, placement, actual
+chunks, context and fusion profile were unchanged. This is not a CPU-oracle gate.
+
+A subsequent live common-server suite passed all six visual cases and all three
+tool smoke cases. Vision used greedy sampling, low reasoning, 1 fps, no prefix
+cache and max_tokens 1200. The tool smoke used greedy sampling, thinking disabled
+and max_tokens 512; it does not substitute for the sampled tools23 quality suite.
+
+### Vision TTFT against llama.cpp
+
+One uninterrupted X L L X L X X L window kept every request. Each of the four
+repetitions per arm sent the same three JSON bodies: first image, repeated image
+with real re-encoding, then 12-frame video. The table gives seconds to the first
+reasoning/content delta, median [minimum–maximum]. All 24 requests passed with
+no length stops, identical input bodies and zero KV prefix hits.
+
+| Request | This branch (X), s | PR #31192 llama-server (L), s |
+| --- | ---: | ---: |
+| First image / first media request | 4.347 [4.294–4.583] | 5.224 [5.194–5.242] |
+| Image / warm encoder, real re-encode | 3.126 [3.112–3.136] | 4.960 [4.940–4.986] |
+| 12-frame video / warm encoder | 4.086 [4.061–4.105] | 36.314 [36.237–36.439] |
+
+A first user-visible content delta can arrive later than a reasoning delta.
+The corresponding visible-content medians were 5.510 / 6.478 s for the first
+image, 4.059 / 6.112 s for the warm image, and 4.256 / 36.532 s for video (X / L).
+All raw pairs and both timing definitions are retained in the receipt.
+
+X used the native resources above, F16 KV, and a CUDA encoder with 16 CPU
+threads and embedding_cache_mb=0. Its first-media request includes lazy helper
+startup; L initializes encoder weights before READY. L used the pinned stock
+`llama-server`, context 65,536, Q8_0 KV, 64 generation / 96 batch threads,
+batch and ubatch 1024, all routed experts in CPU RAM, and CUDA dense/encoder
+operations. These are recorded serving profiles, not equal KV/context settings
+or a claim that L is its fastest possible configuration. Both used fusion off,
+MMQ auto, 1 fps, timestamps every 5000 ms, low reasoning, greedy sampling,
+max_tokens 1200 and cache_prompt=false. Prompt lengths were 515 and 3,863 on
+both servers. No additional HTTP warmup request was sent. L retained its normal
+startup model warmup before READY; no hidden embedding-cache hit was used.
+
+Device memory sampled by `nvidia-smi` every 0.3 s peaked at **28,082 MiB for X**
+and **20,861 MiB for L** during TTFT. This usable-memory reading excludes driver
+reserved memory, unlike the NVML v1 co-residency measurement above. Both may
+miss sub-poll peaks. GPU1's vLLM-omni, ffmpeg and the VM remained running, so
+only comparisons within this window are reported.
+The numerical/fault/co-residency evidence is recorded in
+[`pr2-vision-validation.json`](../tools/m31/bench/receipts/pr2-vision-validation.json);
+every TTFT repetition, both timing definitions, settings and functional cases
+are in [`pr2-vision-ttft.json`](../tools/m31/bench/receipts/pr2-vision-ttft.json).
+
+### Reproduce vision logits
+
+Create an image/video request JSON as above, and put the `vision` object's
+contents in `vision.json`. The reference media can be generated locally:
+
+```sh
+python tools/m31/bench/make_vision_media.py reference-media
+```
+
+Use `reference-media/0.png` for the image and `reference-media/shapes-12s.mp4`
+for the video, with the same files on both sides. The generator records font,
+Pillow and ffmpeg versions plus hashes; compressed bytes can differ with another
+encoder version. Use a new output directory at every step:
+
+```sh
+export GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_MMQ_PREC=auto
+python tools/m31/bench/prepare_vision.py --request image-request.json \
+  --vision-config vision.json --tokenizer "$TOKENIZER_DIR" --out image-input
+# Re-encode the exact rendered prompt in an independent pinned helper process.
+build-m31-vision/m31_vision_adapter image-input/independent-spec.json image-reference-ipc
+python tools/m31/bench/prepare_vision.py --ipc image-reference-ipc/manifest.json \
+  --out image-reference-input
+cmake -S llama-m31 -B llama-m31/build -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON -DLLAMA_OPENSSL=OFF \
+  -DCMAKE_CUDA_ARCHITECTURES=120a -DCMAKE_CXX_COMPILER=g++-14 \
+  -DCMAKE_CUDA_HOST_COMPILER=g++-14
+cmake --build llama-m31/build --target llama-server llama-mtmd-cli -j 8
+cmake -S tools/m31/tests/oracle -B build-m31-oracle \
+  -DM31_LLAMA_SOURCE="$PWD/llama-m31" \
+  -DM31_LLAMA_BUILD="$PWD/llama-m31/build" \
+  -DM31_BUILD_VISION_ORACLE=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-m31-oracle --target m31_vision_oracle -j 8
+build-m31/m31_generate --model "$MODEL" --backend cuda --ctx 4096 --chunk 4096 \
+  --threads 80 --arena-gib 170 --gpu-experts-gib 7 \
+  --register-arena 1 --register-limit-gib 176 --gpu-pack-threads 8 \
+  --mixed-manifest image-input/mixed/manifest.json --rows all --out image-native
+build-m31-oracle/m31_vision_oracle --model "$MODEL" --backend cuda \
+  --oracle-op-offload 1 --ctx 4096 --chunk 4096 --threads 80 \
+  --mixed-manifest image-input/mixed/manifest.json --rows all --out image-oracle
+python tools/m31/bench/compare_mixed.py image-oracle/manifest image-native/manifest \
+  image-input/mixed/manifest.json --independent-input image-reference-input/manifest.json \
+  --out image-comparison.json
+MMPROJ=/path/to/matching-mmproj.gguf
+python tools/m31/bench/check_encoder_cli.py \
+  --expected-manifest image-input/captured-ipc/manifest.json \
+  --cli llama-m31/build/bin/llama-mtmd-cli --image reference-media/0.png \
+  --model "$MODEL" --mmproj "$MMPROJ" --output image-stock-encoder
+```
+
+The budgets describe the measured EPYC/5090; adjust them for your machine.
+The current pinned mtmd path encodes the 12 video frames separately; no batched
+frame-encoder implementation or frame-batching speedup is claimed.
+Use fusion off and the same MMQ precision for every executable. Repeat with the
+video request, explicit 1 fps and a chunk/context large enough for all rows.
+The comparator requires one complete actual prefill, all prompt rows, identical
+text/visual IDs and positions, matching independent encoder arrays, and raw
+F32 logit byte equality. It cannot pass on a last-row-only dump.
+
+### Reproduce the TTFT and functional checks
+
+Generate the media and server configuration above, then prepare the public
+fixtures once (use the same generated files on both servers):
+
+```sh
+python tools/m31/bench/vision_check.py prepare vision-fixtures \
+  --reference-image reference-media/0.png \
+  --reference-video reference-media/shapes-12s.mp4
+```
+
+For the reference serving profile used in the table, start the standalone
+pinned server with the same exported fusion/MMQ settings:
+
+```sh
+llama-m31/build/bin/llama-server --model "$MODEL" --alias minimax-m31 \
+  --host 127.0.0.1 --port 8080 --ctx-size 65536 --ubatch-size 1024 \
+  --batch-size 1024 --threads 64 --threads-batch 96 \
+  --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --parallel 1 \
+  --fit off --load-mode none --n-gpu-layers 999 \
+  --temp 1 --top-p .95 --top-k 40 --min-p .05 \
+  --override-tensor 'ffn_.*_exps\.=CPU' --mmproj "$MMPROJ" --video-fps 1 \
+  --log-verbosity 5
+```
+
+For each arm, load a fresh server, wait for `/health`, then run exactly image,
+image, video in that order. This uses the same public SSE reader and bodies as
+the measured driver; change `arm-results.json` to a fresh filename for every arm:
+
+```sh
+python - <<'PYCODE'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, "tools/m31/bench")
+from vision_check import request
+cases = {case["name"]: case for case in json.loads(
+    Path("vision-fixtures/ttft-cases.json").read_text())}
+rows = []
+output = Path("arm-results.json")
+with output.open("x") as stream:
+    stream.write("[]\n")
+for name in ("image", "image", "video"):
+    body = {"model": "minimax-m31", "messages": cases[name]["messages"],
+            "temperature": 0, "top_p": 1, "seed": 0, "stream": True,
+            "stream_options": {"include_usage": True}, "max_tokens": 1200,
+            "reasoning_effort": "low", "cache_prompt": False, "video_fps": 1}
+    row = {"case": name, "request": body}
+    try:
+        row.update(request("http://127.0.0.1:8080", body, 7200))
+    except Exception as error:
+        row["error"] = repr(error)
+    rows.append(row)
+    output.write_text(json.dumps(rows, indent=2))
+PYCODE
+```
+
+Repeat complete server loads in X L L X L X X L order in one window. Keep every
+response, including failures and length stops, report both `ttft_s` and
+`visible_ttft_s`, and verify input bodies and no KV reuse. Record the sampled
+GPU peak separately, for example with `nvidia-smi --query-gpu=index,memory.used
+--format=csv --loop-ms=300` redirected to a log in another terminal. Device
+memory is shared by both native processes; a per-process sum is insufficient.
+Run the functional fixtures separately so they do not prewarm the first-media
+measurement:
+
+```sh
+python tools/m31/bench/vision_check.py http vision-fixtures/cases.json \
+  --endpoint http://127.0.0.1:8080 --model minimax-m31 --output vision6.json
+python tools/m31/bench/vision_check.py tools --endpoint http://127.0.0.1:8080 \
+  --model minimax-m31 --output tools3.json
+```
+
+Run model-free fault and adapter checks with:
+
+```sh
+ctest --test-dir build-m31 --output-on-failure -R '^m31_'
+python tools/m31/tests/test_vision_helper.py -v
+python tools/m31/tests/test_vision_serve.py -v
+```
 
 ## Numerical contract
 
@@ -563,7 +925,7 @@ git -C llama-m31-reference diff --exit-code
 cmake -S llama-m31-reference -B llama-m31-reference/build \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON \
   -DCMAKE_CUDA_ARCHITECTURES=120a -DCMAKE_CXX_COMPILER=g++-14 \
-  -DCMAKE_CUDA_HOST_COMPILER=g++-14 -DLLAMA_CURL=OFF
+  -DCMAKE_CUDA_HOST_COMPILER=g++-14 -DLLAMA_OPENSSL=OFF
 cmake --build llama-m31-reference/build --target llama-server -j 8
 cmake -S tools/m31/tests/oracle -B build-m31-oracle -DCMAKE_CXX_COMPILER=g++-14 \
   -DM31_LLAMA_SOURCE="$PWD/llama-m31-reference" \
@@ -765,9 +1127,10 @@ Numerical acceptance covers the 20 short prompts and selected rows at 16K and
 context capacity is not a tested port capacity. F16 main and index KV consume
 substantial VRAM; memory planning can split a prompt into several expert passes.
 Arena population and optional host registration add startup work and require
-free host memory. A single active sequence is supported. Image/video input,
-adaptive CPU/GPU short prefill, speculative decode and the Q2 experiments are
-not included. HIP and SYCL toolchains were unavailable, so those backends were
+free host memory. A single active sequence is supported. Feature-specific build
+requirements and validation are stated in the vision and short-prefill sections
+when those follow-ups are present. Speculative decode and the Q2 experiments
+are not included. HIP and SYCL toolchains were unavailable, so those backends were
 not built. Windows, other GPU models, two-GPU placement and other-model inference
 were not tested. The two tools-trial failures and Qwen link failure remain explicit limitations.
 The October 28 generation gate covers only the stated hardware and two depths;
