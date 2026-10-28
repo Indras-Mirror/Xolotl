@@ -1,0 +1,20 @@
+{
+  "format": "m31-historical-v8-inputs-v1",
+  "model_revision": "02c81e41305bf8b718ad2e288f4e52a1cd49f55f",
+  "llama_cpp_reference": "6b95a9908d2c7b242817a447708aec38e937e2c0",
+  "quality_client_sha256": "bca423fc5b57609337aff1cff5d931a328d728fa8fe0a199f4fa7f0e1222d286",
+  "gsm8k_test_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+  "speed_corpus_sha256": "b3dd2af20842931b69a67cc3f80ae6cfe30c36c7df20a270895d9b6915d62067",
+  "final_pr1_acceptance": false,
+  "quality_sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 40,
+    "min_p": 0.05,
+    "max_tokens": 6000,
+    "thinking": "model default",
+    "seed": "absent"
+  },
+  "gsm8k_commit": "b0bb162abedc65e1fdd8e93ed090fd7598ee68bc",
+  "gsm8k_blob": "e4c2ff4942b9a78bd74f04141224c11e28d12dc9"
+}

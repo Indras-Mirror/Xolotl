@@ -1,0 +1,1584 @@
+{
+  "format": "m31-pr1-text-acceptance-v1",
+  "updated_utc": "2026-10-27T22:54:48.552021Z",
+  "state": "collection_complete_with_failed_quality_trials",
+  "source": {
+    "base_commit": "41c46c2ff5d1dd02a153a96f984c87fef58fe2a6",
+    "runtime_commits": [
+      "b7121972903b7cb6d0ddc33b98fcc1bc025ed5fc",
+      "45b54299bddd469dfeba734e3db7c9261a34f3fd"
+    ],
+    "native_worker_sha256": "8c3710d7a3bda60e1a3556cc05b96fa3c95777d2e70ed06c484d5d89ce57527e",
+    "ggml_base_commit": "6050b467c07a95c7b87debd4ddac2f8ba8d9b807",
+    "ggml_patch": "tools/xolotl/ggml/xolotl-ggml.patch"
+  },
+  "model": {
+    "repository": "unsloth/MiniMax-M3.1-Flash-GGUF",
+    "revision": "02c81e41305bf8b718ad2e288f4e52a1cd49f55f",
+    "quantization": "UD-IQ3_S",
+    "shards": [
+      {
+        "name": "MiniMax-M3.1-Flash-UD-IQ3_S-00001-of-00005.gguf",
+        "bytes": 8243332,
+        "sha256": "42bafae90287a6c2647eb161d9d4d1805ebf02fb66cf4a5af8293168375368f7"
+      },
+      {
+        "name": "MiniMax-M3.1-Flash-UD-IQ3_S-00002-of-00005.gguf",
+        "bytes": 49433893696,
+        "sha256": "3970d43fb8bb658bbbaa4d673d1109123ca0ec90d8c5386e5436467bf0dc56ec"
+      },
+      {
+        "name": "MiniMax-M3.1-Flash-UD-IQ3_S-00003-of-00005.gguf",
+        "bytes": 49769955008,
+        "sha256": "88b20020b5cee98cac99df94644a41358573c5baa142ad7ba8201135a1e33d21"
+      },
+      {
+        "name": "MiniMax-M3.1-Flash-UD-IQ3_S-00004-of-00005.gguf",
+        "bytes": 49769955008,
+        "sha256": "093cef05744b8f482fa861b31842e8bf501f3ccde7c65b6b3303b9c1818597e0"
+      },
+      {
+        "name": "MiniMax-M3.1-Flash-UD-IQ3_S-00005-of-00005.gguf",
+        "bytes": 26468407040,
+        "sha256": "8cfd2077e82fca805b5660cc2760027d43c44fc9b96fd4371ef3266c8e9199f4"
+      }
+    ],
+    "total_bytes": 175450454084
+  },
+  "hardware_and_toolchain": {
+    "cpu": "AMD EPYC 9654 96-Core Processor",
+    "physical_cores": 96,
+    "logical_cpus": 192,
+    "host_ram_kib": 655270884,
+    "candidate_gpu": {
+      "physical_index": 0,
+      "name": "NVIDIA GeForce RTX 5090",
+      "nvml_vram_mib": 32607,
+      "power_limit_w": 440.0,
+      "driver": "595.91.07",
+      "idle_link_at_preload": {
+        "generation": 2,
+        "width": 16
+      },
+      "under_load_link_snapshot": {
+        "observed_utc": "2026-10-27T21:18Z",
+        "generation": 5,
+        "width": 16,
+        "sm_clock_mhz": 2670,
+        "temperature_c": 53,
+        "power_w": 197.1,
+        "utilization_percent": 25,
+        "scope": "one live snapshot during HTTP lifecycle generation, not an average performance measurement"
+      }
+    },
+    "other_gpu_workloads_at_acceptance_start": [
+      {
+        "gpu_index": 1,
+        "process": "SRBMiner-MULTI",
+        "reported_used_memory_mib": 1022
+      },
+      {
+        "gpu_index": 1,
+        "process": "VLLM::Worker",
+        "reported_used_memory_mib": 5740
+      },
+      {
+        "gpu_index": 1,
+        "process": "VLLM::Worker",
+        "reported_used_memory_mib": 8530
+      }
+    ],
+    "os": "Ubuntu 26.04.1 LTS",
+    "kernel": "Linux 7.0.0-34-generic",
+    "compiler": {
+      "cxx": "GCC 14.3.0",
+      "cuda": "13.1.115",
+      "architecture": "120a"
+    }
+  },
+  "native_configuration": {
+    "threads": 80,
+    "cpu_pool_poll": 50,
+    "cpu_affinity": "not explicitly pinned",
+    "arena_budget_gib": 170,
+    "expert_cache_budget_gib": 7,
+    "registered_host_memory": true,
+    "registration_limit_gib": 176,
+    "actual_registered_weight_bytes": 163754029056,
+    "pack_threads": 8,
+    "upload_depth": 8,
+    "copy_streams": 1,
+    "cuda_fusion": "off",
+    "mmq_precision": "auto",
+    "main_and_index_kv": "F16"
+  },
+  "reference": {
+    "repository": "ggml-org/llama.cpp",
+    "commit": "6b95a9908d2c7b242817a447708aec38e937e2c0",
+    "numeric_contract": "GPU op-offload, expert weights in original CPU GGUF buffers, dense CUDA, F16 KV, fusion off, matching actual chunks",
+    "thresholds": {
+      "top1_min": 0.99,
+      "mean_kl_max": 0.001,
+      "max_kl_max": 0.05
+    },
+    "long_head_policy": "full final-layer FFN before bounded output head; capacity-equivalence trace validated"
+  },
+  "http_client_recipes": {
+    "quality": {
+      "temperature": 1,
+      "top_p": 0.95,
+      "top_k": 40,
+      "min_p": 0.05,
+      "max_tokens": 6000,
+      "seed_default": "absent; fixed replications use explicit 0 and 1",
+      "thinking": "GGUF model default"
+    },
+    "speed": {
+      "temperature": 0,
+      "generated_tokens": 256,
+      "ignore_eos": true,
+      "cache_prompt": false,
+      "reasoning_effort": "low",
+      "decode_rate_numerator": 255,
+      "first_head_and_sample": "prompt time"
+    },
+    "completion_status": "See individual checks; a recipe is not a completed measurement"
+  },
+  "quality_trial_policy": {
+    "tools_min_correct_per_trial": 19,
+    "tools_total_per_trial": 23,
+    "gsm8k_min_correct": 95,
+    "gsm8k_total": 100,
+    "predeclared_replication_seeds": [
+      0,
+      1
+    ],
+    "all_trials_reported": true,
+    "best_trial_selection": false,
+    "thresholds_changed": false,
+    "initial_native_unseeded_17of23_failure_retained": true,
+    "interpretation": "Different scores alone do not establish a port regression or its cause. Server context/KV/cache policies differ; API cache metadata is reported without claiming equivalence."
+  },
+  "http_collection": {
+    "collection_complete": true,
+    "runner_pass": false,
+    "quality_failures": [
+      "native-tools23-initial-17of23",
+      "tuned-q8-tools-seed1"
+    ],
+    "execution_failed": false,
+    "policy": "Collection completion is separate from passing all gates; the original unseeded failure is never replaced by a seeded result"
+  },
+  "checks": {
+    "gate20": {
+      "status": "pass",
+      "cases": 20,
+      "rows": 28723,
+      "top1": 1.0,
+      "mean_kl": 0.0,
+      "max_kl": 0.0,
+      "bitwise_identical": true,
+      "full_prompt_rows": true,
+      "scope": "complete gate20"
+    },
+    "historical_long": {
+      "status": "pass",
+      "cases": 2,
+      "rows": 512,
+      "top1": 1.0,
+      "mean_kl": 0.0,
+      "max_kl": 0.0,
+      "bitwise_identical": true,
+      "full_prompt_rows": false,
+      "scope": "selected-row long supplement; not every prompt row",
+      "cases_detail": [
+        {
+          "case": "corpus_16384",
+          "input_tokens": 16384,
+          "selected_rows": 256,
+          "prefill_chunks": [
+            10240,
+            6112
+          ],
+          "teacher_forced_decode_steps": 32
+        },
+        {
+          "case": "corpus_32768",
+          "input_tokens": 32768,
+          "selected_rows": 256,
+          "prefill_chunks": [
+            10240,
+            7936,
+            6528,
+            5632,
+            2400
+          ],
+          "teacher_forced_decode_steps": 32
+        }
+      ]
+    },
+    "public_ru_code_long": {
+      "status": "pass",
+      "cases": 4,
+      "rows": 1024,
+      "top1": 1.0,
+      "mean_kl": 0.0,
+      "max_kl": 0.0,
+      "bitwise_identical": true,
+      "full_prompt_rows": false,
+      "scope": "selected-row long supplement; not every prompt row",
+      "cases_detail": [
+        {
+          "case": "code_long_16384",
+          "input_tokens": 16384,
+          "selected_rows": 256,
+          "prefill_chunks": [
+            10240,
+            6112
+          ],
+          "teacher_forced_decode_steps": 32
+        },
+        {
+          "case": "code_long_32768",
+          "input_tokens": 32768,
+          "selected_rows": 256,
+          "prefill_chunks": [
+            10240,
+            7936,
+            6528,
+            5632,
+            2400
+          ],
+          "teacher_forced_decode_steps": 32
+        },
+        {
+          "case": "ru_long_16384",
+          "input_tokens": 16384,
+          "selected_rows": 256,
+          "prefill_chunks": [
+            10240,
+            6112
+          ],
+          "teacher_forced_decode_steps": 32
+        },
+        {
+          "case": "ru_long_32768",
+          "input_tokens": 32768,
+          "selected_rows": 256,
+          "prefill_chunks": [
+            10240,
+            7936,
+            6528,
+            5632,
+            2400
+          ],
+          "teacher_forced_decode_steps": 32
+        }
+      ]
+    },
+    "live_history_oracle": {
+      "status": "pass",
+      "arms": 4,
+      "positions_per_arm": 1,
+      "logits_per_head": 200064,
+      "recipes": "257/reuse256 and 1324/reuse1024, each with zero or seven raw greedy decode steps before rewind",
+      "bitwise_identical": true
+    },
+    "public_cache_state": {
+      "status": "pass",
+      "cases": [
+        {
+          "length": 257,
+          "reused": 256,
+          "same_history_bitwise": true,
+          "whole_vs_split_bitwise": false,
+          "whole_vs_replay_bitwise": false
+        },
+        {
+          "length": 1324,
+          "reused": 1024,
+          "same_history_bitwise": true,
+          "whole_vs_split_bitwise": false,
+          "whole_vs_replay_bitwise": false
+        }
+      ],
+      "contract": "same numerical history; cold whole and split batches are reported separately"
+    },
+    "native_prefix_cancel": {
+      "status": "pass",
+      "requests": 34,
+      "chunk_limit": 256,
+      "scope": "same/append100/append300/branch/cancel/retry/cache opt-out and 255/256/257/511/512/513 boundaries with fixed partition"
+    },
+    "http_lifecycle": {
+      "status": "pass",
+      "source_run": "acceptance-http-v3/http",
+      "checks": 9
+    },
+    "http_prefix_cancel": {
+      "status": "pass",
+      "source_run": "acceptance-http-v3/http",
+      "requests": 7
+    },
+    "native_tools23": {
+      "status": "failed",
+      "source_run": "acceptance-http-v3/http",
+      "suite": "tools23",
+      "complete": true,
+      "pass": false,
+      "sampling": {
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.05,
+        "max_tokens": 6000,
+        "thinking": "model default"
+      },
+      "gsm8k": {
+        "correct": 0,
+        "total": 0
+      },
+      "tools23": {
+        "correct": 17,
+        "total": 23
+      },
+      "length_stops": 0,
+      "marker_leaks": 0,
+      "invalid_tool_ids": 0,
+      "wall_seconds": 169.3947216561064,
+      "client": {
+        "bytes": 9046,
+        "sha256": "7e29b0d29dd2d896d30f078b60d59395a2ba9958bccedd9e17eacad6d62df50e"
+      },
+      "fixtures": {
+        "bytes": 5618,
+        "sha256": "2dec9c38b4382d541537cb90841162f6c1be324b906ace864f78b1465b1a3923"
+      },
+      "trial_role": "Original unseeded trial: completed17/23; failure retained irrespective of subsequent replications",
+      "cache_report": {
+        "client_cache_prompt_fields": [
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent"
+        ],
+        "reported_cached_tokens_by_request": [
+          0,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768
+        ],
+        "prompt_tokens_by_request": [
+          853,
+          852,
+          856,
+          858,
+          874,
+          867,
+          857,
+          860,
+          859,
+          858,
+          854,
+          865,
+          856,
+          857,
+          859,
+          849,
+          861,
+          862,
+          852,
+          859,
+          921,
+          930,
+          957
+        ],
+        "scope": "API cache metadata only; missing counts remain unknown, not zero; server policies are not asserted equivalent"
+      }
+    },
+    "native_tools23_seed0": {
+      "status": "pass",
+      "source_run": "acceptance-http-v4/http",
+      "suite": "tools23",
+      "complete": true,
+      "pass": true,
+      "sampling": {
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.05,
+        "max_tokens": 6000,
+        "thinking": "model default",
+        "seed": 0
+      },
+      "gsm8k": {
+        "correct": 0,
+        "total": 0
+      },
+      "tools23": {
+        "correct": 19,
+        "total": 23
+      },
+      "length_stops": 0,
+      "marker_leaks": 0,
+      "invalid_tool_ids": 0,
+      "wall_seconds": 142.92557408614084,
+      "client": {
+        "bytes": 9714,
+        "sha256": "cf68344496479346278f9937d0db6498ccb5c3b7c0a442c3302452e869516f85"
+      },
+      "fixtures": {
+        "bytes": 5618,
+        "sha256": "2dec9c38b4382d541537cb90841162f6c1be324b906ace864f78b1465b1a3923"
+      },
+      "trial_role": "Predeclared fixed seed replication; no best trial selection",
+      "cache_report": {
+        "client_cache_prompt_fields": [
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent"
+        ],
+        "reported_cached_tokens_by_request": [
+          0,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768
+        ],
+        "prompt_tokens_by_request": [
+          853,
+          852,
+          856,
+          858,
+          874,
+          867,
+          857,
+          860,
+          859,
+          858,
+          854,
+          865,
+          856,
+          857,
+          859,
+          849,
+          861,
+          862,
+          852,
+          859,
+          921,
+          930,
+          957
+        ],
+        "scope": "API cache metadata only; missing counts remain unknown, not zero; server policies are not asserted equivalent"
+      }
+    },
+    "reference_tuned_tools23_seed0": {
+      "status": "pass",
+      "source_run": "acceptance-http-v4/http",
+      "suite": "tools23",
+      "complete": true,
+      "pass": true,
+      "sampling": {
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.05,
+        "max_tokens": 6000,
+        "thinking": "model default",
+        "seed": 0
+      },
+      "gsm8k": {
+        "correct": 0,
+        "total": 0
+      },
+      "tools23": {
+        "correct": 20,
+        "total": 23
+      },
+      "length_stops": 0,
+      "marker_leaks": 0,
+      "invalid_tool_ids": 0,
+      "wall_seconds": 138.03406546777114,
+      "client": {
+        "bytes": 9714,
+        "sha256": "cf68344496479346278f9937d0db6498ccb5c3b7c0a442c3302452e869516f85"
+      },
+      "fixtures": {
+        "bytes": 5618,
+        "sha256": "2dec9c38b4382d541537cb90841162f6c1be324b906ace864f78b1465b1a3923"
+      },
+      "trial_role": "Corresponding predeclared reference replication",
+      "cache_report": {
+        "client_cache_prompt_fields": [
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent"
+        ],
+        "reported_cached_tokens_by_request": [
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          841
+        ],
+        "prompt_tokens_by_request": [
+          853,
+          852,
+          856,
+          858,
+          874,
+          867,
+          857,
+          860,
+          859,
+          858,
+          854,
+          865,
+          856,
+          857,
+          859,
+          849,
+          861,
+          862,
+          852,
+          859,
+          921,
+          930,
+          957
+        ],
+        "scope": "API cache metadata only; missing counts remain unknown, not zero; server policies are not asserted equivalent"
+      }
+    },
+    "native_tools23_seed1": {
+      "status": "pass",
+      "source_run": "acceptance-http-v4/http",
+      "suite": "tools23",
+      "complete": true,
+      "pass": true,
+      "sampling": {
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.05,
+        "max_tokens": 6000,
+        "thinking": "model default",
+        "seed": 1
+      },
+      "gsm8k": {
+        "correct": 0,
+        "total": 0
+      },
+      "tools23": {
+        "correct": 20,
+        "total": 23
+      },
+      "length_stops": 0,
+      "marker_leaks": 0,
+      "invalid_tool_ids": 0,
+      "wall_seconds": 162.82418917119503,
+      "client": {
+        "bytes": 9714,
+        "sha256": "cf68344496479346278f9937d0db6498ccb5c3b7c0a442c3302452e869516f85"
+      },
+      "fixtures": {
+        "bytes": 5618,
+        "sha256": "2dec9c38b4382d541537cb90841162f6c1be324b906ace864f78b1465b1a3923"
+      },
+      "trial_role": "Predeclared fixed seed replication; no best trial selection",
+      "cache_report": {
+        "client_cache_prompt_fields": [
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent"
+        ],
+        "reported_cached_tokens_by_request": [
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768,
+          768
+        ],
+        "prompt_tokens_by_request": [
+          853,
+          852,
+          856,
+          858,
+          874,
+          867,
+          857,
+          860,
+          859,
+          858,
+          854,
+          865,
+          856,
+          857,
+          859,
+          849,
+          861,
+          862,
+          852,
+          859,
+          921,
+          930,
+          957
+        ],
+        "scope": "API cache metadata only; missing counts remain unknown, not zero; server policies are not asserted equivalent"
+      }
+    },
+    "reference_tuned_tools23_seed1": {
+      "status": "failed",
+      "source_run": "acceptance-http-v4/http",
+      "suite": "tools23",
+      "complete": true,
+      "pass": false,
+      "sampling": {
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.05,
+        "max_tokens": 6000,
+        "thinking": "model default",
+        "seed": 1
+      },
+      "gsm8k": {
+        "correct": 0,
+        "total": 0
+      },
+      "tools23": {
+        "correct": 18,
+        "total": 23
+      },
+      "length_stops": 0,
+      "marker_leaks": 0,
+      "invalid_tool_ids": 0,
+      "wall_seconds": 118.54920998169109,
+      "client": {
+        "bytes": 9714,
+        "sha256": "cf68344496479346278f9937d0db6498ccb5c3b7c0a442c3302452e869516f85"
+      },
+      "fixtures": {
+        "bytes": 5618,
+        "sha256": "2dec9c38b4382d541537cb90841162f6c1be324b906ace864f78b1465b1a3923"
+      },
+      "trial_role": "Corresponding predeclared reference replication",
+      "cache_report": {
+        "client_cache_prompt_fields": [
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent"
+        ],
+        "reported_cached_tokens_by_request": [
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          841
+        ],
+        "prompt_tokens_by_request": [
+          853,
+          852,
+          856,
+          858,
+          874,
+          867,
+          857,
+          860,
+          859,
+          858,
+          854,
+          865,
+          856,
+          857,
+          859,
+          849,
+          861,
+          862,
+          852,
+          859,
+          921,
+          930,
+          957
+        ],
+        "scope": "API cache metadata only; missing counts remain unknown, not zero; server policies are not asserted equivalent"
+      }
+    },
+    "native_gsm8k100": {
+      "status": "pass",
+      "source_run": "acceptance-http-v4/http",
+      "suite": "gsm8k",
+      "complete": true,
+      "pass": true,
+      "sampling": {
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.05,
+        "max_tokens": 6000,
+        "thinking": "model default"
+      },
+      "gsm8k": {
+        "correct": 97,
+        "total": 100
+      },
+      "tools23": {
+        "correct": 0,
+        "total": 0
+      },
+      "length_stops": 0,
+      "marker_leaks": 0,
+      "invalid_tool_ids": 0,
+      "wall_seconds": 1223.9869409431703,
+      "client": {
+        "bytes": 9714,
+        "sha256": "cf68344496479346278f9937d0db6498ccb5c3b7c0a442c3302452e869516f85"
+      },
+      "fixtures": {
+        "bytes": 5618,
+        "sha256": "2dec9c38b4382d541537cb90841162f6c1be324b906ace864f78b1465b1a3923"
+      },
+      "dataset": {
+        "bytes": 749738,
+        "sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14"
+      }
+    },
+    "reference_tuned_tools23": {
+      "status": "pass",
+      "source_run": "acceptance-http-v4/http",
+      "suite": "tools23",
+      "complete": true,
+      "pass": true,
+      "sampling": {
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.05,
+        "max_tokens": 6000,
+        "thinking": "model default"
+      },
+      "gsm8k": {
+        "correct": 0,
+        "total": 0
+      },
+      "tools23": {
+        "correct": 20,
+        "total": 23
+      },
+      "length_stops": 0,
+      "marker_leaks": 0,
+      "invalid_tool_ids": 0,
+      "wall_seconds": 160.55899739125744,
+      "client": {
+        "bytes": 9714,
+        "sha256": "cf68344496479346278f9937d0db6498ccb5c3b7c0a442c3302452e869516f85"
+      },
+      "fixtures": {
+        "bytes": 5618,
+        "sha256": "2dec9c38b4382d541537cb90841162f6c1be324b906ace864f78b1465b1a3923"
+      },
+      "trial_role": "Unseeded reference trial",
+      "cache_report": {
+        "client_cache_prompt_fields": [
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent",
+          "absent"
+        ],
+        "reported_cached_tokens_by_request": [
+          0,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          838,
+          841
+        ],
+        "prompt_tokens_by_request": [
+          853,
+          852,
+          856,
+          858,
+          874,
+          867,
+          857,
+          860,
+          859,
+          858,
+          854,
+          865,
+          856,
+          857,
+          859,
+          849,
+          861,
+          862,
+          852,
+          859,
+          921,
+          930,
+          957
+        ],
+        "scope": "API cache metadata only; missing counts remain unknown, not zero; server policies are not asserted equivalent"
+      }
+    },
+    "reference_tuned_gsm8k100": {
+      "status": "pass",
+      "source_run": "acceptance-http-v4/http",
+      "suite": "gsm8k",
+      "complete": true,
+      "pass": true,
+      "sampling": {
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 40,
+        "min_p": 0.05,
+        "max_tokens": 6000,
+        "thinking": "model default"
+      },
+      "gsm8k": {
+        "correct": 96,
+        "total": 100
+      },
+      "tools23": {
+        "correct": 0,
+        "total": 0
+      },
+      "length_stops": 0,
+      "marker_leaks": 0,
+      "invalid_tool_ids": 0,
+      "wall_seconds": 1329.5736484420486,
+      "client": {
+        "bytes": 9714,
+        "sha256": "cf68344496479346278f9937d0db6498ccb5c3b7c0a442c3302452e869516f85"
+      },
+      "fixtures": {
+        "bytes": 5618,
+        "sha256": "2dec9c38b4382d541537cb90841162f6c1be324b906ace864f78b1465b1a3923"
+      },
+      "dataset": {
+        "bytes": 749738,
+        "sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14"
+      }
+    },
+    "native_speed": {
+      "status": "measured",
+      "configuration": {
+        "context": 40000,
+        "kv": "f16",
+        "threads": 80
+      },
+      "repetitions": 3,
+      "generated_tokens": 256,
+      "decode_transitions": 255,
+      "corpus_sha256": "b3dd2af20842931b69a67cc3f80ae6cfe30c36c7df20a270895d9b6915d62067",
+      "client_sha256": "a0f98f0f491c601c730d2a7a17488f6a5f34b5352627979d16f2e6cf0f3153e3",
+      "timing_contract": {
+        "prefill_tps": "1000 * timed prompt_n / prompt_ms",
+        "gen_tps": "1000 * max(generated - 1, 0) / predicted_ms",
+        "first_token": "head and first sample included in prompt_ms",
+        "raw_rates_retained": true
+      },
+      "results": {
+        "4K": {
+          "prompt_tokens": [
+            4348,
+            4348,
+            4349
+          ],
+          "prefill_tps": {
+            "median": 1410.4976318692013,
+            "min": 1385.816733067729,
+            "max": 1413.4356007670058,
+            "raw": [
+              1385.816733067729,
+              1410.4976318692013,
+              1413.4356007670058
+            ]
+          },
+          "decode_tps": {
+            "median": 23.36427190515022,
+            "min": 23.301503175400924,
+            "max": 24.58115637471322,
+            "raw": [
+              24.58115637471322,
+              23.301503175400924,
+              23.36427190515022
+            ]
+          },
+          "raw_api_decode_tps": [
+            24.7,
+            23.4,
+            23.5
+          ],
+          "wall_seconds": [
+            13.570584708359092,
+            14.078500162344426,
+            14.038982430938631
+          ]
+        },
+        "16K": {
+          "prompt_tokens": [
+            16632,
+            16635,
+            16633
+          ],
+          "prefill_tps": {
+            "median": 1528.6278834665932,
+            "min": 1518.987341772152,
+            "max": 1529.106803077517,
+            "raw": [
+              1518.987341772152,
+              1529.106803077517,
+              1528.6278834665932
+            ]
+          },
+          "decode_tps": {
+            "median": 23.22362069907652,
+            "min": 23.081727418376673,
+            "max": 24.02713653066993,
+            "raw": [
+              23.22362069907652,
+              24.02713653066993,
+              23.081727418376673
+            ]
+          },
+          "raw_api_decode_tps": [
+            23.3,
+            24.1,
+            23.2
+          ],
+          "wall_seconds": [
+            22.076750725973397,
+            21.628068934194744,
+            22.068043642211705
+          ]
+        },
+        "32K": {
+          "prompt_tokens": [
+            33023,
+            33020,
+            33017
+          ],
+          "prefill_tps": {
+            "median": 1241.5641836385578,
+            "min": 1239.931657310227,
+            "max": 1242.5532235180774,
+            "raw": [
+              1241.5641836385578,
+              1239.931657310227,
+              1242.5532235180774
+            ]
+          },
+          "decode_tps": {
+            "median": 21.50410686276163,
+            "min": 20.9193007211006,
+            "max": 22.73923007642165,
+            "raw": [
+              21.50410686276163,
+              20.9193007211006,
+              22.73923007642165
+            ]
+          },
+          "raw_api_decode_tps": [
+            21.6,
+            21.0,
+            22.8
+          ],
+          "wall_seconds": [
+            38.721662058960646,
+            39.07574853207916,
+            38.057592425029725
+          ]
+        }
+      }
+    },
+    "reference_matched_f16_speed": {
+      "status": "measured",
+      "configuration": {
+        "context": 40000,
+        "kv": "f16",
+        "threads": 80,
+        "batch_threads": 80,
+        "ubatch": 2048,
+        "gpu_layers": 999,
+        "flash_attention": "on",
+        "load_mode": "none",
+        "fit": "off",
+        "expert_placement_override": "blk\\.(10|11|12)\\.ffn_.*_exps\\.=CUDA0,ffn_.*_exps\\.=CPU",
+        "configuration_status": "recorded command"
+      },
+      "repetitions": 3,
+      "generated_tokens": 256,
+      "decode_transitions": 255,
+      "corpus_sha256": "b3dd2af20842931b69a67cc3f80ae6cfe30c36c7df20a270895d9b6915d62067",
+      "client_sha256": "a0f98f0f491c601c730d2a7a17488f6a5f34b5352627979d16f2e6cf0f3153e3",
+      "timing_contract": {
+        "prefill_tps": "1000 * timed prompt_n / prompt_ms",
+        "gen_tps": "1000 * max(generated - 1, 0) / predicted_ms",
+        "first_token": "head and first sample included in prompt_ms",
+        "raw_rates_retained": true
+      },
+      "results": {
+        "4K": {
+          "prompt_tokens": [
+            4351,
+            4348,
+            4344
+          ],
+          "prefill_tps": {
+            "median": 425.28958985701433,
+            "min": 425.1229268168677,
+            "max": 425.3380453425631,
+            "raw": [
+              425.28958985701433,
+              425.1229268168677,
+              425.3380453425631
+            ]
+          },
+          "decode_tps": {
+            "median": 21.426299160542804,
+            "min": 21.313948951504166,
+            "max": 21.541794375716265,
+            "raw": [
+              21.426299160542804,
+              21.313948951504166,
+              21.541794375716265
+            ]
+          },
+          "raw_api_decode_tps": [
+            21.426299160542808,
+            21.313948951504166,
+            21.541794375716265
+          ],
+          "wall_seconds": [
+            22.263008336070925,
+            24.694876159075648,
+            24.85328384069726
+          ]
+        },
+        "16K": {
+          "prompt_tokens": [
+            16635,
+            16638,
+            16639
+          ],
+          "prefill_tps": {
+            "median": 474.22924992659546,
+            "min": 465.9876235816125,
+            "max": 474.70185482374455,
+            "raw": [
+              465.9876235816125,
+              474.70185482374455,
+              474.22924992659546
+            ]
+          },
+          "decode_tps": {
+            "median": 19.753139974623025,
+            "min": 16.95673996500129,
+            "max": 20.52018095419807,
+            "raw": [
+              19.753139974623025,
+              20.52018095419807,
+              16.95673996500129
+            ]
+          },
+          "raw_api_decode_tps": [
+            19.753139974623025,
+            20.52018095419807,
+            16.95673996500129
+          ],
+          "wall_seconds": [
+            49.03138258913532,
+            47.97675598086789,
+            50.624152667820454
+          ]
+        },
+        "32K": {
+          "prompt_tokens": [
+            33022,
+            33020,
+            33021
+          ],
+          "prefill_tps": {
+            "median": 445.20911109254945,
+            "min": 430.06495515001546,
+            "max": 446.30280879911106,
+            "raw": [
+              430.06495515001546,
+              445.20911109254945,
+              446.30280879911106
+            ]
+          },
+          "decode_tps": {
+            "median": 19.586572766844586,
+            "min": 18.771109216496846,
+            "max": 19.70210570697375,
+            "raw": [
+              18.771109216496846,
+              19.586572766844586,
+              19.70210570697375
+            ]
+          },
+          "raw_api_decode_tps": [
+            18.771109216496843,
+            19.58657276684459,
+            19.70210570697375
+          ],
+          "wall_seconds": [
+            91.70484436303377,
+            88.71418683370575,
+            88.5630580689758
+          ]
+        }
+      }
+    },
+    "reference_tuned_q8_speed": {
+      "status": "measured",
+      "configuration": {
+        "context": 65536,
+        "kv": "q8_0",
+        "threads": 64,
+        "batch_threads": 96,
+        "ubatch": 2048,
+        "gpu_layers": 999,
+        "flash_attention": "on",
+        "load_mode": "none",
+        "fit": "off",
+        "expert_placement_override": "blk\\.(10|11|12)\\.ffn_.*_exps\\.=CUDA0,ffn_.*_exps\\.=CPU",
+        "configuration_status": "recorded command"
+      },
+      "repetitions": 2,
+      "generated_tokens": 256,
+      "decode_transitions": 255,
+      "corpus_sha256": "b3dd2af20842931b69a67cc3f80ae6cfe30c36c7df20a270895d9b6915d62067",
+      "client_sha256": "a0f98f0f491c601c730d2a7a17488f6a5f34b5352627979d16f2e6cf0f3153e3",
+      "timing_contract": {
+        "prefill_tps": "1000 * timed prompt_n / prompt_ms",
+        "gen_tps": "1000 * max(generated - 1, 0) / predicted_ms",
+        "first_token": "head and first sample included in prompt_ms",
+        "raw_rates_retained": true
+      },
+      "results": {
+        "4K": {
+          "prompt_tokens": [
+            4350,
+            4348
+          ],
+          "prefill_tps": {
+            "median": 421.50249546857907,
+            "min": 421.4453248356722,
+            "max": 421.55966610148596,
+            "raw": [
+              421.55966610148596,
+              421.4453248356722
+            ]
+          },
+          "decode_tps": {
+            "median": 21.445275874551236,
+            "min": 21.345614120852005,
+            "max": 21.544937628250466,
+            "raw": [
+              21.544937628250466,
+              21.345614120852005
+            ]
+          },
+          "raw_api_decode_tps": [
+            21.544937628250466,
+            21.345614120852005
+          ],
+          "wall_seconds": [
+            22.237109202425927,
+            23.614452060312033
+          ]
+        },
+        "16K": {
+          "prompt_tokens": [
+            16635,
+            16637
+          ],
+          "prefill_tps": {
+            "median": 470.3447832773114,
+            "min": 470.252414591377,
+            "max": 470.4371519632459,
+            "raw": [
+              470.252414591377,
+              470.4371519632459
+            ]
+          },
+          "decode_tps": {
+            "median": 20.968837878181816,
+            "min": 20.687491588100844,
+            "max": 21.25018416826279,
+            "raw": [
+              20.687491588100844,
+              21.25018416826279
+            ]
+          },
+          "raw_api_decode_tps": [
+            20.687491588100848,
+            21.25018416826279
+          ],
+          "wall_seconds": [
+            47.97142247017473,
+            47.61261988757178
+          ]
+        },
+        "32K": {
+          "prompt_tokens": [
+            33021,
+            33018
+          ],
+          "prefill_tps": {
+            "median": 435.76286510629376,
+            "min": 429.66587788542085,
+            "max": 441.85985232716666,
+            "raw": [
+              429.66587788542085,
+              441.85985232716666
+            ]
+          },
+          "decode_tps": {
+            "median": 20.629633087511472,
+            "min": 20.579564105463245,
+            "max": 20.679702069559703,
+            "raw": [
+              20.579564105463245,
+              20.679702069559703
+            ]
+          },
+          "raw_api_decode_tps": [
+            20.57956410546324,
+            20.679702069559706
+          ],
+          "wall_seconds": [
+            90.04194911103696,
+            87.99350025923923
+          ]
+        }
+      }
+    },
+    "model_free_cpu_and_cuda_ctest": {
+      "status": "pass",
+      "tests_per_build": 10,
+      "backends": [
+        "CPU",
+        "CUDA"
+      ],
+      "model_inference": false,
+      "gnu_allocator_failure_injection": true
+    },
+    "default_build_isolation": {
+      "status": "pass",
+      "cpu_off_artifacts": 3,
+      "cuda_artifacts_across_base_off_candidate_off_on": 5,
+      "scope": "named artifacts and feature selections only; no other-model inference",
+      "companion_receipt": "default-build-isolation.json"
+    }
+  },
+  "pending_checks": [],
+  "failed_checks": [
+    "native_tools23",
+    "reference_tuned_tools23_seed1"
+  ],
+  "numerical_run": "acceptance-final-v2",
+  "http_run": "acceptance-http-v4/http",
+  "excluded_http_attempt": {
+    "run": "acceptance-final-v2/http",
+    "reason": "First-visible-token harness suppressed reasoning on a long internally reasoning request; replaced by v3 with low reasoning. Runtime source unchanged."
+  },
+  "limits": [
+    "Long gates compare selected last256 positions, not every long-context row",
+    "Cache identity requires the same numerical history; different cold/segmented batches can change logits in the pinned reference too",
+    "HIP, SYCL, Windows, other GPU models and two-GPU placement were not validated",
+    "Qwen strata has the same pre-existing new_pool_for_device link failure on base and candidate; no executable or other-model inference check is claimed",
+    "MMQ q4/q8 overrides are accepted configuration values but were not measured by these auto-precision runs"
+  ],
+  "evidence_sha256": {
+    "acceptance-final-v2/final-acceptance.json": "8b7c89626d3d764cc86904961179ecc4f89e5f86130db63a0a779f8004ea4c02",
+    "acceptance-http-v4/http/acceptance.json": "d0ec527a63cd690e85b4467812010ac722df6d1b199887c61ad85c97de660f1b",
+    "model-identity.json": "13352c0c678e72c0987b9048eb8e74d7e08e08e12ff3fd1ee192bed083a0824f",
+    "acceptance-http-v3/http/acceptance.json": "1ed4e544677a6d85ef9e01d1d88865adc94a8f4a805132ac2d5533bd3a4e9b33",
+    "acceptance-final-v2/gate20-compare.json": "c74f73b69638c90a8be1e792e98ec60e890abb43df7a560900b9fb2c890fa1af",
+    "acceptance-final-v2/long-compare.json": "c991c0ef49c6d8625561d61c5975bc4d816c632c6ef404df0de1f3ae127f41e3",
+    "acceptance-final-v2/long-native/corpus_16384/manifest.json": "39b6edbb01e30ada1b4cf7f2af11c465afee596f9e142a6af2339203fea9930c",
+    "acceptance-final-v2/long-native/corpus_32768/manifest.json": "cc27811c0682e8f6ca6a62a4c78a7a03ff60c0c77ed7868bb528b9fbe41ad918",
+    "acceptance-final-v2/public-long/compare.json": "c6f46e2f79d15c6aa6ea2ac24edcdcedfcb07442da9399ac7948529e2cd082a8",
+    "acceptance-final-v2/public-long/native/code_long_16384/manifest.json": "39b6edbb01e30ada1b4cf7f2af11c465afee596f9e142a6af2339203fea9930c",
+    "acceptance-final-v2/public-long/native/code_long_32768/manifest.json": "cc27811c0682e8f6ca6a62a4c78a7a03ff60c0c77ed7868bb528b9fbe41ad918",
+    "acceptance-final-v2/public-long/native/ru_long_16384/manifest.json": "39b6edbb01e30ada1b4cf7f2af11c465afee596f9e142a6af2339203fea9930c",
+    "acceptance-final-v2/public-long/native/ru_long_32768/manifest.json": "cc27811c0682e8f6ca6a62a4c78a7a03ff60c0c77ed7868bb528b9fbe41ad918",
+    "acceptance-final-v2/public-cache-257/summary.json": "390f27fef1a1dda4c7524b4ecb9f57e234a8e59bee54c5c4f90586c184e6e915",
+    "acceptance-final-v2/public-cache-1324/summary.json": "7fb28093381d860b8299273cf22f20a9dc3a24d78458c9fc77bda54c6fd85b88",
+    "acceptance-final-v2/native-cache-fixed-recipe/summary.json": "09f6f0be0bc016b57f608ac2718429e520d76adc8f1cb68b8d2eb23e1ff11c40",
+    "acceptance-http-v3/http/http-lifecycle/lifecycle.json": "c246685d4b5b508f2db4b4a33196d1b1f0a7f0fdd22d294c49f25decc9ac2a97",
+    "acceptance-http-v3/http/http-prefix/summary.json": "97fe30b1d6a0e008d073489b5e2dba56f86d6c32e7231a05938c59ff3d24a0b2",
+    "acceptance-http-v3/http/native-tools23/summary.json": "2ea634257d27f3788ad366adb62d857103082900320e3833c36c287ce3566c1f",
+    "acceptance-http-v3/http/native-tools23/raw.jsonl": "25b90b96e56ffda16655d2d2a4945d7ccd779678a81482870b2e17e6549953aa",
+    "acceptance-http-v4/http/native-tools-seed0/summary.json": "de03743a8b0f520ea91a5e619f0ce883cb362c1f7d204a9f355862ebd97bdc7a",
+    "acceptance-http-v4/http/native-tools-seed0/raw.jsonl": "b17a391c4343850ab22d873276bf01b3f54e49e12a13b62ebc471a40255a0e7f",
+    "acceptance-http-v4/http/tuned-q8-tools-seed0/summary.json": "646e5e861f8fc18d7344f427299aecf21d8f680143d40d7a37e02d9cbf2b0146",
+    "acceptance-http-v4/http/tuned-q8-tools-seed0/raw.jsonl": "8505cb34af869c1cc9d2c243aec173a03263e0af2c9061eeb9215641d7b21074",
+    "acceptance-http-v4/http/native-tools-seed1/summary.json": "a45a5847391731d0d8d6e6aa5f2b71afb890a18037506ab231451ee110f8eee7",
+    "acceptance-http-v4/http/native-tools-seed1/raw.jsonl": "b62ca7d2d4f04f4480796732e65f5afd58edd7f2320dba57872ac9b835c59f3e",
+    "acceptance-http-v4/http/tuned-q8-tools-seed1/summary.json": "9af4c93e311fe332a8c685bbe74c14ab3e049a6e067285c1c9eaab17a881641b",
+    "acceptance-http-v4/http/tuned-q8-tools-seed1/raw.jsonl": "724578a77613b0c097a960ad22b6b976e56cd858e6b684813f396c23ba69367e",
+    "acceptance-http-v4/http/native-gsm100/summary.json": "edf69357d66efdf72a294489220614ad63ff313765b6c7bea650b4e9f7ce8d2c",
+    "acceptance-http-v4/http/tuned-q8-tools23/summary.json": "54d95495609682090bdfebe4fa1a090685b14c0162675bc8da06a9d62ec73a84",
+    "acceptance-http-v4/http/tuned-q8-tools23/raw.jsonl": "7b16c2f183b34f7b5e97e7d3412727e7b1b7c35eb5c70757427b9e4c5d532480",
+    "acceptance-http-v4/http/tuned-q8-gsm100/summary.json": "23ae205e4588d323f8887e9d08b4127eb058d797a205b24e7524f8c1e71cf350",
+    "acceptance-http-v4/http/native-speed/manifest.json": "cc453f31b4329a6b4ad9f657460c03b23eaf9fb060decad07bfc68ba8ec697b9",
+    "acceptance-http-v4/http/matched-f16-command.json": "c920dd1b7c5b3837646ef7fab6c01b849ce9522db7b77bd2ae67e917bd54d877",
+    "acceptance-http-v4/http/matched-f16-speed/manifest.json": "b4066762dfb1ab6205a86741d76b3272598bf4ef275c35e60b2b56683f736774",
+    "acceptance-http-v4/http/tuned-q8-command.json": "c04751347aa7402412a6bc2575d182b935ed3ce47b5e89405b0920eccd82f32b",
+    "acceptance-http-v4/http/tuned-q8-speed/manifest.json": "cbe92472c448aad1d5cb99ae31dc426f19b43c91785e12ac6d5e4eda2aa4729e",
+    "acceptance-final-v2/cpu-topology.log": "a07e5039640c497d5d3839963d5bba7a54cad129e5e4bdce73a9112b8ed6a8d6",
+    "gpu0-live-link-20261027T211800Z.json": "d05e5111694c8354e3b61233ff83027982e0eebbec59af0122fd120ff884f25b"
+  },
+  "final_assessment": {
+    "collection_complete": true,
+    "all_quality_trials_passed": false,
+    "failed_quality_trials_retained": {
+      "native_tools23_unseeded": "17/23",
+      "reference_tuned_tools23_seed1": "18/23"
+    },
+    "speed_repetitions": {
+      "native": 3,
+      "reference_f16": 3,
+      "reference_q8": 2
+    },
+    "decode_change_percent_vs_historical_v8": {
+      "4K": -14.868748751502213,
+      "16K": -14.03434869858775,
+      "32K": -15.020324588968059
+    },
+    "decode_change_cause": "Unresolved; no measured whole-model explanation or fix was established",
+    "baseline_interpretation": "Same-day processes explicitly disabled CUDA fusion. Historical reference fusion environment was not fully recorded; the tuned-Q8 row is not a fastest-possible-reference claim",
+    "coverage": "Numerical/cache/lifecycle/GSM checks passed within documented scopes; quality trial failures and untested backends remain. No overall PASS claim."
+  }
+}
