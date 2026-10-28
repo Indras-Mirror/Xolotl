@@ -310,6 +310,7 @@ the final CUDA helper is
 Both were built with GCC 14.3 / CUDA 13.1.115 / sm_120a on Linux, and tested on
 one RTX 5090, EPYC 9654 (96 cores / 192 threads), 624 GiB RAM and PCIe 5.0 x16.
 GPU1's vLLM-omni workload, ffmpeg and the neighbouring VM remained running.
+The host ran Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic and NVIDIA driver 595.91.07.
 
 The corrected co-residency check kept the original native and helper PIDs:
 image → 16K text → short text → 32K text → short text → image → video all passed.
