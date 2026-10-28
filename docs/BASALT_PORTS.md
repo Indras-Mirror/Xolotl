@@ -34,19 +34,46 @@ Two axes matter more than size:
 
 ## Survey
 
-| # | Change | Our counterpart | Class | Value |
-|---|---|---|---|---|
-| 107 | prefill chunk size priced from the link and non-resident bytes | `src/prefill/prefill.cpp:164 stream_all_min()` (constant 1024) | same output on the measured placement | **Prefill — best item** |
-| 98 | pool: a batch ends with its last job; a parked worker yields after a short spin | `src/kernels/cpu/pool.cpp` (`kWaitParked`, `parked_ == n_`) | output unchanged | **Decode — best item** |
-| 101 | CPU warm-up runs on mixed-format packs and reads the 3 likeliest experts | `src/core/verify.cpp`; v41 has mixed per-expert formats | output unchanged (reads only) | Decode concept → also v41 |
-| 112 | Q2_0 expert down in 64-row blocks, 4 lanes a row | `src/kernels/cuda/iq_kernels.cu:1509 native_down_multi_kernel` | bit-identical | Decode kernel |
-| 111 | AVX-512 sign masks via `pdep`, IQ3_S/IQ2_S grid gathers | `src/kernels/cpu/iq_avx512.cpp` | bit-identical | CPU decode |
-| 74 | NVFP4 CPU expert rows at 1–2 tokens | `src/kernels/cpu/nvfp4_avx512.cpp` | bit-identical (documented) | Decode |
-| 105 | QSA window of 5–8 queries as two rows of four | `src/kernels/cuda/qsa_select.cu` | bit-identical scores | Decode attention |
-| 113 | RAM guard sheds and waits instead of stopping the request | `src/platform/memory.cpp` | behaviour change (serve) | Robustness |
-| 114 | elastic KV tail keeps no RAM copies of its experts | `src/core/expert_source.cpp` | output unchanged | VRAM, medium |
-| 13 | APR trellis types (TQ2_T…TQP7) + Hadamard-folded experts | — | new formats | Large (+2757), research |
-| 100 | lazy L2 prefetch also takes the next layer's FFN read matrices | — | output unchanged | **Skip** |
+| # | Change | Class | Portability, verified by reading the target |
+|---|---|---|---|
+| 98 | pool: a batch ends with its last job; a parked worker yields after a short spin | output unchanged | **PORTED** — same file, same epoch-tagged protocol |
+| 107 | prefill chunk size priced from the link and non-resident bytes | same output on the measured placement | **PORTED** (adapted: the pricing, not the constant) |
+| 111 | AVX-512 sign masks via `pdep`, IQ3_S/IQ2_S grid gathers | bit-identical | Code-portable, **unverifiable here** — see the CPU note |
+| 74 | NVFP4 CPU expert rows at 1–2 tokens | bit-identical (documented) | Code-portable, **unverifiable here** — same reason |
+| 112 | Q2_0 expert down in 64-row blocks, 4 lanes a row | bit-identical | **Concept only**: our `native_down_multi_kernel` is a different kernel |
+| 114 | elastic KV tail keeps no RAM copies of its experts | output unchanged | Concept is present (`lend_from` region) — a real port, needs work |
+| 105 | QSA window of 5–8 queries as two rows of four | bit-identical scores | **Not portable**: our QSA scorer is a different design |
+| 101 | CPU warm-up on mixed-format packs, 3 likeliest experts | output unchanged (reads only) | **Not portable**: the feature does not exist here |
+| 113 | RAM guard sheds and waits instead of stopping the request | behaviour change (serve) | **Not portable**: no RAM guard exists here |
+| 13 | APR trellis types (TQ2_T…TQP7) + Hadamard-folded experts | new formats | Large (+2757), a format decision |
+| 100 | lazy L2 prefetch also takes the next layer's FFN read matrices | output unchanged | **Skip** — below the author's own noise floor |
+
+**Read the last four rows with care.** "Not portable" does not mean "not useful" — it means the
+change targets something this tree does not have, so it is a new feature to design, not a patch to
+apply. That is a much larger and riskier job than a port, and each one needs its own decision
+(does the Qwen/GLM engine even want a CPU-tier warm-up? does it want a RAM guard?), so none of them
+should be smuggled in under "porting Basalt work".
+
+**The CPU note that decides two items.** This box is a **Ryzen 7 5700X (Zen 3): it has no AVX-512
+at all.** So `iq_avx512.cpp` and `nvfp4_avx512.cpp` never execute here, `cpu_avx512_ok()` is false,
+and the AVX2 path runs instead. Items 111 and 74 can be written but cannot be built into a tested
+state, run, or timed on this machine — a port there would be an unverifiable claim. They also carry
+a second warning: our own `iq_avx512.cpp` records that AVX-512 gathers measured **3–5 % slower**
+than scalar lookups on a Zen 4 part, which is why ours are behind `STRATA_IQ_GATHER`. Basalt's
+unconditional gathers are tuned for their hardware, not this one.
+
+## What landed
+
+- **98** (`8a644809`) — pool: the batch ends with its last job; a parked worker yields its core after
+  50 µs. The park barrier was redundant once claims became epoch-tagged, which this header's own
+  comment already argued. `wait_parked()` is deleted. `pool.cpp` syntax-checks clean.
+- **107** (`511b4d45`) — prefill: `stream_all_min_for(bytes, gbps)` in a new
+  `include/strata/prefill/stream_all.hpp`, wired opt-in (`STRATA_PREFILL_STREAM_PRICED=1`) through
+  the existing `probe_pcie_h2d_gbps()`. It only ever *raises* the threshold; 1024 stays the measured
+  floor, and an armed CPU share still wins. Its test (`tests/prefill/stream_all_test.cpp`) compiles
+  and **passes** standalone. `generate.cpp` and `prefill.cpp` both syntax-check clean.
+
+`kRoutedExtraMs` (0.24) is Basalt's constant, not ours, which is why 107 ships opt-in.
 
 Details that change how each item should be taken:
 
