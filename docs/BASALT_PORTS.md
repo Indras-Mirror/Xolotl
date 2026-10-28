@@ -70,8 +70,12 @@ unconditional gathers are tuned for their hardware, not this one.
 - **107** (`511b4d45`) — prefill: `stream_all_min_for(bytes, gbps)` in a new
   `include/strata/prefill/stream_all.hpp`, wired opt-in (`STRATA_PREFILL_STREAM_PRICED=1`) through
   the existing `probe_pcie_h2d_gbps()`. It only ever *raises* the threshold; 1024 stays the measured
-  floor, and an armed CPU share still wins. Its test (`tests/prefill/stream_all_test.cpp`) compiles
-  and **passes** standalone. `generate.cpp` and `prefill.cpp` both syntax-check clean.
+  floor, and an armed CPU share still wins. Its test (`tests/prefill/stream_all_test.cpp`) **passes
+  under ctest in the full build**.
+- **112** (`57474e19`) — Q2_0 expert down at 64 rows a block, 4 lanes a row. Its gate
+  `q2_down_wide_parity` calls `native_expert_grouped` twice on identical inputs and compares bytes:
+  **10,240/10,240 bit-identical across 5 seeds**, and it **passes under ctest in the full build**.
+- Full CUDA build of `ds41_generate` with all three: **313/313, exit 0**.
 
 `kRoutedExtraMs` (0.24) is Basalt's constant, not ours, which is why 107 ships opt-in.
 
