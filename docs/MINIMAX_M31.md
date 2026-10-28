@@ -256,6 +256,8 @@ the separately built `4499fcbc` baseline is
 On 2026-10-28, both used one RTX 5090 32 GB, EPYC 9654 (96 cores / 192 threads),
 624 GiB RAM, PCIe 5.0 x16, GCC 14.3 and CUDA 13.1.115 / sm_120a. GPU1's
 vLLM-omni, ffmpeg and the neighbouring VM remained running.
+The host ran Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic and NVIDIA driver 595.91.07.
+The speed-window hardware capture reported a 440 W GPU0 power limit (575 W stock).
 
 All seven one-chunk boundaries (1, 2, 31, 32, 128, 1024, 1025 rows; **2,243 rows**
 total) matched both the baseline and the pinned PR #31192 CUDA GPU-offload
@@ -282,13 +284,44 @@ counter. None of these 162 layer records used the 1–8-route padding branch
 or a cached expert; model-level positive coverage of those cases is not claimed.
 Component tests cover their rules.
 
-CPU and CUDA each passed **15/15** model-free ctest groups. The portable benchmark
-client tests later passed **22/22** without changing C++ or the worker binary.
+CPU and CUDA each passed **15/15** model-free ctest groups. After publishing
+the portable control tracer, chunk parser and cache-head comparator, the final
+benchmark suite passed **39/39**, and both ctest configurations again passed 15/15.
+These additions changed no C++ or measured worker binary. The published trace
+classes/parser match the measured versions by AST; the cache comparator is
+byte-identical to the executed comparator. Only local ownership guards and CLI
+plumbing differ. Their model-free provenance is recorded in
+[`pr3-prefill-tools-checks.json`](../tools/m31/bench/receipts/pr3-prefill-tools-checks.json).
 Default-build CPU/CUDA isolation against `4499fcbc` is recorded in
 [`pr3-default-build-isolation.json`](../tools/m31/bench/receipts/pr3-default-build-isolation.json).
 The detailed numerical recipe, input reconstruction and counters are in
 [`pr3-prefill-numeric.json`](../tools/m31/bench/receipts/pr3-prefill-numeric.json).
 HIP, SYCL, Windows, other GPUs and two-GPU placement were not tested.
+
+### Full-vocabulary cache-state checks
+
+The already built final PR3 and base `m31_cache_model_check` executables then
+passed four actual-model runs: A1124/B1124/A1324/B1324, reuse 1024, decode 7,
+context 40000, maxchunk 32768 and checkpoint 512 MiB. The arena/cache/registration
+and CPU 80 settings were the same as the throughput profile. GPU packing used
+the checker's unchanged default 8, confirmed in every startup log.
+
+All nine heads at each length matched base bitwise across all 200064 logits:
+whole, repeated whole, whole-rewind, whole-decode-rewind, split, split-rewind,
+split-decode-rewind, checkpoint restore and workspace-release/replay. This is
+**18 paired full-vocabulary heads / 3,601,152 F32 pairs** with exact recipes,
+finite values, full byte equality and raw top-1 metadata independently checked.
+Each checker also passed its own same-history invariants. Actual cold chunks
+were 1124/1324; split chunks were 1024+100/300. Decode-rewind records contain
+seven real single-token forwards before replay.
+
+Whole versus split, and whole versus whole-rewind, were not byte-identical in
+either branch. Those are different histories, retained explicitly; they are
+not mixed into a false equality requirement. Source, checker/library/native
+binary and input seals remained unchanged. This numeric collection preceded
+the separately declared speed-only confirmation in its owned GPU window.
+The full evidence is in
+[`pr3-prefill-cache-numeric.json`](../tools/m31/bench/receipts/pr3-prefill-cache-numeric.json).
 
 ### Initial live-prefix and long-throughput ABBA window
 
@@ -296,6 +329,13 @@ On 2026-10-28, one complete A B B A B A A B window compared the final PR3
 worker (A) with `4499fcbc` (B), using the hardware and resource profile above.
 Every source/binary seal stayed unchanged, request bodies matched, and the
 background container identities stayed unchanged. All samples are retained.
+The historical speed corpus is 930,275 bytes, SHA-256
+`b3dd2af20842931b69a67cc3f80ae6cfe30c36c7df20a270895d9b6915d62067`.
+Its 79 source spans include a locally modified llama-arch.cpp; a clean pinned
+llama.cpp checkout does not reproduce the complete file. Repeating these exact
+HTTP bodies requires that archived corpus. `--corpus` remains an explicit
+portable input; another corpus defines a new matched measurement. The public
+cache/boundary/long numerical generators in this document are separate, exact recipes.
 **The initial speed window failed the predeclared 3% gate: 4K decode was
 10.93% slower by median.** PP at all depths and decode at 16K/32K passed.
 Collection completion is not an overall performance PASS. A separate
@@ -369,6 +409,86 @@ decode arms; no row is discarded or excused by that uncertainty.
 The complete raw summaries, timing warmups, cache observations, source/input
 hashes and unchanged acceptance verdict are recorded in
 [`pr3-prefill-abba.json`](../tools/m31/bench/receipts/pr3-prefill-abba.json).
+### Separate speed-only confirmation
+
+A separately declared A B B A B A A B window repeated only the speed recipe
+after the full-vocabulary cache gate passed. It used the same final binaries,
+model, corpus SHA, resource budgets, current client, fixed nonce seed and
+control-only trace wrapper. A fresh server was loaded for every arm; there were
+no interleaved prefix-latency requests. All eight arms and timing warmups remain.
+Source/binary seals, request bodies and background container identities stayed
+unchanged. The same 3% rule was declared before the run.
+
+**This confirmation also failed:** 4K TG passed, but 16K and 32K TG medians were
+3.51% and 3.12% slower. All three PP medians passed. The first full window remains
+a separate failure; results are not pooled to hide either failed criterion.
+
+| Depth | A PP [range] | B PP [range] | A TG [range] | B TG [range] | TG delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4K | 1378.33 [1370.44–1379.00] | 1379.27 [1376.08–1379.62] | 25.78 [22.16–26.18] | 25.89 [24.22–26.30] | -0.44% |
+| 16K | 1534.11 [1533.12–1535.56] | 1529.98 [1525.05–1530.92] | 24.52 [21.77–25.75] | 25.41 [23.83–25.73] | -3.51% |
+| 32K | 1259.25 [1258.33–1260.54] | 1248.56 [1247.08–1249.63] | 24.28 [21.27–25.00] | 25.06 [23.12–25.26] | -3.12% |
+
+| Arm | PP4K | TG4K | PP16K | TG16K | PP32K | TG32K |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 01-A | 1377.78 | 26.18 | 1533.12 | 25.21 | 1258.33 | 25.00 |
+| 02-B | 1379.62 | 25.77 | 1529.89 | 25.73 | 1247.08 | 25.04 |
+| 03-B | 1376.08 | 26.02 | 1525.05 | 25.28 | 1248.39 | 25.26 |
+| 04-A | 1378.87 | 22.16 | 1534.42 | 21.77 | 1258.77 | 21.27 |
+| 05-B | 1379.18 | 24.22 | 1530.07 | 25.54 | 1248.73 | 23.12 |
+| 06-A | 1370.44 | 25.79 | 1535.56 | 23.83 | 1259.72 | 24.73 |
+| 07-A | 1379.00 | 25.77 | 1533.80 | 25.75 | 1260.54 | 23.83 |
+| 08-B | 1379.35 | 26.30 | 1530.92 | 23.83 | 1249.63 | 25.08 |
+
+All declared pair deltas (A/B−1), percent:
+
+| A / B | PP4K | TG4K | PP16K | TG16K | PP32K | TG32K |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 01-A / 02-B | -0.13 | +1.61 | +0.21 | -2.02 | +0.90 | -0.16 |
+| 04-A / 03-B | +0.20 | -14.86 | +0.61 | -13.89 | +0.83 | -15.79 |
+| 06-A / 05-B | -0.63 | +6.46 | +0.36 | -6.69 | +0.88 | +6.94 |
+| 07-A / 08-B | -0.03 | -2.01 | +0.19 | +8.09 | +0.87 | -4.99 |
+
+Actual chunks remained the same branch-specific recipes as the first window.
+4K response messages matched across every declared pair; long responses used
+different chunk histories. Neither code inspection nor sampled CPU/GPU
+counters isolated the cause of decode differences. Changing the corpus, affinity,
+sampling, thresholds or removing an outlier is not used to turn a failed
+window into a pass. The short-append latency improvement is measured; the full
+long-throughput no-regression gate is **not met**.
+
+Complete confirmation data and its unchanged failure are recorded in
+[`pr3-prefill-speed-confirmation.json`](../tools/m31/bench/receipts/pr3-prefill-speed-confirmation.json).
+
+### Final sampled quality
+
+The same final worker completed all 123 requests in one unseeded trial:
+
+| Suite | Final PR3 | Required | Result |
+| --- | ---: | ---: | --- |
+| GSM8K, first 100 ordered rows |97/100 |95/100 |PASS |
+| Tools, 20 prompts plus 3 continuations |18/23 |19/23 |**FAIL** |
+
+Wire requests explicitly set temperature 1, top_p 0.95, top_k 40, min_p 0.05
+and max_tokens 6000. They omitted seed, reasoning_effort, chat_template_kwargs
+and cache_prompt, using model-default thinking and the server's normal cache
+policy. All 123 rows had zero length stops, marker leaks and invalid tool IDs.
+GSM8K requests reported no reused tokens; tools reported 0 on the first request
+and 768 on each of the remaining 22. Tool calls were never executed.
+
+The five tool failures were cases 4, 8, 11, 12, 18. The returned JSON was valid;
+these cases selected preparatory shell/calendar/status probes as their first
+action. Case 8 had the expected service action second, but the unchanged scorer
+checks the first call and it remains a failure. The three wrong GSM8K rows
+(12, 16, 93) contained wrong final numeric answers; extraction matched those
+visible answers. Parser, common-server shim, grammar, sampler, quality client
+and fixtures were unchanged from 4499fcbc. These facts do not establish a
+stochastic or numerical cause, and no successful replacement trial is used.
+The quality acceptance verdict remains **FAIL** because 18<19.
+
+All outcomes, sampling fields, cache counts, hashes and source/binary stability
+are in [`pr3-prefill-quality.json`](../tools/m31/bench/receipts/pr3-prefill-quality.json).
+
 ### Reproduce short-chunk checks and timings
 
 Build and run the normal CUDA target above; there is no short-prefill option
@@ -429,7 +549,8 @@ ids = tokenizer.encode(Path("cache-text/cache_observatory_1324.txt").read_text()
 for directory, cases in (
     ("boundary-ids", [(f"n{n:04d}", n) for n in (1, 2, 31, 32, 128, 1024, 1025)]),
     ("fixed-long-ids", [("00-retain515", 515), ("10-long16384", 16384),
-                        ("20-long32768", 32768)])):
+                        ("20-long32768", 32768)]),
+    ("cache-numeric-ids", [("corpus", 33000)])):
     out = Path(directory)
     out.mkdir()
     for name, count in cases:
@@ -506,6 +627,45 @@ and new output directories. Omitting the flag retains the old random nonces.
 GPU and CPU background jobs must remain running in both arms. Report median, range, all pairs, actual prompt sizes/chunks and executable
 hashes. The accepted performance gate rejects a median PP or TG slowdown above
 3% at any of those depths; a noisy failed window is retained as a failure.
+
+### Reproduce full-vocabulary cache heads
+
+The complete-ID generator above also writes `cache-numeric-ids/corpus.i32`.
+Set `IDS_FILE="$PWD/cache-numeric-ids/corpus.i32"`, `PR3_BUILD` to the candidate
+build and `BASE_BUILD` to an independent `4499fcbc` build. Build the checker with
+`cmake --build BUILD --target m31_cache_model_check -j 8` in each build tree.
+The following Bash commands use the measured resource profile and new outputs:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+export GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_MMQ_PREC=auto
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+unset CUDA_DEVICE_MAX_CONNECTIONS CUDA_DEVICE_MAX_COPY_CONNECTIONS
+common=(--model "$MODEL" --ids-file "$IDS_FILE" --backend cuda --device 0
+        --ctx 40000 --chunk 32768 --reuse 1024 --decode-steps 7
+        --threads 80 --arena-gib 170 --gpu-experts-gib 7
+        --register-arena 1 --register-limit-gib 176 --checkpoint-mib 512
+        --cpu-fused 1)
+"$PR3_BUILD/m31_cache_model_check" "${common[@]}" --length 1124 --out cache-A-1124
+"$BASE_BUILD/m31_cache_model_check" "${common[@]}" --length 1124 --out cache-B-1124
+"$PR3_BUILD/m31_cache_model_check" "${common[@]}" --length 1324 --out cache-A-1324
+"$BASE_BUILD/m31_cache_model_check" "${common[@]}" --length 1324 --out cache-B-1324
+python3 tools/m31/bench/compare_prefix_heads.py cache-A-1124 cache-B-1124 \
+  --length 1124 --out cache-1124-comparison.json
+python3 tools/m31/bench/compare_prefix_heads.py cache-A-1324 cache-B-1324 \
+  --length 1324 --out cache-1324-comparison.json
+```
+
+The unchanged checker uses eight GPU packing threads; there is no checker CLI option for this setting. Confirm `pack_threads=8` in its startup log. Keep each command's exit status, complete log, `summary.json`, and all nine `.f32` files. A checker failure remains a failure even if it wrote some heads.
+
+The comparator checks every one of the 200064 F32 logits in all nine heads, exact chunk recipes, finite values, raw top-1 metadata, rewind/decode-rewind, repeated cold prefill, checkpoint restore, and workspace release. Whole prefills must use one 1124/1324-token chunk; cached prefills must use exactly 1024+100/300. Every same-history baseline/PR3 head must have identical bytes. Different whole-versus-segmented histories are reported separately and do not have an equality requirement. The comparator returns nonzero on any mismatch; it has no tolerance option.
+
+Model-free regression tests, after measurement windows have finished:
+
+```bash
+python3 tools/m31/tests/test_prefix_heads.py
+```
+
 
 Run GSM8K100 and tools23 with the quality recipe below on the final executable:
 temperature 1, top_p 0.95, max_tokens 6000 and model-default thinking. The existing
