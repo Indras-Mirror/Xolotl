@@ -17,7 +17,9 @@ or download models. Output directories must be new.
   must return separate prefill and decode timings. Both servers are normalized
   to `prompt_n / prompt_seconds` and `(generated - 1) / decode_seconds`; the first
   output head and sample belong to prompt time. Original reported rates remain
-  in the TSV and full raw responses.
+  in the TSV and full raw responses. Optional `--nonce-seed STRING` gives
+  identical request bodies across matched ABBA arms; omitting it retains random
+  uuid4 nonces. The seed is recorded only when explicitly supplied.
 - `prefix_speed.py`: real live-KV append timing through the native line protocol.
   Defaults to a 1,024-token prefix and +100/+300 tokens, with one warmup and
   three measured repetitions per suffix. Every sample resets history with a
@@ -81,3 +83,21 @@ Keep `receipt.json`, `requests.jsonl`, `stdin.log`, `stdout.log` and `stderr.log
 for every arm, including warmups and failed samples. A cold fallback or partial
 reuse fails the run. This measures live cache appends; it does not compare their
 numerics to a different cold-prefill chunk recipe.
+
+## Matched ABBA HTTP bodies
+
+Use the same corpus, tokenizer, resources, repetition count and nonce seed in
+all arms. Request index 0 is the warmup, followed by 4K/16K/32K. The nonce is the
+hex of `UUID(bytes=SHA256(f"{seed}-{index}".encode()).digest()[:16])`, without
+rewriting version or variant bits. The measured PR3 window used this recipe:
+
+```sh
+python tools/m31/bench/speed.py --url "$URL" --tokenizer "$TOKENIZER" \
+  --corpus "$CORPUS" --repetitions 1 --nonce-seed m31-pr3-abba-fixed \
+  --out speed-arm-A1
+```
+
+Repeat with base/base/candidate servers and three new output directories in
+the same window. The public flag reproduces the original local driver's fixed
+nonce sequence; it leaves the default unseeded client and timing denominators
+unchanged. Preserve every raw response and warmup as usual.

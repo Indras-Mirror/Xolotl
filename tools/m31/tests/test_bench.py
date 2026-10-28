@@ -167,6 +167,62 @@ class BenchChecks(unittest.TestCase):
         self.assertNotEqual(a["raw_gen_tps"], b["raw_gen_tps"])
         self.assertEqual(a["raw_prefill_tps"], 9999)
 
+    def run_speed_fixture(self, name, nonce_seed=None):
+        corpus = self.root / "speed-corpus.txt"
+        corpus.write_text("fixed benchmark corpus")
+        output = self.root / name
+        argv = ["speed.py", "--corpus", str(corpus), "--out", str(output), "--repetitions", "1"]
+        if nonce_seed is not None:
+            argv += ["--nonce-seed", nonce_seed]
+        requests = []
+        def response(request, timeout):
+            body = json.loads(request.data)
+            if request.full_url.endswith("/tokenize"):
+                reply = {"tokens": list(range(40000))}
+            elif request.full_url.endswith("/detokenize"):
+                reply = {"content": f"fixed text rows {body['tokens'][0]}..{body['tokens'][-1]}"}
+            else:
+                self.assertTrue(request.full_url.endswith("/v1/chat/completions"))
+                requests.append(body)
+                reply = {"choices": [{"finish_reason": "length"}], "timings": {
+                    "prompt_n": 1000, "prompt_ms": 100, "predicted_n": body["max_tokens"],
+                    "predicted_ms": (body["max_tokens"] - 1) * 10}}
+            return io.BytesIO(json.dumps(reply).encode())
+        with patch.object(sys, "argv", argv), patch("urllib.request.urlopen", side_effect=response), redirect_stdout(io.StringIO()):
+            S.main()
+        manifest = json.loads((output / "manifest.json").read_text())
+        return requests, manifest
+
+    def test_speed_nonce_seed_repeats_exact_abba_bodies_and_records_recipe(self):
+        seed = "m31-pr3-abba-fixed"
+        first, manifest = self.run_speed_fixture("speed-seed-first", seed)
+        second, repeated = self.run_speed_fixture("speed-seed-repeat", seed)
+        changed, _ = self.run_speed_fixture("speed-seed-changed", seed + "-other")
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 4)  # Index0 warmup, then4K/16K/32K.
+        self.assertEqual([body["max_tokens"] for body in first], [32, 256, 256, 256])
+        for index, (same, different) in enumerate(zip(first, changed)):
+            # Raw digest bytes must survive UUID construction: no version/variant
+            # bit rewriting, exactly matching the published ABBA driver's recipe.
+            expected = hashlib.sha256(f"{seed}-{index}".encode()).digest()[:16].hex()
+            content = same["messages"][0]["content"]
+            other = different["messages"][0]["content"]
+            self.assertTrue(content.startswith(f"[{expected}]\n"))
+            self.assertNotEqual(content.split("\n", 1)[0], other.split("\n", 1)[0])
+            self.assertEqual(content.split("\n", 1)[1], other.split("\n", 1)[1])
+            self.assertEqual({k: v for k, v in same.items() if k != "messages"},
+                             {k: v for k, v in different.items() if k != "messages"})
+        self.assertTrue(manifest["complete"] and repeated["complete"])
+        self.assertEqual(manifest["nonce_seed"], seed)
+        self.assertEqual(repeated["nonce_seed"], seed)
+
+    def test_speed_omitted_nonce_seed_keeps_uuid4_default(self):
+        with patch.object(S.uuid, "uuid4", return_value=SimpleNamespace(hex="a" * 32)) as random_nonce:
+            requests, manifest = self.run_speed_fixture("speed-random-default")
+        self.assertEqual(random_nonce.call_count, 4)
+        self.assertTrue(all(body["messages"][0]["content"].startswith("[" + "a" * 32 + "]\n") for body in requests))
+        self.assertNotIn("nonce_seed", manifest)
+
     def test_speed_single_token_has_no_decode_transition(self):
         response = {"timings": {"prompt_n": 1, "prompt_ms": 10, "predicted_n": 1, "predicted_ms": 0}}
         self.assertEqual(S.timing_metrics(response)["gen_tps"], 0)
