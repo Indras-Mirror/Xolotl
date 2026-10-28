@@ -75,6 +75,30 @@ unconditional gathers are tuned for their hardware, not this one.
 
 `kRoutedExtraMs` (0.24) is Basalt's constant, not ours, which is why 107 ships opt-in.
 
+### What #98 could NOT be verified here (2026-10-29)
+
+The gate for #98 is `pool_stress` - it drives hundreds of thousands of 0-4 job batches
+through `run()` and `run_split()` with gaps long enough for the workers to sleep, which is
+exactly the late-wake race that removing the park barriers could reintroduce. **It cannot
+run on this box.** `src/kernels/cpu/expert.cpp` is compiled with `-mavx512f -mavx512bw
+-mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi`, this CPU is a Ryzen 7 5700X (Zen 3, no
+AVX-512), and the test therefore skips at `cpu_features().usable()`.
+
+Tried and rejected: enabling the scalar oracle path (`expert_set_oracle_q8_0(true)`) so the
+protocol could run without AVX-512 kernels. The oracle functions are plain C++, but the
+translation unit is compiled with AVX-512 enabled, so the compiler is free to vectorise
+them - the binary died with **SIGILL (exit 132)** rather than running. That change was
+reverted; a crash is worse than an honest skip.
+
+So the status of #98 is: **compiles in a full CUDA build, and its protocol is unchanged by
+reasoning, but the stress gate has not been run.** It needs a machine with AVX-512 (any
+Zen 4/5, Skylake-X or newer) or a build of `kernels_cpu` with the ISA flags relaxed. Until
+then the timing question (is dropping 3-4 barriers per layer worth anything?) is also open.
+
+`pool_tasks_test` DID run (168 bitwise comparisons passed) and `pool_test` also skips for the
+same AVX-512 reason - so the ctest line "4/4 passed" is misleading: two of the four passed
+vacuously. Exit 0 from a skipping test is not evidence.
+
 **114 was attempted and deferred, on evidence.** It is the one remaining item with a real target
 (`choose_resident_keep_from` and `resident_lent_slots` both exist here), but it needs three
 prerequisites this tree does not have: `exp_flag()` (Basalt's experimental-flag system),
