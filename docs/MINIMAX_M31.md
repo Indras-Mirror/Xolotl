@@ -195,8 +195,24 @@ Choose your GPU architecture and compiler as for the engine. `-DGGML_CUDA=OFF`
 builds a CPU encoder. Image input requires Pillow; video input requires
 `ffmpeg` and `ffprobe` in `PATH`. The helper checks `minimax-m3` model metadata,
 `clip`/`minimax_m3` projector metadata and projection width 6144. This checks the
-model family, not weight-revision identity: use the projector supplied with
-your GGUF revision and record both hashes.
+model family, not weight-revision identity. Pin the LLM and projector artifacts
+separately and record both hashes. The tested pair uses LLM revision `02c81e41`
+above and `mmproj-BF16.gguf` from Unsloth revision
+[`b17b7f5459c0b8f127ea12ee774409b282521d6a`](https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/blob/b17b7f5459c0b8f127ea12ee774409b282521d6a/mmproj-BF16.gguf).
+The projector is 1,735,294,720 bytes, SHA-256
+`8aae10398d53fa7a726199877a07f04f3d371274ae4ce7a1a639af3f0d5124ca`.
+It is absent from the LLM's older pinned repository revision; the two revision
+IDs must not be conflated. The runtime does not automatically prove that an
+arbitrary same-family projector belongs to an arbitrary LLM weight revision.
+
+To obtain the measured projector in a new chosen location:
+
+```sh
+MMPROJ=/path/to/mmproj-BF16.gguf
+curl --fail --location --output "$MMPROJ" \
+  https://huggingface.co/unsloth/MiniMax-M3.1-Flash-GGUF/resolve/b17b7f5459c0b8f127ea12ee774409b282521d6a/mmproj-BF16.gguf
+sha256sum "$MMPROJ"
+```
 
 Add a `vision` object to the engine JSON shown above:
 
