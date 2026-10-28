@@ -12,9 +12,8 @@
 
 namespace strata::m31 {
 
-// Text-only MSA engine. Short CUDA chunks split complete experts across CPU
-// and GPU with native CUDA activation math; long chunks use grouped MMQ.
-// Single-token decode retains CPU quantization and ordered rank reduction.
+// MiniMax-M3.1 MSA engine. See docs/MINIMAX_M31.md for prefill and numerical
+// contracts. Single-token decode preserves the original ordered rank reduction.
 class Engine {
 public:
     Engine();
