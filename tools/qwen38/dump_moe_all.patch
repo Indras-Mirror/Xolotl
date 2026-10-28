@@ -1,0 +1,77 @@
+Xolotl: dump the MoE input of EVERY layer and EVERY chunk (XQ calibration)
+
+The existing diagnostic (src/prefill/prefill.cpp near line 3379) writes the MoE input of exactly
+ONE layer and exactly ONE chunk per process:
+
+    static const char* dump_moe = std::getenv("STRATA_DUMP_MOE_INPUT");
+    static bool dumped_moe = false;
+    if (dump_moe && !dumped_moe && l == std::atoi(...)) { dumped_moe = true; ... }
+
+That is right for the parity test it was written for (one layer's real rows), but the XQ screener
+needs every token of the calibration corpus through every layer, because per-expert error can only
+be measured on the tokens that actually route to that expert.
+
+This patch adds STRATA_DUMP_MOE_ALL=<dir>. With it set the dump happens for every layer and every
+chunk, writing one file per (layer, chunk):
+
+    <dir>/moe_L05_c0003.bin   {int64 T, int64 N, int64 K} T*N f32 X, T*K i32 ids
+
+The old single-layer behaviour is unchanged when the variable is unset.
+
+NOTE ON THE CHUNK COUNTER (this is the part the first draft got wrong): the layer loop
+(prefill.cpp:2556, `for (int64_t l = LB; l < LE; ++l)`) is INSIDE the per-chunk call to
+Prefill::run_impl, so `l` changes within one chunk of one call. A counter reset on a layer change
+therefore resets on EVERY layer, every layer writes c0000, and each new chunk overwrites the
+previous chunk's files - silently, leaving 48 files that hold only the last chunk. This version
+keeps one monotonic counter per layer id, guarded by a mutex because run_impl can serve concurrent
+sessions, so names never collide across chunks.
+
+Cost when enabled: one device-to-host copy of T*N floats plus a file write, per layer per chunk.
+Nothing else changes - same buffers, same shapes, same byte order.
+
+--- a/src/prefill/prefill.cpp	2026-10-27 19:26:26.103407414 +1100
++++ b/src/prefill/prefill.cpp	2026-10-27 19:26:34.476349003 +1100
+@@ -3377,15 +3377,39 @@
+                             }
+                         }
+                         // Diagnostics: STRATA_DUMP_MOE_INPUT=path, STRATA_DUMP_MOE_LAYER=l - the first chunk's MoE input
+-                        // of layer l ({T, N, K} int64, T x N floats, T x K expert ids) for testing products on real rows
++                        // of layer l ({T, N, K} int64, T x N floats, T x K expert ids) for testing products on real rows.
++                        // STRATA_DUMP_MOE_ALL=dir dumps EVERY layer of EVERY chunk as dir/moe_L<NN>_c<NNNN>.bin
++                        // (same header layout). That is what the XQ per-expert screener (tools/qwen38/screen.py)
++                        // needs: a per-expert error can only be measured on the tokens that route to that expert.
+                         static const char* dump_moe = std::getenv("STRATA_DUMP_MOE_INPUT");
++                        static const char* dump_all = std::getenv("STRATA_DUMP_MOE_ALL");
+                         static bool dumped_moe = false;
+-                        if (dump_moe && !dumped_moe && l == std::atoi(std::getenv("STRATA_DUMP_MOE_LAYER") ? std::getenv("STRATA_DUMP_MOE_LAYER") : "0")) {
+-                            dumped_moe = true;
++                        // The layer loop (LB..LE) is INSIDE this per-chunk call, so a counter keyed on a layer-change
++                        // would reset on every layer and each chunk would overwrite the previous chunk's files. Keep
++                        // one monotonic counter PER LAYER instead: c0000, c0001, ... then never collide across chunks,
++                        // and each layer's files stay in chunk order. Guarded: run_impl can serve concurrent sessions.
++                        static std::map<int64_t, int64_t> dump_chunk_by_layer;
++                        static std::mutex dump_mu;
++                        const bool want_layer = dump_moe != nullptr && !dumped_moe &&
++                            l == std::atoi(std::getenv("STRATA_DUMP_MOE_LAYER") ? std::getenv("STRATA_DUMP_MOE_LAYER") : "0");
++                        if (dump_all != nullptr || want_layer) {
++                            if (want_layer) dumped_moe = true;
+                             std::vector<float> x((size_t) (T * N));
+                             cudaMemcpyAsync(x.data(), m.mixed, x.size() * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
+                             cudaStreamSynchronize(m.cs);
+-                            if (std::FILE* f = std::fopen(dump_moe, "wb")) {
++                            char path[4096];
++                            if (dump_all != nullptr) {
++                                int64_t chunk;
++                                {
++                                    const std::lock_guard<std::mutex> lk(dump_mu);
++                                    chunk = dump_chunk_by_layer[l]++;
++                                }
++                                std::snprintf(path, sizeof path, "%s/moe_L%02lld_c%04lld.bin",
++                                              dump_all, (long long) l, (long long) chunk);
++                            } else {
++                                std::snprintf(path, sizeof path, "%s", dump_moe);
++                            }
++                            if (std::FILE* f = std::fopen(path, "wb")) {
+                                 const int64_t hdr[3] = {(int64_t) T, (int64_t) N, (int64_t) K};
+                                 std::fwrite(hdr, sizeof hdr, 1, f);
+                                 std::fwrite(x.data(), sizeof(float), x.size(), f);

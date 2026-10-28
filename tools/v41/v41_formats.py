@@ -200,13 +200,25 @@ def encode_tier(Q, S, tier):
     raise ValueError(tier)
 
 
-def encode_rtn(W, tier):
-    """Round-to-nearest at `tier` with v41_gptq's static scale search (uniform importance): the all-Q2_0 control and
-    the writer's fallback when no quantized expert exists.  W [R, C] float."""
+def encode_rtn(W, tier, importance=None):
+    """Round-to-nearest at `tier` with the writer's scale search.
+
+    `importance` is one nonnegative activation-importance value per input
+    column, matching ggml's imatrix convention. None preserves the original
+    uniform-importance control. The same routine is used by screening and the
+    final writer, so a measured tier is the tier actually emitted.
+    """
     import torch
     import v41_gptq as G
     Wt = torch.from_numpy(np.ascontiguousarray(W, np.float32))
-    S = G.search_scales(Wt, torch.ones(Wt.shape[1]), tier)
+    if importance is None:
+        d = torch.ones(Wt.shape[1])
+    else:
+        d = torch.as_tensor(np.asarray(importance, np.float32).ravel())
+        if d.numel() != Wt.shape[1] or not bool(torch.all(torch.isfinite(d))) or bool(torch.any(d < 0)):
+            raise ValueError("importance must be finite, nonnegative, and one value per input column")
+        d = d.to(Wt.device)
+    S = G.search_scales(Wt, d, tier)
     lo, hi, grp, _ = G.TIERS[tier]
     Q = G._rtn(Wt, G.expand_scales(S, tier, Wt.shape[1]), lo, hi)
     return encode_tier(Q.numpy(), S.numpy(), tier)
