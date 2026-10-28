@@ -294,6 +294,14 @@ class M31Engine(_BaseEngine):
 _BaseService = S.Service
 _engine_silence_s = S.engine_silence_s
 _sampling_defaults_from_config = S.sampling_defaults_from_config
+_engine_args = S.engine_args
+
+
+def engine_args(config):
+    # Common Qwen launches inject --vision and --vram-reserve-mib from the
+    # encoder section. M31's build opt-in enables GENI; its VRAM planner owns
+    # the native budget and does not accept those Qwen-only CLI switches.
+    return _engine_args({**config, "vision": None})
 
 
 def sampling_defaults_from_config(config):
@@ -507,6 +515,7 @@ def install():
     install_video_reader()
     S.engine_silence_s = engine_silence_s
     S.sampling_defaults_from_config = sampling_defaults_from_config
+    S.engine_args = engine_args
 
 
 def main():

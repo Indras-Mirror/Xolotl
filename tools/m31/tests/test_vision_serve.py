@@ -163,6 +163,34 @@ class MediaTests(unittest.TestCase):
 
 
 class WrapperTests(unittest.TestCase):
+    def test_actual_launcher_arguments_preserve_m31_budgets_without_qwen_injection(self):
+        args = ["--model", "/path/to/model.gguf", "--backend", "cuda", "--ctx", "40000",
+                "--chunk", "32768", "--gpu-experts-gib", "7"]
+        vision = {"exe": "/path/to/helper", "model": "/path/to/model.gguf",
+                  "mmproj": "/path/to/mmproj.gguf", "gpu": True}
+        config = {"args": list(args), "vision": vision}
+        M.validate_config(config)
+        # This calls the real common argument builder, including its profile,
+        # parallel and placement handling, through the shim's launch hook.
+        self.assertEqual(M.engine_args(config), args)
+        self.assertEqual(M.engine_args({"args": list(args)}), args)
+        self.assertEqual(config, {"args": args, "vision": vision})
+        self.assertNotIn("--vision", M.engine_args(config))
+        self.assertNotIn("--vram-reserve-mib", M.engine_args(config))
+        with tempfile.TemporaryDirectory() as tmp:
+            capture, script = Path(tmp) / "argv.json", Path(tmp) / "engine"
+            script.write_text("#!" + sys.executable + "\nimport json,pathlib,sys\n" +
+                              "pathlib.Path(" + repr(str(capture)) + ").write_text(json.dumps(sys.argv[1:]))\n" +
+                              "print('INFO vision=1',flush=True)\nprint('READY 40000 stop',flush=True)\n" +
+                              "for line in sys.stdin:\n    if line.startswith('QUIT'): break\n")
+            script.chmod(0o700)
+            engine = M.M31Engine(str(script), M.engine_args(config))
+            try:
+                self.assertEqual(json.loads(capture.read_text()), ["--serve", *args])
+                self.assertEqual(engine.info["vision"], 1)
+            finally:
+                engine.close()
+
     def test_missing_helper_is_deferred_and_environment_is_forwarded(self):
         with tempfile.TemporaryDirectory() as tmp:
             vision = M.M31Vision({"exe": str(Path(tmp) / "missing"), "model": "missing-model",
