@@ -75,6 +75,14 @@ unconditional gathers are tuned for their hardware, not this one.
 
 `kRoutedExtraMs` (0.24) is Basalt's constant, not ours, which is why 107 ships opt-in.
 
+**114 was attempted and deferred, on evidence.** It is the one remaining item with a real target
+(`choose_resident_keep_from` and `resident_lent_slots` both exist here), but it needs three
+prerequisites this tree does not have: `exp_flag()` (Basalt's experimental-flag system),
+`set_spares()`, and `home_given_up` — the last being the mechanism the PR is actually about (the
+copy-less experts taking RAM homes at admission). Writing that blind, into the expert-residency hot
+path, with no way to build or test until the box is free, is how an engine gets a defect nobody
+finds for a week. It wants its own session with a working build.
+
 Details that change how each item should be taken:
 
 - **107 must be reconciled, not copied.** Its pricing formula replaces a constant default. Our
