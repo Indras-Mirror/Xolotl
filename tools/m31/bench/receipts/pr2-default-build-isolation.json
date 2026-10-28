@@ -1,0 +1,118 @@
+{
+  "format": "m31-default-build-isolation-v2",
+  "base_commit": "4499fcbca5bd9f0531036184177fd3d57df6a1d8",
+  "candidate_commit_at_receipt": "5cdfc33563763fd752a51c75755736ef9c6b2838",
+  "created_at": 1793212966.0545933,
+  "m31": "OFF",
+  "vision": "OFF",
+  "gpu_execution": false,
+  "binary_payload_normalization": false,
+  "metadata_recipe": {
+    "canonical_source_build_paths_and_compiler_cwd": true,
+    "decimal_31bit_per_tu_nvcc_seed": true,
+    "nvcc_objdir_as_tempdir": true,
+    "ccache_disabled": true,
+    "owned_comparison_caches_only": true
+  },
+  "cuda_toolchain": {
+    "gcc": "14.3",
+    "cuda": "13.1.115",
+    "architecture": "120a"
+  },
+  "limits": [
+    "Only selected unchanged upstream targets were built; this is not an all-target build.",
+    "strata executable was not linked; PR1 reported a pre-existing new_pool_for_device link failure.",
+    "HIP and SYCL toolchains are absent; neither backend was built.",
+    "No other-model inference was run, and unseeded NVCC builds are not claimed deterministic."
+  ],
+  "backend_results": {
+    "cpu": {
+      "raw_artifacts_identical": true,
+      "target_lists_identical": true,
+      "compile_commands_identical": true,
+      "compile_commands_count": 87,
+      "base_artifacts": {
+        "libstrata_kernels_cpu.a": {
+          "sha256": "6c10a0b21321b99bbd6e8c06fee7bc988940fa4d48a5f9a6986a3abb834fb9a3",
+          "bytes": 1567144
+        },
+        "ds4_ref": {
+          "sha256": "a4e18de17ebe1f596be4ced258102b8ad5e689b1ef2cf1aba00ecfa76a817ef5",
+          "bytes": 2277688
+        },
+        "glm_generate_cpu": {
+          "sha256": "7e3a019dedd87317886cf91f8402b6fed835c083adb77b90c88f965b74206df9",
+          "bytes": 3790968
+        }
+      },
+      "candidate_artifacts": {
+        "libstrata_kernels_cpu.a": {
+          "sha256": "6c10a0b21321b99bbd6e8c06fee7bc988940fa4d48a5f9a6986a3abb834fb9a3",
+          "bytes": 1567144
+        },
+        "ds4_ref": {
+          "sha256": "a4e18de17ebe1f596be4ced258102b8ad5e689b1ef2cf1aba00ecfa76a817ef5",
+          "bytes": 2277688
+        },
+        "glm_generate_cpu": {
+          "sha256": "7e3a019dedd87317886cf91f8402b6fed835c083adb77b90c88f965b74206df9",
+          "bytes": 3790968
+        }
+      },
+      "accepted": true
+    },
+    "cuda": {
+      "raw_artifacts_identical": true,
+      "target_lists_identical": true,
+      "compile_commands_identical": true,
+      "compile_commands_count": 417,
+      "base_artifacts": {
+        "glm_generate": {
+          "sha256": "74ea308b6963dece324f566e0a41710e9fcffbe5c0f25db7c4ecb6eb8e086d63",
+          "bytes": 655921912
+        },
+        "ds41_generate": {
+          "sha256": "675b89b938d47db6fb1b01db8beeeb0dac6ab3b256c7dfd09a73aa47a545c20c",
+          "bytes": 649559768
+        },
+        "libstrata_engine.a": {
+          "sha256": "449fd2821bbfea3c6272e2381a1c5a42447b8bfc9985aec72ccddee3e4fe02f0",
+          "bytes": 2877150
+        },
+        "libstrata_mmq.a": {
+          "sha256": "86320b27f0260dcc3184271d2271f533e6160b27ade6c9455801d0b75b0f31d1",
+          "bytes": 74327696
+        },
+        "CMakeFiles/strata.dir/src/program/generate.cpp.o": {
+          "sha256": "23f286cf074704439fc880144ad46bb0e3372dd6b01e16bfbbfbdf3bfc78ebe4",
+          "bytes": 1704168
+        }
+      },
+      "candidate_artifacts": {
+        "glm_generate": {
+          "sha256": "74ea308b6963dece324f566e0a41710e9fcffbe5c0f25db7c4ecb6eb8e086d63",
+          "bytes": 655921912
+        },
+        "ds41_generate": {
+          "sha256": "675b89b938d47db6fb1b01db8beeeb0dac6ab3b256c7dfd09a73aa47a545c20c",
+          "bytes": 649559768
+        },
+        "libstrata_engine.a": {
+          "sha256": "449fd2821bbfea3c6272e2381a1c5a42447b8bfc9985aec72ccddee3e4fe02f0",
+          "bytes": 2877150
+        },
+        "libstrata_mmq.a": {
+          "sha256": "86320b27f0260dcc3184271d2271f533e6160b27ade6c9455801d0b75b0f31d1",
+          "bytes": 74327696
+        },
+        "CMakeFiles/strata.dir/src/program/generate.cpp.o": {
+          "sha256": "23f286cf074704439fc880144ad46bb0e3372dd6b01e16bfbbfbdf3bfc78ebe4",
+          "bytes": 1704168
+        }
+      },
+      "accepted": true
+    }
+  },
+  "changed_tracked_paths_outside_feature": [],
+  "accepted": true
+}
