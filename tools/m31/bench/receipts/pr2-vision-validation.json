@@ -52,11 +52,25 @@
         "scope": "Historical local hash identity; this record is not a fresh hash of the current local file."
       },
       "fresh_local_rehash": {
-        "status": "pending",
-        "completed": false,
-        "sha256": null,
-        "matches_expected": null,
-        "scope": "No fresh local projector hash is claimed here; the queued check will run after GPU quality measurements."
+        "status": "completed",
+        "completed": true,
+        "sha256": "8aae10398d53fa7a726199877a07f04f3d371274ae4ce7a1a639af3f0d5124ca",
+        "matches_expected": true,
+        "bytes": 1735294720,
+        "file_unchanged_during_hash": true,
+        "descriptor_and_path_stats_match": true,
+        "queued_at_utc": "2026-10-28T20:37:25.438443+00:00",
+        "quality_result_observed_at_utc": "2026-10-28T21:18:55.483009+00:00",
+        "shared_build_lock_acquired_at_utc": "2026-10-28T21:18:55.483131+00:00",
+        "hash_started_at_utc": "2026-10-28T21:18:55.483258+00:00",
+        "finished_at_utc": "2026-10-28T21:18:56.599737+00:00",
+        "started_only_after_quality_result_and_shared_lock": true,
+        "preceding_quality_session_label": "pr3-quality-v1/session-result.json",
+        "preceding_quality_session_returncode": 1,
+        "model_or_gpu_inference": false,
+        "evidence_label": "mmproj-local-provenance.json",
+        "evidence_sha256": "d78f6d706bb2859865fea26354ffbc4e5de27cb503fd0df6757c88489188338b",
+        "scope": "These local projector bytes equal the LFS object at projector revision b17b7f5459c0b8f127ea12ee774409b282521d6a. The tested LLM weights use distinct revision 02c81e41305bf8b718ad2e288f4e52a1cd49f55f; runtime does not automatically prove arbitrary model/projector revision compatibility."
       },
       "runtime_validation_scope": {
         "model_architecture": "minimax-m3",
