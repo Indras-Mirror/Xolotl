@@ -101,3 +101,53 @@ Repeat with base/base/candidate servers and three new output directories in
 the same window. The public flag reproduces the original local driver's fixed
 nonce sequence; it leaves the default unseeded client and timing denominators
 unchanged. Preserve every raw response and warmup as usual.
+
+## Record the actual HTTP chunk recipe
+
+`trace_server.py` runs the actual M31 common-server shim from a chosen checkout.
+It forwards the original stdout records unchanged and records only
+INFO/READY/PP/RESUME/DONE/ERR. It does not log T tokens, change model arithmetic,
+reserve hardware or alter the caller's environment. Use the same wrapper and
+speed client for both branches, with the caller owning the GPU throughout.
+
+```sh
+mkdir trace-A1
+python tools/m31/bench/trace_server.py --source "$CHECKOUT" \
+  --trace trace-A1/protocol.jsonl -- --engine strata --config "$CONFIG" \
+  --tokenizer "$TOKENIZER" --host 127.0.0.1 --port 8080
+# In another terminal, after /health is ready:
+python tools/m31/bench/speed.py --url http://127.0.0.1:8080 \
+  --corpus "$CORPUS" --tokenizer "$TOKENIZER" --repetitions 1 \
+  --nonce-seed m31-pr3-abba-fixed --out trace-A1/speed
+python tools/m31/bench/trace_chunks.py trace-A1/protocol.jsonl \
+  --requests trace-A1/speed/raw.jsonl --out trace-A1/chunks.json
+```
+
+Use new output directories for all ABBABAAB arms. `trace_chunks.py` requires the
+one-repetition warmup/4K/16K/32K recipe, complete PP coverage, zero reuse, exact
+output budgets and one engine PID per arm. Hidden restarts or incomplete traces
+fail. Keep actual chunks and responses even when planner partitions differ.
+The exact historical speed corpus requires its archived input; its SHA and
+reproduction limit are in the main document. A different corpus is a new test.
+
+## Compare complete prefix-state heads
+
+`compare_prefix_heads.py` checks the existing `m31_cache_model_check` outputs at
+1024+100 and 1024+300. It requires all nine complete 200064-F32 heads, finite
+values, correct raw top-1 metadata, exact forward/decode/replay recipes and raw
+byte equality with the baseline. It independently checks within-worker rewind,
+decode-rewind, restore, repeated cold prefill and workspace release invariants.
+Whole-versus-split histories remain separate. There is no tolerance option or
+last-row subset that can replace a missing head.
+
+```sh
+python tools/m31/bench/compare_prefix_heads.py cache-A-1124 cache-B-1124 \
+  --length 1124 --out cache-1124-comparison.json
+python tools/m31/bench/compare_prefix_heads.py cache-A-1324 cache-B-1324 \
+  --length 1324 --out cache-1324-comparison.json
+```
+
+The main document contains the four real-model checker commands and the exact
+public input generator. Model-free regression cases for both tools run as part
+of `test_bench.py` and the existing m31 benchmark ctest group. They start no
+model, encoder or GPU process.

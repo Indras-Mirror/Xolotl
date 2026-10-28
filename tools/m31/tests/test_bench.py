@@ -442,5 +442,9 @@ for line in sys.stdin:
                     P.validate_request(row, 1124, 1024)
 
 
+from test_trace_bench import TracePump, ChunkRecipes
+from test_prefix_heads import StrictHeads
+
+
 if __name__ == "__main__":
     unittest.main()
