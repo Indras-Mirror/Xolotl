@@ -40,11 +40,25 @@ say() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 die() { say "FAILED: $*"; printf 'FAILED %s\n' "$*" > "$STATE/status"; exit 90; }
 ok() { printf '%s\n' "$1" > "$STATE/status"; }
 
+# Run a long stage in the background and wait for it, so a signal is honoured AT ONCE.
+# bash defers trap delivery until the current FOREGROUND child returns, so a stage written as a
+# plain foreground command swallows SIGTERM for its whole duration (measured: a driver blocked on
+# `sleep 30` was still alive 2 s after SIGTERM; the same script with `sleep 30 & wait` fired the
+# trap immediately). This matters because the long stages here run for 30 min to 2 h, and a
+# supervisor stopping the run must be able to trust $STATE/status straight away.
+long() { "$@" & local p=$!; wait "$p"; }
+
 # A death that does not pass through die() - a `set -u` unbound variable, a syntax error, a
 # signal - leaves the PREVIOUS stage's "done" sitting in $STATE/status, which reads as healthy
 # to any watcher or to a person checking in. That is the same defect as a logits header that
 # describes a different file than was written: a status that describes a state the run is not
 # in is worse than no status. rc 90 is die()'s own exit and must keep its message.
+#
+# The EXIT trap alone is NOT enough: killed with SIGTERM while waiting on a child, bash can run
+# the EXIT trap with _rc still 0 (observed 2026-10-28 19:24 - the driver was killed and status
+# went on saying "STEP3 dumps done"). The signals are trapped explicitly so the status is written
+# before the shell exits, whatever $? happens to be.
+trap 'die "terminated by signal"' TERM INT HUP
 trap '_rc=$?; if [ "$_rc" -ne 0 ] && [ "$_rc" -ne 90 ]; then
         printf "FAILED uncaught exit %s (see chain.log tail)\n" "$_rc" > "$STATE/status"
       fi' EXIT
@@ -91,7 +105,7 @@ if [ -f "$STATE/stage2.done" ] && [ -f "$IMATRIX" ]; then
 else
     say "STEP2 llama-imatrix on the edited model"
     [ -e "$IMATRIX" ] && mv "$IMATRIX" "$IMATRIX.partial.$(date +%s)"
-    IMATRIX_BIN="$IMATRIX_BIN" SRC="$MODEL" CORPUS="$CORPUS" OUT="$IMATRIX" LOG="$IMATRIX_LOG" \
+    long env IMATRIX_BIN="$IMATRIX_BIN" SRC="$MODEL" CORPUS="$CORPUS" OUT="$IMATRIX" LOG="$IMATRIX_LOG" \
         bash "$T/run_imatrix.sh" >>"$STATE/step2.log" 2>&1 \
         || { tail -20 "$STATE/step2.log"; die "imatrix failed"; }
     # Completion proof from the file itself: save_imatrix() writes chunk_count at every
@@ -161,7 +175,7 @@ else
     say "  dump space ok: ${free_g}G free"
     mkdir -p "$DUMPS"
     cd "$XOLOTL" || die "no repo"
-    STRATA_DUMP_MOE_ALL="$DUMPS" "$STRATA" \
+    long env STRATA_DUMP_MOE_ALL="$DUMPS" "$STRATA" \
         --native "$MODEL" --pack "$PACK" \
         --ple-gguf "$MODEL" --ple-io direct \
         --mmap-experts --spec 2 \
@@ -196,7 +210,7 @@ else
         say "  screen L$L"
         # --tiers must cover EVERY rung the allocator can pick for gate/up, or
         # items_for raises "missing measurement". q8_0 is in that ladder.
-        ionice -c3 nice -n 10 python3 "$T/screen.py" \
+        long ionice -c3 nice -n 10 python3 "$T/screen.py" \
             --model-dir "$MODEL" --dump "$DUMPS" --layer "$L" \
             --tiers ptq1,iq2_xxs,iq2_xs,iq2_s,iq3_xxs,iq3_s,iq4_nl,q8_0 \
             --edit-report "$EDIT_REPORT" --dn-tiers iq4_nl,q8_0 \
@@ -287,7 +301,7 @@ PY
         --ceiling-gib "${CEILING_GIB:-90}" >"$STATE/step6-predict.log" 2>&1 \
         || { cat "$STATE/step6-predict.log"; die "predicted size exceeds the ceiling"; }
     SRC="$MODEL" IMATRIX="$IMATRIX" GATE_GIB="${CEILING_GIB:-90}" MARGIN_GB=6 \
-        bash "$T/run_quant.sh" "$TT" "$QOUT" >"$STATE/step6-quant.log" 2>&1 \
+        long bash "$T/run_quant.sh" "$TT" "$QOUT" >"$STATE/step6-quant.log" 2>&1 \
         || { tail -25 "$STATE/step6-quant.log"; die "llama-quantize failed"; }
     [ -s "$QOUT" ] || die "quantize produced no output"
     touch "$STATE/stage6.done"

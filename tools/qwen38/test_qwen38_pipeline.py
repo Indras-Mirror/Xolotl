@@ -524,6 +524,69 @@ class ShellScripts(unittest.TestCase):
         self.assertNotIn("STEP2", written)
 
 
+    def _sigterm_status(self, body: str) -> str:
+        """Run head-of-driver + `body`, SIGTERM it like a supervisor, return the status file.
+
+        Uses the REAL head of the driver, so it tests the real traps and the real `long` helper.
+        """
+        src = (HERE / "run_ablated_chain.sh").read_text(encoding="utf-8")
+        head = src.split("# ---------------------------------------------------------------- 0. preconditions")[0]
+        with tempfile.TemporaryDirectory() as d:
+            state = pathlib.Path(d)
+            script = state / "t.sh"
+            script.write_text(head.replace('STATE=/home/mal/.quetza-data/qwen38-abl-chain',
+                                           f'STATE={state}') + "\n" + body + "\n", encoding="utf-8")
+            (state / "status").write_text("STEP3 dumps done\n", encoding="utf-8")
+            p = subprocess.Popen(["bash", str(script)])
+            try:
+                import time
+                time.sleep(0.6)                     # let it reach the body
+                p.terminate()                       # SIGTERM, as a supervisor would
+                try:
+                    p.wait(timeout=6)
+                except subprocess.TimeoutExpired:
+                    # the deferred-trap case: bash is still blocked on its foreground child.
+                    # That IS the failure mode under test, so kill it and read what it left.
+                    p.kill()
+                    p.wait(timeout=5)
+            finally:
+                if p.poll() is None:
+                    p.kill()
+            return (state / "status").read_text(encoding="utf-8")
+
+    def test_driver_reports_a_signal_death(self):
+        # A driver killed with SIGTERM used to leave the previous stage's status standing
+        # (observed 2026-10-28 19:24: killed, and status still said "STEP3 dumps done").
+        written = self._sigterm_status("long sleep 30")
+        self.assertIn("FAILED", written, f"status after SIGTERM was {written!r}")
+        self.assertNotIn("STEP3", written)
+
+    def test_signal_trap_is_not_deferred_by_a_foreground_child(self):
+        # bash defers a trap until the current FOREGROUND child returns, so a stage run as a
+        # plain foreground command swallows SIGTERM for its whole duration. The `long` helper
+        # (child + wait) is what makes the trap fire at once; this pins that it is used.
+        body_ok = "long sleep 30"
+        body_bad = "sleep 30"
+        ok_status = self._sigterm_status(body_ok)
+        bad_status = self._sigterm_status(body_bad)
+        self.assertIn("FAILED", ok_status, "`long` did not deliver the trap promptly")
+        self.assertNotIn("FAILED", bad_status,
+                         "a bare foreground child DID report the signal - bash behaviour changed?")
+
+    def test_every_long_stage_is_run_through_the_long_helper(self):
+        # The stages that can run for 30 min to 2 h must all be interruptible.
+        src = (HERE / "run_ablated_chain.sh").read_text(encoding="utf-8")
+        lines = src.splitlines()
+        for stage in ("run_imatrix.sh", "STRATA_DUMP_MOE_ALL=", "screen.py", "run_quant.sh"):
+            hits = [i for i, ln in enumerate(lines)
+                    if stage in ln and not ln.lstrip().startswith("#")]
+            self.assertTrue(hits, f"{stage} is not invoked at all")
+            # a command can be continued over lines, so look back a little for the helper
+            wrapped = any("long " in ln for i in hits for ln in lines[max(0, i - 3):i + 1])
+            self.assertTrue(wrapped, f"{stage} is invoked without the `long` helper:\n"
+                                     f"  {lines[hits[0]]!r}")
+
+
 class LogitsGate(unittest.TestCase):
     """strata's dump has a 2 x int32 header; reading it as headerless shifts every row by 8 bytes.
     These gates make that class of misread loud instead of authoritative."""
