@@ -339,11 +339,12 @@ Hardware was one RTX 5090 with a 440 W power limit, EPYC 9654 (96 cores,
 the snapshot does not measure their effect on these results. Thread affinity
 was not explicitly pinned. No compilation or conversion ran in the speed window.
 
-PR1's decode medians are **14.9%, 14.0% and 15.0% below historical v8** at
-4K, 16K and 32K. The cause remains unresolved; these runs did not establish a
-whole-model explanation or a measured fix. The historical rates below must not
-be substituted for this slower result. Prefill remained near the historical
-values. All metric rows, model shard identities, environment and exact
+That October 27 worker's decode medians were **14.9%, 14.0% and 15.0% below
+historical v8** at 4K, 16K and 32K. The cause was unresolved in that window;
+those runs did not establish a whole-model explanation or a measured fix.
+The slower rows remain here. The October 28 comparison below tests the later
+barrier fix against protected v8 in the same window. Prefill remained near
+the historical values. All metric rows, model shard identities, environment and exact
 worker hash are in
 [`pr1-text.json`](../tools/m31/bench/receipts/pr1-text.json).
 
@@ -351,6 +352,54 @@ Collection is complete, but the two failed tools trials remain failed. Numerical
 cache, lifecycle and GSM checks passed within their stated coverage; this is not
 an overall-PASS claim. HIP/SYCL/Windows builds and the Qwen executable limitation
 also remain open review coverage.
+
+## Generation follow-up: CPU barrier (2026-10-28)
+
+The later worker keeps the callback's actual `nth` participant count and uses
+CPU relax while waiting, matching v8: `pause` on x86, without an operating-system
+scheduler yield or a spin-count threshold. Its arrival and generation counters
+have v8's 64-byte spacing on x86. Quantized arithmetic and the acquire/release
+synchronization contract are unchanged.
+
+An initial pause-only build passed correctness but failed the predeclared
+generation gate: its median difference from v8 was -3.77% at 4K and +0.83%
+at 32K. That complete eight-run trial is retained. The accepted build adds
+counter separation and passed the same gate: the absolute median difference
+is below 3% at both depths, and neighboring A/B pairs have both signs.
+
+| Depth | PR1 + barrier fix decode median [min–max] | Protected v8 decode median [min–max] | PR1/v8 |
+| --- | ---: | ---: | ---: |
+| 4K | 25.64 [24.87–26.05] | 25.28 [24.58–25.94] | +1.45% |
+| 32K | 24.34 [23.62–24.64] | 24.51 [24.26–24.86] | -0.66% |
+
+Units are tokens/s. The run order was A B B A B A A B, four repeats per
+engine, with a fresh server and an excluded 1K/32-output warmup on each run.
+Requests used the om_bench recipe: greedy, low reasoning, `ignore_eos=true`,
+`cache_prompt=false` and 256 outputs; decode counts 255 transitions. Corpus
+slices and nonces were identical across arms. Both used context 40,000, F16
+main/index KV, 80 CPU threads, chunk 32,768, arena 170 GiB, expert cache 7 GiB,
+registration budget 176 GiB, PACK8, upload depth8/stream1, poll50 and no affinity.
+CUDA fusion was off. Hardware and toolchain were the EPYC 9654 / single RTX 5090
+system described above. Neighboring services and miners on GPU1 stayed running;
+CPU/process/memory and both-GPU telemetry was retained. This did not isolate
+their causal effect or measure RAM bandwidth.
+
+PR1 used the common server and native line protocol; protected v8 retained
+its accepted standalone JSON/interactive-ACK server and stage profiler.
+The result establishes the stated same-window gate, rather than universal
+performance equivalence. The earlier unfixed same-window comparison was
+-10.62%/-4.30%/-1.22% at 4K/16K/32K; those results are also retained.
+
+The new CUDA worker SHA-256 is `938bfae60ef125f47834293fa8cfe55bda42af84b1c40e421e2a9fbea4321587`.
+CPU and CUDA each passed all 10 model-free ctest groups. A fresh GPU-offload
+oracle matched all 128 code128 logit rows bitwise, including 32 teacher-forced
+decode transitions: top-1 100%, mean/max KL0. The numerical test is a short
+diagnostic, not a repeat of the full gate20 or the long-context gates.
+GSM8K100, tools23, 16K speed and long-context logits were not rerun on this
+new worker. The October 27 quality failures and coverage limits remain.
+
+All per-run rows, both candidates, the gate and hashes are in
+[`pr1-barrier-followup.json`](../tools/m31/bench/receipts/pr1-barrier-followup.json).
 
 ## Historical results, not final PR1 acceptance
 
@@ -720,5 +769,6 @@ free host memory. A single active sequence is supported. Image/video input,
 adaptive CPU/GPU short prefill, speculative decode and the Q2 experiments are
 not included. HIP and SYCL toolchains were unavailable, so those backends were
 not built. Windows, other GPU models, two-GPU placement and other-model inference
-were not tested. The two tools-trial failures, unresolved decode slowdown and
-Qwen link failure remain explicit limitations of this handoff.
+were not tested. The two tools-trial failures and Qwen link failure remain explicit limitations.
+The October 28 generation gate covers only the stated hardware and two depths;
+it does not replace the original slower measurements or the untested coverage.
