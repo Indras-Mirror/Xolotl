@@ -58,10 +58,28 @@ static void validate_projector(const std::string & path) {
         gguf_get_val_u32(gguf.get(), dim) != 6144)
         throw std::runtime_error("mmproj projection dimension must be 6144");
 }
+static void prepare_helper_environment() {
+    const char * fusion = std::getenv("GGML_CUDA_DISABLE_FUSION");
+    if (fusion && std::string(fusion) != "1")
+        throw std::runtime_error("M31 vision requires GGML_CUDA_DISABLE_FUSION=1; fusion has not passed the numeric gate");
+#ifdef _WIN32
+    const int result = _putenv_s("GGML_CUDA_DISABLE_FUSION", "1");
+#else
+    const int result = setenv("GGML_CUDA_DISABLE_FUSION", "1", 1);
+#endif
+    if (result != 0) throw std::runtime_error("cannot set CUDA fusion guard");
+}
 int main(int argc, char ** argv) {
-    if (argc != 3) { std::cerr << "usage: vision_adapter SPEC.json NEW_OUTPUT_DIR | --worker CONFIG.json\n"; return 2; }
-    const bool worker = std::string(argv[1]) == "--worker";
     try {
+        // Apply before any backend initialization, including standalone runs.
+        // The validated encoder graph must not depend on the launcher's env.
+        prepare_helper_environment();
+        if (argc == 2 && std::string(argv[1]) == "--check-environment") {
+            std::cout << "fusion=" << std::getenv("GGML_CUDA_DISABLE_FUSION") << '\n';
+            return 0;
+        }
+        if (argc != 3) throw std::runtime_error("usage: vision_adapter SPEC.json NEW_OUTPUT_DIR | --worker CONFIG.json | --check-environment");
+        const bool worker = std::string(argv[1]) == "--worker";
         const auto startup_start = std::chrono::steady_clock::now();
         std::ifstream input(worker ? argv[2] : argv[1]);
         json config; input >> config;

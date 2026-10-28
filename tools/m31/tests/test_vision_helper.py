@@ -26,6 +26,9 @@ if mode == 'startup_timeout':
     time.sleep(30)
 if mode == 'stderr':
     sys.stderr.write('x' * 2000000); sys.stderr.flush()
+if mode == 'environment':
+    config = pathlib.Path(sys.argv[2])
+    (config.parent / 'child-environment.json').write_text(json.dumps({{'fusion': os.environ.get('GGML_CUDA_DISABLE_FUSION')}}))
 print(json.dumps({{'ready': True}}), flush=True)
 if mode == 'write_timeout':
     time.sleep(30)
@@ -163,6 +166,26 @@ class HelperTests(unittest.TestCase):
             for value in (0, -1, float("nan"), float("inf"), True):
                 with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                     VisionEncoder(self.adapter, self.model, self.mmproj, self.root, **{key: value})
+
+    def test_fusion_default_is_child_only_and_explicit_non1_fails_lazily(self):
+        self.helper("environment")
+        parent = dict(os.environ)
+        for value in (None, "1"):
+            self.client.env.pop("GGML_CUDA_DISABLE_FUSION", None)
+            if value is not None:
+                self.client.env["GGML_CUDA_DISABLE_FUSION"] = value
+            self.client.start()
+            state = json.loads((self.root / "outputs/child-environment.json").read_text())
+            self.assertEqual(state["fusion"], "1")
+            self.client.close()
+        for value in ("0", "", "true", "2"):
+            self.client.env["GGML_CUDA_DISABLE_FUSION"] = value
+            # Construction/configuration remains valid; only a vision start
+            # fails. No helper process or model is launched on this path.
+            with self.assertRaisesRegex(VisionUnavailable, "requires GGML_CUDA_DISABLE_FUSION=1"):
+                self.encode()
+            self.assertIsNone(self.client.process)
+        self.assertEqual(dict(os.environ), parent)
 
 
 if __name__ == "__main__":

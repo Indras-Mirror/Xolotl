@@ -113,6 +113,12 @@ class VisionEncoder:
     def _start(self, cancel=None):
         if cancel is not None and cancel.is_set():
             raise self._error("helper request cancelled")
+        # Keep this guard lazy: an incompatible optional encoder environment
+        # rejects its vision request, without preventing text service startup.
+        env = dict(self.env)
+        if env.get("GGML_CUDA_DISABLE_FUSION", "1") != "1":
+            raise self._error("M31 vision requires GGML_CUDA_DISABLE_FUSION=1; fusion has not passed the numeric gate")
+        env["GGML_CUDA_DISABLE_FUSION"] = "1"
         if self.process is not None and self.process.poll() is None:
             return False
         self._close()
@@ -126,7 +132,6 @@ class VisionEncoder:
         self._config_path = config
         config.write_text(json.dumps(self.config) + "\n", encoding="utf-8")
         self.log = (self.cache_dir / "encoder.log").open("ab", buffering=0)
-        env = dict(self.env)
         env["OPENBLAS_NUM_THREADS"] = "1"
         env["OMP_NUM_THREADS"] = str(self.config["threads"])
         if self.config["backend"] == "cpu":

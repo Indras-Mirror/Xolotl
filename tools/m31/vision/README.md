@@ -20,6 +20,10 @@ cmake --build build-m31-vision --target m31_vision_adapter -j 8
 
 Use `-DGGML_CUDA=OFF` for a CPU encoder. CUDA and CPU embeddings differ; use the
 same backend and GGML environment on both sides of a numerical comparison.
+The accepted helper profile sets `GGML_CUDA_DISABLE_FUSION=1` inside its own
+process before backend initialization; no launcher environment is needed.
+An explicit value other than `1` fails the vision request at lazy startup.
+It does not change the Python server's environment or prevent text requests.
 Video decoding also needs `ffmpeg` in `PATH`. The helper supports both images
 and video through mtmd's own media decoding, token boundaries and timestamps.
 `video_fps` defaults to 1; llama.cpp's default is different, so pass it explicitly
@@ -83,6 +87,7 @@ Run the model-free transport fault checks with:
 
 ```sh
 python3 tools/m31/tests/test_vision_helper.py -v
+python3 tools/m31/tests/test_vision_environment.py build-m31-vision/m31_vision_adapter
 ctest --test-dir build-m31 --output-on-failure -R m31_vision
 ```
 
