@@ -476,6 +476,54 @@ class Alloc(unittest.TestCase):
         self.assertEqual(gu[3][0][0], "ptq1")
 
 
+class ShellScripts(unittest.TestCase):
+    """The chain driver's bugs are the ones that cost hours, because they land mid-stage."""
+
+    SCRIPTS = ["run_ablated_chain.sh", "run_imatrix.sh", "run_quant.sh"]
+
+    def test_no_unquoted_assignment_holds_a_literal_space(self):
+        # `USB=/media/mal/Team CX2/x` is NOT an assignment: bash reads it as a temporary env
+        # prefix for the command `CX2/x`. The variable never lands, and `set -u` then kills the
+        # driver at the first use. This cost a stage transition on 2026-10-28.
+        assign = re.compile(r"^\s*(?:export\s+|local\s+)?([A-Za-z_]\w*)=(\S.*)$")
+        offenders = []
+        for name in self.SCRIPTS:
+            for i, line in enumerate((HERE / name).read_text(encoding="utf-8").splitlines(), 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                m = assign.match(line)
+                if not m:
+                    continue
+                # only the assignment's own value: `W=$STATE/x; mkdir -p "$W"` has a space after
+                # the command separator, not inside the value
+                val = re.split(r";|&&|\|\||\s#", m.group(2))[0].strip()
+                if " " in val and not val.startswith(('"', "'", "$(", "`", "${")):
+                    offenders.append(f"{name}:{i}: {line.strip()}")
+        self.assertEqual(offenders, [], "unquoted assignment with a space:\n" + "\n".join(offenders))
+
+    def test_every_script_parses_under_nounset(self):
+        for name in self.SCRIPTS:
+            r = subprocess.run(["bash", "-n", str(HERE / name)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, f"{name}: {r.stderr}")
+
+    def test_driver_reports_a_death_that_does_not_pass_through_die(self):
+        # Without the EXIT trap a `set -u` abort leaves the previous stage's "done" in the status
+        # file. Run a truncated copy that dies early and prove the status says FAILED.
+        src = (HERE / "run_ablated_chain.sh").read_text(encoding="utf-8")
+        head = src.split("# ---------------------------------------------------------------- 0. preconditions")[0]
+        with tempfile.TemporaryDirectory() as d:
+            state = pathlib.Path(d)
+            # the trap references $STATE/status, so define STATE before the trap as the driver does
+            script = state / "t.sh"
+            script.write_text(head.replace('STATE=/home/mal/.quetza-data/qwen38-abl-chain',
+                                           f'STATE={state}') + "\n( exit 7 )\n", encoding="utf-8")
+            (state / "status").write_text("STEP2 imatrix done\n", encoding="utf-8")
+            subprocess.run(["bash", str(script)], capture_output=True, text=True)
+            written = (state / "status").read_text(encoding="utf-8")
+        self.assertIn("FAILED", written)
+        self.assertNotIn("STEP2", written)
+
+
 class LogitsGate(unittest.TestCase):
     """strata's dump has a 2 x int32 header; reading it as headerless shifts every row by 8 bytes.
     These gates make that class of misread loud instead of authoritative."""

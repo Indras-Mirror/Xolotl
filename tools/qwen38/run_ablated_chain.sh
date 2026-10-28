@@ -40,6 +40,15 @@ say() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 die() { say "FAILED: $*"; printf 'FAILED %s\n' "$*" > "$STATE/status"; exit 90; }
 ok() { printf '%s\n' "$1" > "$STATE/status"; }
 
+# A death that does not pass through die() - a `set -u` unbound variable, a syntax error, a
+# signal - leaves the PREVIOUS stage's "done" sitting in $STATE/status, which reads as healthy
+# to any watcher or to a person checking in. That is the same defect as a logits header that
+# describes a different file than was written: a status that describes a state the run is not
+# in is worse than no status. rc 90 is die()'s own exit and must keep its message.
+trap '_rc=$?; if [ "$_rc" -ne 0 ] && [ "$_rc" -ne 90 ]; then
+        printf "FAILED uncaught exit %s (see chain.log tail)\n" "$_rc" > "$STATE/status"
+      fi' EXIT
+
 say "=== ablated chain start ==="
 
 # ---------------------------------------------------------------- 0. preconditions
@@ -114,7 +123,11 @@ else
     # dumps-abl needs ~23G and NVME has ~16G. The pristine dumps are the control arm's only
     # remaining derived artifact and are not regenerable once the model is edited, so they are
     # MOVED to the USB disk (verified by file count) rather than deleted.
-    USB=/media/mal/Team CX2/qwen38-control/dumps-pristine
+    # QUOTED. Unquoted, `USB=/media/mal/Team CX2/...` is parsed as a temporary env assignment
+    # for the command `CX2/...` - the variable never reaches this shell, and `set -u` then kills
+    # the driver at the first `$USB`. That happened: STEP3 died at 18:26:50 with
+    # "CX2/qwen38-control/dumps-pristine: No such file or directory" then "USB: unbound variable".
+    USB="/media/mal/Team CX2/qwen38-control/dumps-pristine"
     if [ -d "$NVME/dumps" ]; then
         if [ -d "$USB" ]; then
             # A previous attempt copied but did not get to delete. Only remove the NVMe copy
