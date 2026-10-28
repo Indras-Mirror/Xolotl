@@ -3,6 +3,8 @@
 import argparse
 import queue
 import subprocess
+import struct
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -23,7 +25,7 @@ class Protocol(unittest.TestCase):
             self.lines.put(None)
         self.reader = threading.Thread(target=pump, daemon=True)
         self.reader.start()
-        self.until("READY")
+        self.startup = self.until("READY")
 
     def tearDown(self):
         if self.p.poll() is None:
@@ -65,6 +67,28 @@ class Protocol(unittest.TestCase):
                     "GENI 1 ignored 1", "BGENI 3 1 ignored 1"):
             self.send(bad)
             self.until("ERR")
+            self.assertIn("T 3", self.request("GEN 1 1,2"))
+
+    def test_vision_wire_one_prefill_and_recovery(self):
+        if not any("vision=1" in line for line in self.startup):
+            self.skipTest("STRATA_M31_VISION is off")
+        with tempfile.TemporaryDirectory(prefix="m31-protocol-") as directory:
+            blob = Path(directory) / "input.sve1"
+            blob.write_bytes(struct.pack("<5i8f", 0x31455653,2,2,1,4,*([.25]*8)))
+            lines = self.request(f"GENI 1 {blob} 1,-1,-1,2")
+            self.assertIn("T 3", lines)
+            self.assertEqual(len([line for line in lines if line.startswith("PP ")]), 1)
+            self.assertEqual(lines[-1].split()[2], "4")
+            batched = self.request(f"BGENI 3 1 {blob} 1,-1,-1,2")
+            self.assertIn("T 3", batched)
+            self.assertEqual(self.until("BADM")[-1], "BADM 3 0")
+            for bad in (f"{blob} 1,-1,2,-1", f"{blob}-absent 1,-1,-1,2"):
+                self.send("GENI 1 " + bad)
+                self.assertIn("vision unavailable", self.until("ERR")[-1])
+                self.assertIn("T 3", self.request("GEN 1 1,2"))
+            blob.write_bytes(struct.pack("<5i8f",0x31455653,2,2,1,4,float("nan"),*([.25]*7)))
+            self.send(f"GENI 1 {blob} 1,-1,-1,2")
+            self.assertIn("non-finite",self.until("ERR")[-1])
             self.assertIn("T 3", self.request("GEN 1 1,2"))
 
     def test_done_uses_common_parser_fields_and_milliseconds(self):

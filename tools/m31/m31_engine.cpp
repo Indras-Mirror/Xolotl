@@ -1390,6 +1390,12 @@ void Engine::reset() {
 }
 
 bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
+    return forward_mixed(tokens, nullptr, nullptr, 0, n, error);
+}
+
+bool Engine::forward_mixed(const int32_t * tokens, const int32_t * visual_rows,
+                           const float * visual_embeddings, int visual_count,
+                           int n, std::string & error) {
     try {
         const auto prepare_started = p_->cfg.profile ? Impl::Clock::now() : Impl::Clock::time_point{};
         require(p_->ready && !p_->poisoned, "not initialized or reset required after a failed pass");
@@ -1397,7 +1403,23 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
         const auto & g = p_->g;
         require(msa_chunk_limit(p_->pos,n,g.index_heads,g.block)==n,
                 "pass exceeds MSA int32 indexing; split it with prefill_chunk()");
-        for (int i = 0; i < n; ++i) require(tokens[i] >= 0 && tokens[i] < g.vocab, "token id out of range");
+#ifndef M31_ENGINE_VISION
+        require(visual_count == 0 && !visual_rows && !visual_embeddings, "vision unavailable in this build");
+#endif
+        require(visual_count >= 0 && visual_count <= p_->cfg.context, "invalid visual embedding count");
+        require(visual_count == 0 || (visual_rows && visual_embeddings), "missing visual row map/embeddings");
+        for (int i = 0; i < n; ++i) {
+            const int index = visual_rows ? visual_rows[i] : -1;
+            if (index == -1) require(tokens[i] >= 0 && tokens[i] < g.vocab, "token id out of range");
+            else {
+                require(index >= 0 && index < visual_count && tokens[i] == -1, "invalid visual row/token mapping");
+                const auto * row = visual_embeddings + size_t(index) * size_t(g.embd);
+                for (int64_t j = 0; j < g.embd; ++j)
+                    require(std::isfinite(row[j]), "non-finite visual embedding");
+            }
+        }
+        // PR #31192 selects MTMD_POS_TYPE_NORMAL for MiniMax's NEOX RoPE.
+        // Each embedding consumes one ordinary pos+i RoPE/MSA/causal row.
         // Validation above has not touched KV, hidden, graph state or streams.
         // A caller can re-plan a rejected pass without resetting valid state.
         require(!p_->cfg.cancelled || !p_->cfg.cancelled(), "cancelled");
@@ -1409,10 +1431,14 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
         const auto * traits = ggml_get_type_traits(emb->type);
         require(emb->type == GGML_TYPE_F32 || traits->to_float, "no embedding dequantizer");
         for (int i = 0; i < n; ++i) {
-            const auto * row = static_cast<const uint8_t *>(emb->data) + size_t(tokens[i]) * emb->nb[1];
             auto * dst = p_->hidden.data() + size_t(i) * g.embd;
-            if (emb->type == GGML_TYPE_F32) std::memcpy(dst, row, size_t(g.embd) * sizeof(float));
-            else traits->to_float(row, dst, g.embd);
+            if (visual_rows && visual_rows[i] >= 0) {
+                std::memcpy(dst, visual_embeddings + size_t(visual_rows[i]) * g.embd, size_t(g.embd) * sizeof(float));
+            } else {
+                const auto * row = static_cast<const uint8_t *>(emb->data) + size_t(tokens[i]) * emb->nb[1];
+                if (emb->type == GGML_TYPE_F32) std::memcpy(dst, row, size_t(g.embd) * sizeof(float));
+                else traits->to_float(row, dst, g.embd);
+            }
         }
         if (p_->cfg.reuse_allocations) {
             const auto nk = kv_length(p_->pos + n, g);

@@ -2,6 +2,10 @@
 #include "m31_run.hpp"
 #include "m31_protocol.hpp"
 #include "m31_grammar.hpp"
+#include "m31_vision.hpp"
+#if defined(M31_ENGINE_VISION) && !defined(M31_PROTOCOL_TEST_ONLY)
+#include "m31_mixed.hpp"
+#endif
 #ifdef M31_ENGINE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -85,6 +89,9 @@ struct Cli {
         cli.args = run::parse(int(pointers.size()), pointers.data());
     }
     const auto & a = cli.args;
+#ifndef M31_ENGINE_VISION
+    if (!a.mixed_manifest.empty()) throw std::runtime_error("vision unavailable in this build");
+#endif
     if (a.model.empty()) throw std::runtime_error("--model is required");
     if (a.backend != "cpu" && a.backend != "cuda") throw std::runtime_error("backend must be cpu or cuda");
     if (a.oracle_op_offload) throw std::runtime_error("--oracle-op-offload is oracle-only");
@@ -215,7 +222,13 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
     const auto vocab = int(engine.geometry().vocab);
     if (!cli.stop.empty()) for (auto id : protocol::token_ids(cli.stop, vocab)) stops.insert(id);
     if (!cli.suppress.empty()) for (auto id : protocol::token_ids(cli.suppress, vocab)) suppress.insert(id);
-    std::cout << "INFO prefix_cache=1 vision=0 logit_bias=1 batch=0 grammar="
+    constexpr bool vision_available =
+#ifdef M31_ENGINE_VISION
+        true;
+#else
+        false;
+#endif
+    std::cout << "INFO prefix_cache=1 vision=" << int(vision_available) << " logit_bias=1 batch=0 grammar="
 #ifdef M31_HAVE_GRAMMAR
               << 1
 #else
@@ -223,14 +236,24 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
 #endif
               << "\nREADY " << config.context << " stop\n" << std::flush;
     std::vector<int32_t> history;
+    MixedInput history_mixed;
     std::string line;
     while (!quit && lines.next(line)) {
         if (line == "QUIT") break;
         if (line.empty() || line == "STOP" || line.rfind("BSTOP ", 0) == 0) continue;
         protocol::Request request;
+        MixedInput mixed;
         try {
-            request = protocol::parse_request(line, vocab, config.context);
-            grammar.prepare(request.chat_b64, request.ids);
+            request = protocol::parse_request(line, vocab, config.context, vision_available);
+            if (request.vision) {
+                try { mixed = load_vision_embeddings(request.embeddings, request.ids, int(engine.geometry().embd)); }
+                catch (const std::exception & e) {
+                    const std::string message = e.what();
+                    throw std::runtime_error(message.rfind("vision unavailable:", 0) == 0
+                        ? message : "vision unavailable: " + message);
+                }
+            }
+            grammar.prepare(request.chat_b64, request.ids, request.vision);
         } catch (const std::exception & e) { error_line(e.what()); continue; }
         cancelled = false;
         // A sampler belongs to one generation, as in the accepted worker. An
@@ -238,6 +261,8 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
         std::mt19937_64 random(request.seeded ? request.seed : uint64_t(std::random_device{}()));
         std::string error;
         int reused = request.cache_prompt ? protocol::reusable_prefix(history, request.ids) : 0;
+        if (reused && request.vision)
+            reused = reusable_visual_prefix(reused, request.ids, history_mixed, mixed, int(engine.geometry().embd));
         if (reused && !engine.rewind(reused, error)) { history.clear(); engine.reset(); reused = 0; }
         else if (!reused) { engine.reset(); history.clear(); }
         if (reused) { history.resize(size_t(reused)); std::cout << "RESUME " << reused << '\n' << std::flush; }
@@ -250,8 +275,14 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
         try {
             for (int position = reused; position < int(request.ids.size());) {
                 if (config.cancelled && config.cancelled()) { cancelled = true; break; }
-                const int n = engine.prefill_chunk(std::min(config.max_chunk, int(request.ids.size()) - position), error);
-                if (n <= 0 || !engine.forward(request.ids.data() + position, n, error)) {
+                const int remaining = int(request.ids.size()) - position;
+                const int n = engine.prefill_chunk(std::min(config.max_chunk, remaining), error);
+                if (request.vision && n != remaining) throw std::runtime_error("vision unavailable: mixed prompt exceeds single-prefill budget");
+                const bool forwarded = n > 0 && (request.vision
+                    ? engine.forward_mixed(request.ids.data() + position, mixed.visual_rows.data() + position,
+                                           mixed.embeddings.data(), mixed.visual_count, n, error)
+                    : engine.forward(request.ids.data() + position, n, error));
+                if (!forwarded) {
                     if (cancelled) break;
                     throw std::runtime_error(error);
                 }
@@ -316,10 +347,11 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
                 finish = "cancel";
                 if (decoding) decode_ms = elapsed_ms(td);
             }
-            if (cancelled || !request.cache_prompt || !request.checkpoint) { engine.reset(); history.clear(); }
+            if (cancelled || !request.cache_prompt || !request.checkpoint) { engine.reset(); history.clear(); history_mixed = {}; }
+            else history_mixed = std::move(mixed);
             done(generated, int(request.ids.size()), prompt_ms, decode_ms, finish, reused, read, request.slot);
         } catch (const std::exception & e) {
-            engine.reset(); history.clear();
+            engine.reset(); history.clear(); history_mixed = {};
             if (cancelled) {
                 if (decoding) decode_ms = elapsed_ms(td);
                 else prompt_ms = elapsed_ms(tp);
@@ -336,7 +368,11 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
 void offline(Engine & engine, const run::Args & args, run::Dump * & active_dump) {
     if (!run::fs::create_directory(args.out)) throw std::runtime_error("output directory exists; use a new path");
     for (const auto & path : run::cases(args)) {
-        const auto ids = run::read_ids(path);
+        MixedInput mixed;
+#ifdef M31_ENGINE_VISION
+        if (!args.mixed_manifest.empty()) mixed = load_mixed_manifest(path, int(engine.geometry().vocab), args.context);
+#endif
+        const auto ids = args.mixed_manifest.empty() ? run::read_ids(path) : mixed.tokens;
         if (ids.size() > size_t(args.context)) throw std::runtime_error("case exceeds configured context");
         engine.reset();
         run::Dump dump(run::fs::path(args.out) / path.stem(), args, ids, int(engine.geometry().vocab));
@@ -344,7 +380,13 @@ void offline(Engine & engine, const run::Args & args, run::Dump * & active_dump)
         for (int pos = 0; pos < int(ids.size());) {
             std::string error;
             const int n = engine.prefill_chunk(run::chunk_size(args, int(ids.size()), pos), error);
-            if (n <= 0 || !engine.forward(ids.data() + pos, n, error)) throw std::runtime_error(error);
+            if (!args.mixed_manifest.empty() && n != int(ids.size()) - pos)
+                throw std::runtime_error("mixed prompt exceeds single-prefill budget");
+            const bool forwarded = n > 0 && (args.mixed_manifest.empty()
+                ? engine.forward(ids.data() + pos, n, error)
+                : engine.forward_mixed(ids.data() + pos, mixed.visual_rows.data() + pos,
+                                       mixed.embeddings.data(), mixed.visual_count, n, error));
+            if (!forwarded) throw std::runtime_error(error);
             dump.record_chunk(pos, n);
             const int count = args.head_tail ? std::min(n, args.head_tail) : n;
             const int first = n - count;
@@ -366,7 +408,7 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
         std::cout << "m31_generate --serve -m MODEL [--backend cpu|cuda --device N --ctx N --chunk N --threads N]\n"
                      "             [--arena-gib N --gpu-experts-gib N --register-arena 0|1 --register-limit-gib N]\n"
-                     "m31_generate -m MODEL (--ids-file CASE.i32|--cases DIR) --out NEW-DIR\n"
+                     "m31_generate -m MODEL (--ids-file CASE.i32|--cases DIR|--mixed-manifest manifest.json) --out NEW-DIR\n"
                      "             [--rows all|last|last:N|stride:N --head-tail N --decode-tail N]\n";
         return 0;
     }

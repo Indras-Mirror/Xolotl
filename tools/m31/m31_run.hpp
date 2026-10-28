@@ -20,7 +20,7 @@ namespace strata::m31::run {
 namespace fs = std::filesystem;
 
 struct Args {
-    std::string model, ids, cases, out, backend = "cpu", rows = "all", taps = "none";
+    std::string model, ids, cases, mixed_manifest, out, backend = "cpu", rows = "all", taps = "none";
     int chunk = 32768, context = 4096, threads = 32, decode_tail = 0, head_tail = 0;
     double arena_gib = 0;
     double gpu_experts_gib = 0;
@@ -45,6 +45,7 @@ inline Args parse(int argc, char ** argv) {
         if (k == "-m" || k == "--model") a.model = v;
         else if (k == "--ids-file") a.ids = v;
         else if (k == "--cases") a.cases = v;
+        else if (k == "--mixed-manifest") a.mixed_manifest = v;
         else if (k == "--out") a.out = v;
         else if (k == "--backend") a.backend = v;
         else if (k == "--rows") a.rows = v;
@@ -82,8 +83,8 @@ inline Args parse(int argc, char ** argv) {
         }
         else throw std::runtime_error("unknown option " + k);
     }
-    if (a.model.empty() || a.out.empty() || (int(!a.ids.empty()) + int(!a.cases.empty()) != 1))
-        throw std::runtime_error("usage: -m model.gguf (--ids-file x.i32 | --cases DIR) --out NEW-DIR "
+    if (a.model.empty() || a.out.empty() || (int(!a.ids.empty()) + int(!a.cases.empty()) + int(!a.mixed_manifest.empty()) != 1))
+        throw std::runtime_error("usage: -m model.gguf (--ids-file x.i32 | --cases DIR | --mixed-manifest manifest.json) --out NEW-DIR "
                                  "[--backend cpu|cuda --chunk 32768 --ctx 4096 --threads 32 "
                                  "--rows all|last|last:N|stride:N --head-tail N --taps none|layers|all]");
     if (a.backend != "cpu" && a.backend != "cuda") throw std::runtime_error("backend must be cpu or cuda");
@@ -110,7 +111,8 @@ inline std::string quote(const std::string & s) {
 }
 inline std::vector<fs::path> cases(const Args & a) {
     std::vector<fs::path> result;
-    if (!a.ids.empty()) result.emplace_back(a.ids);
+    if (!a.mixed_manifest.empty()) result.emplace_back(a.mixed_manifest);
+    else if (!a.ids.empty()) result.emplace_back(a.ids);
     else {
         for (const auto & e : fs::directory_iterator(a.cases))
             if (e.is_regular_file() && e.path().extension() == ".i32") result.push_back(e.path());
@@ -273,7 +275,9 @@ struct Dump {
           << ",\"backend\":" << quote(args.backend) << ",\"kv\":\"f16\",\"actual_chunks\":[";
         for (size_t i = 0; i < chunks.size(); ++i)
             f << (i ? "," : "") << "{\"position\":" << chunks[i].first << ",\"tokens\":" << chunks[i].second << "}";
-        f << "],\"positions\":[";
+        if (!args.mixed_manifest.empty())
+            f << "],\"mixed_manifest\":" << quote(fs::canonical(args.mixed_manifest).string()) << ",\"positions\":[";
+        else f << "],\"positions\":[";
         for (size_t i = 0; i < positions.size(); ++i) f << (i ? "," : "") << positions[i];
         f << "]}\n";
         if (!f) throw std::runtime_error("cannot write manifest");

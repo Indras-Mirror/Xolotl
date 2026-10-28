@@ -12,7 +12,7 @@
 
 namespace strata::m31 {
 
-// Text-only MSA engine. CUDA prefill uses stock grouped MMQ; single-token
+// MSA engine with optional mixed text/vision input. CUDA prefill uses stock grouped MMQ; single-token
 // decode uses the original CPU quantization traits and ordered rank reduction.
 class Engine {
 public:
@@ -25,6 +25,12 @@ public:
     // Append one chunk. A preflight rejection preserves valid state. Once execution
     // starts, an error requires reset(): caches may be partially written.
     bool forward(const int32_t * tokens, int n, std::string & error);
+    // Linear decoder positions: -1 tokens select rows of the F32 vision table;
+    // text tokens have visual_rows[i] == -1. Requires STRATA_M31_VISION.
+    // Validation occurs before mutation, with the same failure/reset contract.
+    bool forward_mixed(const int32_t * tokens, const int32_t * visual_rows,
+                       const float * visual_embeddings, int visual_count,
+                       int n, std::string & error);
     // Exact whole-prefix checkpoint: owned host copies of valid F16 K/V/index
     // rows only. Checkpoints belong to this initialized Engine; no model math,
     // weights, live graph pointers or expert-cache entries are serialized.
