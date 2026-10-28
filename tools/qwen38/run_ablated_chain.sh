@@ -40,6 +40,48 @@ say() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 die() { say "FAILED: $*"; printf 'FAILED %s\n' "$*" > "$STATE/status"; exit 90; }
 ok() { printf '%s\n' "$1" > "$STATE/status"; }
 
+# ---- the interpreter: find one that HAS numpy, and prove it, before any stage relies on it.
+#
+# On 2026-10-29 02:46 every allocator call died with ModuleNotFoundError: the driver had been
+# launched by the systemd user unit, whose PATH has no anaconda, so `python3` was
+# /usr/bin/python3 (no numpy) - while an interactive shell run at 18:28 had used
+# /home/mal/anaconda3/bin/python3 and worked. The chain's own sweep loop then reported each of
+# those deaths as "infeasible", which made a missing module look like a budget verdict.
+#
+# Two fixes, both needed: pin the interpreter here (and put its bin first on PATH so any
+# subprocess gets the same one), and check it up front so a bad interpreter fails loudly at
+# startup rather than silently mid-run.
+pick_python() {
+    local c
+    for c in /home/mal/anaconda3/bin/python3 "$(command -v python3 2>/dev/null)" /usr/bin/python3; do
+        [ -n "$c" ] && [ -x "$c" ] || continue
+        "$c" -c 'import numpy' >/dev/null 2>&1 && { printf '%s\n' "$c"; return 0; }
+    done
+    return 1
+}
+PY=$(pick_python) || {
+    say "FAILED: no python3 with numpy (tried anaconda, PATH, /usr/bin/python3)"
+    printf 'FAILED no python3 with numpy\n' > "$STATE/status"
+    exit 2
+}
+export PATH="$(dirname "$PY"):$PATH"
+say "interpreter: $PY ($("$PY" -c 'import numpy; print("numpy", numpy.__version__)'))"
+
+# Classify a failed allocator run: "infeasible" (a real budget verdict) or "crashed" (anything
+# else). Kept as a function so a test can pin it - inlining this grep is exactly how a missing
+# module came to look like a budget verdict at 02:46 on 2026-10-29.
+#   infeasible: the allocator raised its own explicit "cannot fund the cheapest legal layer
+#               choices" ValueError. It ARRIVES AS A TRACEBACK, so a crash cannot be detected by
+#               looking for a traceback alone.
+#   crashed:    everything else - import error, bad flag, unreadable stats, OOM kill.
+classify_alloc_log() {
+    if grep -q "cannot fund the cheapest legal layer choices" "$1" 2>/dev/null; then
+        echo infeasible
+    else
+        echo crashed
+    fi
+}
+
 # Run a long stage in the background and wait for it, so a signal is honoured AT ONCE.
 # bash defers trap delivery until the current FOREGROUND child returns, so a stage written as a
 # plain foreground command swallows SIGTERM for its whole duration (measured: a driver blocked on
@@ -238,7 +280,7 @@ n = sum(len(json.load(open(p))["experts"]) for p in glob.glob(sys.argv[1] + "/L*
 print(int(round(n * (GU * GU_BPW + DN * DN_BPW) / 8)))
 PY
 )
-    say "  cheapest legal expert bytes: $(python3 -c "print(f'{$FLOOR/2**30:.2f} GiB')")"
+    say "  cheapest legal expert bytes: $("$PY" -c "print(f'{$FLOOR/2**30:.2f} GiB')")"
     W=$STATE/allocwork; mkdir -p "$W"; ln -sfn "$STATS" "$W/stats"
     # Sweep the budget and report the measured knee before committing to one. The
     # allocator's objective is held-out expert-output MSE, which is a proxy - not
@@ -247,27 +289,35 @@ PY
     say "  budget sweep (expert GiB -> proxy error):"
     : >"$STATE/sweep.tsv"
     for M in 1.00 1.10 1.20 1.35 1.50 1.75; do
-        B=$(python3 -c "print(f'{$FLOOR * $M / 2**30:.2f}')")
-        if python3 "$XOLOTL/tools/v41/v41_alloc.py" --work "$W" --arch qwen4exp \
+        B=$("$PY" -c "print(f'{$FLOOR * $M / 2**30:.2f}')")
+        if "$PY" "$XOLOTL/tools/v41/v41_alloc.py" --work "$W" --arch qwen4exp \
             --per-proj --edit-downs --layer-choice --budget-gib "$B" \
             --unseen-floor iq2_xxs --out "$STATE/sweep-$B.json" >"$STATE/sweep-$B.log" 2>&1
         then
-            E=$(python3 -c "
+            E=$("$PY" -c "
 import json; d=json.load(open('$STATE/sweep-$B.json'))
 print(f\"{d['used_bytes']/2**30:.3f}\t{d['proxy_err_mixed']:.6f}\")")
             printf '%s\t%s\n' "$B" "$E" >>"$STATE/sweep.tsv"
             say "    budget ${B} GiB -> $(echo "$E" | tr '\t' ' ') (used, err)"
+        elif [ "$(classify_alloc_log "$STATE/sweep-$B.log")" = "infeasible" ]; then
+            say "    budget ${B} GiB -> infeasible (below the legal floor)"
         else
-            say "    budget ${B} GiB -> infeasible"
+            # A CRASH IS NOT A VERDICT. On 2026-10-29 every budget printed "infeasible" because
+            # numpy was missing, so the whole sweep read as "no budget is affordable" - the exact
+            # opposite of the truth. Anything that is not a clean result and not the explicit
+            # infeasibility message stops the chain here instead of being summarised as a number.
+            say "    budget ${B} GiB -> ALLOCATOR CRASHED (not a budget verdict):"
+            tail -8 "$STATE/sweep-$B.log" | sed 's/^/      /'
+            die "allocator crashed at budget ${B} GiB (see $STATE/sweep-$B.log)"
         fi
     done
     # Default 1.20x the legal floor: experts ~45 GiB, total ~74 GiB with the 26.8 GiB
     # PLE table and ~2.5 GiB dense. That still fits the 90 GB box with mmap experts;
     # 3x would be ~142 GiB and would not run here at all. BUDGET_GIB overrides.
     # The real quality test is top-1 agreement on the built file, not this proxy.
-    BUDGET=${BUDGET_GIB:-$(python3 -c "print(f'{$FLOOR * 1.20 / 2**30:.2f}')")}
+    BUDGET=${BUDGET_GIB:-$("$PY" -c "print(f'{$FLOOR * 1.20 / 2**30:.2f}')")}
     say "  budget: ${BUDGET} GiB"
-    python3 "$XOLOTL/tools/v41/v41_alloc.py" --work "$W" --arch qwen4exp \
+    "$PY" "$XOLOTL/tools/v41/v41_alloc.py" --work "$W" --arch qwen4exp \
         --per-proj --edit-downs --layer-choice --budget-gib "$BUDGET" \
         --unseen-floor iq2_xxs --out "$ALLOC" >"$STATE/step5.log" 2>&1 \
         || { tail -20 "$STATE/step5.log"; die "alloc failed"; }

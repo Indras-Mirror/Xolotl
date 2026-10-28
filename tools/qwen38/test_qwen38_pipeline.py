@@ -587,6 +587,71 @@ class ShellScripts(unittest.TestCase):
                                      f"  {lines[hits[0]]!r}")
 
 
+class AllocInterpreter(unittest.TestCase):
+    """The 2026-10-29 02:46 failure: the driver ran under systemd's PATH, `python3` was
+    /usr/bin/python3 with no numpy, every allocator call died, and the sweep summarised all six
+    deaths as "infeasible" - so a missing module read as "no budget is affordable"."""
+
+    def _classify(self, text):
+        src = (HERE / "run_ablated_chain.sh").read_text(encoding="utf-8")
+        head = src.split("# ---------------------------------------------------------------- 0. preconditions")[0]
+        with tempfile.TemporaryDirectory() as d:
+            log = pathlib.Path(d) / "l.log"
+            log.write_text(text, encoding="utf-8")
+            script = pathlib.Path(d) / "t.sh"
+            script.write_text(head.replace("STATE=/home/mal/.quetza-data/qwen38-abl-chain",
+                                           f"STATE={d}") + f'\nclassify_alloc_log "{log}"\n',
+                              encoding="utf-8")
+            # the driver does `exec >>"$LOG" 2>&1`, so the classification lands in chain.log
+            # rather than on stdout - read it there
+            subprocess.run(["bash", str(script)], capture_output=True, text=True,
+                           env={**os.environ,
+                                "PATH": "/home/mal/anaconda3/bin:" + os.environ["PATH"]})
+            chain_log = pathlib.Path(d) / "chain.log"
+            if not chain_log.exists():
+                return ""
+            lines = [ln for ln in chain_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            return lines[-1].strip() if lines else ""
+
+    def test_genuine_infeasibility_is_a_verdict(self):
+        # this is what the allocator really prints when the budget cannot fund the floor, and it
+        # arrives as a Traceback - which is why "any traceback means crash" would be wrong
+        log = ("Traceback (most recent call last):\n"
+               '  File "v41_alloc.py", line 241, in solve_layers\n'
+               "    raise ValueError(f\"budget {budget / 2**30:.3f} GiB cannot fund the cheapest "
+               "legal layer choices\")\n"
+               "ValueError: budget 37.420 GiB cannot fund the cheapest legal layer choices\n")
+        self.assertEqual(self._classify(log), "infeasible")
+
+    def test_an_import_error_is_a_crash_not_a_budget_verdict(self):
+        log = ('Traceback (most recent call last):\n  File "v41_alloc.py", line 14, in <module>\n'
+               "    import numpy as np\nModuleNotFoundError: No module named 'numpy'\n")
+        self.assertEqual(self._classify(log), "crashed")
+
+    def test_any_other_failure_is_a_crash(self):
+        for log in ("Segmentation fault\n", "", "unknown flag --budget-gib\n",
+                    'ValueError: bad allocation map\n'):
+            self.assertEqual(self._classify(log), "crashed", f"misclassified {log!r}")
+
+    def test_driver_refuses_to_run_without_numpy(self):
+        # The guard must fire BEFORE any stage runs, with a message that names the real problem.
+        # /usr/bin/python3 on this box has no numpy, so pointing the candidate list at it
+        # reproduces the exact 02:46 condition without faking anything.
+        src = (HERE / "run_ablated_chain.sh").read_text(encoding="utf-8")
+        head = src.split("# ---------------------------------------------------------------- 0. preconditions")[0]
+        with tempfile.TemporaryDirectory() as d:
+            state = pathlib.Path(d)
+            script = state / "t.sh"
+            script.write_text(
+                head.replace('STATE=/home/mal/.quetza-data/qwen38-abl-chain', f'STATE={state}')
+                    .replace("for c in /home/mal/anaconda3/bin/python3", "for c in /usr/bin/python3"),
+                encoding="utf-8")
+            env = {"PATH": "/usr/bin:/bin", "HOME": str(state)}   # coreutils present, numpy absent
+            r = subprocess.run(["/bin/bash", str(script)], capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("no python3 with numpy", (state / "status").read_text(encoding="utf-8"))
+
+
 class LogitsGate(unittest.TestCase):
     """strata's dump has a 2 x int32 header; reading it as headerless shifts every row by 8 bytes.
     These gates make that class of misread loud instead of authoritative."""
