@@ -80,3 +80,8 @@ out/
 /HANDOFF_*.md
 /RESUME_PROMPT_*.md
 /START_HERE*.md
+
+# MTP draft assets (787 MB of binaries - fetched, not source)
+/data/mtp/
+# bench scratch output
+/speedbench-results.jsonl

@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "xol-qfn - our own Qwen3.8-Flash-Next-flavoured quant on the Xolotl engine.",
+    "TEMPLATE. Every path below is resolved by scripts/xol-qfn.sh, which rewrites this file into",
+    "an effective config at launch time. Do not point 'exe' or the repo-relative paths at another",
+    "checkout: the whole point is that a fresh `git clone` + build works with no machine-specific",
+    "editing. Model/pack paths are the two things a user must supply (they are model assets, not",
+    "source), via --model/--pack or XOLQFN_MODEL/XOLQFN_PACK.",
+    "",
+    "Measured on an RTX 4090 + 90 GiB box: 152.6 tok/s decode, 4285 tok/s prefill at 16K/1024."
+  ],
+
+  "exe": "@REPO@/build-xolotl/strata",
+  "cwd": "@REPO@",
+
+  "args": [
+    "--pack", "@PACK@",
+    "--native", "@MODEL@",
+    "--ple-gguf", "@MODEL@",
+    "--ple-io", "direct",
+    "--expert-profile", "@REPO@/data/expert-profile.bin",
+    "--expert-cache", "auto",
+    "--prefill", "auto",
+    "--spec", "4",
+    "--spec-min-p", "0.5",
+    "--mtp", "@REPO@/data/mtp/rt",
+    "--max-context", "@CTX@",
+    "--kv", "int8",
+    "--kv-resident", "@KVRES@"
+  ],
+
+  "env": {
+    "STRATA_ROUTE_RESIDENT": "0.8",
+    "STRATA_ROUTE_RESIDENT_RANKS": "5-9"
+  },
+
+  "tokenizer": "@PACK@/tokenizer",
+  "model_name": "@NAME@",
+  "aliases": "qwen38-flash-next-xq-abl,qwen/qwen3.8-flash",
+  "log": "@LOG@",
+  "port": 8099,
+  "gpu": 0,
+
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20
+  },
+  "fit_max_tokens": true,
+  "reasoning_budget_tokens": 32768
+}
