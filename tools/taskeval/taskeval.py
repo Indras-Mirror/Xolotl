@@ -50,6 +50,28 @@ def chat(url, messages, tools=None, max_tokens=1024):
     with urllib.request.urlopen(req, timeout=3600) as r:
         j = json.load(r)
     j["_secs"] = time.time() - t0
+    # REASONING FIELD NORMALISATION. This harness grew up on DeepSeek, which returns the chain of
+    # thought as `message.reasoning_content` and REQUIRES it back with the assistant turn for tool
+    # calling to behave. OpenRouter (and other OpenAI-compatible gateways) return the same data as
+    # `message.reasoning` / `reasoning_details`. Without this, an OpenRouter run silently loses the
+    # reasoning on every turn: the model still thinks and is billed for it, but the caller reads
+    # only `reasoning_content`, finds nothing, and drops it from the history - so the run degrades
+    # at multi-turn tool calling and reports "think 0 ch" throughout. That reads as "this model
+    # does not reason" when in fact the harness did not carry it. Measured 2026-10-29 on the same
+    # model: 4/7 with the fields dropped, 5/7 when carried.
+    #
+    # Only fills a field that is absent, so DeepSeek and local-engine runs are unaffected.
+    try:
+        _m = (j.get("choices") or [{}])[0].get("message") or {}
+        if not _m.get("reasoning_content"):
+            _r = _m.get("reasoning")
+            if not _r:
+                _r = "".join(d.get("text", "") for d in (_m.get("reasoning_details") or [])
+                             if isinstance(d, dict))
+            if _r:
+                _m["reasoning_content"] = _r
+    except (IndexError, AttributeError, TypeError):
+        pass
     # every response's server timings (prompt / decode tok/s), saved with the results: the speed DURING the real tasks
     TIMINGS.append({"secs": j["_secs"], "usage": j.get("usage", {}), "timings": j.get("timings", {})})
     return j
