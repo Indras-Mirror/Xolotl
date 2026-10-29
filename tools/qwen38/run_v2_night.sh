@@ -41,6 +41,9 @@ IDS=/media/mal/NVME1TB/qwen38/corpus-v4/ids-512.txt
 CORPUS_IDS=/media/mal/NVME1TB/qwen38/corpus-v4/ids-49153.txt
 QUANTIZE=$HOME/AI/llama.cpp-qwen4exp/build/bin/llama-quantize
 STRATA=$XOLOTL/build-xolotl/strata
+# --spec 2 needs a non-empty residency profile (48 layers x 512 experts); without it strata exits 2
+# "--spec needs the device residency table".  NB: strata has NO "generate" subcommand.
+PROFILE=/home/mal/qwen38-profile.bin
 MAX_GB=70
 THREADS=16                       # peer's measured figure: ~705 MB peak per worker
 
@@ -267,8 +270,8 @@ print('prompt', P, 'tokens; gate ids', P + 8, '; max id', max(ids[:P+8]))" \
         [ -f "$N" ] || die "8 gate: no $N"
         [ -f "$PL" ] || die "8 gate: no PLE shard $PL"
         say "8 gate: dumping logits for $kind (native $(basename "$N"), ple $(basename "$PL"))"
-        "$STRATA" generate --native "$N" --pack "$P" --ple-gguf "$PL" --spec 2 --ple-io direct \
-            --mmap-experts --expert-cache 1536 --prefill 512 --max-context 2048 \
+        "$STRATA" --native "$N" --pack "$P" --ple-gguf "$PL" --spec 2 --ple-io direct \
+            --mmap-experts --expert-cache 1536 --expert-profile "$PROFILE" --prefill 512 --max-context 2048 \
             --tokens-file "$STATE/8-prompt.txt" --max-new 1 --dump-logits "$STATE/8-$kind.logits" \
             > "$STATE/8-$kind.out" 2>&1 || die "strata logit dump failed for $kind"
     done

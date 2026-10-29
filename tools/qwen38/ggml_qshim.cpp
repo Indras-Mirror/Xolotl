@@ -78,6 +78,8 @@ int gq_id(const char * name) {
         {"q2_0", GGML_TYPE_Q2_0},
         {"iq2_xxs", GGML_TYPE_IQ2_XXS}, {"iq2_xs", GGML_TYPE_IQ2_XS}, {"iq2_s", GGML_TYPE_IQ2_S},
         {"iq3_xxs", GGML_TYPE_IQ3_XXS}, {"iq3_s", GGML_TYPE_IQ3_S}, {"iq4_nl", GGML_TYPE_IQ4_NL},
+        // in the published GSQ-RCO allocations (IQ4_XS on 181 tensors, IQ1_M on gate/up), so screenable here
+        {"iq4_xs", GGML_TYPE_IQ4_XS}, {"iq1_s", GGML_TYPE_IQ1_S}, {"iq1_m", GGML_TYPE_IQ1_M},
         // 4-bit float formats.  Both have 64-only or 32-only blocks that DO divide qwen4exp's
         // n_ff = 640, so unlike every IQ2/IQ3/K-quant they are usable on the down projection:
         // NVFP4 = 64 values per block (4 E4M3 sub-scales), MXFP4 = 32 (one E8M0 scale).
