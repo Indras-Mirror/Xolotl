@@ -12,7 +12,13 @@ the first row's logits - every row shifts by 8 bytes and every number it prints 
 looking authoritative. This tool parses the header and REFUSES a file whose size disagrees with it,
 so a truncated dump fails loudly instead of being reinterpreted.
 
-    strata generate --model M.gguf --tokens 1,2,3 --max-new 1 --dump-logits out.f32
+The invocation: `strata generate` has NO --model flag. A qwen4exp model is loaded as a native (IQ)
+pack, which needs --native SHARD, --pack DIR, --ple-gguf SHARD and --spec T (T >= 2) - the engine
+refuses the pack without them, and the error names exactly that.
+
+    strata --native M.gguf --pack PACKDIR --ple-gguf M.gguf --spec 2 --ple-io direct \
+           --mmap-experts --expert-cache 1536 --prefill 512 --max-context 1024 \
+           --tokens 1,2,3 --max-new 1 --dump-logits out.f32
     python3 logits_gate.py parent.f32 quant.f32 [--ids prompt.i32] [--json out.json]
                           [--min-top1 0.90] [--max-kl 0.05]
 
