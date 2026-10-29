@@ -45,6 +45,43 @@ std::vector<int32_t> tokens(size_t n, unsigned offset = 0) {
     for (size_t i = 0; i < n; ++i) ids[i] = int32_t((i * 17 + offset) % 64);
     return ids;
 }
+void check_row_schedules() {
+    // Parsing happens once at CpuFusedDecode construction; check the accepted forms.
+    check(RowSchedule::parse(nullptr).mode == RowSchedule::Mode::Guided, "unset decode rows is not auto");
+    check(RowSchedule::parse("0").mode == RowSchedule::Mode::Guided, "decode rows 0 is not auto");
+    check(RowSchedule::parse("auto").mode == RowSchedule::Mode::Guided, "decode rows auto rejected");
+    check(RowSchedule::parse("static").mode == RowSchedule::Mode::Static, "decode rows static rejected");
+    const auto fixed = RowSchedule::parse("48");
+    check(fixed.mode == RowSchedule::Mode::Fixed && fixed.rows == 48, "fixed decode rows misparsed");
+    for (const char * bad : {"", "x", "-1", "+4", " 4", "4 ", "1048577", "auto ", "Static"}) {
+        bool rejected = false;
+        try { (void)RowSchedule::parse(bad); } catch (const std::invalid_argument &) { rejected = true; }
+        check(rejected, std::string("invalid decode rows accepted: '") + bad + "'");
+    }
+    // Every row is claimed exactly once in every mode, including participants
+    // that receive no rows (nth larger than the number of batches).
+    for (const char * mode : {"auto", "static", "1", "16", "64", "1000"}) {
+        const auto schedule = RowSchedule::parse(mode);
+        for (const size_t size : {size_t(1), size_t(17), size_t(512), size_t(24576)}) {
+            for (const int nth : {1, 2, 9, 80}) {
+                std::vector<std::atomic<int>> hits(size);
+                RowCounter counter;
+                std::atomic<bool> outside{false};
+                std::vector<std::thread> workers;
+                for (int ith = 0; ith < nth; ++ith) workers.emplace_back([&, ith] {
+                    schedule_rows(schedule, size, ith, nth, counter, [&](size_t begin, size_t end) {
+                        if (!(begin < end && end <= size)) { outside.store(true); return; }
+                        for (size_t row = begin; row < end; ++row) hits[row].fetch_add(1, std::memory_order_relaxed);
+                    });
+                });
+                for (auto & worker : workers) worker.join();
+                check(!outside.load(), std::string("row schedule ") + mode + " produced a batch outside the matrix");
+                for (size_t row = 0; row < size; ++row)
+                    check(hits[row].load() == 1, std::string("row schedule ") + mode + " lost or repeated a row");
+            }
+        }
+    }
+}
 void check_fused_participants() {
     struct Backend { ggml_backend_t value = ggml_backend_cpu_init(); ~Backend() { if (value) ggml_backend_free(value); } } backend;
     check(backend.value != nullptr, "fused fixture backend");
@@ -68,14 +105,16 @@ void check_fused_participants() {
     }
     std::vector<float> input(256), reference;
     for (size_t i = 0; i < input.size(); ++i) input[i] = float(int(i % 13) - 6) * .1f;
-    // Nine workers exceed the down matrix's eight 64-row batches: idle
-    // participants must still join every barrier. The last arm asks for four
-    // workers from a two-worker pool, so ggml clamps the actual nth to two.
+    // With fixed 64-row batches, nine workers exceed the down matrix's eight
+    // batches: idle participants must still join every barrier. The last arm
+    // asks for four workers from a two-worker pool, so ggml clamps the actual
+    // nth to two. All row schedules must give bitwise-identical output.
+    for (const char * mode : {"auto", "64", "static"})
     for (const auto setting : {std::pair<int, int>{1, 1}, {4, 4}, {9, 9}, {2, 4}}) {
         auto parameters = ggml_threadpool_params_default(setting.first);
         auto * pool = ggml_threadpool_new(&parameters); check(pool != nullptr, "fused fixture pool");
         {
-            CpuFusedDecode fused(backend.value, pool, unsigned(setting.second));
+            CpuFusedDecode fused(backend.value, pool, unsigned(setting.second), RowSchedule::parse(mode));
             std::vector<float> output;
             for (int repeat = 0; repeat < 3; ++repeat) {
                 fused.forward(weights[0], weights[1], weights[2], nullptr, nullptr, nullptr,
@@ -164,6 +203,7 @@ int main(int argc, char ** argv) {
         cancelled.reset(); forward(cancelled, prompt);
         check(head(cancelled, 0, 29) == batch, "reset after cancellation changed request");
 
+        check_row_schedules();
         check_fused_participants();
 
         // Barrier rounds use the actual participants, independent of a

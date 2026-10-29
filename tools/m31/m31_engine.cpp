@@ -1216,8 +1216,11 @@ bool Engine::init(const std::string & path, const Config & requested, std::strin
             ggml_backend_cpu_set_threadpool(p_->cpu, p_->cpu_pool);
             if (ggml_backend_is_cpu(p_->backend)) ggml_backend_cpu_set_threadpool(p_->backend, p_->cpu_pool);
         } else std::fprintf(stderr, "M31 CPU pool: threads=%d persistent=0\n", cfg.threads);
-        if (cfg.cpu_fused && !cfg.tap)
+        if (cfg.cpu_fused && !cfg.tap) {
             p_->cpu_fused = std::make_unique<CpuFusedDecode>(p_->cpu, p_->cpu_pool, unsigned(cfg.threads));
+            std::fprintf(stderr, "M31 CPU fused decode rows: %s (%s)\n",
+                p_->cpu_fused->row_schedule().describe().c_str(), RowSchedule::environment);
+        }
         if (cfg.reuse_allocations) {
             p_->dense_workspace = std::make_unique<Workspace>(p_->backend);
             p_->cpu_workspace = std::make_unique<Workspace>(p_->cpu);

@@ -1,5 +1,6 @@
 #pragma once
 #include "ggml-cpu.h"
+#include "row_schedule.hpp"
 #include "task_barrier.hpp"
 #include <algorithm>
 #include <atomic>
@@ -21,10 +22,10 @@ class CpuFusedDecode {
     ggml_threadpool_t pool;
     unsigned threads;
     CpuTaskBarrier barrier;
-    // Claim independent matrix rows in bounded batches to limit matrix work
-    // stranded behind a delayed worker. Every worker still joins the barriers.
-    static constexpr size_t matrix_chunk_rows = 64;
-    struct alignas(64) RowCounter { std::atomic<size_t> next{0}; };
+    // Independent matrix rows are handed out by RowSchedule (guided batches by
+    // default) to limit matrix work stranded behind a delayed worker. Every
+    // worker still joins the barriers.
+    RowSchedule schedule;
     RowCounter gate_next, down_next;
     ggml_context * context = nullptr;
     ggml_gallocr_t allocator = nullptr;
@@ -42,13 +43,6 @@ class CpuFusedDecode {
     static std::pair<size_t, size_t> range(size_t size, int ith, int nth) {
         return {size * size_t(ith) / size_t(nth), size * size_t(ith + 1) / size_t(nth)};
     }
-    template <class Function>
-    static void matrix_rows(size_t size, RowCounter & counter, Function rows) {
-        for (size_t begin = counter.next.fetch_add(matrix_chunk_rows, std::memory_order_relaxed);
-             begin < size;
-             begin = counter.next.fetch_add(matrix_chunk_rows, std::memory_order_relaxed))
-            rows(begin, std::min(begin + matrix_chunk_rows, size));
-    }
     static void compute(ggml_tensor * output, int ith, int nth, void * opaque) {
         auto & self = *static_cast<CpuFusedDecode *>(opaque);
         const auto & w = self.weight;
@@ -60,7 +54,7 @@ class CpuFusedDecode {
         }
         self.barrier.wait(unsigned(nth));
         const auto * qup = t[0]->vec_dot_type == t[1]->vec_dot_type ? self.quant[0].data() : self.quant[1].data();
-        self.matrix_rows(self.used * self.ff * 2, self.gate_next,
+        schedule_rows(self.schedule, self.used * self.ff * 2, ith, nth, self.gate_next,
             [&](size_t begin, size_t end) {
                 for (size_t index = begin; index < end; ++index) {
                     const int role = index >= self.used * self.ff;
@@ -86,7 +80,7 @@ class CpuFusedDecode {
             ggml_get_type_traits_cpu(t[2]->vec_dot_type)->from_float(self.hidden.data() + rank * self.ff,
                 self.quant[2].data() + rank * qstride, int64_t(self.ff));
         self.barrier.wait(unsigned(nth));
-        self.matrix_rows(self.used * self.embd, self.down_next,
+        schedule_rows(self.schedule, self.used * self.embd, ith, nth, self.down_next,
             [&](size_t begin, size_t end) {
                 for (size_t item = begin; item < end; ++item) {
                     const size_t rank = item / self.embd, row = item % self.embd;
@@ -119,8 +113,11 @@ public:
         }
         return true;
     }
-    CpuFusedDecode(ggml_backend_t cpu, ggml_threadpool_t threadpool, unsigned n_threads)
-        : backend(cpu), pool(threadpool), threads(n_threads) {
+    // The row schedule is fixed for the object's lifetime; the default reads
+    // STRATA_M31_DECODE_ROWS once and rejects an invalid value here.
+    CpuFusedDecode(ggml_backend_t cpu, ggml_threadpool_t threadpool, unsigned n_threads,
+                   RowSchedule row_schedule = RowSchedule::from_environment())
+        : backend(cpu), pool(threadpool), threads(n_threads), schedule(row_schedule) {
         if (!cpu || !ggml_backend_is_cpu(cpu) || !threadpool || !threads || threads > GGML_MAX_N_THREADS)
             throw std::invalid_argument("M31 fused CPU: requires CPU backend and matching persistent pool");
     }
@@ -183,6 +180,7 @@ public:
         output.resize(embd);
         std::memcpy(output.data(), output_tensor->data, embd * sizeof(float));
     }
+    const RowSchedule & row_schedule() const { return schedule; }
     // Already weighted terms, ordered by the submitted ID/weight rank. Borrowed until next forward.
     const std::vector<float> & contributions() const { return down; }
 };

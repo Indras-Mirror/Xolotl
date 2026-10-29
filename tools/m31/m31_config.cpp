@@ -1,4 +1,5 @@
 #include "m31_config.hpp"
+#include "cpu/row_schedule.hpp"
 #include <cmath>
 #include <cctype>
 #include <cstdlib>
@@ -197,6 +198,7 @@ void validate_config(const Config & c, bool initializing_cuda) {
     require(!c.register_arena, "arena registration is unavailable in this build");
 #endif
     (void)mmq_precision_mode();
+    (void)RowSchedule::from_environment();
     reject_legacy_environment();
 }
 void prepare_engine_environment() {
@@ -208,6 +210,7 @@ void prepare_engine_environment() {
     require(setenv("GGML_CUDA_DISABLE_FUSION", "1", 1) == 0, "cannot set CUDA fusion guard");
 #endif
     (void)mmq_precision_mode();
+    (void)RowSchedule::from_environment();
     reject_legacy_environment();
 }
 std::string effective_config(const Config & c) {

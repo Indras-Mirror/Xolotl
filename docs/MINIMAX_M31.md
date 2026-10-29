@@ -237,7 +237,7 @@ slot leases stay live until the real GPU consumer has finished.
 Activation helper buffers are reserved at initialization for at most 1024 rows,
 before the planner samples free VRAM. The long-context planner therefore sees
 those retained allocations. Single-token dot arithmetic and rank-reduction order
-are unchanged; fused CPU matrix-row scheduling now uses bounded dynamic batches,
+are unchanged; fused CPU matrix-row scheduling now uses guided dynamic batches,
 as described below. The long batch algorithm is unchanged, although the
 available-memory budget can alter long chunk sizes.
 The same-chunk numerical contract still applies. Report actual chunks when
@@ -504,13 +504,27 @@ reduction order are unchanged. All five barriers still use the actual callback
 participant count. This limits matrix work stranded behind a slower worker;
 every participant must still reach the barriers.
 
-The change has no scheduling flag, affinity policy or lazy-allocation option.
+The change has no affinity policy or lazy-allocation option.
 The hybrid CPU lane and eager quant-helper reservation remain as before.
 A model-free fixture now also requests nine workers for eight down-matrix
 batches, exercising participants that receive no down work, repeated graph reuse,
 and the existing requested-four/pool-two mismatch. Repeating identical inputs
 does not independently prove reset correctness if stale outputs match; the
 changing-input gate20 decode sequences below provide stronger reset coverage.
+
+A follow-up row-batch sweep (one fresh-process fixed-3072 window, 3 processes
+per arm, EPYC 9654, 80 threads) measured median TG 4K/16K/32K of 25.65/25.89/24.50
+for base 4499, 26.58/25.97/25.27 for 16-row, 26.91/26.66/25.85 for 32-row,
+27.43/26.97/25.98 for 64-row and 27.51/27.02/26.06 tok/s for guided batches:
+16 and 32 rows were slower, guided and 64 rows were within 0.3% with overlapping
+ranges. The default is now **guided**: about remaining/(2·nth) rows per claim, rounded
+down to a multiple of 16 and at least 16, still one `fetch_add` per claim.
+`STRATA_M31_DECODE_ROWS` selects the schedule once at engine start: unset, `0`
+or `auto` = guided; `N` (1..1048576) = fixed N-row batches (`64` reproduces
+`13af6b16`); `static` = the original equal per-worker partition of `4499fcbc`;
+any other value is rejected at startup. The choice is printed after the
+`M31 CPU pool:` line. Row arithmetic is identical in every mode; only work
+placement differs, so the best fixed size may differ on other CPUs.
 
 **Corrected-worker numerical, decode and cache-speed gates passed. Overall acceptance is FAIL: tools23 scored 18/23 against 19/23. The PR remains draft.** Historical
 and diagnostic measurements below belong to the original worker or explicitly
