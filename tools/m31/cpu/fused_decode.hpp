@@ -2,6 +2,7 @@
 #include "ggml-cpu.h"
 #include "task_barrier.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -20,6 +21,11 @@ class CpuFusedDecode {
     ggml_threadpool_t pool;
     unsigned threads;
     CpuTaskBarrier barrier;
+    // Claim independent matrix rows in bounded batches to limit matrix work
+    // stranded behind a delayed worker. Every worker still joins the barriers.
+    static constexpr size_t matrix_chunk_rows = 64;
+    struct alignas(64) RowCounter { std::atomic<size_t> next{0}; };
+    RowCounter gate_next, down_next;
     ggml_context * context = nullptr;
     ggml_gallocr_t allocator = nullptr;
     ggml_cgraph * graph = nullptr;
@@ -36,6 +42,13 @@ class CpuFusedDecode {
     static std::pair<size_t, size_t> range(size_t size, int ith, int nth) {
         return {size * size_t(ith) / size_t(nth), size * size_t(ith + 1) / size_t(nth)};
     }
+    template <class Function>
+    static void matrix_rows(size_t size, RowCounter & counter, Function rows) {
+        for (size_t begin = counter.next.fetch_add(matrix_chunk_rows, std::memory_order_relaxed);
+             begin < size;
+             begin = counter.next.fetch_add(matrix_chunk_rows, std::memory_order_relaxed))
+            rows(begin, std::min(begin + matrix_chunk_rows, size));
+    }
     static void compute(ggml_tensor * output, int ith, int nth, void * opaque) {
         auto & self = *static_cast<CpuFusedDecode *>(opaque);
         const auto & w = self.weight;
@@ -47,19 +60,21 @@ class CpuFusedDecode {
         }
         self.barrier.wait(unsigned(nth));
         const auto * qup = t[0]->vec_dot_type == t[1]->vec_dot_type ? self.quant[0].data() : self.quant[1].data();
-        auto [begin, end] = range(self.used * self.ff * 2, ith, nth);
-        for (size_t index = begin; index < end; ++index) {
-            const int role = index >= self.used * self.ff;
-            const size_t item = role ? index - self.used * self.ff : index;
-            const size_t rank = item / self.ff, row = item % self.ff;
-            const auto * source = static_cast<const uint8_t *>(w[role]->data) + size_t(self.ids[rank]) * w[role]->nb[2] + row * w[role]->nb[1];
-            float value;
-            t[role]->vec_dot(int(self.embd), &value, 0, source, 0, role ? qup : self.quant[0].data(), 0, 1);
-            if (self.scales[role]) value *= self.scales[role][self.ids[rank]];
-            (role ? self.up : self.gate)[item] = value;
-        }
+        self.matrix_rows(self.used * self.ff * 2, self.gate_next,
+            [&](size_t begin, size_t end) {
+                for (size_t index = begin; index < end; ++index) {
+                    const int role = index >= self.used * self.ff;
+                    const size_t item = role ? index - self.used * self.ff : index;
+                    const size_t rank = item / self.ff, row = item % self.ff;
+                    const auto * source = static_cast<const uint8_t *>(w[role]->data) + size_t(self.ids[rank]) * w[role]->nb[2] + row * w[role]->nb[1];
+                    float value;
+                    t[role]->vec_dot(int(self.embd), &value, 0, source, 0, role ? qup : self.quant[0].data(), 0, 1);
+                    if (self.scales[role]) value *= self.scales[role][self.ids[rank]];
+                    (role ? self.up : self.gate)[item] = value;
+                }
+            });
         self.barrier.wait(unsigned(nth));
-        std::tie(begin, end) = range(self.hidden.size(), ith, nth);
+        auto [begin, end] = range(self.hidden.size(), ith, nth);
         for (size_t i = begin; i < end; ++i) {
             const float a = std::min(self.gate[i], 7.f), b = std::clamp(self.up[i], -7.f, 7.f);
             const float glu = a / (1.f + expf(1.702f * (-a)));
@@ -71,15 +86,17 @@ class CpuFusedDecode {
             ggml_get_type_traits_cpu(t[2]->vec_dot_type)->from_float(self.hidden.data() + rank * self.ff,
                 self.quant[2].data() + rank * qstride, int64_t(self.ff));
         self.barrier.wait(unsigned(nth));
-        std::tie(begin, end) = range(self.used * self.embd, ith, nth);
-        for (size_t item = begin; item < end; ++item) {
-            const size_t rank = item / self.embd, row = item % self.embd;
-            const auto * source = static_cast<const uint8_t *>(w[2]->data) + size_t(self.ids[rank]) * w[2]->nb[2] + row * w[2]->nb[1];
-            float value;
-            t[2]->vec_dot(int(self.ff), &value, 0, source, 0, self.quant[2].data() + rank * qstride, 0, 1);
-            if (self.scales[2]) value *= self.scales[2][self.ids[rank]];
-            self.down[item] = value * self.route_weights[rank];
-        }
+        self.matrix_rows(self.used * self.embd, self.down_next,
+            [&](size_t begin, size_t end) {
+                for (size_t item = begin; item < end; ++item) {
+                    const size_t rank = item / self.embd, row = item % self.embd;
+                    const auto * source = static_cast<const uint8_t *>(w[2]->data) + size_t(self.ids[rank]) * w[2]->nb[2] + row * w[2]->nb[1];
+                    float value;
+                    t[2]->vec_dot(int(self.ff), &value, 0, source, 0, self.quant[2].data() + rank * qstride, 0, 1);
+                    if (self.scales[2]) value *= self.scales[2][self.ids[rank]];
+                    self.down[item] = value * self.route_weights[rank];
+                }
+            });
         self.barrier.wait(unsigned(nth));
         std::tie(begin, end) = range(self.embd, ith, nth);
         auto * destination = static_cast<float *>(output->data);
@@ -158,6 +175,10 @@ public:
                 throw;
             }
         }
+        // The caller owns dispatch. Both counters are reset before ggml
+        // publishes this graph to workers, so no new barrier is needed.
+        gate_next.next.store(0, std::memory_order_relaxed);
+        down_next.next.store(0, std::memory_order_relaxed);
         if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) throw std::runtime_error("M31 fused CPU: graph compute failed");
         output.resize(embd);
         std::memcpy(output.data(), output_tensor->data, embd * sizeof(float));

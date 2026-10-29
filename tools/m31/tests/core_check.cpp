@@ -68,9 +68,10 @@ void check_fused_participants() {
     }
     std::vector<float> input(256), reference;
     for (size_t i = 0; i < input.size(); ++i) input[i] = float(int(i % 13) - 6) * .1f;
-    // The last arm asks for four workers from a two-worker pool: ggml clamps
-    // the actual callback nth to two. The fused barrier must finish and agree.
-    for (const auto setting : {std::pair<int, int>{1, 1}, {4, 4}, {2, 4}}) {
+    // Nine workers exceed the down matrix's eight 64-row batches: idle
+    // participants must still join every barrier. The last arm asks for four
+    // workers from a two-worker pool, so ggml clamps the actual nth to two.
+    for (const auto setting : {std::pair<int, int>{1, 1}, {4, 4}, {9, 9}, {2, 4}}) {
         auto parameters = ggml_threadpool_params_default(setting.first);
         auto * pool = ggml_threadpool_new(&parameters); check(pool != nullptr, "fused fixture pool");
         {
