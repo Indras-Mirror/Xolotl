@@ -18,6 +18,10 @@ public:
     struct Stats {
         uint64_t hits = 0, misses = 0, evictions = 0, upload_bytes = 0;
         uint64_t graph_batches = 0, forwards = 0;
+        uint64_t short_hybrid_forwards = 0, short_cpu_experts = 0, short_gpu_experts = 0;
+        uint64_t short_cached_experts = 0, short_cpu_routes = 0, short_gpu_routes = 0;
+        uint64_t short_cold_gpu_bytes = 0;
+        double short_cpu_seconds = 0, short_wall_seconds = 0;
         // Wall time on the calling thread. Async upload_submit can overlap prior
         // DMA; execute includes device completion and must not be called pure kernel time.
         double prepare_seconds = 0, pack_seconds = 0, upload_submit_seconds = 0;
@@ -65,6 +69,21 @@ public:
     void forward_device(int layer,int n,ggml_tensor * normalized,
                         const std::vector<int32_t> & ids,const std::vector<float> & weights,
                         ggml_tensor * shared,ggml_tensor * residual,ggml_tensor * destination);
+    // Whole-expert split; callback returns unreduced weighted F32 contributions
+    // for the selected original [token,rank] indices. All borrowed buffers and
+    // the persistent CPU submission thread are joined before return or throw.
+    using CpuRoutes = std::function<void(int,int,const std::vector<float> &,
+        const std::vector<int32_t> &,const std::vector<float> &,
+        const std::vector<int32_t> &,std::vector<float> &)>;
+    void forward_device_hybrid(int layer,int n,ggml_tensor * normalized,
+        const std::vector<int32_t> & ids,const std::vector<float> & weights,
+        ggml_tensor * shared,ggml_tensor * residual,ggml_tensor * destination,
+        const CpuRoutes & cpu_routes);
+    // Native fallback during a hybrid append must not speculatively upload
+    // the next layer before that layer's CPU/GPU assignment is known.
+    void forward_device_no_prefetch(int layer,int n,ggml_tensor * normalized,
+        const std::vector<int32_t> & ids,const std::vector<float> & weights,
+        ggml_tensor * shared,ggml_tensor * residual,ggml_tensor * destination);
     // Readable during a live HTTP worker; no destructor or signal shutdown needed.
     void print_profile(const char * label = "live") const;
     bool native_gpu_math() const;

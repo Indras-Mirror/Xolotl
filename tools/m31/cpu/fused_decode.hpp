@@ -1,7 +1,9 @@
 #pragma once
 #include "ggml-cpu.h"
+#include "row_schedule.hpp"
 #include "task_barrier.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -20,6 +22,11 @@ class CpuFusedDecode {
     ggml_threadpool_t pool;
     unsigned threads;
     CpuTaskBarrier barrier;
+    // Independent matrix rows are handed out by RowSchedule (guided batches by
+    // default) to limit matrix work stranded behind a delayed worker. Every
+    // worker still joins the barriers.
+    RowSchedule schedule;
+    RowCounter gate_next, down_next;
     ggml_context * context = nullptr;
     ggml_gallocr_t allocator = nullptr;
     ggml_cgraph * graph = nullptr;
@@ -47,19 +54,21 @@ class CpuFusedDecode {
         }
         self.barrier.wait(unsigned(nth));
         const auto * qup = t[0]->vec_dot_type == t[1]->vec_dot_type ? self.quant[0].data() : self.quant[1].data();
-        auto [begin, end] = range(self.used * self.ff * 2, ith, nth);
-        for (size_t index = begin; index < end; ++index) {
-            const int role = index >= self.used * self.ff;
-            const size_t item = role ? index - self.used * self.ff : index;
-            const size_t rank = item / self.ff, row = item % self.ff;
-            const auto * source = static_cast<const uint8_t *>(w[role]->data) + size_t(self.ids[rank]) * w[role]->nb[2] + row * w[role]->nb[1];
-            float value;
-            t[role]->vec_dot(int(self.embd), &value, 0, source, 0, role ? qup : self.quant[0].data(), 0, 1);
-            if (self.scales[role]) value *= self.scales[role][self.ids[rank]];
-            (role ? self.up : self.gate)[item] = value;
-        }
+        schedule_rows(self.schedule, self.used * self.ff * 2, ith, nth, self.gate_next,
+            [&](size_t begin, size_t end) {
+                for (size_t index = begin; index < end; ++index) {
+                    const int role = index >= self.used * self.ff;
+                    const size_t item = role ? index - self.used * self.ff : index;
+                    const size_t rank = item / self.ff, row = item % self.ff;
+                    const auto * source = static_cast<const uint8_t *>(w[role]->data) + size_t(self.ids[rank]) * w[role]->nb[2] + row * w[role]->nb[1];
+                    float value;
+                    t[role]->vec_dot(int(self.embd), &value, 0, source, 0, role ? qup : self.quant[0].data(), 0, 1);
+                    if (self.scales[role]) value *= self.scales[role][self.ids[rank]];
+                    (role ? self.up : self.gate)[item] = value;
+                }
+            });
         self.barrier.wait(unsigned(nth));
-        std::tie(begin, end) = range(self.hidden.size(), ith, nth);
+        auto [begin, end] = range(self.hidden.size(), ith, nth);
         for (size_t i = begin; i < end; ++i) {
             const float a = std::min(self.gate[i], 7.f), b = std::clamp(self.up[i], -7.f, 7.f);
             const float glu = a / (1.f + expf(1.702f * (-a)));
@@ -71,15 +80,17 @@ class CpuFusedDecode {
             ggml_get_type_traits_cpu(t[2]->vec_dot_type)->from_float(self.hidden.data() + rank * self.ff,
                 self.quant[2].data() + rank * qstride, int64_t(self.ff));
         self.barrier.wait(unsigned(nth));
-        std::tie(begin, end) = range(self.used * self.embd, ith, nth);
-        for (size_t item = begin; item < end; ++item) {
-            const size_t rank = item / self.embd, row = item % self.embd;
-            const auto * source = static_cast<const uint8_t *>(w[2]->data) + size_t(self.ids[rank]) * w[2]->nb[2] + row * w[2]->nb[1];
-            float value;
-            t[2]->vec_dot(int(self.ff), &value, 0, source, 0, self.quant[2].data() + rank * qstride, 0, 1);
-            if (self.scales[2]) value *= self.scales[2][self.ids[rank]];
-            self.down[item] = value * self.route_weights[rank];
-        }
+        schedule_rows(self.schedule, self.used * self.embd, ith, nth, self.down_next,
+            [&](size_t begin, size_t end) {
+                for (size_t item = begin; item < end; ++item) {
+                    const size_t rank = item / self.embd, row = item % self.embd;
+                    const auto * source = static_cast<const uint8_t *>(w[2]->data) + size_t(self.ids[rank]) * w[2]->nb[2] + row * w[2]->nb[1];
+                    float value;
+                    t[2]->vec_dot(int(self.ff), &value, 0, source, 0, self.quant[2].data() + rank * qstride, 0, 1);
+                    if (self.scales[2]) value *= self.scales[2][self.ids[rank]];
+                    self.down[item] = value * self.route_weights[rank];
+                }
+            });
         self.barrier.wait(unsigned(nth));
         std::tie(begin, end) = range(self.embd, ith, nth);
         auto * destination = static_cast<float *>(output->data);
@@ -102,8 +113,11 @@ public:
         }
         return true;
     }
-    CpuFusedDecode(ggml_backend_t cpu, ggml_threadpool_t threadpool, unsigned n_threads)
-        : backend(cpu), pool(threadpool), threads(n_threads) {
+    // The row schedule is fixed for the object's lifetime; the default reads
+    // STRATA_M31_DECODE_ROWS once and rejects an invalid value here.
+    CpuFusedDecode(ggml_backend_t cpu, ggml_threadpool_t threadpool, unsigned n_threads,
+                   RowSchedule row_schedule = RowSchedule::from_environment())
+        : backend(cpu), pool(threadpool), threads(n_threads), schedule(row_schedule) {
         if (!cpu || !ggml_backend_is_cpu(cpu) || !threadpool || !threads || threads > GGML_MAX_N_THREADS)
             throw std::invalid_argument("M31 fused CPU: requires CPU backend and matching persistent pool");
     }
@@ -158,10 +172,15 @@ public:
                 throw;
             }
         }
+        // The caller owns dispatch. Both counters are reset before ggml
+        // publishes this graph to workers, so no new barrier is needed.
+        gate_next.next.store(0, std::memory_order_relaxed);
+        down_next.next.store(0, std::memory_order_relaxed);
         if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) throw std::runtime_error("M31 fused CPU: graph compute failed");
         output.resize(embd);
         std::memcpy(output.data(), output_tensor->data, embd * sizeof(float));
     }
+    const RowSchedule & row_schedule() const { return schedule; }
     // Already weighted terms, ordered by the submitted ID/weight rank. Borrowed until next forward.
     const std::vector<float> & contributions() const { return down; }
 };

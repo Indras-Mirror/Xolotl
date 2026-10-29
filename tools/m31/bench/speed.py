@@ -79,6 +79,7 @@ def main():
     p.add_argument("--out", type=Path, required=True, help="new output directory")
     p.add_argument("--repetitions", type=int, default=2)
     p.add_argument("--timeout", type=float, default=7200)
+    p.add_argument("--nonce-seed", help="repeatable request nonces for matched ABBA bodies; omitted uses uuid4")
     a = p.parse_args()
     if a.repetitions <= 0 or a.timeout <= 0:
         p.error("repetitions and timeout must be positive")
@@ -97,6 +98,8 @@ def main():
                     "gen_tps": "1000 * max(generated - 1, 0) / predicted_ms",
                     "first_token": "head and first sample included in prompt_ms",
                     "raw_rates_retained": True}}
+    if a.nonce_seed is not None:
+        manifest["nonce_seed"] = a.nonce_seed
     if tokenizer:
         manifest["tokenizer_sha256"] = {name: hashlib.sha256((a.tokenizer / name).read_bytes()).hexdigest()
             for name in ("vocab.json", "merges.txt", "token_type.json")}
@@ -108,7 +111,9 @@ def main():
             start = (k * 7919) % max(1, len(tokens) - count)
             selected = tokens[start:start + count]
             chunk = tokenizer.decode(selected) if tokenizer else post(a, "/detokenize", {"tokens": selected})[0]["content"]
-            body = {"model": a.model, "messages": [{"role": "user", "content": f"[{uuid.uuid4().hex}]\n" + chunk + ASK}],
+            nonce = uuid.uuid4() if a.nonce_seed is None else uuid.UUID(
+                bytes=hashlib.sha256(f"{a.nonce_seed}-{k}".encode()).digest()[:16])
+            body = {"model": a.model, "messages": [{"role": "user", "content": f"[{nonce.hex}]\n" + chunk + ASK}],
                     "temperature": 0, "max_tokens": maximum, "ignore_eos": True, "stream": False,
                     "cache_prompt": False, "reasoning_effort": "low"}
             response, wall = post(a, "/v1/chat/completions", body)

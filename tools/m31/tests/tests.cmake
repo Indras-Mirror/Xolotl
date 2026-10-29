@@ -86,3 +86,22 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Cla
   add_test(NAME m31_fused_allocation COMMAND m31_fused_allocation_check)
   set_tests_properties(m31_fused_allocation PROPERTIES LABELS "m31;cpu;unit" TIMEOUT 30)
 endif()
+
+# These checks execute no CUDA operation, including in a CUDA build.
+foreach(_m31_short_check policy cost cpu_lane cuda_math_cpu cuda_executor)
+  set(_m31_short_target "m31_shortprefill_${_m31_short_check}_test")
+  add_executable(${_m31_short_target} "${_m31_dir}/tests/shortprefill_${_m31_short_check}_test.cpp")
+  target_include_directories(${_m31_short_target} PRIVATE "${_m31_ggml_src}")
+  target_link_libraries(${_m31_short_target} PRIVATE m31_engine)
+  if(NOT MSVC)
+    target_compile_options(${_m31_short_target} PRIVATE -fno-fast-math -ffp-contract=off)
+  endif()
+  add_dependencies(m31_checks ${_m31_short_target})
+  add_test(NAME "m31_shortprefill_${_m31_short_check}" COMMAND ${_m31_short_target})
+  set_tests_properties("m31_shortprefill_${_m31_short_check}" PROPERTIES LABELS "m31;cpu;unit" TIMEOUT 60)
+endforeach()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_definitions(m31_shortprefill_cuda_executor_test PRIVATE M31_SHORT_ALLOC_WRAP=1)
+  target_link_options(m31_shortprefill_cuda_executor_test PRIVATE "LINKER:--wrap=ggml_gallocr_alloc_graph")
+endif()

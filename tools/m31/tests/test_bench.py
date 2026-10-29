@@ -16,6 +16,11 @@ import compare_logits as C
 import quality as Q
 import replay_oracle as R
 import speed as S
+import prefix_speed as P
+import copy
+import hashlib
+import struct
+import time
 import numpy as np
 
 
@@ -162,6 +167,62 @@ class BenchChecks(unittest.TestCase):
         self.assertNotEqual(a["raw_gen_tps"], b["raw_gen_tps"])
         self.assertEqual(a["raw_prefill_tps"], 9999)
 
+    def run_speed_fixture(self, name, nonce_seed=None):
+        corpus = self.root / "speed-corpus.txt"
+        corpus.write_text("fixed benchmark corpus")
+        output = self.root / name
+        argv = ["speed.py", "--corpus", str(corpus), "--out", str(output), "--repetitions", "1"]
+        if nonce_seed is not None:
+            argv += ["--nonce-seed", nonce_seed]
+        requests = []
+        def response(request, timeout):
+            body = json.loads(request.data)
+            if request.full_url.endswith("/tokenize"):
+                reply = {"tokens": list(range(40000))}
+            elif request.full_url.endswith("/detokenize"):
+                reply = {"content": f"fixed text rows {body['tokens'][0]}..{body['tokens'][-1]}"}
+            else:
+                self.assertTrue(request.full_url.endswith("/v1/chat/completions"))
+                requests.append(body)
+                reply = {"choices": [{"finish_reason": "length"}], "timings": {
+                    "prompt_n": 1000, "prompt_ms": 100, "predicted_n": body["max_tokens"],
+                    "predicted_ms": (body["max_tokens"] - 1) * 10}}
+            return io.BytesIO(json.dumps(reply).encode())
+        with patch.object(sys, "argv", argv), patch("urllib.request.urlopen", side_effect=response), redirect_stdout(io.StringIO()):
+            S.main()
+        manifest = json.loads((output / "manifest.json").read_text())
+        return requests, manifest
+
+    def test_speed_nonce_seed_repeats_exact_abba_bodies_and_records_recipe(self):
+        seed = "m31-pr3-abba-fixed"
+        first, manifest = self.run_speed_fixture("speed-seed-first", seed)
+        second, repeated = self.run_speed_fixture("speed-seed-repeat", seed)
+        changed, _ = self.run_speed_fixture("speed-seed-changed", seed + "-other")
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 4)  # Index0 warmup, then4K/16K/32K.
+        self.assertEqual([body["max_tokens"] for body in first], [32, 256, 256, 256])
+        for index, (same, different) in enumerate(zip(first, changed)):
+            # Raw digest bytes must survive UUID construction: no version/variant
+            # bit rewriting, exactly matching the published ABBA driver's recipe.
+            expected = hashlib.sha256(f"{seed}-{index}".encode()).digest()[:16].hex()
+            content = same["messages"][0]["content"]
+            other = different["messages"][0]["content"]
+            self.assertTrue(content.startswith(f"[{expected}]\n"))
+            self.assertNotEqual(content.split("\n", 1)[0], other.split("\n", 1)[0])
+            self.assertEqual(content.split("\n", 1)[1], other.split("\n", 1)[1])
+            self.assertEqual({k: v for k, v in same.items() if k != "messages"},
+                             {k: v for k, v in different.items() if k != "messages"})
+        self.assertTrue(manifest["complete"] and repeated["complete"])
+        self.assertEqual(manifest["nonce_seed"], seed)
+        self.assertEqual(repeated["nonce_seed"], seed)
+
+    def test_speed_omitted_nonce_seed_keeps_uuid4_default(self):
+        with patch.object(S.uuid, "uuid4", return_value=SimpleNamespace(hex="a" * 32)) as random_nonce:
+            requests, manifest = self.run_speed_fixture("speed-random-default")
+        self.assertEqual(random_nonce.call_count, 4)
+        self.assertTrue(all(body["messages"][0]["content"].startswith("[" + "a" * 32 + "]\n") for body in requests))
+        self.assertNotIn("nonce_seed", manifest)
+
     def test_speed_single_token_has_no_decode_transition(self):
         response = {"timings": {"prompt_n": 1, "prompt_ms": 10, "predicted_n": 1, "predicted_ms": 0}}
         self.assertEqual(S.timing_metrics(response)["gen_tps"], 0)
@@ -228,6 +289,161 @@ class BenchChecks(unittest.TestCase):
         trace_path.write_text(json.dumps(trace) + "\n")
         with self.assertRaisesRegex(ValueError, "active KV"):
             R.validate_capacity(self.reference, self.candidate, "case")
+
+
+class PrefixSpeedChecks(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.model = self.root / "model.gguf"
+        self.model.write_text("model-free fixture")
+        self.ids = self.root / "tokens.i32"
+        self.ids.write_bytes(struct.pack("<1324i", *range(1324)))
+        self.output = self.root / "results"
+        self.argv = ["--engine", sys.executable, "--model", str(self.model),
+                     "--ids-file", str(self.ids), "--out", str(self.output), "--repetitions", "1",
+                     "--startup-timeout", "2", "--request-timeout", "2", "--shutdown-timeout", ".2"]
+
+    def fake_worker(self, mode="normal"):
+        script = self.root / "worker.py"
+        script.write_text("MODE = " + repr(mode) + "\n" + r'''import sys, time
+if MODE == "startup-timeout":
+    time.sleep(60)
+print("READY 40000 stop", flush=True)
+history = []
+for line in sys.stdin:
+    if line.strip() == "QUIT":
+        break
+    if MODE == "reply-timeout":
+        time.sleep(60)
+    if MODE == "died":
+        sys.exit(7)
+    fields = line.split()
+    assert fields[:2] == ["GEN", "1"]
+    assert "temperature=0" in fields and "ignore_eos=1" in fields and "seed=123" in fields
+    ids = list(map(int, fields[-1].split(",")))
+    cache = "cache_prompt=1" in fields
+    reused = 0
+    if cache:
+        for a, b in zip(history, ids):
+            if a != b:
+                break
+            reused += 1
+        reused = min(reused, len(ids) - 1) // 256 * 256
+    if MODE == "cold-fallback" and reused:
+        reused = 0
+    if reused:
+        print("RESUME", reused, flush=True)
+    remaining = len(ids) - reused
+    chunks = [remaining // 2, remaining - remaining // 2] if remaining > 2 else [remaining]
+    read = reused
+    for chunk in chunks:
+        read += chunk
+        print("PP", read, len(ids), "1.25 100", flush=True)
+    print("T 42", flush=True)
+    print("DONE", 1, len(ids), "2.5 0 length 0 0", reused, "0 0 0 0 0", remaining, 0, flush=True)
+    history = ids if cache else []
+''')
+        return [sys.executable, str(script)]
+
+    def run_fake(self, mode="normal"):
+        with patch.object(P, "engine_command", return_value=self.fake_worker(mode)), redirect_stdout(io.StringIO()), \
+                patch("sys.stderr", new=io.StringIO()):
+            result = P.main(self.argv)
+        return result, json.loads((self.output / "receipt.json").read_text())
+
+    def test_cli_invalid_recipe_is_rejected_before_files_or_process(self):
+        script = Path(P.__file__)
+        for flag, value in (("--prefix", "1025"), ("--suffixes", "100,100"),
+                            ("--repetitions", "0"), ("--request-timeout", "nan"),
+                            ("--context", "1024"), ("--device", "-1")):
+            with self.subTest(flag=flag):
+                result = subprocess.run([sys.executable, str(script), *self.argv, flag, value],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse(self.output.exists())
+
+    def test_input_is_little_endian_int32_and_must_cover_largest_suffix(self):
+        self.assertEqual(P.load_ids(self.ids, 1324)[-1], 1323)
+        self.ids.write_bytes(struct.pack("<1323i", *range(1323)))
+        with self.assertRaisesRegex(ValueError, "at least 1324"):
+            P.load_ids(self.ids, 1324)
+        self.ids.write_bytes(struct.pack("<1324i", *range(1324)) + b"x")
+        with self.assertRaisesRegex(ValueError, "trailing bytes"):
+            P.load_ids(self.ids, 1324)
+
+    def test_live_prefix_receipt_retains_warmups_raw_rows_and_actual_chunks(self):
+        result, receipt = self.run_fake()
+        self.assertEqual(result, 0)
+        self.assertTrue(receipt["pass"])
+        self.assertEqual(receipt["engine_sha256"], hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest())
+        self.assertEqual(receipt["ids_sha256"], hashlib.sha256(self.ids.read_bytes()).hexdigest())
+        self.assertEqual(receipt["argv"], [sys.executable, str(self.root / "worker.py")])
+        self.assertEqual(len(receipt["runs"]), 4)  # Two suffixes, warmup plus one measured repetition.
+        self.assertEqual(sum(row["warmup"] for row in receipt["runs"]), 2)
+        for row in receipt["runs"]:
+            self.assertEqual(row["reset"]["cache_prompt"], False)
+            self.assertEqual(row["reset"]["done"]["read"], 2)
+            self.assertEqual(row["prime"]["done"]["reused"], 0)
+            self.assertEqual(row["append"]["resume"], [1024])
+            self.assertEqual([p["chunk"] for p in row["append"]["pp"]], [row["suffix"] // 2] * 2)
+            self.assertGreaterEqual(row["append"]["wall_seconds"], 0)
+            self.assertEqual(row["append"]["done"]["prompt_ms"], 2.5)
+        self.assertEqual(receipt["summary"]["100"]["samples"], 1)
+        self.assertEqual(len((self.output / "requests.jsonl").read_text().splitlines()), 12)
+        self.assertIn("RESUME 1024", (self.output / "stdout.log").read_text())
+        self.assertIn("GEN 1 temperature=0", (self.output / "stdin.log").read_text())
+
+    def test_cold_fallback_is_a_failure_and_diagnostics_survive(self):
+        result, receipt = self.run_fake("cold-fallback")
+        self.assertEqual(result, 1)
+        self.assertFalse(receipt["pass"])
+        self.assertIn("live-prefix contract", receipt["error"])
+        self.assertTrue((self.output / "stderr.log").is_file())
+        self.assertEqual(len((self.output / "requests.jsonl").read_text().splitlines()), 3)
+
+    def test_startup_reply_and_dead_worker_are_bounded_failures(self):
+        for index, mode in enumerate(("startup-timeout", "reply-timeout", "died")):
+            with self.subTest(mode=mode):
+                self.output = self.root / f"failure-{index}"
+                argv = list(self.argv)
+                argv[argv.index("--out") + 1] = str(self.output)
+                argv[argv.index("--startup-timeout") + 1] = ".2" if mode == "startup-timeout" else "2"
+                argv[argv.index("--request-timeout") + 1] = ".2"
+                with patch.object(P, "engine_command", return_value=self.fake_worker(mode)), \
+                        redirect_stdout(io.StringIO()), patch("sys.stderr", new=io.StringIO()):
+                    started = time.monotonic()
+                    result = P.main(argv)
+                self.assertLess(time.monotonic() - started, 3)
+                self.assertEqual(result, 1)
+                receipt = json.loads((self.output / "receipt.json").read_text())
+                self.assertFalse(receipt["pass"])
+                self.assertTrue(receipt["error"])
+                self.assertTrue((self.output / "stdout.log").is_file())
+                if mode != "startup-timeout":
+                    self.assertIn("READY 40000", (self.output / "stdout.log").read_text())
+                    requests = [json.loads(line) for line in (self.output / "requests.jsonl").read_text().splitlines()]
+                    self.assertEqual(len(requests), 1)
+                    self.assertIn("exited" if mode == "died" else "output deadline", requests[0]["error"])
+
+    def test_receipt_validation_rejects_partial_resume_bad_chunks_and_nonfinite_time(self):
+        _, receipt = self.run_fake()
+        valid = receipt["runs"][0]["append"]
+        for change in (lambda row: row.update(resume=[768]),
+                       lambda row: row["done"].update(read=99),
+                       lambda row: row["done"].update(generated=0),
+                       lambda row: row["pp"][0].update(chunk=51),
+                       lambda row: row["done"].update(prompt_ms=float("inf"))):
+            with self.subTest(change=change):
+                row = copy.deepcopy(valid)
+                change(row)
+                with self.assertRaises(ValueError):
+                    P.validate_request(row, 1124, 1024)
+
+
+from test_trace_bench import TracePump, ChunkRecipes
+from test_prefix_heads import StrictHeads
 
 
 if __name__ == "__main__":

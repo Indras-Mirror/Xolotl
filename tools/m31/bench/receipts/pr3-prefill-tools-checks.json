@@ -1,0 +1,74 @@
+{
+  "format": "m31-public-prefill-tools-checks-v1",
+  "updated_utc": "2026-10-28T21:52:08Z",
+  "scope": "Portable diagnostic tools added after the GPU measurement windows; model-free checks only. The measured private tee/parser/comparator semantics are preserved. No new model/GPU execution or numerical/quality rerun is claimed.",
+  "runtime_unchanged": {
+    "worker_sha256_before": "5a7d75db17e0e7fecff61a7d3a488a5eaf13872cb529eb0fc5fe20e36dfd3f2a",
+    "worker_sha256_after": "5a7d75db17e0e7fecff61a7d3a488a5eaf13872cb529eb0fc5fe20e36dfd3f2a",
+    "cpp_source_matches_numeric_receipt": true,
+    "cpp_source_unchanged_after_checks": true,
+    "cpp_source_seal_sha256": "ccedcc06df14dd4984d64633acd9175c77d3ce454037c64df77c8becbf85317e",
+    "numeric_receipt": "pr3-prefill-numeric.json",
+    "numeric_receipt_sha256": "cbed0d003f7af12430184d7fd6677f3306ef93e6c9b0abd8288d83842352a3d9"
+  },
+  "copied_stage_files_byte_equal": {
+    "tools/m31/bench/trace_server.py": true,
+    "tools/m31/bench/trace_chunks.py": true,
+    "tools/m31/tests/test_trace_bench.py": true,
+    "tools/m31/bench/compare_prefix_heads.py": true,
+    "tools/m31/tests/test_prefix_heads.py": true
+  },
+  "measured_trace_ast_identical": {
+    "ControlTrace": true,
+    "TeeReader": true,
+    "install_trace": true,
+    "load_shim": true,
+    "parse_groups": true
+  },
+  "measured_cache_comparator_whole_file_byte_equal": true,
+  "tests": {
+    "direct_benchmark_suite": {
+      "tests": 39,
+      "passed": 39,
+      "returncode": 0
+    },
+    "cpu_ctest_m31": {
+      "groups": 15,
+      "passed": 15,
+      "returncode": 0
+    },
+    "cuda_build_ctest_m31": {
+      "groups": 15,
+      "passed": 15,
+      "returncode": 0,
+      "gpu_execution": false
+    },
+    "cuda_visible_devices": "",
+    "shared_build_lock": true,
+    "build_performed": false
+  },
+  "coverage": [
+    "original ready/pump line forwarding",
+    "no double tee or T-token logging",
+    "complete PP chunks and DONE/API budget agreement",
+    "hidden PID restart, missing progress, reused prompt and engine error refusals",
+    "complete prefix-state heads and exact history recipes",
+    "finite raw F32, correct top-1 metadata, rewind/restore/release invariants and raw byte equality"
+  ],
+  "public_source_sha256": {
+    "tools/m31/bench/trace_server.py": "b4b2263c6ad6c215f2300b65139584112103712aae0a50cf4ba137d297ccd301",
+    "tools/m31/bench/trace_chunks.py": "322ac9ac58b58103e1d93754f94429f49d29d6ccb1669b100559a9b71ced6782",
+    "tools/m31/tests/test_trace_bench.py": "1b192d7a1ba27c8ca26ac15081e819ccca4de91dae7b61e7981352fbff847188",
+    "tools/m31/bench/compare_prefix_heads.py": "6bb1c20f8f9b52bcc8339db59cfe6eaf63e077895a2c7b25b40c113ef6edf8c6",
+    "tools/m31/tests/test_prefix_heads.py": "1d3bc480deae7ff8d29c1dfa242f44813ce8d86530474bfde3559c48e34774ab",
+    "tools/m31/tests/test_bench.py": "de8441bb1ba8e18e69e9daa3670ff2be1b9976649235f1f7f85f3349f30bf7ea",
+    "tools/m31/bench/README.md": "06751eb35f36cc62b239662e2606700c0b4b225b73fb34b821bed7876d34a3b6"
+  },
+  "local_check_receipt_sha256": "ae70c97b6effc66bc164fbf4ea3a771f1a4f66cb78409f4f8753bf05e70693b9",
+  "limits": [
+    "No HIP/SYCL/Windows or other-device execution",
+    "Model-free fake pumps/heads do not replace the separately recorded real-model numerical gates",
+    "These additions do not change either measured ABBA outcome or sampled quality result"
+  ],
+  "pass": true
+}

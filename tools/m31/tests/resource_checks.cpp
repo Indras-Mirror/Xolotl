@@ -1,4 +1,5 @@
 #include "../m31_config.hpp"
+#include "../cpu/row_schedule.hpp"
 #include "../prefill/chunk_limit.hpp"
 #include "../prefill/plan.hpp"
 #include "../prefill/vision_budget.hpp"
@@ -22,6 +23,7 @@ int main(int argc,char **argv) {
             prepare_engine_environment();validate_config(Config{});
             std::printf("fusion=%s\n",std::getenv("GGML_CUDA_DISABLE_FUSION"));
             std::puts(effective_config(Config{}).c_str());
+            std::printf("decode_rows=%s\n",RowSchedule::from_environment().describe().c_str());
             return 0;
         }
 

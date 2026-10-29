@@ -62,6 +62,13 @@ public:
     bool logits(int row, int count, std::vector<float> & out, std::string & error);
     void reset();
     int64_t position() const;
+    struct PrefillStats {
+        uint64_t hybrid_layers = 0, cpu_routes = 0, gpu_routes = 0, cold_gpu_bytes = 0;
+        uint64_t quant_calls = 0, quant_runtime_allocations = 0;
+        size_t quant_device_bytes = 0;
+    };
+    // Cumulative counters; requesting them performs no allocation or model work.
+    PrefillStats prefill_stats() const;
     // Cap every backend at the MSA int32 limit. CUDA also applies a
     // conservative scratch-memory plan to the remaining prompt chunk.
     // In vision-enabled CUDA builds, cap by live VRAM to account for the helper.

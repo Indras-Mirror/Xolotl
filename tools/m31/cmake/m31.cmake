@@ -29,6 +29,7 @@ set(_m31_ggml_src "${STRATA_GGML_DIR}/ggml/src")
 add_library(m31_engine STATIC
   "${_m31_dir}/m31_engine.cpp"
   "${_m31_dir}/m31_config.cpp"
+  "${_m31_dir}/prefill/short/shortprefill_cuda_math_cpu.cpp"
   "${_m31_dir}/gpu/experts.cpp"
   "${_m31_dir}/gpu/host_executor.cpp")
 target_include_directories(m31_engine PUBLIC "${_m31_dir}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -36,10 +37,19 @@ target_include_directories(m31_engine PRIVATE "${_m31_ggml_src}" "${_m31_ggml_sr
 target_compile_features(m31_engine PUBLIC cxx_std_20)
 target_link_libraries(m31_engine PUBLIC ggml ggml-cpu ggml-base Threads::Threads)
 if(STRATA_ENABLE_CUDA AND TARGET ggml-cuda AND NOT STRATA_HIP_GFX906)
-  target_sources(m31_engine PRIVATE "${_m31_dir}/gpu/registered_arena.cu")
+  target_sources(m31_engine PRIVATE "${_m31_dir}/gpu/registered_arena.cu"
+    "${_m31_dir}/prefill/short/shortprefill_gpu_quant.cu")
+  set_source_files_properties("${_m31_dir}/prefill/short/shortprefill_gpu_quant.cu"
+    PROPERTIES COMPILE_OPTIONS "--use_fast_math")
   target_compile_definitions(m31_engine PUBLIC M31_ENGINE_CUDA=1 PRIVATE M31_REGISTERED_ARENA_CUDA=1)
   target_link_libraries(m31_engine PUBLIC ggml-cuda CUDA::cudart)
   set_target_properties(m31_engine PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+else()
+  target_sources(m31_engine PRIVATE "${_m31_dir}/prefill/short/shortprefill_gpu_quant_stub.cpp")
+endif()
+if(NOT MSVC)
+  set_source_files_properties("${_m31_dir}/prefill/short/shortprefill_cuda_math_cpu.cpp"
+    PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
 endif()
 
 # Tokenization and constrained sampling use this same pinned ggml. No PR oracle is a runtime dependency.

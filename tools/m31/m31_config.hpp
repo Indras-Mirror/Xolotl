@@ -9,7 +9,8 @@
 #include <vector>
 
 namespace strata::m31 {
-// Algorithm choices are the accepted v8 path. Only resource budgets are knobs.
+// Accepted native batch/decode math and automatic short-chunk CPU/GPU split.
+// Algorithm thresholds are fixed; only resource budgets are knobs.
 struct Config {
     ggml_backend_t backend = nullptr; // borrowed; nullptr selects CPU
     int threads = int(std::max(1u, std::min(32u, std::thread::hardware_concurrency())));
