@@ -69,6 +69,7 @@ from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve.voice import VoiceServer, start_lazy_voice  # noqa: E402  local: the voice sidecar (ASR/TTS)
 from serve import images as images_api  # noqa: E402
+from serve import request_log as reqlog  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -2574,6 +2575,7 @@ class Vision:
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
                                                                      "the vision encoder stopped"))
             self.cache[key] = (out, int(line.split()[1]))
+            self.encodes = getattr(self, "encodes", 0) + 1         # pictures encoded, not found in the cache
             held = {str(p) for p in keep} | {str(out)}
             for old in list(self.cache):                               # oldest first, but never one still in use
                 if len(self.cache) <= 64:
@@ -3208,6 +3210,9 @@ class Service:
         self.api_monitor = False
         self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
         self.request_trace = threading.local()
+        # opt-in (--request-log / $STRATA_REQUEST_LOG / "request_log"): serve/request_log.py's RequestLog, one JSON
+        # line of timings and token counts per request (no prompts or answers); None = nothing is written
+        self.request_log = None
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
@@ -3802,11 +3807,12 @@ class Service:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
-    def begin_request(self, path, req):
-        """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
-        if not self.api_monitor:
+    def begin_request(self, path, req, client=None, user_agent=None):
+        """#332: a monitor record for this request, or None when the monitor and the request log are both off
+        (nothing is kept then).  With only the request log on, the record keeps no prompt or answer text."""
+        if not self.api_monitor and self.request_log is None:
             return None
-        raw = json.dumps(req, ensure_ascii=False, indent=2)
+        raw = json.dumps(req, ensure_ascii=False, indent=2) if self.api_monitor else ""
         record = {"id": uuid.uuid4().hex[:12], "path": path, "model": req.get("model") or self.model,
                   "started_at": time.time(), "state": "queued", "stream": bool(req.get("stream")),
                   "response_format": (req.get("response_format") or {}).get("type")
@@ -3815,10 +3821,35 @@ class Service:
                   "output": "", "reasoning": "", "output_truncated": False, "reasoning_truncated": False,
                   "queue_s": 0.0, "load_s": 0.0, "first_token_s": None,
                   "_clock": time.perf_counter()}
-        with self.status_lock:
-            self.api_requests.append(record)
+        if self.api_monitor:
+            with self.status_lock:
+                self.api_requests.append(record)
+        else:                                           # the request log alone: no request or answer text is kept
+            for key in ("input", "input_truncated", "output", "reasoning", "output_truncated", "reasoning_truncated"):
+                record.pop(key)
+        if self.request_log is not None:
+            with self.status_lock:
+                queued = self.status.get("queued", 0)
+            record["_log"] = reqlog.new_stats(queued, client, user_agent, self.request_log.detail)
         self.request_trace.record = record
         return record
+
+    def _log_stats(self):
+        """The request log's figures for the request on this thread (None when the log is off)."""
+        trace = getattr(self.request_trace, "record", None)
+        return None if trace is None else trace.get("_log")
+
+    def write_request_log(self, record) -> None:
+        """The request log's line for a finished request (its record from begin_request).  Never raises."""
+        log, stats = self.request_log, record.get("_log")
+        if log is None or stats is None:
+            return
+        try:
+            with self.status_lock:
+                line = reqlog.entry(record, stats, log.detail)
+            log.write(line)
+        except Exception as e:  # noqa: BLE001 - the log must never fail a request
+            print(f"[strata] request log: {type(e).__name__}: {e}", flush=True)
 
     def request_records(self, request_id=None):
         with self.status_lock:
@@ -4041,8 +4072,9 @@ class Service:
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
-    def expand_image_tokens(self, ids, encoded):
-        """Expand the template's image markers into one token per encoder row."""
+    def expand_image_tokens(self, ids, encoded, ends=None):
+        """Expand the template's image markers into one token per encoder row.  `ends` (a list): each picture's end
+        position in the expanded prompt is appended to it (the request log)."""
         pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
         start = self.tok.encode(VISION_START, parse_special=True)[0]
         literal = self.tok.encode(IMAGE_PAD, parse_special=False)
@@ -4053,6 +4085,8 @@ class Service:
                     raise ValueError("the prompt and its images do not match")
                 out += [pad] * encoded[k][1]
                 k += 1
+                if ends is not None:
+                    ends.append(len(out))
             elif t == pad:
                 out += literal
             else:
@@ -4086,21 +4120,34 @@ class Service:
                 return fetched[src] if src in fetched else Vision.download(src) \
                     if src.startswith(("http://", "https://")) else src
             images = [fetch(src) for src in images]
+            stats = self._log_stats()
+            waiting = time.perf_counter()
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self._turn(cancel):
+                encoding = time.perf_counter()
+                fresh = getattr(self.vision, "encodes", None)  # the encoder's count of pictures it encoded
                 self._vision_up()
                 try:
                     encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
                                else [self.vision.encode(src) for src in images])
                 finally:
                     self.last_image_at = time.time()
+                    if stats is not None:
+                        stats["image_wait_s"] = stats.get("image_wait_s", 0.0) + encoding - waiting
+                        stats["image_encode_s"] = stats.get("image_encode_s", 0.0) + time.perf_counter() - encoding
+            if stats is not None:
+                stats["images"] = len(encoded)
+                if fresh is not None and getattr(self.vision, "encodes", None) is not None:
+                    stats["images_encoded"] = self.vision.encodes - fresh
+                    stats["images_from_encoder_cache"] = len(encoded) - stats["images_encoded"]
+                stats["image_ends"] = []
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            ids = self.expand_image_tokens(ids, encoded)
+            ids = self.expand_image_tokens(ids, encoded, None if stats is None else stats["image_ends"])
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
@@ -4339,6 +4386,8 @@ class Service:
         # so the generated reasoning must not become this request's cached input (#615).
         segments = []
         trace = getattr(self.request_trace, "record", None)
+        stats = None if trace is None else trace.get("_log")   # the request log's figures (None: it is off)
+        calls, start_s = 0, None                        # the tool calls written; when the turn began (request log)
         waiting = time.perf_counter()
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
@@ -4371,6 +4420,8 @@ class Service:
                 if not got:                              # cancelled while queued
                     with self.status_lock:
                         self.status["queued"] -= 1
+                        if stats is not None:
+                            stats.update(finish="cancel", cancelled=True)
                     yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
                                    "reasoning_tokens": 0, "reasoning_recoveries": 0}
                     return
@@ -4409,6 +4460,11 @@ class Service:
                             self.status.update(st)
                         self.last_request_at = time.time()
                         rate.clear()                    # the previous request's samples must not leak into this one
+                    start_s = round(time.perf_counter() - trace["_clock"], 3) if stats is not None else None
+                    # the request log's detail: the prompt read's PP lines (one engine at a time only: with parallel
+                    # requests the engine's progress is not this request's)
+                    pp_log = stats.get("prefill_progress") if stats is not None and not par else None
+                    pp_seen = getattr(self.engine, "progress", None)
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
@@ -4431,6 +4487,13 @@ class Service:
                             last_out = time.perf_counter()
                             for t in gen:
                                 if t is None:               # heartbeat while the engine is quiet
+                                    if pp_log is not None:
+                                        pr = getattr(self.engine, "progress", None)
+                                        if pr is not None and pr is not pp_seen and \
+                                                len(pp_log) < reqlog.PREFILL_SAMPLES_MAX:
+                                            pp_seen = pr
+                                            ms = float(getattr(self.engine, "progress_ms", 0) or 0)
+                                            pp_log.append([pr[0], pr[1], round(ms, 1)])
                                     last_print = self._progress(last_print, st=st)
                                     last_out = time.perf_counter()
                                     yield "ping", None
@@ -4464,6 +4527,7 @@ class Service:
                                         reasoning_text += ev.text or ""
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
+                                        calls += ev.kind == "tool_call"
                                     yield "event", ev
                                 if evs:
                                     last_out = time.perf_counter()
@@ -4691,8 +4755,15 @@ class Service:
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
+                            if stats is not None:
+                                reqlog.add_run(stats, prompt_tokens=len(ids), max_tokens=max_new, thinking=thinking,
+                                               generated=n, finish=finish, last=last, timings=timings,
+                                               segments=segments, start_s=start_s)
+                                if hit_rate is not None and "segments" in stats:
+                                    stats["expert_hit_rate"] = hit_rate
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
-                                  f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                                  f"({finish}, cancel={cancel.is_set()}){hit_msg}{reqlog.done_suffix(trace)}",
+                                  flush=True)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
@@ -4714,7 +4785,15 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
+            calls += ev.kind == "tool_call"
             yield "event", ev
+        if stats is not None:
+            with self.status_lock:
+                stats["reasoning_tokens"] = stats.get("reasoning_tokens", 0) + thinking_n
+                stats["tool_calls"] = stats.get("tool_calls", 0) + calls
+                stats["cancelled"] = stats.get("cancelled", False) or cancel.is_set()
+                if stops is not None and stops.hit is not None:
+                    stats["stop_sequence"] = True
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
@@ -5425,8 +5504,9 @@ def make_handler(svc: Service):
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
-                    raw = json.dumps(obj, ensure_ascii=False, indent=2)
-                    self.record.update(response=raw[:262144], response_truncated=len(raw) > 262144)
+                    if svc.api_monitor:                     # the request log alone keeps no answer text
+                        raw = json.dumps(obj, ensure_ascii=False, indent=2)
+                        self.record.update(response=raw[:262144], response_truncated=len(raw) > 262144)
                     for key in ("error", "usage", "timings"):
                         if key in obj:
                             self.record[key] = obj[key]
@@ -5754,7 +5834,8 @@ def make_handler(svc: Service):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
-                    self.record = svc.begin_request(path, req)
+                    self.record = svc.begin_request(path, req, self.client_address[0] if self.client_address else None,
+                                                    self.headers.get("User-Agent"))
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path.startswith("/slots/"):
@@ -5833,6 +5914,7 @@ def make_handler(svc: Service):
                         record["finished_at"] = time.time()
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
                     svc.request_trace.record = None
+                    svc.write_request_log(record)
 
         def _images(self, req):
             """POST /v1/images/generations (serve/images.py): one sd-cli job in the GPU's turn."""
@@ -6025,7 +6107,7 @@ def make_handler(svc: Service):
         def _capture(self, items, api):
             """Retain bounded input/output for the monitor without changing the API response (the items as they
             are when the monitor is off)."""
-            if self.record is None:
+            if self.record is None or not svc.api_monitor:   # the request log alone keeps no answer text
                 return items
             return self._captured(items, api)
 
@@ -6983,6 +7065,19 @@ def main() -> int:
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
                          "memory (also \"api_monitor\": true in the config; off by default)")
+    ap.add_argument("--request-log", default=os.environ.get("STRATA_REQUEST_LOG") or None, metavar="PATH",
+                    help="append one JSON line per API request to PATH: arrival time, wait, time to first token, token "
+                         "counts, speeds, how it ended; no prompts, answers or keys (also $STRATA_REQUEST_LOG or "
+                         "\"request_log\" in the config; off by default)")
+    ap.add_argument("--request-log-max-mb", type=float, default=None, metavar="MB",
+                    help=f"rotate the request log at this size: PATH.1, PATH.2, ... (default {reqlog.DEFAULT_MAX_MB}; "
+                         "0 = never, for logrotate; also \"request_log_max_mb\" in the config)")
+    ap.add_argument("--request-log-backups", type=int, default=None, metavar="N",
+                    help=f"rotated request logs kept (default {reqlog.DEFAULT_BACKUPS}; also \"request_log_backups\" "
+                         "in the config)")
+    ap.add_argument("--request-log-detail", action="store_true",
+                    help="also write the engine's own figures per request (each DONE line, the prompt read's progress) "
+                         "to the request log (also $STRATA_REQUEST_LOG_DETAIL=1 or \"request_log_detail\": true)")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests, so other programs (games, other "
                          "model servers) can use the VRAM; the next request loads it again (also \"idle_unload_s\" "
@@ -7170,6 +7265,22 @@ def main() -> int:
         print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
               "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
               flush=True)
+    log_path = a.request_log or cfg.get("request_log")
+    if log_path:
+        try:
+            svc.request_log = reqlog.RequestLog(
+                log_path, a.request_log_max_mb if a.request_log_max_mb is not None
+                else cfg.get("request_log_max_mb", reqlog.DEFAULT_MAX_MB),
+                a.request_log_backups if a.request_log_backups is not None
+                else cfg.get("request_log_backups", reqlog.DEFAULT_BACKUPS),
+                detail=a.request_log_detail or os.environ.get("STRATA_REQUEST_LOG_DETAIL") == "1"
+                or cfg.get("request_log_detail") is True)
+        except (ValueError, OSError) as e:
+            raise SystemExit(f"[strata] request log: {e}")
+        rlog = svc.request_log
+        print(f"[strata] request log on: {rlog.path} (one JSON line per request, no prompts or answers; "
+              + (f"rotated at {rlog.max_bytes / 2**20:g} MB, {rlog.backups} kept" if rlog.max_bytes else "not rotated")
+              + (", with the engine's figures" if rlog.detail else "") + ")", flush=True)
     if svc.cors_origins:
         print(f"[strata] CORS on /v1/* for {', '.join(svc.cors_origins)}"
               + ("" if svc.api_key or "*" not in svc.cors_origins else
