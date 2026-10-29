@@ -1,7 +1,7 @@
 # MiniMax-M3.1-Flash
 
-Opt-in text engine and shim to the common Strata HTTP server, developed in
-[issue #62](https://github.com/Indras-Mirror/Xolotl/issues/62).
+Opt-in MiniMax engine and shim to the common Strata HTTP server, with a separate
+image/video opt-in, developed in [issue #62](https://github.com/Indras-Mirror/Xolotl/issues/62).
 See [build, run, measured results and reproduction commands](../../docs/MINIMAX_M31.md).
 
 ```sh
@@ -21,8 +21,8 @@ runs `serve/server.py`; it does not implement a second HTTP server.
 ```text
 in : GEN <max_new> [key=value ...] <ids csv>
      BGEN <slot> <max_new> [key=value ...] <ids csv>
-     GENI <max_new> [...] <ids csv> <embeddings>
-     BGENI <slot> <max_new> [...] <ids csv> <embeddings>
+     GENI <max_new> [key=value ...] <SVE1-file> <ids csv>
+     BGENI <slot> <max_new> [key=value ...] <SVE1-file> <ids csv>
      STOP
      QUIT
 out: READY <ctx> stop
@@ -33,19 +33,48 @@ out: READY <ctx> stop
      ERR <text>
 ```
 
-The current slice is text only. `GENI` and `BGENI` fail explicitly with
-`ERR vision unavailable`. Vision and adaptive short prefill are follow-up slices.
-Prefix reuse must reflect restored engine state, rather than a promised cache
-hit; `cache_prompt=false` disables lookup and store. `STOP` is accepted at prefill
-boundaries and decode steps, and the process stays available for the next request.
-Stdout carries only protocol lines; diagnostics go to stderr.
+`GENI` and `BGENI` require `-DSTRATA_M31_VISION=ON`, which defaults to OFF.
+Without it they return `ERR vision unavailable`. The embeddings file precedes
+the token list, matching the common server's serializer. Visual rows use token
+ID `-1`; ordinary text IDs must remain within the vocabulary.
+
+SVE1 contains consecutive little-endian records: five int32 fields
+`0x31455653, rows, nx, ny, width`, then `rows * width` F32 values. The M31 shim
+writes `nx=rows`, `ny=1`, `width=6144`; the engine accepts `nx * ny=rows` and uses
+ordinary linear decoder positions. Records cover complete visual spans in
+prompt order. The engine checks file size, dimension, row mapping and finite
+values before changing KV state.
+
+Prefix reuse reports restored engine state. Visual prefixes additionally match
+the actual F32 embedding bytes, so identical placeholder IDs or file names
+cannot reuse a different picture's KV. `cache_prompt=false` disables lookup
+and store. `STOP` is accepted at prefill boundaries and decode steps, and the
+process stays available for the next request. Stdout carries only protocol
+lines; diagnostics go to stderr.
+
+## Optional image and video input
+
+There is no `mtmd` target in this tree. Build the separate helper in `vision/`
+against unmodified llama.cpp PR #31192 at `6b95a990`; its ggml stays in that
+process. The M31 shim starts it lazily when vision is configured. Images and all
+video frames join the text in one mixed prefill. The full remaining mixed prompt
+must fit the configured chunk and planner budget; otherwise it fails explicitly.
+
+Missing helper/model/mmproj, helper death, malformed output and startup or reply
+timeouts produce `vision unavailable` (HTTP 503), including a blocked helper
+write or incomplete reply. The helper is reaped and a later request may restart
+it. Text requests remain available. Build, configuration, content-part examples
+and portable oracle commands are in the
+[vision section](../../docs/MINIMAX_M31.md#vision-separate-opt-in).
+Adaptive short-chunk prefill remains a separate contribution.
 
 ## Layout
 
 - `m31_engine.*`, `m31_geometry.hpp`, `m31_arena.hpp`: model graph and storage.
 - `m31_config.*`: typed defaults, budgets and validation.
 - `gpu/`, `prefill/`, `cpu/`: expert streaming, planning and fused decode.
-- `serve/`: common-server shim, tokenizer export and tool parsing.
+- `serve/`: common-server shim, tokenizer export, tool parsing and bounded media/helper I/O.
+- `vision/`: external mtmd helper and its separate pinned CMake build.
 - `tests/`: small CPU tests; `tests/oracle/` is a separate, pinned llama.cpp build.
 - `bench/`: portable quality, speed and logit comparison clients.
 
@@ -55,11 +84,15 @@ are excluded.
 
 ## Validation checklist
 
+The numerical and performance items below record PR1's text validation and its
+remaining limitations. Vision build and reproduction commands are documented
+separately; these PR1 checks do not claim final image/video acceptance.
+
 - [x] Opt-in target; default-build artifact and target comparisons are recorded
   with their exact coverage and Qwen link limitation in
   [the default-build section](../../docs/MINIMAX_M31.md#default-build-comparison).
-- [x] Text engine and common-server shim are isolated from vision and adaptive
-  short prefill, which remain separate slices.
+- [x] Vision is a separate build opt-in with an external helper; adaptive short
+  prefill remains a separate slice. The default text configuration needs neither.
 - [x] CPU and CUDA build/check commands, GPU-offload oracle commands and the
   model revision are documented. HIP, SYCL, Windows and other GPUs remain untested.
 - [x] Historical v8 numbers identify the hardware and distinguish the GPU oracle

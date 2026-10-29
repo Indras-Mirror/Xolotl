@@ -12,8 +12,8 @@
 
 namespace strata::m31 {
 
-// Text-only MSA engine. CUDA prefill uses stock grouped MMQ; single-token
-// decode uses the original CPU quantization traits and ordered rank reduction.
+// MiniMax-M3.1 MSA engine. See docs/MINIMAX_M31.md for prefill and numerical
+// contracts. Single-token decode preserves the original ordered rank reduction.
 class Engine {
 public:
     Engine();
@@ -25,6 +25,12 @@ public:
     // Append one chunk. A preflight rejection preserves valid state. Once execution
     // starts, an error requires reset(): caches may be partially written.
     bool forward(const int32_t * tokens, int n, std::string & error);
+    // Linear decoder positions: -1 tokens select rows of the F32 vision table;
+    // text tokens have visual_rows[i] == -1. Requires STRATA_M31_VISION.
+    // Validation occurs before mutation, with the same failure/reset contract.
+    bool forward_mixed(const int32_t * tokens, const int32_t * visual_rows,
+                       const float * visual_embeddings, int visual_count,
+                       int n, std::string & error);
     // Exact whole-prefix checkpoint: owned host copies of valid F16 K/V/index
     // rows only. Checkpoints belong to this initialized Engine; no model math,
     // weights, live graph pointers or expert-cache entries are serialized.
@@ -58,7 +64,11 @@ public:
     int64_t position() const;
     // Cap every backend at the MSA int32 limit. CUDA also applies a
     // conservative scratch-memory plan to the remaining prompt chunk.
-    // Returns0 with error on invalid state/insufficient budget; forward never changes n.
+    // In vision-enabled CUDA builds, cap by live VRAM to account for the helper.
+    // If retained scratch prevents any chunk, release it and plan once again:
+    // KV/position survive, but the previous chunk's logits are invalidated.
+    // Consume that head before planning the next append. No new rows run here.
+    // Returns 0 with error on invalid state/insufficient budget; forward never changes n.
     int prefill_chunk(int requested, std::string & error) const;
 private:
     struct Impl;

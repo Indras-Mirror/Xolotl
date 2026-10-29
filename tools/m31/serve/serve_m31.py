@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MiniMax-M3.1 text model adapter for the common OpenAI/Anthropic server.
+"""MiniMax-M3.1 adapter for the common OpenAI/Anthropic server.
 
     python tools/m31/serve/serve_m31.py --engine strata --config strata-m31.json
 
@@ -15,8 +15,12 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
+import struct
 import sys
 import threading
+import time
+import uuid
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -27,6 +31,118 @@ from m31_tok import M31Tokenizer  # noqa: E402
 import m31_parser as P  # noqa: E402
 from serve import frontend as F  # noqa: E402
 from serve import server as S  # noqa: E402
+from vision_http import MediaInput, install_video_reader  # noqa: E402
+
+
+_BaseVision = S.Vision
+
+
+class M31Vision:
+    """Deferred mtmd helper: a broken optional encoder cannot prevent text service."""
+    lazy_vision, elastic = True, False
+
+    def __init__(self, cfg, log=None, env=None, lazy=False):
+        from vision_encoder import VisionEncoder
+        self.dir = _BaseVision.work_dir()
+        self.last_used = time.time()
+        self.on_start = None
+        self.options = dict(cfg)
+        cache = cfg.get("cache_dir") or self.dir / "cache"
+        backend = cfg.get("backend", "cuda" if cfg.get("gpu") else "cpu")
+        self.client = VisionEncoder(cfg.get("exe", ""), cfg.get("model", ""), cfg.get("mmproj", ""), cache,
+                                    backend=backend, threads=cfg.get("threads", 16),
+                                    timeout=cfg.get("timeout", 180), startup_timeout=cfg.get("startup_timeout", 180),
+                                    embedding_cache_mb=cfg.get("embedding_cache_mb", 256), env=env)
+        limits = {key: value for key, value in cfg.items() if key in (
+            "max_media_bytes", "max_total_bytes", "max_media", "max_image_pixels", "max_video_seconds",
+            "max_video_frames", "max_video_fps", "video_fps", "allow_http", "allow_local")}
+        self.media = MediaInput(cache, **limits)
+        self.log = log
+
+    def alive(self):
+        proc = getattr(self.client, "process", None)
+        return proc is not None and proc.poll() is None
+
+    def encode_prompt(self, prompt, media, fps, cancel=None):
+        self.last_used = time.time()
+        if not self.alive() and self.on_start:
+            self.on_start()
+        try:
+            return self.client.encode(prompt, media, video_fps=fps,
+                                      timestamp_interval_ms=self.options.get("timestamp_interval_ms", 5000),
+                                      cancel=cancel)
+        except (OSError, RuntimeError, ValueError) as exc:
+            if cancel is not None and cancel.is_set():
+                raise S.ClientGone() from None
+            message = str(exc)
+            raise S.VisionUnavailable(message if message.startswith("vision unavailable") else
+                                      "vision unavailable: " + message) from None
+        finally:
+            self.last_used = time.time()
+
+    def close(self):
+        self.client.close()
+
+    unload = close
+
+    def restart(self):
+        self.client.restart()
+
+    def release(self, manifest):
+        """Only this client's own per-request IPC directory is temporary."""
+        directory = Path(manifest).parent
+        if directory.parent == self.client.cache_dir and directory.name.startswith("request-"):
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def shutdown(self):
+        self.close()
+        self.media.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+        if self.log is not None:
+            self.log.close()
+
+
+def mixed_embeddings(manifest, output, max_rows=2**31 - 1):
+    """Translate the pinned mtmd helper's linear chunks into common GENI SVE1 records."""
+    path = Path(manifest)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if value.get("format") != "m31-vision-ipc-v1" or value.get("source_pr") != \
+            "6b95a9908d2c7b242817a447708aec38e937e2c0" or value.get("n_embd") != 6144 or \
+            value.get("llm_inference") is not False or value.get("encoded") is not True:
+        raise ValueError("vision unavailable: invalid helper manifest")
+    ids, visual = [], 0
+    with Path(output).open("xb") as out:
+        for index, chunk in enumerate(value["chunks"]):
+            count = chunk["rows"]
+            if type(count) is not int or count <= 0 or count > max_rows - len(ids) or chunk["index"] != index or \
+                    chunk["row"] != len(ids) or chunk["position"] != len(ids) or chunk["n_pos"] != count:
+                raise ValueError("vision unavailable: invalid mixed row continuity")
+            if chunk["type"] == "text":
+                tokens = chunk["tokens"]
+                if len(tokens) != count or any(type(token) is not int or not 0 <= token < 2**31 for token in tokens):
+                    raise ValueError("vision unavailable: invalid helper text tokens")
+                ids.extend(tokens)
+            elif chunk["type"] == "image":
+                if chunk["visual_row"] != visual:
+                    raise ValueError("vision unavailable: invalid visual row continuity")
+                file = Path(chunk["embeddings"])
+                if file.is_absolute() or file.name != str(file):
+                    raise ValueError("vision unavailable: invalid helper embedding filename")
+                file = path.parent / file
+                if file.is_symlink() or not file.is_file() or file.stat().st_size != count * 6144 * 4:
+                    raise ValueError("vision unavailable: invalid helper embedding size")
+                # M31 uses ordinary linear decoder positions, so the SVE1 grid
+                # carries row count rather than Qwen's multi-axis coordinates.
+                out.write(struct.pack("<5i", 0x31455653, count, count, 1, 6144))
+                with file.open("rb") as source:
+                    shutil.copyfileobj(source, out)
+                ids.extend([-1] * count)
+                visual += count
+            else:
+                raise ValueError("vision unavailable: unsupported helper chunk")
+    if value["rows"] != len(ids) or value["visual_rows"] != visual or not visual:
+        raise ValueError("vision unavailable: invalid helper row totals")
+    return ids
 
 
 def openai_tools(tools):
@@ -164,8 +280,6 @@ class M31Engine(_BaseEngine):
         return result
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
-        if embeddings is not None:
-            raise ValueError("vision unavailable in the MiniMax text engine")
         sampling = dict(sampling or {})
         if isinstance(ids, PreparedIds):
             sampling.setdefault("m31_chat_b64", chat_key(ids.chat_request))
@@ -174,12 +288,20 @@ class M31Engine(_BaseEngine):
         # raises while the Service still owns the request FIFO.
         if not math.isfinite(float(self.silence_s)) or self.silence_s <= 0:
             raise ValueError("MiniMax requires a finite engine_silence_s greater than zero")
-        yield from super().generate(ids, max_new, sampling, cancel)
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
 _BaseService = S.Service
 _engine_silence_s = S.engine_silence_s
 _sampling_defaults_from_config = S.sampling_defaults_from_config
+_engine_args = S.engine_args
+
+
+def engine_args(config):
+    # Common Qwen launches inject --vision and --vram-reserve-mib from the
+    # encoder section. M31's build opt-in enables GENI; its VRAM planner owns
+    # the native budget and does not accept those Qwen-only CLI switches.
+    return _engine_args({**config, "vision": None})
 
 
 def sampling_defaults_from_config(config):
@@ -202,8 +324,10 @@ def engine_silence_s(config):
 
 
 def validate_config(config):
-    if config.get("vision"):
-        raise ValueError("vision unavailable in the MiniMax text engine")
+    vision = config.get("vision")
+    if vision is not None and (not isinstance(vision, dict) or not all(
+            isinstance(vision.get(key), str) and vision[key] for key in ("exe", "model", "mmproj"))):
+        raise ValueError("MiniMax vision requires exe, model and mmproj paths")
     if config.get("replicas"):
         raise ValueError("MiniMax text PR1 uses one native engine process")
     parallel = config.get("parallel", 1)
@@ -237,7 +361,35 @@ class M31Service(_BaseService):
     def encode_prompt(self, messages, tools, kwargs):
         # Follow the GGUF template and PR tokenizer oracle exactly. The common
         # Qwen literal-tag substitution changes MiniMax's template token IDs.
-        return self.tok.encode(self.template.render(messages, tools=tools, **kwargs), parse_special=True)
+        prompt = self.template.render(messages, tools=tools, **kwargs)
+        prepared = getattr(self._m31_request, "vision", None)
+        if prepared is None:
+            return self.tok.encode(prompt, parse_special=True)
+        prepared["template_ids"] = self.tok.encode(prompt, parse_special=True)
+        if MediaInput.marker in prompt:
+            raise ValueError("literal mtmd media marker is reserved in multimodal requests")
+        for marker in prepared["markers"]:
+            if prompt.count(marker) != 1:
+                raise ValueError("MiniMax template did not preserve media markers")
+            prompt = prompt.replace(marker, MediaInput.marker)
+        cancel = prepared["cancel"]
+        with self._turn(cancel):
+            if cancel is not None and cancel.is_set():
+                raise S.ClientGone()
+            manifest = self.vision.encode_prompt(prompt, prepared["media"], prepared["fps"], cancel)
+        try:
+            if cancel is not None and cancel.is_set():
+                raise S.ClientGone()
+            try:
+                ids = mixed_embeddings(manifest, prepared["path"],
+                                       max_rows=self.engine.max_context or getattr(self.engine, "known_ctx", 2**31 - 1))
+            except (OSError, ValueError, KeyError, TypeError, OverflowError) as exc:
+                raise S.VisionUnavailable("vision unavailable: " + str(exc)) from None
+        finally:
+            if hasattr(self.vision, "release"):
+                self.vision.release(manifest)
+        prepared["rows"] = len(ids)
+        return ids
 
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         request = req or {}
@@ -255,10 +407,9 @@ class M31Service(_BaseService):
         cache = request.get("cache_prompt", True)
         if not isinstance(cache, bool):
             raise ValueError("cache_prompt must be boolean")
-        if any(isinstance(message.get("content"), list) and any(
+        has_media = any(isinstance(message.get("content"), list) and any(
                 isinstance(part, dict) and part.get("type") not in ("text", "input_text", None)
-                for part in message["content"]) for message in messages):
-            raise ValueError("vision unavailable in the MiniMax text engine")
+                for part in message["content"]) for message in messages)
         if request.get("grammar"):
             raise ValueError("raw GBNF grammar is unavailable; use response_format or tool schemas")
         kind, name = F.tool_choice_of(request.get("tool_choice"))
@@ -281,8 +432,30 @@ class M31Service(_BaseService):
             raise ValueError("ignore_eos must be boolean")
         # Common HTTP parsing uses ``value or 0`` and the base Service treats 0
         # as unlimited. Preserve an explicit zero before either interpretation.
-        ids, thinking, maximum = super().prepare(messages, tools, kwargs, 1 if zero else max_new,
-                                                 force, request, cancel)
+        prepared = None
+        if has_media:
+            if self.vision is None:
+                raise S.VisionUnavailable("vision unavailable: configure the opt-in mtmd helper")
+            if (getattr(self.engine, "info", {}) or {}).get("vision") == 0:
+                raise S.VisionUnavailable("vision unavailable: build the engine with STRATA_M31_VISION=ON")
+            messages, media, markers, fps = self.vision.media.prepare(messages, request.get("video_fps"), cancel)
+            prepared = {"media": media, "markers": markers, "fps": fps, "cancel": cancel,
+                        "path": self.vision.dir / ("request-" + uuid.uuid4().hex + ".sve")}
+        self._m31_request.vision = prepared
+        try:
+            ids, thinking, maximum = super().prepare(messages, tools, kwargs, 1 if zero else max_new,
+                                                     force, request, cancel)
+        except BaseException:
+            if prepared is not None:
+                prepared["path"].unlink(missing_ok=True)
+            raise
+        finally:
+            self._m31_request.vision = None
+            if prepared is not None:
+                self.vision.media.release(prepared["media"])
+        if prepared is not None:
+            self.embeddings.path = prepared["path"]
+            self.embeddings.keys = None
         if zero:
             maximum = 0
         chat = {"messages": template_messages(messages), "tools": openai_tools(tools),
@@ -290,6 +463,9 @@ class M31Service(_BaseService):
                 "parallel_tool_calls": parallel,
                 "enable_thinking": kwargs.get("enable_thinking", True),
                 "chat_template_kwargs": dict(kwargs)}
+        if prepared is not None:
+            chat["vision_template_ids"] = prepared["template_ids"]
+            chat["vision_prompt_rows"] = prepared["rows"]
         format_ = request.get("response_format") or S.responses_api.text_format(request) or {}
         if format_.get("type") == "json_schema":
             chat["json_schema"] = (format_.get("json_schema") or {}).get("schema", {})
@@ -335,8 +511,11 @@ def install():
     S.StrataEngine = M31Engine
     S.Detokenizer = M31Detokenizer
     S.Service = M31Service
+    S.Vision = M31Vision
+    install_video_reader()
     S.engine_silence_s = engine_silence_s
     S.sampling_defaults_from_config = sampling_defaults_from_config
+    S.engine_args = engine_args
 
 
 def main():

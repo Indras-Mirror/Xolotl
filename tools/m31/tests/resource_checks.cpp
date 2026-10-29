@@ -1,6 +1,7 @@
 #include "../m31_config.hpp"
 #include "../prefill/chunk_limit.hpp"
 #include "../prefill/plan.hpp"
+#include "../prefill/vision_budget.hpp"
 #include "../prefill/slot_leases.hpp"
 #include "../prefill/expert_budget.hpp"
 #include <climits>
@@ -49,6 +50,74 @@ int main(int argc,char **argv) {
             "coexisting retained owners must be summed");
         b.free_after_resident=(uint64_t(4)<<30)+b.reserve_bytes+b.extra_scratch_bytes;
         expect(plan_prefill(g,b).chunk==0,"planner budget mistakenly uses max of retained owners");
+        // A persistent encoder appears after native initialization. The live
+        // cap credits each disjoint current owner once, never the old peak.
+        const uint64_t gib=uint64_t(1)<<30,mib=uint64_t(1)<<20;
+        PrefillBudget vision_budget=b;
+        vision_budget.free_after_resident=9*gib;
+        vision_budget.reserve_bytes=gib;vision_budget.extra_scratch_bytes=gib;
+        VisionPrefillMemory memory;
+        memory.total_bytes=32*gib;memory.free_bytes=9*gib-2400*mib;
+        auto capped=cap_vision_prefill_budget(vision_budget,memory);
+        expect(capped.free_after_resident==memory.free_bytes,"external encoder residency was ignored");
+        expect(capped.retained_dense_bytes==0&&capped.retained_routed_bytes==0,
+            "high-water scratch statistics were credited as current allocations");
+        expect(capped.reserve_bytes==gib&&capped.extra_scratch_bytes==gib,"vendor reserves were weakened");
+        memory.dense_bytes=256*mib;memory.routed_bytes=128*mib;
+        memory.hidden_bytes=64*mib;memory.attention_bytes=32*mib;
+        capped=cap_vision_prefill_budget(vision_budget,memory);
+        expect(capped.free_after_resident==memory.free_bytes+480*mib,"native owners were omitted or double credited");
+        expect(capped.retained_dense_bytes==256*mib&&capped.retained_routed_bytes==128*mib&&
+            capped.retained_hidden_bytes==64*mib,"plan retained owners differ from live credits");
+        memory.free_bytes=10*gib;
+        expect(cap_vision_prefill_budget(vision_budget,memory).free_after_resident==9*gib,
+            "live memory expanded the initialized budget");
+        memory.free_bytes=512*mib;memory.dense_bytes=3*gib;memory.routed_bytes=gib;
+        memory.hidden_bytes=128*mib;memory.attention_bytes=256*mib;
+        int reads=0,releases=0;
+        auto read_memory=[&]{++reads;return memory;};
+        auto release_memory=[&]{++releases;
+            // CUDA internal pools consume another512MiB during release. A new
+            // physical reading must replace, rather than augment, old credits.
+            memory.free_bytes+=memory.owned_bytes()-512*mib;
+            memory.dense_bytes=memory.routed_bytes=memory.hidden_bytes=memory.attention_bytes=0;};
+        const auto reclaimed=plan_vision_prefill(g,vision_budget,read_memory,release_memory);
+        expect(reclaimed.reclaimed&&reclaimed.plan.chunk==128&&reads==2&&releases==1,
+            "old retained peak permanently refused a fresh append");
+        expect(reclaimed.budget.free_after_resident==memory.free_bytes,
+            "replan reused released allocation credits or stale free VRAM");
+        const auto next_plan=plan_vision_prefill(g,vision_budget,read_memory,release_memory);
+        expect(next_plan.plan.chunk==128&&!next_plan.reclaimed&&reads==3&&releases==1,
+            "successful append unnecessarily released its previous head");
+        {
+            auto long_budget=vision_budget;
+            long_budget.max_chunk=4096;long_budget.position=20000;
+            long_budget.context=40000;long_budget.remaining=4096;
+            VisionPrefillMemory current;
+            current.total_bytes=32*gib;current.free_bytes=2*gib;
+            current.dense_bytes=512*mib;current.routed_bytes=256*mib;
+            current.hidden_bytes=32*mib;current.attention_bytes=64*mib;
+            int unnecessary_release=0;
+            const auto smaller=plan_vision_prefill(g,long_budget,[&]{return current;},[&]{++unnecessary_release;});
+            expect(smaller.plan.chunk>0&&smaller.plan.chunk<4096&&!smaller.reclaimed&&!unnecessary_release,
+                "successful smaller live plan released its previous head");
+        }
+        memory.free_bytes=gib+512*mib;
+        const auto refused=plan_vision_prefill(g,vision_budget,read_memory,release_memory);
+        expect(!refused.plan.chunk&&!refused.reclaimed&&releases==1,
+            "planner retried without reusable scratch or ignored vendor reserves");
+        memory.free_bytes=512*mib;memory.dense_bytes=3*gib;memory.routed_bytes=gib;
+        reads=releases=0;bool release_error=false;
+        try{plan_vision_prefill(g,vision_budget,read_memory,[&]{++releases;throw std::runtime_error("allocator release failed");});}
+        catch(const std::runtime_error &error){release_error=std::string(error.what())=="allocator release failed";}
+        expect(release_error&&reads==1&&releases==1,"scratch release failure was hidden or retried");
+        memory={};rejects([&]{cap_vision_prefill_budget(vision_budget,memory);},"missing physical memory counters accepted");
+        memory.total_bytes=gib;memory.free_bytes=2*gib;
+        rejects([&]{cap_vision_prefill_budget(vision_budget,memory);},"impossible free memory accepted");
+        memory.free_bytes=512*mib;memory.dense_bytes=gib;
+        rejects([&]{cap_vision_prefill_budget(vision_budget,memory);},"impossible scratch credit accepted");
+        memory.total_bytes=UINT64_MAX;memory.free_bytes=0;memory.dense_bytes=UINT64_MAX;memory.hidden_bytes=1;
+        rejects([&]{cap_vision_prefill_budget(vision_budget,memory);},"scratch credit overflow accepted");
         b.free_after_resident=uint64_t(32)<<30;g.block=129;
         rejects([&]{plan_prefill(g,b);},"nondividing MSA block accepted");
         // Force an uploader to attempt reuse while a real asynchronous reader is

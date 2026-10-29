@@ -17,6 +17,11 @@ before = {
     'template': frontend.ChatTemplate,
     'parser': frontend.OutputParser,
     'tokenizer': strata_tokenizer.Tokenizer,
+    'vision': server.Vision,
+    'engine_args': server.engine_args,
+    'content_parts': frontend._parts_of,
+    'image_parts': frontend.IMAGE_PARTS,
+    'anthropic_blocks': frontend.ANTHROPIC_BLOCKS,
     'end_token': server.IM_END,
     'thinking_end': server.THINK_END,
 }
@@ -33,6 +38,11 @@ after = {
     'template': frontend.ChatTemplate,
     'parser': frontend.OutputParser,
     'tokenizer': strata_tokenizer.Tokenizer,
+    'vision': server.Vision,
+    'engine_args': server.engine_args,
+    'content_parts': frontend._parts_of,
+    'image_parts': frontend.IMAGE_PARTS,
+    'anthropic_blocks': frontend.ANTHROPIC_BLOCKS,
     'end_token': server.IM_END,
     'thinking_end': server.THINK_END,
 }

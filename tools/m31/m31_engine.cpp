@@ -7,6 +7,9 @@
 #include "cpu/fused_decode.hpp"
 #include "cpu/threadpool_config.hpp"
 #include "prefill/plan.hpp"
+#ifdef M31_ENGINE_VISION
+#include "prefill/vision_budget.hpp"
+#endif
 #include "prefill/chunk_limit.hpp"
 #include "gpu/prefill_hidden.hpp"
 
@@ -1101,6 +1104,25 @@ struct Engine::Impl {
             ggml_backend_tensor_set(cell_blocks, blocks.data(), 0, ggml_nbytes(cell_blocks));
         }
     }
+
+    // This is scratch/cache reclamation only: logical KV rows and position
+    // remain valid. The previous head is invalidated before the next append.
+    bool release_prefill_workspace(std::string & error) {
+        try {
+            require(ready && !poisoned, "workspace release requires valid state");
+            poisoned = true;
+            clear_dense_decode_cache(true);
+            if (gpu_experts) gpu_experts->release_prefill_workspace();
+            attention_inputs.reset(); dense_workspace.reset();
+            if (cfg.reuse_allocations) dense_workspace = std::make_unique<Workspace>(backend);
+            prefill_hidden.reset();
+            if (gpu_prefill_chain) prefill_hidden = std::make_unique<GpuPrefillHidden>();
+            hidden.clear(); last_n = 0;
+            decode_chain_active = prefill_chain_active = false;
+            poisoned = false;
+            return true;
+        } catch (const std::exception & e) { error = e.what(); return false; }
+    }
 };
 
 Engine::Engine() : p_(new Impl) {}
@@ -1254,7 +1276,39 @@ int Engine::prefill_chunk(int requested, std::string & error) const {
             const auto & stats = p_->gpu_experts->stats();
             budget.streaming_slots = stats.slot_count;
         }
+#ifdef M31_ENGINE_VISION
+        const auto vision_plan = plan_vision_prefill(p_->g, budget, [&] {
+            VisionPrefillMemory memory;
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(p_->backend), &free_bytes, &total_bytes);
+            memory.free_bytes = free_bytes; memory.total_bytes = total_bytes;
+            // The owners below are disjoint. Borrowed tensor views and the
+            // backend's private caches are deliberately not separate credits.
+            if (p_->dense_workspace)
+                memory.dense_bytes = ggml_gallocr_get_buffer_size(p_->dense_workspace->allocator, 0);
+            if (p_->gpu_experts) memory.routed_bytes = p_->gpu_experts->retained_workspace_bytes();
+            if (p_->prefill_hidden) memory.hidden_bytes = p_->prefill_hidden->bytes();
+            if (p_->attention_inputs && p_->attention_inputs->buffer)
+                memory.attention_bytes = ggml_backend_buffer_get_size(p_->attention_inputs->buffer);
+            return memory;
+        }, [&] {
+            std::string release_error;
+            const bool released = p_->release_prefill_workspace(release_error);
+            require(released, "vision VRAM scratch release failed: " + release_error);
+        });
+        if (vision_plan.reclaimed || vision_plan.budget.free_after_resident != budget.free_after_resident)
+            std::fprintf(stderr,
+                "M31 vision VRAM plan pos=%lld requested=%d planned=%d initial_free=%llu live_free=%llu owned_scratch=%llu budget_free=%llu reclaimed=%d\n",
+                (long long)p_->pos, requested, vision_plan.plan.chunk,
+                (unsigned long long)budget.free_after_resident,
+                (unsigned long long)vision_plan.memory.free_bytes,
+                (unsigned long long)vision_plan.memory.owned_bytes(),
+                (unsigned long long)vision_plan.budget.free_after_resident, int(vision_plan.reclaimed));
+        budget = vision_plan.budget;
+        const auto & plan = vision_plan.plan;
+#else
         const auto plan = plan_prefill(p_->g, budget);
+#endif
         require(plan.chunk > 0, "adaptive prefill refused: " + plan.reason);
         if (p_->cfg.profile) std::fprintf(stderr,
             "M31 prefill-plan pos=%lld requested=%d planned=%d keys=%lld initial_free=%llu scratch=%llu headroom=%llu\n",
@@ -1282,20 +1336,7 @@ bool Engine::rewind(int64_t position, std::string & error) {
 }
 
 bool Engine::release_prefill_workspace(std::string & error) {
-    try {
-        require(p_->ready && !p_->poisoned, "workspace release requires valid state");
-        p_->poisoned = true;
-        p_->clear_dense_decode_cache(true);
-        if (p_->gpu_experts) p_->gpu_experts->release_prefill_workspace();
-        p_->attention_inputs.reset(); p_->dense_workspace.reset();
-        if (p_->cfg.reuse_allocations) p_->dense_workspace = std::make_unique<Workspace>(p_->backend);
-        p_->prefill_hidden.reset();
-        if (p_->gpu_prefill_chain) p_->prefill_hidden = std::make_unique<GpuPrefillHidden>();
-        p_->hidden.clear(); p_->last_n = 0;
-        p_->decode_chain_active = p_->prefill_chain_active = false;
-        p_->poisoned = false;
-        return true;
-    } catch (const std::exception & e) { error = e.what(); return false; }
+    return p_->release_prefill_workspace(error);
 }
 
 size_t Engine::prefix_checkpoint_bytes() const {
@@ -1390,6 +1431,12 @@ void Engine::reset() {
 }
 
 bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
+    return forward_mixed(tokens, nullptr, nullptr, 0, n, error);
+}
+
+bool Engine::forward_mixed(const int32_t * tokens, const int32_t * visual_rows,
+                           const float * visual_embeddings, int visual_count,
+                           int n, std::string & error) {
     try {
         const auto prepare_started = p_->cfg.profile ? Impl::Clock::now() : Impl::Clock::time_point{};
         require(p_->ready && !p_->poisoned, "not initialized or reset required after a failed pass");
@@ -1397,7 +1444,23 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
         const auto & g = p_->g;
         require(msa_chunk_limit(p_->pos,n,g.index_heads,g.block)==n,
                 "pass exceeds MSA int32 indexing; split it with prefill_chunk()");
-        for (int i = 0; i < n; ++i) require(tokens[i] >= 0 && tokens[i] < g.vocab, "token id out of range");
+#ifndef M31_ENGINE_VISION
+        require(visual_count == 0 && !visual_rows && !visual_embeddings, "vision unavailable in this build");
+#endif
+        require(visual_count >= 0 && visual_count <= p_->cfg.context, "invalid visual embedding count");
+        require(visual_count == 0 || (visual_rows && visual_embeddings), "missing visual row map/embeddings");
+        for (int i = 0; i < n; ++i) {
+            const int index = visual_rows ? visual_rows[i] : -1;
+            if (index == -1) require(tokens[i] >= 0 && tokens[i] < g.vocab, "token id out of range");
+            else {
+                require(index >= 0 && index < visual_count && tokens[i] == -1, "invalid visual row/token mapping");
+                const auto * row = visual_embeddings + size_t(index) * size_t(g.embd);
+                for (int64_t j = 0; j < g.embd; ++j)
+                    require(std::isfinite(row[j]), "non-finite visual embedding");
+            }
+        }
+        // PR #31192 selects MTMD_POS_TYPE_NORMAL for MiniMax's NEOX RoPE.
+        // Each embedding consumes one ordinary pos+i RoPE/MSA/causal row.
         // Validation above has not touched KV, hidden, graph state or streams.
         // A caller can re-plan a rejected pass without resetting valid state.
         require(!p_->cfg.cancelled || !p_->cfg.cancelled(), "cancelled");
@@ -1409,10 +1472,14 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
         const auto * traits = ggml_get_type_traits(emb->type);
         require(emb->type == GGML_TYPE_F32 || traits->to_float, "no embedding dequantizer");
         for (int i = 0; i < n; ++i) {
-            const auto * row = static_cast<const uint8_t *>(emb->data) + size_t(tokens[i]) * emb->nb[1];
             auto * dst = p_->hidden.data() + size_t(i) * g.embd;
-            if (emb->type == GGML_TYPE_F32) std::memcpy(dst, row, size_t(g.embd) * sizeof(float));
-            else traits->to_float(row, dst, g.embd);
+            if (visual_rows && visual_rows[i] >= 0) {
+                std::memcpy(dst, visual_embeddings + size_t(visual_rows[i]) * g.embd, size_t(g.embd) * sizeof(float));
+            } else {
+                const auto * row = static_cast<const uint8_t *>(emb->data) + size_t(tokens[i]) * emb->nb[1];
+                if (emb->type == GGML_TYPE_F32) std::memcpy(dst, row, size_t(g.embd) * sizeof(float));
+                else traits->to_float(row, dst, g.embd);
+            }
         }
         if (p_->cfg.reuse_allocations) {
             const auto nk = kv_length(p_->pos + n, g);

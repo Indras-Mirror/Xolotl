@@ -147,7 +147,7 @@ public:
         const auto * ids = llama_vocab_get_suppress_tokens(vocab_, &count);
         return count ? std::set<int>(ids, ids + count) : std::set<int>();
     }
-    void prepare(const std::string & encoded, const std::vector<int32_t> & expected) {
+    void prepare(const std::string & encoded, const std::vector<int32_t> & expected, bool vision = false) {
         common_chat_params chat;
         if (encoded.empty()) { grammar_.init(vocab_, chat); return; }
         using json = nlohmann::ordered_json;
@@ -173,14 +173,34 @@ public:
             inputs.chat_template_kwargs[it.key()] = it.value().dump();
         chat = common_chat_templates_apply(templates_.get(), inputs);
         const auto ids = tokenize(vocab_, chat.prompt.str(), false, true);
-        if (ids.size() > expected.size() || !std::equal(ids.begin(), ids.end(), expected.begin()))
-            throw std::runtime_error("chat template/tokenizer mismatch between server and native grammar");
+        size_t suffix = ids.size();
+        if (vision) {
+            // mtmd replaces media markers with linear embedding rows. Audit
+            // the unexpanded template independently, then replay only assistant
+            // continuation tokens after the assembled mixed prompt.
+            if (!request.contains("vision_template_ids") || !request["vision_template_ids"].is_array() ||
+                request["vision_template_ids"].size() != ids.size() ||
+                !request.contains("vision_prompt_rows") || !request["vision_prompt_rows"].is_number_integer())
+                throw std::runtime_error("missing vision template audit");
+            for (size_t i = 0; i < ids.size(); ++i)
+                if (!request["vision_template_ids"][i].is_number_integer() ||
+                    request["vision_template_ids"][i].get<int64_t>() != ids[i])
+                    throw std::runtime_error("vision template/tokenizer mismatch between server and native grammar");
+            const auto rows = request["vision_prompt_rows"].get<int64_t>();
+            if (rows < 1 || uint64_t(rows) > expected.size()) throw std::runtime_error("invalid vision prompt rows");
+            suffix = size_t(rows);
+        } else {
+            if (request.contains("vision_template_ids") || request.contains("vision_prompt_rows"))
+                throw std::runtime_error("vision audit metadata on text request");
+            if (ids.size() > expected.size() || !std::equal(ids.begin(), ids.end(), expected.begin()))
+                throw std::runtime_error("chat template/tokenizer mismatch between server and native grammar");
+        }
         grammar_.init(vocab_, chat);
         // The common server may continue a turn after an injected reasoning
         // terminator or forced-tool prefix. Replay the already generated suffix
         // into a fresh request-local grammar instead of keeping mutable state
         // shared with a different HTTP request.
-        if (grammar_.active()) for (size_t i = ids.size(); i < expected.size(); ++i) {
+        if (grammar_.active()) for (size_t i = suffix; i < expected.size(); ++i) {
             if (!grammar_.allowed(expected[i])) throw std::runtime_error("assistant continuation violates grammar");
             grammar_.accept(expected[i]);
         }
@@ -202,7 +222,7 @@ public:
     int vocab_size() const { return 0; }
     std::set<int> stops() const { return {}; }
     std::set<int> suppress() const { return {}; }
-    void prepare(const std::string & request, const std::vector<int32_t> &) {
+    void prepare(const std::string & request, const std::vector<int32_t> &, bool = false) {
         if (!request.empty()) throw std::runtime_error("grammar unavailable in this build");
     }
     bool active() const { return false; }

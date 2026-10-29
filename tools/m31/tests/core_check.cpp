@@ -102,6 +102,53 @@ int main(int argc, char ** argv) {
         output.write(reinterpret_cast<const char *>(batch.data()), std::streamsize(batch.size() * sizeof(float)));
         check(bool(output), "cannot write fixture logits"); output.close();
 
+#ifdef M31_ENGINE_VISION
+        // Inject exact token-embedding rows as visual F32. This crosses real
+        // mixed attention/MSA/experts/head code and must preserve every logit.
+        auto artifact = strata::GgufModel::open(model);
+        size_t embedding_shard = 0;
+        const auto * embedding = artifact.find("token_embd.weight", &embedding_shard);
+        check(embedding && embedding->type == GGML_TYPE_F32, "mixed fixture requires F32 token embeddings");
+        const auto * embedding_data = artifact.shard(embedding_shard).tensor_data(*embedding);
+        const size_t width = size_t(engine.geometry().embd);
+        auto mixed_ids = prompt;
+        std::vector<int32_t> visual_map(prompt.size(), -1);
+        std::vector<float> visual(4 * width);
+        for (size_t i = 0; i < 4; ++i) {
+            std::memcpy(visual.data() + i * width, embedding_data + size_t(prompt[i + 2]) * width * sizeof(float), width * sizeof(float));
+            mixed_ids[i + 2] = -1; visual_map[i + 2] = int32_t(i);
+        }
+        engine.reset();
+        check(engine.forward_mixed(mixed_ids.data(), visual_map.data(), visual.data(), 4, int(prompt.size()), error), error);
+        check(head(engine, 0, 29) == batch, "mixed embedding injection changed batch logits");
+        const auto mixed_position = engine.position();
+        auto invalid_map = visual_map; invalid_map[2] = 4;
+        check(!engine.forward_mixed(mixed_ids.data(), invalid_map.data(), visual.data(), 4, int(prompt.size()), error),
+              "out-of-range mixed map accepted");
+        auto nonfinite_visual = visual; nonfinite_visual[0] = std::numeric_limits<float>::quiet_NaN();
+        check(!engine.forward_mixed(mixed_ids.data(), visual_map.data(), nonfinite_visual.data(), 4, int(prompt.size()), error),
+              "non-finite mixed embedding accepted");
+        check(engine.position() == mixed_position && head(engine, 0, 29) == batch, "mixed validation poisoned state");
+        Engine::PrefixCheckpointPtr mixed_checkpoint;
+        check(engine.checkpoint_prefix(1 << 20, mixed_checkpoint, error), error);
+        const auto mixed_suffix = tokens(3, 19);
+        forward(engine, mixed_suffix); const auto mixed_extended = head(engine, 0, 3);
+        check(engine.restore_prefix(mixed_checkpoint, error), error);
+        forward(engine, mixed_suffix);
+        check(head(engine, 0, 3) == mixed_extended, "mixed checkpoint restore changed logits");
+        const auto after_release_suffix = tokens(2, 9);
+        forward(engine, after_release_suffix); const auto after_release_expected = head(engine, 0, 2);
+        check(engine.restore_prefix(mixed_checkpoint, error), error);
+        forward(engine, mixed_suffix); // A live head exists when planning discards scratch.
+        const auto before_release = engine.position();
+        check(engine.release_prefill_workspace(error), error);
+        check(engine.position() == before_release, "scratch release changed mixed KV position");
+        std::vector<float> released_head;
+        check(!engine.logits(0, 1, released_head, error), "scratch release exposed a stale head");
+        forward(engine, after_release_suffix);
+        check(head(engine, 0, 2) == after_release_expected, "scratch release changed restored mixed KV rows");
+#endif
+
         // Independently exercise decode topology; NumPy checks the batch below.
         engine.reset(); std::vector<float> decode;
         for (auto id : prompt) {

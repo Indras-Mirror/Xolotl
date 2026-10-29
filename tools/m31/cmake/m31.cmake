@@ -49,14 +49,14 @@ target_include_directories(m31_generate PRIVATE "${_m31_ggml_src}")
 target_link_libraries(m31_generate PRIVATE m31_engine m31_grammar)
 message(STATUS "STRATA_M31: building the text engine and m31_generate --serve")
 
+option(STRATA_M31_VISION "Enable M3.1 mixed prefill with an external mtmd helper" OFF)
+if(STRATA_M31_VISION)
+  target_compile_definitions(m31_engine PUBLIC M31_ENGINE_VISION=1)
+  message(STATUS "STRATA_M31_VISION: mixed prefill enabled; build the optional mtmd helper separately")
+endif()
+
 option(STRATA_M31_TESTS "Build small model-free M31 CPU and protocol checks" ON)
 if(STRATA_M31_TESTS)
   enable_testing()
   include("${_m31_dir}/tests/tests.cmake")
-endif()
-
-# PR2 will add the separate mtmd process. PR1 always rejects GENI/BGENI explicitly.
-option(STRATA_M31_VISION "Build the M3.1 vision helper (requires an mtmd target)" OFF)
-if(STRATA_M31_VISION)
-  message(FATAL_ERROR "STRATA_M31_VISION: vision unavailable in the text-only port")
 endif()

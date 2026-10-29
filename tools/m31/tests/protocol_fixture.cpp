@@ -3,7 +3,7 @@
 #include "../m31_generate.cpp"
 namespace {
 struct FixtureEngine {
-    struct Geometry { int vocab = 8; } geometry_;
+    struct Geometry { int vocab = 8, embd = 4; } geometry_;
     int64_t position_ = 0;
     int last_n_ = 0;
     bool valid_ = true, bad_logits_ = false;
@@ -14,6 +14,9 @@ struct FixtureEngine {
         if (position_ == 0 && ids[0] == 6) bad_logits_ = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(4));
         position_ += n; last_n_ = n; return valid_;
+    }
+    bool forward_mixed(const int32_t * ids, const int32_t *, const float *, int, int n, std::string & error) {
+        return forward(ids, n, error);
     }
     bool logits(int row, int count, std::vector<float> & result, std::string &) {
         if (row < 0 || row + count > last_n_) return false;
@@ -31,7 +34,7 @@ struct FixtureGrammar {
     int vocab_size() const { return 8; }
     std::set<int> stops() const { return {7}; }
     std::set<int> suppress() const { return {}; }
-    void prepare(const std::string & encoded, const std::vector<int32_t> &) {
+    void prepare(const std::string & encoded, const std::vector<int32_t> &, bool = false) {
         active_ = encoded == "allow2";
         if (encoded == "broken") throw std::runtime_error("fixture grammar rejected");
     }
