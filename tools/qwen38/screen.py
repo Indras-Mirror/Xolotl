@@ -413,8 +413,22 @@ def main():
     tiers_dn = [t for t in tiers if G.row_bytes(t, n_ff) > 0]
     if a.edit_report:
         tiers_dn = [t.strip() for t in a.dn_tiers.split(",") if t.strip() and G.row_bytes(t.strip(), n_ff) > 0]
-    if any(t not in ("iq4_nl", "q8_0") for t in tiers_dn) and a.edit_report:
-        raise SystemExit("edited down tensors allow only IQ4_NL or Q8_0")
+    # Q2_0 IS ALLOWED ON AN EDITED DOWN TENSOR.  The old guard permitted only IQ4_NL and Q8_0,
+    # which contradicted the block-size comment directly above it: Q2_0's block is 64 and
+    # n_ff=640, so 640 % 64 == 0 - Q2_0 is format-legal for down, and it is what the published
+    # GSQ-RCO allocation uses for all 48 ffn_down_exps tensors.  With the guard in place this
+    # screener could not measure the very tier the reference build ships, so a re-allocation on
+    # ablated weights could only ever produce a much larger file.
+    #
+    # What the guard was really expressing is a POLICY worry - that a ~2% abliteration edit is
+    # small relative to Q2_0's error - and that worry is exactly what this screener exists to
+    # measure, not what it should assume.  The tiers are measured per expert and the allocator
+    # chooses; nothing is written here.  Tiers the FORMAT cannot hold are already dropped above
+    # by the row_bytes filter, so the only thing left to reject is a type that is not quantised
+    # at all.
+    _DN_ALLOWED = {"q2_0", "iq4_nl", "q8_0"}
+    if any(t not in _DN_ALLOWED for t in tiers_dn) and a.edit_report:
+        raise SystemExit(f"edited down tensors allow only {sorted(_DN_ALLOWED)}, got {tiers_dn}")
     dropped = [t for t in tiers if t not in tiers_dn]
     if dropped:
         print(f"L{a.layer}: down (n_ff={n_ff}) cannot hold {dropped}; "
