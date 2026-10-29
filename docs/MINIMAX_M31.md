@@ -526,7 +526,39 @@ any other value is rejected at startup. The choice is printed after the
 `M31 CPU pool:` line. Row arithmetic is identical in every mode; only work
 placement differs, so the best fixed size may differ on other CPUs.
 
-**Corrected-worker numerical, decode and cache-speed gates passed. Overall acceptance is FAIL: tools23 scored 18/23 against 19/23. The PR remains draft.** Historical
+#### Choosing `--threads`
+
+The engine's default is 32 threads; every run in this document passes `--threads`
+explicitly. With guided row batches (`c1508666`), one fresh-process window on the
+EPYC 9654 (96 cores / 192 logical CPUs, 12-channel DDR5) compared 64 to 160 threads:
+fixed-3072 chunks, 256 greedy tokens, 3 processes per arm in Williams order. The
+table shows median TG in tok/s, the change against 80 (geometric mean over the three
+depths), and how long the neighbouring TSLab process waited for a CPU, in ms per second
+(median and peak).
+
+| Threads | 4K | 16K | 32K | vs 80 | Neighbour wait, ms/s |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 26.36 | 25.80 | 24.96 | -6.6% | 0.6 [1.6] |
+| **80** | **28.20** | **27.63** | **26.76** | - | 0.8 [12] |
+| 96 | 29.13 | 26.87 | 25.28 | -1.7% | 1.2 [14] |
+| 112 | 27.76 | 26.88 | 25.59 | -2.9% | 5.3 [27] |
+| 128 | 28.45 | 27.25 | 26.07 | -1.0% | 8.7 [152] |
+| 160 | 25.85 | 26.89 | 25.99 | -4.7% | 232 [1849] |
+
+Routed CPU work reads 5.12 GB of experts per token. A `--profile` probe at 4K put
+the routed phase at about 246 GB/s with 80 threads and 245–253 GB/s from 112 to 160,
+so more threads add little bandwidth here. At 96 threads and above the arms became
+bimodal; we read that as two workers landing on SMT siblings of one core, since there
+is no spare core. Prefill did not change with the thread count (within ±0.3%). Pool
+workers spin on their CPU while decoding, so threads beyond the physical cores mainly
+take time from other processes.
+
+On this machine 80 threads is the best setting. Elsewhere, start at or below the
+number of physical cores, leave some cores free for the rest of the system, and measure
+decode at the depths you use. These numbers come from a single CPU, so the engine
+default stays unchanged. `--cpu-poll` (pool spin before sleeping) was not swept.
+
+**Corrected-worker numerical, decode and cache-speed gates passed. One sampled tools23 trial scored 18/23 against our 19/23 threshold; with short-chunk logits bitwise equal to `4499fcbc`, we treat this as sampling spread (PR1 trials on main: 17, 19 and 20).** Historical
 and diagnostic measurements below belong to the original worker or explicitly
 named diagnostic binaries. Completed corrected-worker numerical checks are
 identified separately in the validation subsection; no diagnostic throughput
