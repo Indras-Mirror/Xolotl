@@ -208,12 +208,13 @@ additional mode switches are needed:
 
 | New rows | Routed experts | Dense/attention |
 | --- | --- | --- |
-| 1 | Existing CPU decode | Existing GPU decode |
+| 1 | CPU fused decode with bounded row scheduling | Existing GPU decode |
 | 2–31 | Existing CPU path | GPU |
 | 32–1024 | Complete experts split between CPU and GPU | GPU |
 | Above 1024 | Existing native GPU batch | GPU |
 
-CPU-only builds retain their previous execution path. Hybrid layers currently
+CPU-only builds retain their previous prefill routing. Fused single-token decode
+uses bounded row scheduling in both CPU-only and CUDA builds. Hybrid layers currently
 support IQ3_XXS and IQ4_XS. A layer containing NVFP4 uses the existing native
 GPU path; it does not approximate NVFP4 on the CPU. This covers the tested
 UD-IQ3_S model's heterogeneous expert formats.
@@ -235,8 +236,10 @@ slot leases stay live until the real GPU consumer has finished.
 
 Activation helper buffers are reserved at initialization for at most 1024 rows,
 before the planner samples free VRAM. The long-context planner therefore sees
-those retained allocations. Single-token decode and the long batch algorithm
-are unchanged, although the available-memory budget can alter long chunk sizes.
+those retained allocations. Single-token dot arithmetic and rank-reduction order
+are unchanged; fused CPU matrix-row scheduling now uses bounded dynamic batches,
+as described below. The long batch algorithm is unchanged, although the
+available-memory budget can alter long chunk sizes.
 The same-chunk numerical contract still applies. Report actual chunks when
 comparing two builds; a different partition is a different numerical history.
 
@@ -247,9 +250,9 @@ likewise selects hybrid. The prefix's earlier batch history remains in KV;
 these requests must be compared with the corresponding live-history reference,
 not an unrelated cold 1124/1324-row forward.
 
-### Final short-prefill numerical checks
+### Original short-prefill numerical checks
 
-The final CUDA worker SHA-256 is
+The original PR3 CUDA worker measured on October 28 had SHA-256
 `5a7d75db17e0e7fecff61a7d3a488a5eaf13872cb529eb0fc5fe20e36dfd3f2a`;
 the separately built `4499fcbc` baseline is
 `a2f47f967e01ac8c1ed3d92a241bed1cf527ab781e32787fb88ba6405a97e707`.
@@ -285,7 +288,7 @@ or a cached expert; model-level positive coverage of those cases is not claimed.
 Component tests cover their rules.
 
 CPU and CUDA each passed **15/15** model-free ctest groups. After publishing
-the portable control tracer, chunk parser and cache-head comparator, the final
+the portable control tracer, chunk parser and cache-head comparator, that
 benchmark suite passed **39/39**, and both ctest configurations again passed 15/15.
 These additions changed no C++ or measured worker binary. The published trace
 classes/parser match the measured versions by AST; the cache comparator is
@@ -298,9 +301,9 @@ The detailed numerical recipe, input reconstruction and counters are in
 [`pr3-prefill-numeric.json`](../tools/m31/bench/receipts/pr3-prefill-numeric.json).
 HIP, SYCL, Windows, other GPUs and two-GPU placement were not tested.
 
-### Full-vocabulary cache-state checks
+### Original full-vocabulary cache-state checks
 
-The already built final PR3 and base `m31_cache_model_check` executables then
+The original PR3 and base `m31_cache_model_check` executables then
 passed four actual-model runs: A1124/B1124/A1324/B1324, reuse 1024, decode 7,
 context 40000, maxchunk 32768 and checkpoint 512 MiB. The arena/cache/registration
 and CPU 80 settings were the same as the throughput profile. GPU packing used
@@ -325,7 +328,7 @@ The full evidence is in
 
 ### Initial live-prefix and long-throughput ABBA window
 
-On 2026-10-28, one complete A B B A B A A B window compared the final PR3
+On 2026-10-28, one complete A B B A B A A B window compared the original PR3
 worker (A) with `4499fcbc` (B), using the hardware and resource profile above.
 Every source/binary seal stayed unchanged, request bodies matched, and the
 background container identities stayed unchanged. All samples are retained.
@@ -412,7 +415,7 @@ hashes and unchanged acceptance verdict are recorded in
 ### Separate speed-only confirmation
 
 A separately declared A B B A B A A B window repeated only the speed recipe
-after the full-vocabulary cache gate passed. It used the same final binaries,
+after the full-vocabulary cache gate passed. It used the same original binaries,
 model, corpus SHA, resource budgets, current client, fixed nonce seed and
 control-only trace wrapper. A fresh server was loaded for every arm; there were
 no interleaved prefix-latency requests. All eight arms and timing warmups remain.
@@ -455,16 +458,16 @@ different chunk histories. Neither code inspection nor sampled CPU/GPU
 counters isolated the cause of decode differences. Changing the corpus, affinity,
 sampling, thresholds or removing an outlier is not used to turn a failed
 window into a pass. The short-append latency improvement is measured; the full
-long-throughput no-regression gate is **not met**.
+long-throughput no-regression gate for the original worker was **not met**.
 
 Complete confirmation data and its unchanged failure are recorded in
 [`pr3-prefill-speed-confirmation.json`](../tools/m31/bench/receipts/pr3-prefill-speed-confirmation.json).
 
-### Final sampled quality
+### Original sampled quality
 
-The same final worker completed all 123 requests in one unseeded trial:
+The original `5a7d75db…` worker completed all 123 requests in one unseeded trial:
 
-| Suite | Final PR3 | Required | Result |
+| Suite | Original PR3 | Required | Result |
 | --- | ---: | ---: | --- |
 | GSM8K, first 100 ordered rows |97/100 |95/100 |PASS |
 | Tools, 20 prompts plus 3 continuations |18/23 |19/23 |**FAIL** |
@@ -484,10 +487,314 @@ checks the first call and it remains a failure. The three wrong GSM8K rows
 visible answers. Parser, common-server shim, grammar, sampler, quality client
 and fixtures were unchanged from 4499fcbc. These facts do not establish a
 stochastic or numerical cause, and no successful replacement trial is used.
-The quality acceptance verdict remains **FAIL** because 18<19.
+The original quality trial remains **FAIL** because 18<19; it is retained
+separately from the corrected-worker trial below.
 
 All outcomes, sampling fields, cache counts, hashes and source/binary stability
 are in [`pr3-prefill-quality.json`](../tools/m31/bench/receipts/pr3-prefill-quality.json).
+
+### Decode investigation and bounded row scheduling (2026-10-29)
+
+Commit `13af6b16` replaces static per-worker partitions of the fused CPU
+gate/up and down matrices with **64-row dynamic batches**. Two separately
+64-byte-aligned atomic counters are reset by the submitting thread before ggml
+publishes each graph. Workers claim independent output rows; the dot kernels,
+scale/route multiplications, hidden activation arithmetic and original-rank
+reduction order are unchanged. All five barriers still use the actual callback
+participant count. This limits matrix work stranded behind a slower worker;
+every participant must still reach the barriers.
+
+The change has no scheduling flag, affinity policy or lazy-allocation option.
+The hybrid CPU lane and eager quant-helper reservation remain as before.
+A model-free fixture now also requests nine workers for eight down-matrix
+batches, exercising participants that receive no down work, repeated graph reuse,
+and the existing requested-four/pool-two mismatch. Repeating identical inputs
+does not independently prove reset correctness if stale outputs match; the
+changing-input gate20 decode sequences below provide stronger reset coverage.
+
+**Corrected-worker numerical, decode and cache-speed gates passed. Overall acceptance is FAIL: tools23 scored 18/23 against 19/23. The PR remains draft.** Historical
+and diagnostic measurements below belong to the original worker or explicitly
+named diagnostic binaries. Completed corrected-worker numerical checks are
+identified separately in the validation subsection; no diagnostic throughput
+is promoted to final acceptance.
+
+#### Historical controls retained
+
+The base/base controls both passed the unchanged per-depth decode gate
+(median candidate/base >=0.97). Default deltas at 4K/16K/32K were
++2.543% / -0.127% / +0.802%; fixed-3072 deltas were
++0.651% / +0.841% / -1.799%. These are two observed control windows, not a
+precise estimate of the population false-failure rate.
+
+The original PR3 family failed six of seven completed windows. All failures
+remain recorded; the two always_inline rows are a previous unsuccessful
+candidate, not the bounded-row change:
+
+| Historical window | A worker | 4K TG delta | 16K TG delta | 32K TG delta | Gate |
+| --- | --- | ---: | ---: | ---: | --- |
+| Initial full | Original PR3 | -10.931% | -0.585% | -1.754% | FAIL |
+| Separate speed-only | Original PR3 | -0.442% | -3.513% | -3.118% | FAIL |
+| Clean default | Original PR3 | -0.099% | +0.980% | -0.001% | PASS |
+| Clean fixed-3072 | Original PR3 | -3.359% | -0.220% | -1.106% | FAIL |
+| Earlier candidate, fixed-3072 | always_inline | -3.792% | +0.269% | +0.969% | FAIL |
+| Earlier candidate, default | always_inline | +0.595% | +0.211% | -3.561% | FAIL |
+| Original PR3, subsequent default control window | Original PR3 | -8.576% | -5.950% | -7.963% | FAIL |
+
+Original PR3 identifies worker `5a7d75db…`; base identifies `a2f47f96…`
+at `4499fcbc`. The always_inline candidate was `2f2a1b3e…`.
+The decode numerator was 255 transitions for 256 outputs. The original
+default planner can choose different long chunk histories between branches;
+fixed-3072 removes that recipe difference. No slow arm was discarded.
+
+#### Warmup and allocation controls
+
+The proposed hybrid-warmup explanation had an incorrect premise:
+`speed.py` defines warmup as 1,024 selected input tokens and **32 generated
+tokens**. Formatting produces an actual 1,277-token prompt, chunk `[1277]`,
+outside the hybrid range. All 40 archived warmup groups in the audited scope
+confirmed this. Historical failures therefore do not require a hybrid pass.
+
+A separate native diagnostic tested exact prompt warmups of 32 and 1,025
+tokens: A=original PR3/32, B=original PR3/1025, C=base/32, D=base/1025.
+Fresh processes ran in ABCDDCBA order, two per condition; each filtered pair
+forms ABBA. Long raw prompts were 4096/16384/32768, fixed chunks were 4096,
+and generation used 128 greedy outputs. All long recipes and generated IDs
+matched; this does not claim full-vocabulary logit identity.
+
+| Condition | 4K median TG | 16K median TG | 32K median TG |
+| --- | ---: | ---: | ---: |
+| A, original PR3 / warm32 | 23.555577 | 23.961574 | 23.196042 |
+| B, original PR3 / warm1025 | 26.326595 | 24.682994 | 25.075013 |
+| C, base / warm32 | 24.660416 | 25.767398 | 25.212078 |
+| D, base / warm1025 | 26.079787 | 25.971172 | 24.380025 |
+
+The retained slow 08-A process delivered 20.824 / 22.107 / 21.211 tok/s;
+the other A process delivered 26.287 / 25.816 / 25.181. Even without a hybrid
+warmup, B/D at 16K was **-4.960%**. Two observations per condition do not prove
+warmup poisoning or its absence.
+
+After each actual hybrid warmup, one CPU-lane thread was added. It then slept
+in `futex_do_wait`, with zero additional CPU ticks and scheduler runtime
+through all three long requests. Masks remained 0–191, nice 0 and policy 0.
+The slow process did not show additional lane CPU usage or greater pool
+runqueue wait than its fast counterpart. These snapshots do not distinguish
+useful work from userspace barrier spin.
+
+Another diagnostic compared eager and lazy helper initialization in the
+**same ELF**, ABBA with two fresh processes per side, the unchanged HTTP speed
+client/corpus, and fixed-3072 chunks. Lazy/eager decode deltas were
+**-2.371% / -1.421% / +3.945%**. Bodies, recipes and generated responses
+matched. The rounded GPU memory counter was exactly 160 MiB lower with lazy
+initialization at each depth, consistent with the 167,521,792-byte helper
+counter. This did not produce a consistent benefit. A supplementary observer
+was introduced during the first eager 32K decode and covered later processes
+fully, so this window also has a partial-start instrumentation confound.
+It is not a clean causal estimate or an accepted fix.
+
+#### Worker progress, SMT and frequency
+
+A temporary same-treatment fused-thread probe retained all 128 complete
+sampled tokens (7,296 layers). Fast/slow quartile median routed times were
+22.220/25.296 ms at 4K, 22.319/31.242 ms at 16K and 22.219/32.105 ms at 32K.
+Slow layers had larger critical-worker matrix times and corresponding barrier
+waits. For gate/up, the median critical/median-worker work ratio increased
+from about 1.18 in fast long-context samples to 1.82–1.92 in slow ones.
+These are descriptive quartiles of one treatment, not independent trials or
+an outlier filter applied to acceptance.
+
+Own-model SMT pairs were associated with some slow samples: stationary
+entry/exit CPUs, different logical siblings of the same core, and overlapping
+callback intervals. They appeared in 25.0% / 37.5% of slow 16K/32K layers and
+0% of their fast layers. In one repeated slow 32K case, a critical worker on
+CPU104 shared a core with another model worker on CPU8 for 114 layers.
+Entry/exit observations do not exclude migration away and back; overlapping
+wall intervals do not prove continuous execution on those CPUs. External
+background matches were less consistent, and the 1 Hz observer cannot resolve
+sub-millisecond matrix stages.
+
+A sustained whole-pool frequency collapse was not supported. In archived
+normal versus pinned replays, user-cycles/task-clock stayed near 3.43–3.47 GHz
+while routed work rose from about 23 ms to 32–35 ms; IPC fell from about 2.0
+to 1.58–1.69. Uniform probe APERF/MPERF ratios in the four 4K counter windows
+were 1.46270–1.46864. Those counters were system-wide on mapped logical CPUs,
+and the reference frequency was not independently established; the ratios
+are not converted to GHz. A short frequency change on one critical worker
+is not excluded.
+
+#### Same-process scheduling/affinity control
+
+A four-condition diagnostic held one process, pool and heap throughout:
+A=static/all initially allowed CPUs, B=dynamic/all, C=static/one allowed
+logical sibling per physical core, D=dynamic/physical. The physical mask
+covered all 96 physical cores and all 12 L3 domains. Only model tasks changed
+affinity, at completed-request boundaries; background jobs retained their
+settings. Uniform observers started before model load.
+
+Each depth used ABCDDCBA, two observations per condition, canonical raw prompts
+4348/16638/33022, fixed-3072 chunks and 256 greedy outputs. All 24 observations
+are retained. One native PID, 18 consumed scheduling transitions, identical
+per-depth prompt/chunk/output histories and before/after affinity masks were
+verified.
+
+| Contrast, median TG | 4K | 16K | 32K |
+| --- | ---: | ---: | ---: |
+| Dynamic/all versus static/all, B/A | +2.9596% | +6.9191% | +8.6244% |
+| Dynamic/physical versus static/physical, D/C | +7.614% | +7.012% | +3.114% |
+| Static physical versus static all, C/A | -6.116% | -1.099% | +2.979% |
+
+Dynamic row scheduling helped under both affinity settings; physical-only
+placement alone was not a consistent improvement. The selected source change
+therefore changes row scheduling and leaves affinity and eager allocation
+alone. This supports a matrix-work imbalance/barrier amplification mechanism.
+It does **not** establish why the original PR3 processes encountered slow
+placement/progress more often than base in the historical windows: their
+fused source was already identical, and base also exhibited slow tails.
+
+This is a single-process crossover with n=2 per condition/depth. Expanding a
+mask does not restore its previous placement, so carryover remains possible.
+It is neither the required fresh-process HTTP acceptance nor a broad hardware
+calibration. The first process state, other machines and quants may behave
+differently.
+
+#### Corrected-source validation status
+
+The corrected source is `13af6b16`. CPU and CUDA builds completed, and each
+passed all 15 model-free ctest groups. The final CUDA worker SHA-256 is
+`8580e92a4b7011ed523c00d13b4fc9d68e827a7ed0041a527e31fd005645b481`.
+
+All seven boundaries (1/2/31/32/128/1024/1025; 2,243 rows) matched the sealed
+saved PR3, base and GPU-oracle references bitwise across all 200,064 vocabulary
+entries per row. The corrected-worker gate20 matched the sealed GPU oracle
+and saved PR3 in all 20 cases, 28,723 rows. This gate20 comparison does not
+claim a newly generated base4499 gate20 dump. Prefix/cancellation passed all
+34 requests; the 32 completed deterministic token sequences matched saved PR3.
+Cancelled tails are timing-dependent, so their contract is checked without
+claiming arbitrary byte equality. These are new corrected-worker runs against
+saved references, not a fresh oracle collection.
+
+| Corrected-worker check | Status |
+| --- | --- |
+| CPU and CUDA build/ctest | PASS, 15/15 each |
+| Boundaries 1/2/31/32/128/1024/1025, bitwise contract | PASS, all 2,243 rows |
+| gate20 | PASS, 20 cases / 28,723 rows |
+| Prefix/cancel | PASS, 34/34; 32 deterministic sequences matched |
+| Live-cache +100/+300 speed retained | PASS, 2.233x / 2.396x versus base |
+| Fresh-process ABBABAAB versus base, fixed-3072, each depth >=97% | PASS, all three depths; PP gates also PASS |
+| Fresh-process ABBABAAB versus base, default, each depth >=97% | PASS, all three decode depths |
+| GSM8K100, reference sampling | PASS, 98/100 against 95/100 |
+| tools23, reference sampling | FAIL, 18/23 against 19/23 |
+| Final resource cleanup | PASS, all recorded checks |
+| Overall acceptance | FAIL, tools23 threshold only |
+
+The completed corrected-worker fixed-3072 window used eight fresh processes
+in ABBABAAB order (four per arm), the same HTTP bodies and actual chunk recipes,
+and 256 greedy outputs. All responses matched across arms. All eight worker
+seals and protocol traces validated, and all three PP gates passed.
+
+| Fixed-3072 depth | Corrected median TG | Base median TG | Corrected/base delta | TG gate |
+| --- | ---: | ---: | ---: | --- |
+| 4K | 27.62988284 | 25.93835484 | +6.5213387916% | PASS |
+| 16K | 27.00913608 | 25.14828611 | +7.3995100801% | PASS |
+| 32K | 25.98482006 | 25.11387616 | +3.4679787920% | PASS |
+
+The separate default window also completed ABBABAAB, four fresh processes per
+arm:
+
+| Default depth | Corrected median TG | Base median TG | Corrected/base delta | TG gate |
+| --- | ---: | ---: | ---: | --- |
+| 4K | 27.32844088 | 26.16726554 | +4.4375112128% | PASS |
+| 16K | 26.71576819 | 25.85912935 | +3.3127133837% | PASS |
+| 32K | 25.88018169 | 24.23378420 | +6.7938109701% | PASS |
+
+**All six final decode gates passed.** There was one final ABBABAAB window per
+mode, with no retries to obtain PASS. These results do not replace any
+historical failure. Unlike fixed-3072, default long chunk histories may differ
+between corrected PR3 and base because the unchanged helper reservation
+affects planner headroom. Matching all default recipes, response messages or
+full logits is not claimed; default measures the matched HTTP workload with
+each branch's planner.
+
+The final live-cache speed check also passed:
+
+| Append to live 1024-token prefix | Corrected median, ms | Base median, ms | Base/corrected |
+| --- | ---: | ---: | ---: |
+| +100 | 853.0165 | 1904.775 | 2.2329872869x |
+| +300 | 1226.975 | 2939.955 | 2.3961001650x |
+
+All 48 observations are retained. The 16 timing warmups were excluded from
+the medians; prime/reset work was recorded separately. Actual reuse was 1024,
+new rows read were 100 or 300, and same-history greedy IDs passed. The original
+append measurements above remain separate historical results.
+
+The corrected worker completed **one** sampled quality trial: GSM8K 98/100
+passed the 95/100 threshold; tools23 scored 18/23 and failed the 19/23 threshold.
+All 123 records completed with zero length stops, marker leaks or invalid tool
+IDs. Requests retained the reference sampling: temperature 1, top_p 0.95,
+top_k 40, min_p 0.05, max_tokens 6000, model-default thinking and no added seed.
+No replacement trial was used to obtain a passing result. The tools failure
+is not excused by the successful numerical/performance checks.
+
+The final pipeline has complete=True and unchanged=True. Stage return codes
+were numeric 0, performance 0 and quality 1. Controller exit 1 therefore records
+a completed quality-gate failure, not an incomplete run or cleanup failure.
+All cleanup operations returned 0; the final resource audit passed every
+recorded check: miner ownership restored, no hold or temporary preset, config
+restored, leases free, CPU chat healthy and background identities retained.
+
+Two earlier technical failures are retained separately: the reserve session's
+first resource audit ran before the asynchronous miner process appeared and
+failed; its later readiness audit passed. The first fused-profile derivation
+also returned 2 / valid=False because it expected nth in worker records. The
+corrected v2 reads nth from layer summaries and validates 57 layers / 80 workers;
+it is valid=True on the same 128 sampled tokens. The initially failed audit, parser output and raw measurements remain
+available; neither failure was silently removed.
+
+The original cache speeds and original GSM8K 97/100, tools 18/23 FAIL remain
+separate historical evidence. Overall acceptance of the corrected worker is
+**FAIL solely because 18<19 on tools23**, so the PR stays draft. HIP, SYCL,
+Windows, other GPUs/quants, multi-GPU placement and a new OFF-build isolation
+comparison were not tested in this follow-up.
+
+The complete evidence, including all historical failures, both final decode
+windows, numerical references, quality and resource receipts, is in
+[`pr3-decode-root.json`](../tools/m31/bench/receipts/pr3-decode-root.json).
+It identifies measured source commit 13af6b1664a1aa1e89e759bd58fbd0f014baeb2e
+separately from any later documentation-only commit.
+
+The local root investigation archive retains every diagnostic observation and
+failure under `/mnt/ai/logs/m31-pr2/root/`: `historical-warmup-audit.json`,
+`warmup-session/warmup-summary.json`, `warmup-thread-analysis.json`,
+`reserve-session/diagnostic-analysis.json`, `instrumentation-scope.json`
+inside that reserve directory, `thread-analysis-v2/summary.json`,
+`own-smt-analysis/summary.json`, `critical-background-analysis/summary.json`,
+`thread-profile-session/thread-frequency-analysis.json`, and
+`dynamic-affinity-session/dynamic-affinity-analysis.json`. These temporary
+instrumentation probes are local diagnostic artifacts, not shipped benchmark
+interfaces. The linked final receipt identifies the corrected ELF and its
+completed validation results.
+
+For a portable corrected/base comparison, use the public boundary, prefix,
+cache-head and HTTP recipes below with separate output directories and a
+separately built `4499fcbc` baseline. Run each arm inside the same GPU resource
+reservation, retain CPU/GPU background workloads, and use fresh processes in
+ABBABAAB order. Keep all results, including failures. The HTTP command below
+uses the same public client for both servers; it does not recreate the
+temporary same-process switches:
+
+```sh
+# MODEL, TOKENIZER_DIR and CORPUS are explicit local inputs.
+# Set the server's native --chunk to 32768 for default, then 3072 for fixed.
+python tools/m31/bench/speed.py --url http://127.0.0.1:8080 \
+  --tokenizer "$TOKENIZER_DIR" --corpus "$CORPUS" --repetitions 1 \
+  --nonce-seed m31-pr3-abba-fixed --out speed-corrected-A1
+```
+
+Repeat for each fresh arm and both chunk settings with unique output paths.
+The standard hardware/resource profile is the RTX 5090 32 GB at 440 W,
+EPYC 9654, 624 GiB RAM, 80 CPU threads, a 170 GiB arena, a 7 GiB expert cache,
+a 176 GiB registered-memory budget, context 40000 and 8 packing threads.
+Keep F16 KV, fusion off, and OMP/OPENBLAS at one thread. A different corpus or chunk history
+defines a new comparison and must be reported.
 
 ### Reproduce short-chunk checks and timings
 
@@ -516,7 +823,7 @@ by the portable prompt/tokenization recipe above. Keep complete actual chunks an
 The policy boundaries are 1/2/31/32/1024/1025; short tests must not accidentally
 fall back to a long batch and then claim to cover hybrid.
 
-The unchanged 1/2/31-row paths use `4499fcbc` at the same IDs/chunks as their
+The 1/2/31-row arithmetic uses `4499fcbc` at the same IDs/chunks as its
 strict byte oracle. The 2–31-row path keeps PR1's CPU activation arithmetic;
 its GPU-oracle differences are reported as diagnostics. New hybrid 32/128/1024
 and preserved batch 1025 are checked strictly against the GPU-offload oracle.
@@ -672,8 +979,8 @@ temperature 1, top_p 0.95, max_tokens 6000 and model-default thinking. The exist
 thresholds are 95/100 and 19/23. Keep unsuccessful sampled trials too.
 
 Model-free CPU and CUDA ctest include policy/cost, native activation arithmetic,
-CPU lane failure/recovery, real requested-four/pool-two worker mismatch and
-allocation-failure retry tests. They do not replace model-level GPU checks.
+CPU lane failure/recovery, requested-four/pool-two worker mismatch, nine workers
+for eight down-matrix batches, and allocation-failure retry tests. They do not replace model-level GPU checks.
 
 ## Cache state and numerical history
 
