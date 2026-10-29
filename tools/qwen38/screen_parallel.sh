@@ -25,12 +25,17 @@ fi
 XOLOTL=/home/mal/AI/Xolotl
 T=$XOLOTL/tools/qwen38
 NVME=/media/mal/NVME1TB/qwen38
-MODEL=$NVME/qwen38-full-q8_0.gguf
-DUMPS=$NVME/dumps-abl
-STATS=$NVME/stats-abl
-IMP=$NVME/imp-abl
-EDIT_REPORT=/home/mal/.quetza-data/qwen38-q8-edit.json
-STATE=/home/mal/.quetza-data/qwen38-abl-chain
+# Every path and the tier ladders are env-overridable so the same tested driver serves V1
+# (single file, 8 gu tiers) and V2 (Swift shard set, down-only). Defaults reproduce V1 exactly.
+MODEL=${MODEL:-$NVME/qwen38-full-q8_0.gguf}
+DUMPS=${DUMPS:-$NVME/dumps-abl}
+STATS=${STATS:-$NVME/stats-abl}
+IMP=${IMP:-$NVME/imp-abl}
+EDIT_REPORT=${EDIT_REPORT:-/home/mal/.quetza-data/qwen38-q8-edit.json}
+STATE=${STATE:-/home/mal/.quetza-data/qwen38-abl-chain}
+NLAYERS=${NLAYERS:-48}
+GU_TIERS=${GU_TIERS:-ptq1,iq2_xxs,iq2_xs,iq2_s,iq3_xxs,iq3_s,iq4_nl,q8_0}
+DN_TIERS=${DN_TIERS:-iq4_nl,q8_0}
 
 JOBS=${1:-14}
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
@@ -58,8 +63,8 @@ screen_one() {
     fi
     ionice -c3 nice -n 10 python3 "$T/screen.py" \
         --model-dir "$MODEL" --dump "$DUMPS" --layer "$L" \
-        --tiers ptq1,iq2_xxs,iq2_xs,iq2_s,iq3_xxs,iq3_s,iq4_nl,q8_0 \
-        --edit-report "$EDIT_REPORT" --dn-tiers iq4_nl,q8_0 \
+        --tiers "$GU_TIERS" \
+        --edit-report "$EDIT_REPORT" --dn-tiers "$DN_TIERS" \
         --out "$f" --importance-out "$p" \
         >"$(printf "%s/screen-L%02d.log" "$STATE" "$L")" 2>&1
     local rc=$?
@@ -73,9 +78,9 @@ screen_one() {
     echo "L$L done"
 }
 export -f screen_one
-export T NVME MODEL DUMPS STATS IMP EDIT_REPORT STATE
+export T NVME MODEL DUMPS STATS IMP EDIT_REPORT STATE GU_TIERS DN_TIERS NLAYERS
 
-todo=${LAYERS:-$(seq 0 47)}
+todo=${LAYERS:-$(seq 0 $((NLAYERS-1)))}
 echo "=== parallel screen: jobs=$JOBS, layers ${LAYERS:-0-47} (present layers skipped)"
 printf '%s\n' $todo | xargs -P "$JOBS" -I{} bash -c 'screen_one {}'
 
@@ -84,12 +89,12 @@ printf '%s\n' $todo | xargs -P "$JOBS" -I{} bash -c 'screen_one {}'
 n_j=$(ls "$STATS"/*.json 2>/dev/null | wc -l)
 n_p=$(ls "$IMP"/*.npz 2>/dev/null | wc -l)
 echo "=== artifacts: $n_j json, $n_p npz"
-if [ "$n_j" -eq 48 ] && [ "$n_p" -eq 48 ]; then
-    echo "SCREEN_COMPLETE 48/48"
+if [ "$n_j" -eq "$NLAYERS" ] && [ "$n_p" -eq "$NLAYERS" ]; then
+    echo "SCREEN_COMPLETE $NLAYERS/$NLAYERS"
     exit 0
 fi
 echo "SCREEN_INCOMPLETE - missing:"
-for L in $(seq 0 47); do
+for L in $(seq 0 $((NLAYERS-1))); do
     f=$(printf "%s/L%02d.json" "$STATS" "$L"); p=$(printf "%s/L%02d.npz" "$IMP" "$L")
     { [ -f "$f" ] && [ -f "$p" ]; } || echo "  L$L"
 done

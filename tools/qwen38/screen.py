@@ -346,7 +346,20 @@ def main():
         er = json.load(open(a.edit_report))
         if er.get("state") != "edited" or er.get("layers") != "all" or len(er.get("targets", [])) != 145:
             raise SystemExit("--edit-report is not a completed all-target edit")
-        if pathlib.Path(er["model"]).resolve() != pathlib.Path(a.model_dir).resolve():
+        # A SHARDED report sets model=None and lists shards instead (q8_ablate.py:650-653).
+        # Calling Path(er["model"]) unconditionally raises TypeError on a shard set, which is every
+        # Swift run, so this never reached the check it was written to make.  Compare the shard set
+        # when sharded, the single file when not, and never fall through on a mismatch.
+        if er.get("model") is None:
+            want = sorted(str(pathlib.Path(p).resolve()) for p in (er.get("shards") or []))
+            if not want:
+                raise SystemExit("--edit-report has neither a model nor shards")
+            md = pathlib.Path(a.model_dir)
+            got = ([str(md.resolve())] if md.is_file()
+                   else sorted(str(p.resolve()) for p in md.glob("*.gguf")))
+            if want != got:
+                raise SystemExit("edit report's shard set is not this model_dir")
+        elif pathlib.Path(er["model"]).resolve() != pathlib.Path(a.model_dir).resolve():
             raise SystemExit("edit report is for a different calibration model")
     elif str(a.model_dir).endswith(".gguf"):
         raise SystemExit("GGUF calibration requires --edit-report; refusing to mix pristine and edited runs")
