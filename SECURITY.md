@@ -40,5 +40,7 @@ this PC only. The details and every setting are in [docs/DETAILS.md](docs/DETAIL
   that ask for them. They run with your user's rights, and the model decides when to call them.
 - **The request monitor** (`/api-monitor`, which keeps the last prompts and answers in memory) is off unless
   `"api_monitor": true` is set.
+- **The request log** (`--request-log PATH`, one line of timings and token counts per request) is off unless set. It
+  writes no prompts, answers or keys, but it does keep each client's address and `User-Agent`.
 
 Strata has not had an outside security audit yet.
