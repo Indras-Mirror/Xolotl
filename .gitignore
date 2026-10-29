@@ -85,3 +85,8 @@ out/
 /data/mtp/
 # bench scratch output
 /speedbench-results.jsonl
+
+# XQ tooling stays private (Xolotl-private)
+/tools/qwen38/lattice_gptq.py
+/tools/qwen38/iq4nl_codec.py
+/tools/qwen38/gptq_vs_rtn.py
