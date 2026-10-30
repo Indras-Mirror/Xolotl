@@ -1,85 +1,114 @@
-# tools/m31 — MiniMax-M3.1-Flash engine (scaffold)
+# MiniMax-M3.1-Flash
 
-This directory is the **landing shape** for the community port in
-[issue #62](https://github.com/Indras-Mirror/Xolotl/issues/62), not the port itself. There is no engine code here yet: the
-contributor's tree lives on their fork, and this scaffold exists so that branch drops in
-without a CMake redesign.
-
-Nothing here is built by default. `tools/m31/cmake/m31.cmake` is `include()`d OPTIONAL at the
-end of the root `CMakeLists.txt` (after `glm.cmake`) and returns immediately unless
-`-DSTRATA_M31=ON` is passed **and** `tools/m31/m31_generate.cpp` exists. A default configure is
-unchanged.
-
-## Building it
+Opt-in MiniMax engine and shim to the common Strata HTTP server, with a separate
+image/video opt-in, developed in [issue #62](https://github.com/Indras-Mirror/Xolotl/issues/62).
+See [build, run, measured results and reproduction commands](../../docs/MINIMAX_M31.md).
 
 ```sh
-cmake -S . -B build-m31 -DSTRATA_M31=ON -DSTRATA_ENABLE_CUDA=ON   # existing tree flags, plus this one
-cmake --build build-m31 --target m31_generate -j
+cmake -S . -B build-m31 -DSTRATA_M31=ON -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON
+cmake --build build-m31 --target m31_generate m31_checks -j 8
+ctest --test-dir build-m31 --output-on-failure -R m31
 ```
 
-| option | default | target |
-|---|---|---|
-| `STRATA_M31` | `OFF` | `m31_engine` (every `tools/m31/*.cpp` except the entry point), `m31_generate` (the entry point) |
-| `STRATA_M31_VISION` | `OFF` | `m31_vision` from `tools/m31/vision/*.cpp` — only when an `mtmd` target exists |
+`STRATA_M31=OFF` is the default. It adds no targets or build settings. The entry
+point remains `tools/m31/m31_generate.cpp`, as in upstream's landing scaffold.
+`m31_engine` holds the engine; `m31_generate` provides offline logit dumps and
+`--serve`. Python code in `serve/` selects the M31 tokenizer/template/parser and
+runs `serve/server.py`; it does not implement a second HTTP server.
 
-`STRATA_M31_VISION` stays off until llama.cpp PR #31192 (the mtmd encoder) is in the pinned
-ggml. Until then the vision path is the contributor's helper process, opt-in and documented in
-their `docs/MINIMAX_M31.md`; it is not a target in this tree, because linking an encoder the
-tree does not have would be a build claim we cannot keep.
+## Engine protocol
 
-## What the port must provide
-
-The engine is started by `serve/server.py` as `<exe> --serve <args>` and speaks the same line
-protocol as `tools/glm/glm_generate.cpp` (`--serve` block, ~line 538) and the DS4.1 engine. The
-server side is `StrataEngine` in `serve/server.py` (~line 807); the protocol is not M31-specific:
-
-```
-in : GEN <max_new> [key=value ...] <ids csv>      solo request
-     GENI <max_new> [...] <ids csv> <embeddings>  solo request with image/video embeddings
-     BGEN <slot> <max_new> [...] <ids csv>        batch slot
-     BGENI <slot> <max_new> [...] <ids csv> <embeddings>
-     STOP                                        cancel the request in flight
+```text
+in : GEN <max_new> [key=value ...] <ids csv>
+     BGEN <slot> <max_new> [key=value ...] <ids csv>
+     GENI <max_new> [key=value ...] <SVE1-file> <ids csv>
+     BGENI <slot> <max_new> [key=value ...] <SVE1-file> <ids csv>
+     STOP
      QUIT
 out: READY <ctx> stop
-     RESUME <reused>                              prefix reuse actually taken
-     PP <read> <total> <ms> <tok/s>               one line per prefill boundary
-     T <id>                                      one per generated token
+     RESUME <reused>
+     PP <read> <total> <ms> <tok/s>
+     T <id>
      DONE <generated> <prompt> <prompt_ms> <decode_ms> <finish> ... <reused> ...
      ERR <text>
 ```
 
-So the "~150-line shim to `serve/server.py`" in the issue is the contributor's serve loop for
-this protocol, not new server code. Three behaviours the server depends on and the port must
-carry (their plan item 1):
+`GENI` and `BGENI` require `-DSTRATA_M31_VISION=ON`, which defaults to OFF.
+Without it they return `ERR vision unavailable`. The embeddings file precedes
+the token list, matching the common server's serializer. Visual rows use token
+ID `-1`; ordinary text IDs must remain within the vocabulary.
 
-1. **Prefix reuse** — `RESUME <reused>` for a request that extends or shares the last prompt,
-   otherwise the whole prompt is re-read and the conversation cache is pointless.
-2. **Cancellation** — a `STOP` is honoured at the next token or prefill boundary, and the process
-   stays alive for the next `GEN`.
-3. **`GENI` / `BGENI`** — image and video rows go through the prefill path with embeddings, the
-   same way text does, instead of one small LLM batch per frame.
+SVE1 contains consecutive little-endian records: five int32 fields
+`0x31455653, rows, nx, ny, width`, then `rows * width` F32 values. The M31 shim
+writes `nx=rows`, `ny=1`, `width=6144`; the engine accepts `nx * ny=rows` and uses
+ordinary linear decoder positions. Records cover complete visual spans in
+prompt order. The engine checks file size, dimension, row mapping and finite
+values before changing KV state.
 
-## Layout expected by `m31.cmake`
+Prefix reuse reports restored engine state. Visual prefixes additionally match
+the actual F32 embedding bytes, so identical placeholder IDs or file names
+cannot reuse a different picture's KV. `cache_prompt=false` disables lookup
+and store. `STOP` is accepted at prefill boundaries and decode steps, and the
+process stays available for the next request. Stdout carries only protocol
+lines; diagnostics go to stderr.
 
-```
-tools/m31/
-  m31_generate.cpp        the serve entry point (arg parsing, --serve loop, sampling)
-  *.cpp                   the rest of the engine -> m31_engine
-  vision/*.cpp            optional, STRATA_M31_VISION only
-  cmake/m31.cmake         this scaffold
-```
+## Optional image and video input
 
-Exactly one `main()` in `tools/m31/*.cpp`. The development probes and measurement launchers are
-expected to be removed before merge (issue #62, plan item 2); a second `main()` collides at link
-time and `CONFIGURE_DEPENDS` will pick a new file up automatically.
+There is no `mtmd` target in this tree. Build the separate helper in `vision/`
+against unmodified llama.cpp PR #31192 at `6b95a990`; its ggml stays in that
+process. The M31 shim starts it lazily when vision is configured. Images and all
+video frames join the text in one mixed prefill. The full remaining mixed prompt
+must fit the configured chunk and planner budget; otherwise it fails explicitly.
 
-## Merge checklist (from AGENTS.md)
+Missing helper/model/mmproj, helper death, malformed output and startup or reply
+timeouts produce `vision unavailable` (HTTP 503), including a blocked helper
+write or incomplete reply. The helper is reaped and a later request may restart
+it. Text requests remain available. Build, configuration, content-part examples
+and portable oracle commands are in the
+[vision section](../../docs/MINIMAX_M31.md#vision-separate-opt-in).
+Adaptive short-chunk prefill remains a separate contribution.
 
-- [ ] Opt-in target, default build byte-identical; say how that was checked.
-- [ ] One PR per slice: (a) text engine + serve shim, (b) vision, (c) adaptive short-chunk prefill.
-- [ ] Every backend a file touches is built (CUDA; HIP/SYCL where applicable — say what was not).
-- [ ] `docs/MINIMAX_M31.md` with the numbers and the hardware they were measured on.
-- [ ] The claim that the PR's own GPU and CPU paths agree on only ~78% top-1 (KL ~0.78) explained
-      in the docs, with why GSM8K/tools is the gate instead of KL to a CPU oracle.
-- [ ] The reference commit and the exact commands behind the GSM8K, tool-call and byte-identical
-      logit numbers, so they can be re-run on a single 4090.
+## Layout
+
+- `m31_engine.*`, `m31_geometry.hpp`, `m31_arena.hpp`: model graph and storage.
+- `m31_config.*`: typed defaults, budgets and validation.
+- `gpu/`, `prefill/`, `cpu/`: expert streaming, planning and fused decode.
+- `serve/`: common-server shim, tokenizer export, tool parsing and bounded media/helper I/O.
+- `vision/`: external mtmd helper and its separate pinned CMake build.
+- `tests/`: small CPU tests; `tests/oracle/` is a separate, pinned llama.cpp build.
+- `bench/`: portable quality, speed and logit comparison clients.
+
+The optional oracle is test infrastructure. It is not needed to run the engine
+or HTTP server. Development probes, machine launchers and experimental kernels
+are excluded.
+
+## Validation checklist
+
+The numerical and performance items below record PR1's text validation and its
+remaining limitations. Vision build and reproduction commands are documented
+separately; these PR1 checks do not claim final image/video acceptance.
+
+- [x] Opt-in target; default-build artifact and target comparisons are recorded
+  with their exact coverage and Qwen link limitation in
+  [the default-build section](../../docs/MINIMAX_M31.md#default-build-comparison).
+- [x] Vision is a separate build opt-in with an external helper; adaptive short
+  prefill remains a separate slice. The default text configuration needs neither.
+- [x] CPU and CUDA build/check commands, GPU-offload oracle commands and the
+  model revision are documented. HIP, SYCL, Windows and other GPUs remain untested.
+- [x] Historical v8 numbers identify the hardware and distinguish the GPU oracle
+  from the roughly 78% top-1 CPU/GPU agreement. They are not final PR1 quality results.
+- [x] Self-contained gate20, public long and cache-partition inputs have portable
+  reproduction commands; cache comparisons state the required numerical history.
+- [x] Final worker numerical/cache/lifecycle checks and same-day quality/speed
+  collection are complete; all outcomes are recorded in
+  [the PR1 results](../../docs/MINIMAX_M31.md#pr1-candidate-checks) and
+  [the receipt](bench/receipts/pr1-text.json).
+- [ ] Every tools23 trial meets the unchanged 19/23 threshold: PR1's original
+  unseeded trial scored 17/23, and the reference seed-1 trial scored 18/23.
+  Both failures remain in the report; no best trial replaces them.
+- [ ] HIP, SYCL and Windows build coverage remains unverified. The root Qwen
+  executable also has the documented upstream link failure.
+
+The final PR1 decode medians were about 14–15% below historical v8 on this
+machine, with the cause unresolved. Collection completion is not an overall-PASS
+claim; the measured results and remaining limits are explicit in the document.

@@ -1,0 +1,1455 @@
+{
+  "format": "m31-prefill-cache-numeric-v1",
+  "date_utc": "2026-10-28",
+  "state": "Completed cache numerical component PASS; separate speed/quality failures remain recorded.",
+  "scope": "All public Engine cache heads on the final PR3 candidate and upstream PR1 base, with exact recorded history recipes and complete raw F32 vocabulary vectors.",
+  "pass": true,
+  "complete": true,
+  "source_and_binary_seals_unchanged": true,
+  "window": {
+    "label": "pr3-confirmation-v1/cache-numeric",
+    "started_utc": "2026-10-28T21:20:39.992378Z",
+    "finished_utc": "2026-10-28T21:26:45.436242Z",
+    "run_order": [
+      [
+        "A",
+        1124
+      ],
+      [
+        "B",
+        1124
+      ],
+      [
+        "A",
+        1324
+      ],
+      [
+        "B",
+        1324
+      ]
+    ],
+    "card_index": 0,
+    "gpu_count_used": 1,
+    "owned_aictl_cgroup": true,
+    "card_and_build_locks_held": true,
+    "parent_window_completion_or_cleanup_claimed": false,
+    "scope": "Only the completed cache component is recorded. The larger confirmation window contains separate speed work; no outcome or cleanup of that larger window is asserted here."
+  },
+  "model": {
+    "repository": "unsloth/MiniMax-M3.1-Flash-GGUF",
+    "revision": "02c81e41305bf8b718ad2e288f4e52a1cd49f55f",
+    "quantization": "UD-IQ3_S",
+    "vocabulary": 200064,
+    "unmodified": true,
+    "identity_scope": "same model as PR1; shard identity is recorded in pr1-text.json; no new full-shard hash scan in this window"
+  },
+  "hardware_and_toolchain": {
+    "cpu": "AMD EPYC 9654",
+    "physical_cores": 96,
+    "logical_cpus": 192,
+    "host_ram_gib": 624,
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "gpus_used": 1,
+    "gpu_vram_gib": 32,
+    "pcie": "5.0 x16",
+    "gcc": "14.3.0",
+    "cuda": "13.1.115",
+    "cuda_architecture": "sm_120a",
+    "background": "GPU1 tts-video, ffmpeg and tslab remained running; no isolated performance inference from numerical checks"
+  },
+  "configuration": {
+    "backend": "cuda",
+    "kv": "F16 main and indexer",
+    "resources": {
+      "reuse": 1024,
+      "decode_steps": 7,
+      "context": 40000,
+      "chunk": 32768,
+      "threads": 80,
+      "arena_gib": 170,
+      "gpu_experts_gib": 7,
+      "register_arena": 1,
+      "register_limit_gib": 176,
+      "checkpoint_mib": 512,
+      "pack_threads": 8
+    },
+    "pack_threads": "8 from the unchanged checker Config default, asserted from effective-config logs; no pack-thread CLI flag was added.",
+    "checker_cpp_changed": false,
+    "native_cpp_changed_for_this_check": false,
+    "GGML_CUDA_DISABLE_FUSION": "1",
+    "input_count": 33000,
+    "input_endianness": "little-endian int32",
+    "input_prefix_sha256": "e4fc92fde4096bb7fe852fa7d760b31d7a135dbfdd614c2201309b2a0f2af8b2",
+    "input_source_sha256": "e4fc92fde4096bb7fe852fa7d760b31d7a135dbfdd614c2201309b2a0f2af8b2",
+    "input_prefix_unchanged": true,
+    "input_reproduction_receipt": "tools/m31/bench/receipts/pr3-prefill-numeric.json"
+  },
+  "coverage": {
+    "checker_runs_passed": 4,
+    "checker_runs_total": 4,
+    "lengths": [
+      1124,
+      1324
+    ],
+    "prefix_rows": 1024,
+    "suffix_rows": [
+      100,
+      300
+    ],
+    "decode_steps_per_decode_rewind": 7,
+    "vocabulary_size": 200064,
+    "head_names": [
+      "whole",
+      "whole_rewind",
+      "whole_again",
+      "whole_decode_rewind",
+      "split",
+      "split_rewind",
+      "split_decode_rewind",
+      "restore",
+      "release_rewind"
+    ],
+    "heads_per_run": 9,
+    "cross_arm_head_pairs": 18,
+    "float32_values_per_head": 200064,
+    "compared_float32_pairs": 3601152,
+    "raw_bytes_per_head": 800256,
+    "raw_head_files": 36,
+    "raw_head_bytes_per_arm_across_both_lengths": 14404608,
+    "changed_vocabulary_entries": 0,
+    "bitwise_identical_for_every_same_history_cross_arm_head": true
+  },
+  "within_checker_invariants": {
+    "pass": true,
+    "cold_repeat": [
+      "whole",
+      "whole_again"
+    ],
+    "rewind_after_decode": [
+      "whole_rewind",
+      "whole_decode_rewind"
+    ],
+    "split_checkpoint_restore_release": [
+      "split",
+      "split_rewind",
+      "split_decode_rewind",
+      "restore",
+      "release_rewind"
+    ],
+    "strict_raw_f32_equality_in_each_group": true,
+    "decode_recipe": "Seven greedy single-token forward/logit steps, then rewind to 1024 and replay exactly 100 or 300 suffix rows. The recorded forward_chunks include every decode step before replay.",
+    "cross_history_diagnostics": {
+      "whole_vs_split_bitwise": {
+        "A": false,
+        "B": false
+      },
+      "whole_vs_replay_bitwise": {
+        "A": false,
+        "B": false
+      },
+      "scope": "Different histories are explicitly not bitwise equal in either engine. Those diagnostic differences are retained and are not required equal; same-history cross-arm and replay invariants are strict."
+    }
+  },
+  "runs": [
+    {
+      "index": 1,
+      "arm": "A",
+      "length": 1124,
+      "suffix": 100,
+      "returncode": 0,
+      "pass": true,
+      "started_utc": "2026-10-28T21:20:41.727880Z",
+      "finished_utc": "2026-10-28T21:22:05.368548Z",
+      "argv": [
+        "<CANDIDATE_BUILD>/m31_cache_model_check",
+        "--model",
+        "<MODEL>",
+        "--ids-file",
+        "measurements/pr3-confirmation-v1/cache-numeric/ids-33000.i32",
+        "--out",
+        "measurements/pr3-confirmation-v1/cache-numeric/01-A-1124",
+        "--length",
+        "1124",
+        "--reuse",
+        "1024",
+        "--backend",
+        "cuda",
+        "--device",
+        "0",
+        "--ctx",
+        "40000",
+        "--chunk",
+        "32768",
+        "--threads",
+        "80",
+        "--arena-gib",
+        "170",
+        "--gpu-experts-gib",
+        "7",
+        "--register-arena",
+        "1",
+        "--register-limit-gib",
+        "176",
+        "--checkpoint-mib",
+        "512",
+        "--decode-steps",
+        "7",
+        "--cpu-fused",
+        "1"
+      ],
+      "same_history_bitwise": true,
+      "head_metadata_reference": "comparisons[length=1124].heads.*.candidate",
+      "raw_summary_sha256": "ec0e61692987363c1c86634575a12b6fcb3827df7ab3af7ebae673034100b553",
+      "checker_log_sha256": "c572afb311c7c2c6a7056cf14d214e0ce3d36476386ee2b84e34516a2172c446"
+    },
+    {
+      "index": 2,
+      "arm": "B",
+      "length": 1124,
+      "suffix": 100,
+      "returncode": 0,
+      "pass": true,
+      "started_utc": "2026-10-28T21:22:05.435287Z",
+      "finished_utc": "2026-10-28T21:23:38.035849Z",
+      "argv": [
+        "<BASE_BUILD>/m31_cache_model_check",
+        "--model",
+        "<MODEL>",
+        "--ids-file",
+        "measurements/pr3-confirmation-v1/cache-numeric/ids-33000.i32",
+        "--out",
+        "measurements/pr3-confirmation-v1/cache-numeric/02-B-1124",
+        "--length",
+        "1124",
+        "--reuse",
+        "1024",
+        "--backend",
+        "cuda",
+        "--device",
+        "0",
+        "--ctx",
+        "40000",
+        "--chunk",
+        "32768",
+        "--threads",
+        "80",
+        "--arena-gib",
+        "170",
+        "--gpu-experts-gib",
+        "7",
+        "--register-arena",
+        "1",
+        "--register-limit-gib",
+        "176",
+        "--checkpoint-mib",
+        "512",
+        "--decode-steps",
+        "7",
+        "--cpu-fused",
+        "1"
+      ],
+      "same_history_bitwise": true,
+      "head_metadata_reference": "comparisons[length=1124].heads.*.base",
+      "raw_summary_sha256": "ec0e61692987363c1c86634575a12b6fcb3827df7ab3af7ebae673034100b553",
+      "checker_log_sha256": "dcd288a5c4836f2e9144b8291e69e1c6e2cdad4dafd8ff0283a3c6ea6b788115"
+    },
+    {
+      "index": 3,
+      "arm": "A",
+      "length": 1324,
+      "suffix": 300,
+      "returncode": 0,
+      "pass": true,
+      "started_utc": "2026-10-28T21:23:38.101772Z",
+      "finished_utc": "2026-10-28T21:25:04.133273Z",
+      "argv": [
+        "<CANDIDATE_BUILD>/m31_cache_model_check",
+        "--model",
+        "<MODEL>",
+        "--ids-file",
+        "measurements/pr3-confirmation-v1/cache-numeric/ids-33000.i32",
+        "--out",
+        "measurements/pr3-confirmation-v1/cache-numeric/03-A-1324",
+        "--length",
+        "1324",
+        "--reuse",
+        "1024",
+        "--backend",
+        "cuda",
+        "--device",
+        "0",
+        "--ctx",
+        "40000",
+        "--chunk",
+        "32768",
+        "--threads",
+        "80",
+        "--arena-gib",
+        "170",
+        "--gpu-experts-gib",
+        "7",
+        "--register-arena",
+        "1",
+        "--register-limit-gib",
+        "176",
+        "--checkpoint-mib",
+        "512",
+        "--decode-steps",
+        "7",
+        "--cpu-fused",
+        "1"
+      ],
+      "same_history_bitwise": true,
+      "head_metadata_reference": "comparisons[length=1324].heads.*.candidate",
+      "raw_summary_sha256": "7fb28093381d860b8299273cf22f20a9dc3a24d78458c9fc77bda54c6fd85b88",
+      "checker_log_sha256": "02bad055e0f8cc0b99913d81935a14d8297f9dd513ee4b9e51011cf664019fb8"
+    },
+    {
+      "index": 4,
+      "arm": "B",
+      "length": 1324,
+      "suffix": 300,
+      "returncode": 0,
+      "pass": true,
+      "started_utc": "2026-10-28T21:25:04.197516Z",
+      "finished_utc": "2026-10-28T21:26:43.233791Z",
+      "argv": [
+        "<BASE_BUILD>/m31_cache_model_check",
+        "--model",
+        "<MODEL>",
+        "--ids-file",
+        "measurements/pr3-confirmation-v1/cache-numeric/ids-33000.i32",
+        "--out",
+        "measurements/pr3-confirmation-v1/cache-numeric/04-B-1324",
+        "--length",
+        "1324",
+        "--reuse",
+        "1024",
+        "--backend",
+        "cuda",
+        "--device",
+        "0",
+        "--ctx",
+        "40000",
+        "--chunk",
+        "32768",
+        "--threads",
+        "80",
+        "--arena-gib",
+        "170",
+        "--gpu-experts-gib",
+        "7",
+        "--register-arena",
+        "1",
+        "--register-limit-gib",
+        "176",
+        "--checkpoint-mib",
+        "512",
+        "--decode-steps",
+        "7",
+        "--cpu-fused",
+        "1"
+      ],
+      "same_history_bitwise": true,
+      "head_metadata_reference": "comparisons[length=1324].heads.*.base",
+      "raw_summary_sha256": "7fb28093381d860b8299273cf22f20a9dc3a24d78458c9fc77bda54c6fd85b88",
+      "checker_log_sha256": "652e2b29502b1a2ea4e38e364f8b3b3c653317def4f041d9987779fb34f44205"
+    }
+  ],
+  "comparisons": [
+    {
+      "format": "m31-cache-numeric-comparison-v1",
+      "pass": true,
+      "length": 1124,
+      "reuse": 1024,
+      "suffix": 100,
+      "decode_steps": 7,
+      "vocab": 200064,
+      "heads": {
+        "whole": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "2d98e6ac097a244e09c1559d1218834d8c24ca2fdb1331238835b4bd94153892",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 0,
+                "tokens": 1124
+              }
+            ]
+          },
+          "base": {
+            "sha256": "2d98e6ac097a244e09c1559d1218834d8c24ca2fdb1331238835b4bd94153892",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 0,
+                "tokens": 1124
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "whole_rewind": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "36b126efbbab83fa6e41172eba720b7e93ec117eff8971eca2b5aa1bc642330f",
+            "bytes": 800256,
+            "top1": 65493,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "base": {
+            "sha256": "36b126efbbab83fa6e41172eba720b7e93ec117eff8971eca2b5aa1bc642330f",
+            "bytes": 800256,
+            "top1": 65493,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "whole_again": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "2d98e6ac097a244e09c1559d1218834d8c24ca2fdb1331238835b4bd94153892",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 0,
+                "tokens": 1124
+              }
+            ]
+          },
+          "base": {
+            "sha256": "2d98e6ac097a244e09c1559d1218834d8c24ca2fdb1331238835b4bd94153892",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 0,
+                "tokens": 1124
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "whole_decode_rewind": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "36b126efbbab83fa6e41172eba720b7e93ec117eff8971eca2b5aa1bc642330f",
+            "bytes": 800256,
+            "top1": 65493,
+            "forward_chunks": [
+              {
+                "position": 1124,
+                "tokens": 1
+              },
+              {
+                "position": 1125,
+                "tokens": 1
+              },
+              {
+                "position": 1126,
+                "tokens": 1
+              },
+              {
+                "position": 1127,
+                "tokens": 1
+              },
+              {
+                "position": 1128,
+                "tokens": 1
+              },
+              {
+                "position": 1129,
+                "tokens": 1
+              },
+              {
+                "position": 1130,
+                "tokens": 1
+              },
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "base": {
+            "sha256": "36b126efbbab83fa6e41172eba720b7e93ec117eff8971eca2b5aa1bc642330f",
+            "bytes": 800256,
+            "top1": 65493,
+            "forward_chunks": [
+              {
+                "position": 1124,
+                "tokens": 1
+              },
+              {
+                "position": 1125,
+                "tokens": 1
+              },
+              {
+                "position": 1126,
+                "tokens": 1
+              },
+              {
+                "position": 1127,
+                "tokens": 1
+              },
+              {
+                "position": 1128,
+                "tokens": 1
+              },
+              {
+                "position": 1129,
+                "tokens": 1
+              },
+              {
+                "position": 1130,
+                "tokens": 1
+              },
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "split": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "061708d2bef2b02a1ec93de1f6e86016fd6700323910bb24b3630563ee9a3ba6",
+            "bytes": 800256,
+            "top1": 84384,
+            "forward_chunks": [
+              {
+                "position": 0,
+                "tokens": 1024
+              },
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "base": {
+            "sha256": "061708d2bef2b02a1ec93de1f6e86016fd6700323910bb24b3630563ee9a3ba6",
+            "bytes": 800256,
+            "top1": 84384,
+            "forward_chunks": [
+              {
+                "position": 0,
+                "tokens": 1024
+              },
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "split_rewind": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "061708d2bef2b02a1ec93de1f6e86016fd6700323910bb24b3630563ee9a3ba6",
+            "bytes": 800256,
+            "top1": 84384,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "base": {
+            "sha256": "061708d2bef2b02a1ec93de1f6e86016fd6700323910bb24b3630563ee9a3ba6",
+            "bytes": 800256,
+            "top1": 84384,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "split_decode_rewind": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "061708d2bef2b02a1ec93de1f6e86016fd6700323910bb24b3630563ee9a3ba6",
+            "bytes": 800256,
+            "top1": 84384,
+            "forward_chunks": [
+              {
+                "position": 1124,
+                "tokens": 1
+              },
+              {
+                "position": 1125,
+                "tokens": 1
+              },
+              {
+                "position": 1126,
+                "tokens": 1
+              },
+              {
+                "position": 1127,
+                "tokens": 1
+              },
+              {
+                "position": 1128,
+                "tokens": 1
+              },
+              {
+                "position": 1129,
+                "tokens": 1
+              },
+              {
+                "position": 1130,
+                "tokens": 1
+              },
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "base": {
+            "sha256": "061708d2bef2b02a1ec93de1f6e86016fd6700323910bb24b3630563ee9a3ba6",
+            "bytes": 800256,
+            "top1": 84384,
+            "forward_chunks": [
+              {
+                "position": 1124,
+                "tokens": 1
+              },
+              {
+                "position": 1125,
+                "tokens": 1
+              },
+              {
+                "position": 1126,
+                "tokens": 1
+              },
+              {
+                "position": 1127,
+                "tokens": 1
+              },
+              {
+                "position": 1128,
+                "tokens": 1
+              },
+              {
+                "position": 1129,
+                "tokens": 1
+              },
+              {
+                "position": 1130,
+                "tokens": 1
+              },
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "restore": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "061708d2bef2b02a1ec93de1f6e86016fd6700323910bb24b3630563ee9a3ba6",
+            "bytes": 800256,
+            "top1": 84384,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "base": {
+            "sha256": "061708d2bef2b02a1ec93de1f6e86016fd6700323910bb24b3630563ee9a3ba6",
+            "bytes": 800256,
+            "top1": 84384,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "release_rewind": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "061708d2bef2b02a1ec93de1f6e86016fd6700323910bb24b3630563ee9a3ba6",
+            "bytes": 800256,
+            "top1": 84384,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "base": {
+            "sha256": "061708d2bef2b02a1ec93de1f6e86016fd6700323910bb24b3630563ee9a3ba6",
+            "bytes": 800256,
+            "top1": 84384,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 100
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        }
+      },
+      "within_checker_invariants": true,
+      "exact_actual_recipes": true,
+      "diagnostic_flags_equal": true,
+      "whole_vs_split_bitwise": {
+        "A": false,
+        "B": false
+      },
+      "whole_vs_replay_bitwise": {
+        "A": false,
+        "B": false
+      },
+      "scope": "all9 complete F32 heads; strict same-history cross-arm bytes; no cross-history equality requirement"
+    },
+    {
+      "format": "m31-cache-numeric-comparison-v1",
+      "pass": true,
+      "length": 1324,
+      "reuse": 1024,
+      "suffix": 300,
+      "decode_steps": 7,
+      "vocab": 200064,
+      "heads": {
+        "whole": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "1f17471c0f20e528f4b5819af10bab286b29a3ba11893a13a1296f96887ce370",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 0,
+                "tokens": 1324
+              }
+            ]
+          },
+          "base": {
+            "sha256": "1f17471c0f20e528f4b5819af10bab286b29a3ba11893a13a1296f96887ce370",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 0,
+                "tokens": 1324
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "whole_rewind": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "6b0b4f8493f67133e2201d876023027732aad3c04d0c0654de93e1df402094f6",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "base": {
+            "sha256": "6b0b4f8493f67133e2201d876023027732aad3c04d0c0654de93e1df402094f6",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "whole_again": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "1f17471c0f20e528f4b5819af10bab286b29a3ba11893a13a1296f96887ce370",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 0,
+                "tokens": 1324
+              }
+            ]
+          },
+          "base": {
+            "sha256": "1f17471c0f20e528f4b5819af10bab286b29a3ba11893a13a1296f96887ce370",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 0,
+                "tokens": 1324
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "whole_decode_rewind": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "6b0b4f8493f67133e2201d876023027732aad3c04d0c0654de93e1df402094f6",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 1324,
+                "tokens": 1
+              },
+              {
+                "position": 1325,
+                "tokens": 1
+              },
+              {
+                "position": 1326,
+                "tokens": 1
+              },
+              {
+                "position": 1327,
+                "tokens": 1
+              },
+              {
+                "position": 1328,
+                "tokens": 1
+              },
+              {
+                "position": 1329,
+                "tokens": 1
+              },
+              {
+                "position": 1330,
+                "tokens": 1
+              },
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "base": {
+            "sha256": "6b0b4f8493f67133e2201d876023027732aad3c04d0c0654de93e1df402094f6",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 1324,
+                "tokens": 1
+              },
+              {
+                "position": 1325,
+                "tokens": 1
+              },
+              {
+                "position": 1326,
+                "tokens": 1
+              },
+              {
+                "position": 1327,
+                "tokens": 1
+              },
+              {
+                "position": 1328,
+                "tokens": 1
+              },
+              {
+                "position": 1329,
+                "tokens": 1
+              },
+              {
+                "position": 1330,
+                "tokens": 1
+              },
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "split": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "703a40053434ca9e14798ab4cece068ae56f307c13c77337df34e8ad5f13a139",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 0,
+                "tokens": 1024
+              },
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "base": {
+            "sha256": "703a40053434ca9e14798ab4cece068ae56f307c13c77337df34e8ad5f13a139",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 0,
+                "tokens": 1024
+              },
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "split_rewind": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "703a40053434ca9e14798ab4cece068ae56f307c13c77337df34e8ad5f13a139",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "base": {
+            "sha256": "703a40053434ca9e14798ab4cece068ae56f307c13c77337df34e8ad5f13a139",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "split_decode_rewind": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "703a40053434ca9e14798ab4cece068ae56f307c13c77337df34e8ad5f13a139",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 1324,
+                "tokens": 1
+              },
+              {
+                "position": 1325,
+                "tokens": 1
+              },
+              {
+                "position": 1326,
+                "tokens": 1
+              },
+              {
+                "position": 1327,
+                "tokens": 1
+              },
+              {
+                "position": 1328,
+                "tokens": 1
+              },
+              {
+                "position": 1329,
+                "tokens": 1
+              },
+              {
+                "position": 1330,
+                "tokens": 1
+              },
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "base": {
+            "sha256": "703a40053434ca9e14798ab4cece068ae56f307c13c77337df34e8ad5f13a139",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 1324,
+                "tokens": 1
+              },
+              {
+                "position": 1325,
+                "tokens": 1
+              },
+              {
+                "position": 1326,
+                "tokens": 1
+              },
+              {
+                "position": 1327,
+                "tokens": 1
+              },
+              {
+                "position": 1328,
+                "tokens": 1
+              },
+              {
+                "position": 1329,
+                "tokens": 1
+              },
+              {
+                "position": 1330,
+                "tokens": 1
+              },
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "restore": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "703a40053434ca9e14798ab4cece068ae56f307c13c77337df34e8ad5f13a139",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "base": {
+            "sha256": "703a40053434ca9e14798ab4cece068ae56f307c13c77337df34e8ad5f13a139",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        },
+        "release_rewind": {
+          "pass": true,
+          "bitwise_identical": true,
+          "candidate": {
+            "sha256": "703a40053434ca9e14798ab4cece068ae56f307c13c77337df34e8ad5f13a139",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "base": {
+            "sha256": "703a40053434ca9e14798ab4cece068ae56f307c13c77337df34e8ad5f13a139",
+            "bytes": 800256,
+            "top1": 32,
+            "forward_chunks": [
+              {
+                "position": 1024,
+                "tokens": 300
+              }
+            ]
+          },
+          "changed_vocabulary_entries": 0,
+          "first_changed_indices": []
+        }
+      },
+      "within_checker_invariants": true,
+      "exact_actual_recipes": true,
+      "diagnostic_flags_equal": true,
+      "whole_vs_split_bitwise": {
+        "A": false,
+        "B": false
+      },
+      "whole_vs_replay_bitwise": {
+        "A": false,
+        "B": false
+      },
+      "scope": "all9 complete F32 heads; strict same-history cross-arm bytes; no cross-history equality requirement"
+    }
+  ],
+  "comparator": {
+    "executed_label": "compare-pr3-cache-numeric-v1.py",
+    "sha256": "6bb1c20f8f9b52bcc8339db59cfe6eaf63e077895a2c7b25b40c113ef6edf8c6",
+    "prospective_public_path": "tools/m31/bench/compare_prefix_heads.py",
+    "staged_public_file_sha256": "6bb1c20f8f9b52bcc8339db59cfe6eaf63e077895a2c7b25b40c113ef6edf8c6",
+    "staged_public_file_identical_byte_for_byte_to_executed_comparator": true,
+    "staged_public_file_installed_on_branch_during_measurement": false,
+    "ast_parses": true,
+    "ast_structures_identical": true,
+    "normalized_ast_sha256": "5122f5b8528663292b1be38302919bd1492ecd7186944dad98a0ad4f11d70ee6",
+    "direct_raw_byte_equality_ast_present": true,
+    "acceptance_rule": "Every one of nine raw head byte strings must equal its same-history counterpart. No floating tolerance or top1-only substitute is accepted.",
+    "input_validation": "Exactly nine files and summary heads; full 200064 finite little-endian F32 values per file; raw top1 metadata check; exact fixed forward_chunks, within-checker raw invariants and honest cross-history diagnostic flags.",
+    "fixed_cli_vocabulary": 200064,
+    "allowed_cli_lengths": [
+      1124,
+      1324
+    ],
+    "preflight": {
+      "complete": true,
+      "returncode": 0,
+      "model_free": true,
+      "local_and_staged_suites_returned_zero": true,
+      "test_methods_per_suite": 7,
+      "test_method_asts_unchanged": true,
+      "staged_test_changes": "Import loader path only; seven test method ASTs match the executed local suite.",
+      "local_test_sha256": "64bd867753f8eb6f944c02a5f32172266ed185e77ff9a7d2974a21ee1f513814",
+      "staged_public_test_sha256": "1d3bc480deae7ff8d29c1dfa242f44813ce8d86530474bfde3559c48e34774ab",
+      "log_sha256": "8f32230efac24990bc5402900602196b48513e8bce3fccb79461d82360e45a6a"
+    }
+  },
+  "build_provenance": {
+    "A": {
+      "compiled_runtime_source_commit": "a7305f42914c03850520e8554efdf506c22b743f",
+      "source_head_at_post_quality_sealing": "a468200d2bdeb88f1556f0548894aa1b0e1a4067",
+      "native_worker_sha256": "5a7d75db17e0e7fecff61a7d3a488a5eaf13872cb529eb0fc5fe20e36dfd3f2a",
+      "checker_sha256": "3787472ea71884ff9b4636c3d3ac56a9b698dda917c12a9238036f75401318d2",
+      "linked_engine_library_sha256": "c4aa5bc075a57c93acccdba9ec0b2640e8c16f396315e86ba2d863436bffa58e",
+      "checker_bytes": 610426952,
+      "checker_cpp_sha256": "0f353c92d025de03712d86e3d5a23c46fde740dc00db0c22681a1180959b86d7",
+      "checker_cpp_unchanged_from_base": true,
+      "build_cache_sha256": "64e892520e819229349d61e532b51136240cc0277973adfeaf0686191587f487",
+      "compile_commands_sha256": "a9cffb7ae76089c84637e89b4343eaa058b202ca177458b70043cc178dcff381",
+      "checker_link_command_sha256": "2527891596c1f6bfe68a5817c27f2542bbb930780beca5305685890c71a49b38",
+      "engine_or_checker_rebuilt_for_this_cache_window": false
+    },
+    "B": {
+      "compiled_runtime_source_commit": "4499fcbca5bd9f0531036184177fd3d57df6a1d8",
+      "source_head_at_post_quality_sealing": "4499fcbca5bd9f0531036184177fd3d57df6a1d8",
+      "native_worker_sha256": "a2f47f967e01ac8c1ed3d92a241bed1cf527ab781e32787fb88ba6405a97e707",
+      "checker_sha256": "7d535e8890d0fbe210681de46c74d8505e41717edf6494266579de4fdf98f372",
+      "linked_engine_library_sha256": "773c8b92712a1905e5ed68eefb3f131dab6572ab80d24968788906f809affbbe",
+      "checker_bytes": 609757432,
+      "checker_cpp_sha256": "0f353c92d025de03712d86e3d5a23c46fde740dc00db0c22681a1180959b86d7",
+      "checker_cpp_unchanged_from_base": true,
+      "build_cache_sha256": "497d7b0ef1023d6e3a8370cd3093fd4e0328faeece3446ff381460c28109f83a",
+      "compile_commands_sha256": "cbfe0ea8419f2bddb08fe3c7d6af81940a92157a90bf90c97d5da62ae951c477",
+      "checker_link_command_sha256": "d33a6793cc47468e6ba74f48402c236c762b31a1a58fc9abca4f843803f3f631",
+      "engine_or_checker_rebuilt_for_this_cache_window": false
+    }
+  },
+  "seals": {
+    "manifest_sha256": "3f13216036a9485e5c04b76d2485edcea720d495504b9d51c93bea4e5f3681d5",
+    "prepared_manifest_sha256": "ee3fa9ba4486a9116b89bca44b1dd83e14c21dc697d262ff25788e8b6b028301",
+    "predeclared_contract_sha256": "f03e3767dc30812b85a801b7b29cc7d708e81d564e79c5f423bc680a40c07bf3",
+    "initial_file_sha256": {
+      "<BASE_BUILD>/CMakeCache.txt": "497d7b0ef1023d6e3a8370cd3093fd4e0328faeece3446ff381460c28109f83a",
+      "<BASE_BUILD>/CMakeFiles/m31_cache_model_check.dir/link.txt": "d33a6793cc47468e6ba74f48402c236c762b31a1a58fc9abca4f843803f3f631",
+      "<BASE_BUILD>/compile_commands.json": "cbfe0ea8419f2bddb08fe3c7d6af81940a92157a90bf90c97d5da62ae951c477",
+      "<BASE_BUILD>/libm31_engine.a": "773c8b92712a1905e5ed68eefb3f131dab6572ab80d24968788906f809affbbe",
+      "<BASE_BUILD>/m31_cache_model_check": "7d535e8890d0fbe210681de46c74d8505e41717edf6494266579de4fdf98f372",
+      "<BASE_BUILD>/m31_generate": "a2f47f967e01ac8c1ed3d92a241bed1cf527ab781e32787fb88ba6405a97e707",
+      "<PREFIX_CORPUS_IDS>": "e4fc92fde4096bb7fe852fa7d760b31d7a135dbfdd614c2201309b2a0f2af8b2",
+      "<CANDIDATE_BUILD>/CMakeCache.txt": "64e892520e819229349d61e532b51136240cc0277973adfeaf0686191587f487",
+      "<CANDIDATE_BUILD>/CMakeFiles/m31_cache_model_check.dir/link.txt": "2527891596c1f6bfe68a5817c27f2542bbb930780beca5305685890c71a49b38",
+      "<CANDIDATE_BUILD>/compile_commands.json": "a9cffb7ae76089c84637e89b4343eaa058b202ca177458b70043cc178dcff381",
+      "<CANDIDATE_BUILD>/libm31_engine.a": "c4aa5bc075a57c93acccdba9ec0b2640e8c16f396315e86ba2d863436bffa58e",
+      "<CANDIDATE_BUILD>/m31_cache_model_check": "3787472ea71884ff9b4636c3d3ac56a9b698dda917c12a9238036f75401318d2",
+      "<CANDIDATE_BUILD>/m31_generate": "5a7d75db17e0e7fecff61a7d3a488a5eaf13872cb529eb0fc5fe20e36dfd3f2a",
+      "measurements/compare-pr3-cache-numeric-v1.py": "6bb1c20f8f9b52bcc8339db59cfe6eaf63e077895a2c7b25b40c113ef6edf8c6",
+      "measurements/http-vision-faults.py": "b015012a9660e131447523d3c7158175f733db11d4c898827da6472494593f2a",
+      "<PUBLIC_STAGING>/tools/m31/bench/compare_prefix_heads.py": "6bb1c20f8f9b52bcc8339db59cfe6eaf63e077895a2c7b25b40c113ef6edf8c6",
+      "<PUBLIC_STAGING>/tools/m31/tests/test_prefix_heads.py": "1d3bc480deae7ff8d29c1dfa242f44813ce8d86530474bfde3559c48e34774ab",
+      "measurements/pr3-cache-numeric-contract-v1.json": "f03e3767dc30812b85a801b7b29cc7d708e81d564e79c5f423bc680a40c07bf3",
+      "measurements/pr3-cache-numeric-v1-prepared.json": "ee3fa9ba4486a9116b89bca44b1dd83e14c21dc697d262ff25788e8b6b028301",
+      "measurements/run-pr3-cache-numeric-v1.py": "b4b428f19cb3d9bec2c0adb4fc47d96b12df6068609240ad51771159ac0e46fb",
+      "measurements/run-pr3-confirmation-window.py": "5e64e47930f5f1e47a4b5f22ffd9f2fbaee1d0956b8bbf90be1eed1bfe00ec72",
+      "measurements/seal-pr3-cache-numeric-v1.py": "b21204930eb5247f4650375786412164e7dd79732b29d0ea2260c3a0852aff9d",
+      "measurements/test-pr3-cache-numeric-v1.py": "64bd867753f8eb6f944c02a5f32172266ed185e77ff9a7d2974a21ee1f513814"
+    },
+    "final_file_sha256": {
+      "<BASE_BUILD>/CMakeCache.txt": "497d7b0ef1023d6e3a8370cd3093fd4e0328faeece3446ff381460c28109f83a",
+      "<BASE_BUILD>/CMakeFiles/m31_cache_model_check.dir/link.txt": "d33a6793cc47468e6ba74f48402c236c762b31a1a58fc9abca4f843803f3f631",
+      "<BASE_BUILD>/compile_commands.json": "cbfe0ea8419f2bddb08fe3c7d6af81940a92157a90bf90c97d5da62ae951c477",
+      "<BASE_BUILD>/libm31_engine.a": "773c8b92712a1905e5ed68eefb3f131dab6572ab80d24968788906f809affbbe",
+      "<BASE_BUILD>/m31_cache_model_check": "7d535e8890d0fbe210681de46c74d8505e41717edf6494266579de4fdf98f372",
+      "<BASE_BUILD>/m31_generate": "a2f47f967e01ac8c1ed3d92a241bed1cf527ab781e32787fb88ba6405a97e707",
+      "<PREFIX_CORPUS_IDS>": "e4fc92fde4096bb7fe852fa7d760b31d7a135dbfdd614c2201309b2a0f2af8b2",
+      "<CANDIDATE_BUILD>/CMakeCache.txt": "64e892520e819229349d61e532b51136240cc0277973adfeaf0686191587f487",
+      "<CANDIDATE_BUILD>/CMakeFiles/m31_cache_model_check.dir/link.txt": "2527891596c1f6bfe68a5817c27f2542bbb930780beca5305685890c71a49b38",
+      "<CANDIDATE_BUILD>/compile_commands.json": "a9cffb7ae76089c84637e89b4343eaa058b202ca177458b70043cc178dcff381",
+      "<CANDIDATE_BUILD>/libm31_engine.a": "c4aa5bc075a57c93acccdba9ec0b2640e8c16f396315e86ba2d863436bffa58e",
+      "<CANDIDATE_BUILD>/m31_cache_model_check": "3787472ea71884ff9b4636c3d3ac56a9b698dda917c12a9238036f75401318d2",
+      "<CANDIDATE_BUILD>/m31_generate": "5a7d75db17e0e7fecff61a7d3a488a5eaf13872cb529eb0fc5fe20e36dfd3f2a",
+      "measurements/compare-pr3-cache-numeric-v1.py": "6bb1c20f8f9b52bcc8339db59cfe6eaf63e077895a2c7b25b40c113ef6edf8c6",
+      "measurements/http-vision-faults.py": "b015012a9660e131447523d3c7158175f733db11d4c898827da6472494593f2a",
+      "<PUBLIC_STAGING>/tools/m31/bench/compare_prefix_heads.py": "6bb1c20f8f9b52bcc8339db59cfe6eaf63e077895a2c7b25b40c113ef6edf8c6",
+      "<PUBLIC_STAGING>/tools/m31/tests/test_prefix_heads.py": "1d3bc480deae7ff8d29c1dfa242f44813ce8d86530474bfde3559c48e34774ab",
+      "measurements/pr3-cache-numeric-contract-v1.json": "f03e3767dc30812b85a801b7b29cc7d708e81d564e79c5f423bc680a40c07bf3",
+      "measurements/pr3-cache-numeric-v1-prepared.json": "ee3fa9ba4486a9116b89bca44b1dd83e14c21dc697d262ff25788e8b6b028301",
+      "measurements/run-pr3-cache-numeric-v1.py": "b4b428f19cb3d9bec2c0adb4fc47d96b12df6068609240ad51771159ac0e46fb",
+      "measurements/run-pr3-confirmation-window.py": "5e64e47930f5f1e47a4b5f22ffd9f2fbaee1d0956b8bbf90be1eed1bfe00ec72",
+      "measurements/seal-pr3-cache-numeric-v1.py": "b21204930eb5247f4650375786412164e7dd79732b29d0ea2260c3a0852aff9d",
+      "measurements/test-pr3-cache-numeric-v1.py": "64bd867753f8eb6f944c02a5f32172266ed185e77ff9a7d2974a21ee1f513814"
+    },
+    "candidate_source_sha256": {
+      "tools/m31/bench/compare_logits.py": "51676755a5333cf01ed9a2fb4babc8c3411aa60a2a830ab854eab5c96781b03b",
+      "tools/m31/bench/make_prompts.py": "dd00a83717afa2ddad550c20414ec2e24c6cc4e955b94f029c3d8d3ed009a551",
+      "tools/m31/bench/prefix_speed.py": "229fa8803124361a2d1cd242c500e36985de771c26f4db503e2b76924eebb218",
+      "tools/m31/bench/quality.py": "cf68344496479346278f9937d0db6498ccb5c3b7c0a442c3302452e869516f85",
+      "tools/m31/bench/replay_oracle.py": "fb808614e1f7db567333620a1a6fb3ed85f1e9c418a53a0e5535cd90252709a3",
+      "tools/m31/bench/speed.py": "e42b742840d10e61629ab083599f0179a5f441f6fddeaf641d7c7405f1381612",
+      "tools/m31/bench/tool_fixtures.py": "2dec9c38b4382d541537cb90841162f6c1be324b906ace864f78b1465b1a3923",
+      "tools/m31/cmake/grammar.cmake": "0f229de720a191a48b2fc63b25a6f88d01987c02d8d08cfb31dc60c16e8cc51d",
+      "tools/m31/cmake/m31.cmake": "358988db034ca245b7fbe8a850359226aced43a64346465102b92f9384cf8eec",
+      "tools/m31/cpu/fused_decode.hpp": "0967cea5714b1b847713d052071bd9cecd4dc798780ac5ae8ed37721c5ea8b42",
+      "tools/m31/cpu/task_barrier.hpp": "4777be8a63339328d6e560ac702acf86a37cbe66bf4756c1c3b478ece5cadc55",
+      "tools/m31/cpu/threadpool_config.hpp": "885f51f91673a6ef6efbef8423e04ef05a47318806f13ee1249e7ca874e42377",
+      "tools/m31/gpu/device_experts.hpp": "afd8752d6974f41ee9775c1c8400344f03c1b79f6c76bec3aedcc69e05043b21",
+      "tools/m31/gpu/device_forward.hpp": "a4d90df08753c83b95501097dcf27e9ec0cc76d4d108f2a163397ed674680ccd",
+      "tools/m31/gpu/experts.cpp": "be6b0bec3727c51f142d69c05755240e995c8ea80bcb7fa69dea6849c2935fbd",
+      "tools/m31/gpu/experts.hpp": "bb99becd247c08575b0a037bf76a1eff0a5542f7379f8e7224b24fc2559a7125",
+      "tools/m31/gpu/host_executor.cpp": "64e2c44c561c505a13dbeed2cbe3e7583b338957c38d89821feca9e1eaf33fdf",
+      "tools/m31/gpu/host_executor.hpp": "23b93782da451cd5aeddad169786101b2cd308c7ebafa88341e63b32918a67d0",
+      "tools/m31/gpu/hybrid_forward.hpp": "d9172c55db64e3d601af435cfd26c313020413d253386f3ccd7b4af39f7442b3",
+      "tools/m31/gpu/pack_spans.hpp": "b020932aad8f3c3c5f6c38e6d20bad9e7d39b5290f8970b6288f15c50b6ae5d2",
+      "tools/m31/gpu/prefill_hidden.hpp": "d6000950fa212b37bb5a5fc08222e36db394b4f0b3edf96e32b0017c62104b94",
+      "tools/m31/gpu/registered_arena.cu": "a67e09ffc15894281929190e516abf726213133788621cd741147ff3bc301b97",
+      "tools/m31/gpu/registered_arena.hpp": "c72d32d4b25e185ad14e0be072a3369c309dbcd6fc4ed19a66e5d00d0f49f578",
+      "tools/m31/m31_arena.hpp": "83b0b36233ffd83890ee6f6e78f6146f8380d0161e2ccd51f8c33b38db6aa2c6",
+      "tools/m31/m31_config.cpp": "cf4bf1df744a75d69ac0878aa121e62e5084e7f9919c4edb2181719a8f96ea59",
+      "tools/m31/m31_config.hpp": "4aafc6e1a5e3a8eefb0fb0ed3c958c54005a8f40c6da7f4526dec625c0207e90",
+      "tools/m31/m31_engine.cpp": "84a61b2e5949dccc2fac28b2691a0f8aa1560a5790e85dbb98c07263535b4a63",
+      "tools/m31/m31_engine.hpp": "f78e8e2c524fa7addacc60a0a409bd1244bd0bdc1cbb74162aad6c092e645f77",
+      "tools/m31/m31_generate.cpp": "3e7dc5e51d6807833b9784c3d2971d106c04657a21bff7d9e8f526bef77914e7",
+      "tools/m31/m31_geometry.hpp": "9b46e17e72b4f1ca6b0969c8e10e1750e8dead1dcd62134abb8cac9fd4af82af",
+      "tools/m31/m31_grammar.hpp": "ede2f464a7715a9045205c896204faf6ab25167bdf13475a50fce2c0039ee2f1",
+      "tools/m31/m31_protocol.hpp": "3664cc0bec53bd204dabf3e52be409b648280364da6329b59c8d844cb0bfa6b6",
+      "tools/m31/m31_run.hpp": "feee1a02763405973b747313398f86dab0f888cf887efb80836ab6481e869c61",
+      "tools/m31/m31_sampling.hpp": "a0e91d10bf1e70680e05f33db1cad9a0bc90144c94a8bf91f1d130cd3dc35764",
+      "tools/m31/prefill/background.hpp": "dd2f30015e44e68710a7b51cf92cc3fbdeb0180080825b33cfebf78867b80cc7",
+      "tools/m31/prefill/chunk_limit.hpp": "c18a3b2b2294fc52bfb212d3a95426ee747ef3041645beef6137f3ca5c23fcdb",
+      "tools/m31/prefill/expert_budget.hpp": "145e91e7716fa734b28d9f99fd685ad71759789ffc163396eef5c8ad2190353a",
+      "tools/m31/prefill/pipeline.hpp": "88189f4496a271f3fa258c3b17fde71b2976783ba6cce2a455ebe3a37a97a470",
+      "tools/m31/prefill/plan.hpp": "91fd98201aa0dca58b02a828bc9e8b61e4c73e8077b9de09b2b643cbd7b13801",
+      "tools/m31/prefill/route_worklist.hpp": "d21fa06d25d83a97dfe504c912ed441db7c00958f4de1ecc9d2cf7d63ba52c79",
+      "tools/m31/prefill/short/policy.hpp": "a948c2527cb69465ea99f412a5ae742e0d3ee1333c64083e9a499f03be76e545",
+      "tools/m31/prefill/short/shortprefill_cost.hpp": "2762f16480fb9b73c711bcf7538607a5981afd50aa681b90f1459ce959d09fff",
+      "tools/m31/prefill/short/shortprefill_cpu_lane.hpp": "81328749dba92dbb00dbb3556896d13b301ec805459caf55e671faafcb187212",
+      "tools/m31/prefill/short/shortprefill_cuda_executor.hpp": "0f11a0f4d4f7247c1f1287af21e0962c2024db48bc1d7ffba76be68edbace7da",
+      "tools/m31/prefill/short/shortprefill_cuda_math_cpu.cpp": "0659be6f7f905a88a7310d46d709c6ff7bb0327eb3d1327223bcd7743020c369",
+      "tools/m31/prefill/short/shortprefill_cuda_math_cpu.hpp": "b217df7a3c224f4011944f8c23392d6255d603a66ad8366e43f711dc57013fa0",
+      "tools/m31/prefill/short/shortprefill_cuda_nvfp4_cpu.hpp": "d99e6bfbf30444ea36fce85faa67e1c2465dfb8dd7184c7406087968ad59553d",
+      "tools/m31/prefill/short/shortprefill_gpu_quant.cu": "c0313e010b9e76f2013c5b5426483f00f107a1ca487bcfcd504c5aed1af2f954",
+      "tools/m31/prefill/short/shortprefill_gpu_quant.hpp": "ccec657e562dbf265ea1a1dcb718f728b103cefde0ed23afb1fdd17588896ece",
+      "tools/m31/prefill/short/shortprefill_gpu_quant_stub.cpp": "aa053541062490aa4507873d807cb72dc4c36c267d7790dd13bddc657a034633",
+      "tools/m31/prefill/slot_leases.hpp": "019bc7133edab95a2cad231a1eaa6a5f0c5cffba59360c7154bd2cf4a8f93c47",
+      "tools/m31/serve/export_tokenizer.py": "b9b20a9c8e0dfaf84e39079a3422393c13f1d862fa98e4c7755b2488bd9464d2",
+      "tools/m31/serve/m31_parser.py": "12903907cba3889c87db1ad8f120013692d83da9e1cc2d360014be88c4f491ec",
+      "tools/m31/serve/m31_tok.py": "42d907f56d663b5f8a530eba1cfd604c17f53c2fc44ed6315614f7519f189644",
+      "tools/m31/serve/serve_m31.py": "6c6344f0e209b87ead5ce7076206c30b1cba9ee7085551be894b01be4c87edf4",
+      "tools/m31/tests/cache_model_check.cpp": "0f353c92d025de03712d86e3d5a23c46fde740dc00db0c22681a1180959b86d7",
+      "tools/m31/tests/check_native_grammar.py": "7bfeb764e32e41d09efb303398017a3b91883e790651660e353a7dd9eb6e59b9",
+      "tools/m31/tests/check_tokenizer_oracle.py": "109241197ebe58e0b45044cd1064b2096e05a19df4e063edcf464f2a2fbf23d0",
+      "tools/m31/tests/core_check.cpp": "f1b2c2da492d25ca22391d60ad1ac227dae16977eb346ea4b76e5a1fbe8f1982",
+      "tools/m31/tests/fused_allocation_check.cpp": "d0e0b570233b35d7e256397efd79f536839ede12597d43df0ef92b6a2a9904dc",
+      "tools/m31/tests/grammar_api_check.cpp": "50b08ef72840aa66e7db9fb9fecbfe131d3e3ee4da1526e33095106b5c7bcc74",
+      "tools/m31/tests/grammar_model_check.cpp": "b3a370a75037b7b126bc00e9b694a7dd4eddabba83b8ce75067aaca56673163c",
+      "tools/m31/tests/numpy_reference.py": "f51a05de9eb6ad9a7eb415185dfeb9e42c323d6398f293f07ae491c493b51521",
+      "tools/m31/tests/oracle/CMakeLists.txt": "2ce89e1e65ee687b3b33654688efcfdf9848993a10905884b5f2b0975bb4e4e4",
+      "tools/m31/tests/oracle/m31_cache_oracle.cpp": "4c700e72c2d23732a2025dc6a05ca327a2bbe258da98d3c2a5cb82a5363ff79f",
+      "tools/m31/tests/oracle/m31_oracle.cpp": "8639591153b39f1c9ac81150ed069b809b4174037d0ab8bf7255f09b90008913",
+      "tools/m31/tests/oracle/m31_tokenizer.cpp": "61a697895c13c663c47cdc240c00950e5441eb3b16cfe7d3093c74ca113da131",
+      "tools/m31/tests/oracle/server_grammar.hpp": "75aef7b7f8092025d1bee96af114d1564be8af0ef06a7995a1f44d3c77f11e08",
+      "tools/m31/tests/protocol_check.cpp": "6b0830acaef1753f29b14b3d659cb08faa911aed025e298c6a4b575bda801936",
+      "tools/m31/tests/protocol_fixture.cpp": "003c681636e8162a6f33b249ee21b902d641ee8bb8a9f7fc4e36e7fe803a80b9",
+      "tools/m31/tests/resource_checks.cpp": "1f9eb303308673d11361d73e505088fd2a1741616e1b57d54c06c5c91448687e",
+      "tools/m31/tests/run_core_check.py": "b2f9f406183936ab285305062a6d9dd3b9559933141fbc19bccc20a52666a00a",
+      "tools/m31/tests/shortprefill_cost_test.cpp": "734eddcbb67313f7c8504bd0f4409981ebc6010d02777e0446bd718ebc41ab67",
+      "tools/m31/tests/shortprefill_cpu_lane_test.cpp": "4546ed301e0a919e428e9e07e4cc5e731ca39c6980e8b1a5018bbd31773ee097",
+      "tools/m31/tests/shortprefill_cuda_executor_test.cpp": "1a327412f75f0bec1adfa6627d02a4ad9d5d7a03bf7903d75b183420d3eb87ee",
+      "tools/m31/tests/shortprefill_cuda_math_cpu_test.cpp": "be3e46fef32728576c01cf9f2106a5dbda6c65661a00695aeca3034b23446a0d",
+      "tools/m31/tests/shortprefill_policy_test.cpp": "da161f964f8d93c6574be12a7a261a7a0a4c248bca80d3b90ad70a08462f5052",
+      "tools/m31/tests/test_bench.py": "bada227ff54a6cd84d956566fe6ea4d78fa7b1f5b9625e899dde0f303b640555",
+      "tools/m31/tests/test_config_environment.py": "ee7ef353b68916d0dfd23ea7ea4d462d56e83658512ec5214865c62d1578d5b8",
+      "tools/m31/tests/test_isolation.py": "43261aba26e87e9ae0b3d8adad90e37d561c81ce2cd0cb04f4614a11302bed31",
+      "tools/m31/tests/test_protocol.py": "254e4807610e5d3580d9111c657346e925673178b760a366566edb6d304ded64",
+      "tools/m31/tests/test_serve.py": "1daa83bce3257d32192ee0b2553e3c84e7b5b318d13d6cf73c05e5938d82de07",
+      "tools/m31/tests/tests.cmake": "ce5e1e87a8b6205cc66ea83b8cf8575529d868dce7bd7d3231e67faddb3fbb81",
+      "tools/m31/tests/tiny_fixture.py": "b40b47bf776e9def9ba65319569485287aab4d02bf4ef948797c41773eb3201a"
+    },
+    "base_source_sha256": {
+      "tools/m31/bench/compare_logits.py": "51676755a5333cf01ed9a2fb4babc8c3411aa60a2a830ab854eab5c96781b03b",
+      "tools/m31/bench/make_prompts.py": "dd00a83717afa2ddad550c20414ec2e24c6cc4e955b94f029c3d8d3ed009a551",
+      "tools/m31/bench/quality.py": "cf68344496479346278f9937d0db6498ccb5c3b7c0a442c3302452e869516f85",
+      "tools/m31/bench/replay_oracle.py": "fb808614e1f7db567333620a1a6fb3ed85f1e9c418a53a0e5535cd90252709a3",
+      "tools/m31/bench/speed.py": "a0f98f0f491c601c730d2a7a17488f6a5f34b5352627979d16f2e6cf0f3153e3",
+      "tools/m31/bench/tool_fixtures.py": "2dec9c38b4382d541537cb90841162f6c1be324b906ace864f78b1465b1a3923",
+      "tools/m31/cmake/grammar.cmake": "0f229de720a191a48b2fc63b25a6f88d01987c02d8d08cfb31dc60c16e8cc51d",
+      "tools/m31/cmake/m31.cmake": "42e8922e244cce9554b079ffbb144762577884ceb74ed07d7430c434d2320645",
+      "tools/m31/cpu/fused_decode.hpp": "0967cea5714b1b847713d052071bd9cecd4dc798780ac5ae8ed37721c5ea8b42",
+      "tools/m31/cpu/task_barrier.hpp": "4777be8a63339328d6e560ac702acf86a37cbe66bf4756c1c3b478ece5cadc55",
+      "tools/m31/cpu/threadpool_config.hpp": "885f51f91673a6ef6efbef8423e04ef05a47318806f13ee1249e7ca874e42377",
+      "tools/m31/gpu/device_experts.hpp": "afd8752d6974f41ee9775c1c8400344f03c1b79f6c76bec3aedcc69e05043b21",
+      "tools/m31/gpu/device_forward.hpp": "c4afeef5bcd9970ba704c667d36a5d7ccf92a1e569fe6125d9d405d44a4bb09d",
+      "tools/m31/gpu/experts.cpp": "ab55e35d118f245a160ecc6db63900dccf6e7c3d1e74cf1de9e7daf3df002157",
+      "tools/m31/gpu/experts.hpp": "f266ef84ed13fa3d4baa70b1bad22f050bdc348c998eb8b48a9e1e0c350d96f9",
+      "tools/m31/gpu/host_executor.cpp": "64e2c44c561c505a13dbeed2cbe3e7583b338957c38d89821feca9e1eaf33fdf",
+      "tools/m31/gpu/host_executor.hpp": "23b93782da451cd5aeddad169786101b2cd308c7ebafa88341e63b32918a67d0",
+      "tools/m31/gpu/pack_spans.hpp": "b020932aad8f3c3c5f6c38e6d20bad9e7d39b5290f8970b6288f15c50b6ae5d2",
+      "tools/m31/gpu/prefill_hidden.hpp": "d6000950fa212b37bb5a5fc08222e36db394b4f0b3edf96e32b0017c62104b94",
+      "tools/m31/gpu/registered_arena.cu": "a67e09ffc15894281929190e516abf726213133788621cd741147ff3bc301b97",
+      "tools/m31/gpu/registered_arena.hpp": "c72d32d4b25e185ad14e0be072a3369c309dbcd6fc4ed19a66e5d00d0f49f578",
+      "tools/m31/m31_arena.hpp": "83b0b36233ffd83890ee6f6e78f6146f8380d0161e2ccd51f8c33b38db6aa2c6",
+      "tools/m31/m31_config.cpp": "07768016cf4b3c3fee20740580389d3e59f11c223b13f87c920355e33467d0fd",
+      "tools/m31/m31_config.hpp": "0cb7a8466dc284e9b0e63b2246e496d9e7f0c07ebeb8b8483345527ea26da209",
+      "tools/m31/m31_engine.cpp": "070fbf1fde32a85de8c05701e568d27d5a2ca67fd58fb51e7943a2a64cab3733",
+      "tools/m31/m31_engine.hpp": "6ffc09d4d8bacc78ea40a1253215ff3e190d98482cf47234991df1fa354e6f3a",
+      "tools/m31/m31_generate.cpp": "3e7dc5e51d6807833b9784c3d2971d106c04657a21bff7d9e8f526bef77914e7",
+      "tools/m31/m31_geometry.hpp": "9b46e17e72b4f1ca6b0969c8e10e1750e8dead1dcd62134abb8cac9fd4af82af",
+      "tools/m31/m31_grammar.hpp": "ede2f464a7715a9045205c896204faf6ab25167bdf13475a50fce2c0039ee2f1",
+      "tools/m31/m31_protocol.hpp": "3664cc0bec53bd204dabf3e52be409b648280364da6329b59c8d844cb0bfa6b6",
+      "tools/m31/m31_run.hpp": "feee1a02763405973b747313398f86dab0f888cf887efb80836ab6481e869c61",
+      "tools/m31/m31_sampling.hpp": "a0e91d10bf1e70680e05f33db1cad9a0bc90144c94a8bf91f1d130cd3dc35764",
+      "tools/m31/prefill/background.hpp": "dd2f30015e44e68710a7b51cf92cc3fbdeb0180080825b33cfebf78867b80cc7",
+      "tools/m31/prefill/chunk_limit.hpp": "c18a3b2b2294fc52bfb212d3a95426ee747ef3041645beef6137f3ca5c23fcdb",
+      "tools/m31/prefill/expert_budget.hpp": "145e91e7716fa734b28d9f99fd685ad71759789ffc163396eef5c8ad2190353a",
+      "tools/m31/prefill/pipeline.hpp": "88189f4496a271f3fa258c3b17fde71b2976783ba6cce2a455ebe3a37a97a470",
+      "tools/m31/prefill/plan.hpp": "91fd98201aa0dca58b02a828bc9e8b61e4c73e8077b9de09b2b643cbd7b13801",
+      "tools/m31/prefill/route_worklist.hpp": "d21fa06d25d83a97dfe504c912ed441db7c00958f4de1ecc9d2cf7d63ba52c79",
+      "tools/m31/prefill/slot_leases.hpp": "019bc7133edab95a2cad231a1eaa6a5f0c5cffba59360c7154bd2cf4a8f93c47",
+      "tools/m31/serve/export_tokenizer.py": "b9b20a9c8e0dfaf84e39079a3422393c13f1d862fa98e4c7755b2488bd9464d2",
+      "tools/m31/serve/m31_parser.py": "12903907cba3889c87db1ad8f120013692d83da9e1cc2d360014be88c4f491ec",
+      "tools/m31/serve/m31_tok.py": "42d907f56d663b5f8a530eba1cfd604c17f53c2fc44ed6315614f7519f189644",
+      "tools/m31/serve/serve_m31.py": "6c6344f0e209b87ead5ce7076206c30b1cba9ee7085551be894b01be4c87edf4",
+      "tools/m31/tests/cache_model_check.cpp": "0f353c92d025de03712d86e3d5a23c46fde740dc00db0c22681a1180959b86d7",
+      "tools/m31/tests/check_native_grammar.py": "7bfeb764e32e41d09efb303398017a3b91883e790651660e353a7dd9eb6e59b9",
+      "tools/m31/tests/check_tokenizer_oracle.py": "109241197ebe58e0b45044cd1064b2096e05a19df4e063edcf464f2a2fbf23d0",
+      "tools/m31/tests/core_check.cpp": "f1b2c2da492d25ca22391d60ad1ac227dae16977eb346ea4b76e5a1fbe8f1982",
+      "tools/m31/tests/fused_allocation_check.cpp": "d0e0b570233b35d7e256397efd79f536839ede12597d43df0ef92b6a2a9904dc",
+      "tools/m31/tests/grammar_api_check.cpp": "50b08ef72840aa66e7db9fb9fecbfe131d3e3ee4da1526e33095106b5c7bcc74",
+      "tools/m31/tests/grammar_model_check.cpp": "b3a370a75037b7b126bc00e9b694a7dd4eddabba83b8ce75067aaca56673163c",
+      "tools/m31/tests/numpy_reference.py": "f51a05de9eb6ad9a7eb415185dfeb9e42c323d6398f293f07ae491c493b51521",
+      "tools/m31/tests/oracle/CMakeLists.txt": "2ce89e1e65ee687b3b33654688efcfdf9848993a10905884b5f2b0975bb4e4e4",
+      "tools/m31/tests/oracle/m31_cache_oracle.cpp": "4c700e72c2d23732a2025dc6a05ca327a2bbe258da98d3c2a5cb82a5363ff79f",
+      "tools/m31/tests/oracle/m31_oracle.cpp": "8639591153b39f1c9ac81150ed069b809b4174037d0ab8bf7255f09b90008913",
+      "tools/m31/tests/oracle/m31_tokenizer.cpp": "61a697895c13c663c47cdc240c00950e5441eb3b16cfe7d3093c74ca113da131",
+      "tools/m31/tests/oracle/server_grammar.hpp": "75aef7b7f8092025d1bee96af114d1564be8af0ef06a7995a1f44d3c77f11e08",
+      "tools/m31/tests/protocol_check.cpp": "6b0830acaef1753f29b14b3d659cb08faa911aed025e298c6a4b575bda801936",
+      "tools/m31/tests/protocol_fixture.cpp": "003c681636e8162a6f33b249ee21b902d641ee8bb8a9f7fc4e36e7fe803a80b9",
+      "tools/m31/tests/resource_checks.cpp": "1f9eb303308673d11361d73e505088fd2a1741616e1b57d54c06c5c91448687e",
+      "tools/m31/tests/run_core_check.py": "b2f9f406183936ab285305062a6d9dd3b9559933141fbc19bccc20a52666a00a",
+      "tools/m31/tests/test_bench.py": "d99f6588e3422e866244ff3b0357b645b0da90e2d5560b33698008c038070caf",
+      "tools/m31/tests/test_config_environment.py": "ee7ef353b68916d0dfd23ea7ea4d462d56e83658512ec5214865c62d1578d5b8",
+      "tools/m31/tests/test_isolation.py": "43261aba26e87e9ae0b3d8adad90e37d561c81ce2cd0cb04f4614a11302bed31",
+      "tools/m31/tests/test_protocol.py": "254e4807610e5d3580d9111c657346e925673178b760a366566edb6d304ded64",
+      "tools/m31/tests/test_serve.py": "1daa83bce3257d32192ee0b2553e3c84e7b5b318d13d6cf73c05e5938d82de07",
+      "tools/m31/tests/tests.cmake": "efe1d894e00cd79ce257f685f2d1dbecba766ac3f6f8b3b78efa83fcf7de0acf",
+      "tools/m31/tests/tiny_fixture.py": "b40b47bf776e9def9ba65319569485287aab4d02bf4ef948797c41773eb3201a"
+    },
+    "all_initial_and_final_seals_identical": true
+  },
+  "prior_quality_completion": {
+    "label": "pr3-quality-v1/driver-result.json",
+    "sha256": "c374eccdd49e2e048438d5fe0a277cc98b156e7ef8a6f4dde39557c06cccce66",
+    "complete": true,
+    "source_unchanged": true,
+    "quality_returncode": 1,
+    "scope": "Quality completion and post-quality shared-lock sealing were prerequisites. Its failed tools23 gate was not treated as a passing quality result."
+  },
+  "independent_gate_status": {
+    "cache_numerics_pass": true,
+    "original_speed_gate_pass": false,
+    "original_speed_receipt": "tools/m31/bench/receipts/pr3-prefill-abba.json",
+    "final_quality_gate_pass": false,
+    "quality_receipt": "tools/m31/bench/receipts/pr3-prefill-quality.json",
+    "tools23_correct": 18,
+    "tools23_required": 19,
+    "separate_speed_confirmation_result_claimed": false,
+    "overall_pr3_acceptance_claimed": false,
+    "policy": "This cache PASS adds numerical evidence. It does not replace the original speed FAIL or the 18/23 tools FAIL, and supplies no result for the separate speed-only confirmation."
+  },
+  "evidence_sha256": {
+    "result.json": "bdd1b096884ed31190324d1c223d466f64d7bdf471186ffd041f227d1ed456a2",
+    "1124-all-heads.json": "5bb65ee64c9df20c20356beb8530c97f0661412bbc2687c89a80e4bebe2ae339",
+    "1324-all-heads.json": "eac0135cefa6e65f4aab7021525acf082b1c7d988a03038716f83711addf437e"
+  },
+  "limits": [
+    "Exactly two tested prefix lengths and their nine declared cache heads; no universal proof over all token histories.",
+    "These are final PR1/base versus PR3 cache heads; no new llama.cpp oracle process was run for this component.",
+    "Cross-history whole-versus-split and whole-versus-replay differences are retained; only matched histories are required bitwise equal.",
+    "No speed acceptance, quality recovery, whole confirmation-window cleanup or new VRAM peak is claimed here.",
+    "HIP, SYCL, Windows, other GPUs and multi-GPU placement remain unvalidated."
+  ]
+}

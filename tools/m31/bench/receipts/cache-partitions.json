@@ -1,0 +1,119 @@
+{
+  "format": "m31-cache-partition-observation-v1",
+  "date": "2026-10-27",
+  "model_revision": "02c81e41305bf8b718ad2e288f4e52a1cd49f55f",
+  "reference_commit": "6b95a9908d2c7b242817a447708aec38e937e2c0",
+  "native_worker_sha256": "30b6a5eaf334c0339b4bba277f4f16609856275e35650899e08f56b3e70b100e",
+  "hardware": {
+    "cpu": "AMD EPYC 9654",
+    "host_ram_gib": 624,
+    "gpu": "NVIDIA RTX 5090",
+    "gpu_vram_gib": 32,
+    "gpus_used": 1
+  },
+  "configuration": {
+    "context": 40000,
+    "kv": "F16",
+    "cuda_fusion": false,
+    "native_threads": 80,
+    "oracle_threads": 32,
+    "arena_gib": 170,
+    "gpu_expert_cache_gib": 7
+  },
+  "scope": "One last-position head per partition, all 200064 F32 logits; not all prompt rows or quality acceptance",
+  "input_generator": "make_prompts.py --suite cache-observatory",
+  "observations": [
+    {
+      "tokens": 257,
+      "whole_chunks": [
+        257
+      ],
+      "split_chunks": [
+        256,
+        1
+      ],
+      "input_ids_sha256": "1c72837c6d4956033f91517b56cae745a9bd8f0b85abb621c07845cd6defa3b6",
+      "same_partition_native_oracle": {
+        "whole": {
+          "bitwise": true,
+          "top1": [
+            12156,
+            12156
+          ],
+          "kl": 0.0,
+          "max_abs": 0.0
+        },
+        "split": {
+          "bitwise": true,
+          "top1": [
+            8364,
+            8364
+          ],
+          "kl": 0.0,
+          "max_abs": 0.0
+        }
+      },
+      "registered_staged_equal": {
+        "whole": true,
+        "split": true
+      },
+      "oracle_whole_vs_split": {
+        "bitwise": false,
+        "top1": [
+          12156,
+          8364
+        ],
+        "kl": 4.172323190072634,
+        "max_abs": 13.30731201171875
+      }
+    },
+    {
+      "tokens": 1324,
+      "whole_chunks": [
+        1324
+      ],
+      "split_chunks": [
+        1024,
+        300
+      ],
+      "input_ids_sha256": "8c4cd0a69849b936edbd661c67f433856f2583934cd1d51a262f47a1a2dd4cad",
+      "same_partition_native_oracle": {
+        "whole": {
+          "bitwise": true,
+          "top1": [
+            32,
+            32
+          ],
+          "kl": 0.0,
+          "max_abs": 0.0
+        },
+        "split": {
+          "bitwise": true,
+          "top1": [
+            32,
+            32
+          ],
+          "kl": 0.0,
+          "max_abs": 0.0
+        }
+      },
+      "registered_staged_equal": {
+        "whole": true,
+        "split": true
+      },
+      "oracle_whole_vs_split": {
+        "bitwise": false,
+        "top1": [
+          32,
+          32
+        ],
+        "kl": 0.0240769725788414,
+        "max_abs": 13.352998733520508
+      }
+    }
+  ],
+  "cause": "Not isolated; shape-dependent arithmetic is an inference, partition sensitivity is measured",
+  "same_history_cache_acceptance": "Separate required check; this receipt does not claim its completion",
+  "public_generator_reproduces_observed_ids": true,
+  "public_generator_sha256": "dd00a83717afa2ddad550c20414ec2e24c6cc4e955b94f029c3d8d3ed009a551"
+}

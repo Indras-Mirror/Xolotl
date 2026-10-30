@@ -1,0 +1,243 @@
+{
+  "format": "m31-vision-build-v1",
+  "date_utc": "2026-10-28",
+  "scope": "CPU/CUDA build and model-free validation only; model logits and speed results are not recorded here.",
+  "upstream_base_commit": "4499fcbca5bd9f0531036184177fd3d57df6a1d8",
+  "sources": {
+    "native_cpp_compiled_commit": "ac679f0849cba08bcf9670a09247c31f766c1ae1",
+    "external_helper_cpp_compiled_commit": "f5b2324c3cfba193769d9aa0b0e86bb333fde908",
+    "final_python_and_test_source_commit": "e5cf56e9f2935975dd0a6ca37f24028396b8a9c4",
+    "native_ggml_commit": "6050b467c07a95c7b87debd4ddac2f8ba8d9b807",
+    "native_ggml_patch": "tools/xolotl/ggml/xolotl-ggml.patch",
+    "external_helper_llama_cpp_commit": "6b95a9908d2c7b242817a447708aec38e937e2c0",
+    "external_helper_llama_cpp_origin": "llama.cpp PR #31192, unmodified checkout",
+    "separate_helper_process": true,
+    "external_ggml_linked_into_native_engine": false
+  },
+  "build_host": {
+    "operating_system": "Ubuntu 26.04.1 LTS",
+    "kernel": "7.0.0-34-generic",
+    "cpu": "AMD EPYC 9654",
+    "physical_cores": 96,
+    "logical_cpus": 192,
+    "ram_gib": 624,
+    "installed_gpus": 2,
+    "gpu_model": "NVIDIA GeForce RTX 5090",
+    "nominal_vram_gib_per_gpu": 32,
+    "model_inference_run_for_these_checks": false,
+    "hardware_context_reference": "tools/m31/bench/receipts/pr1-barrier-followup.json"
+  },
+  "toolchain": {
+    "cmake": "4.2.3",
+    "c_and_cxx_compiler": "GCC 14.3.0",
+    "cuda_compiler": "NVCC 13.1.115",
+    "cuda_host_compiler": "GCC 14.3.0",
+    "cuda_architecture": "sm_120a",
+    "python_for_ctest": "3.14.4",
+    "build_type": "Release",
+    "local_cuda_glibc_compatibility": {
+      "local_only": true,
+      "project_default": false,
+      "cuda_flags": [
+        "-U_GNU_SOURCE",
+        "-D_DEFAULT_SOURCE",
+        "-include <LOCAL_CUDA_GLIBC_COMPAT_HEADER>"
+      ],
+      "local_header_sha256": "ea81990b79831cb71bfe3f133f6522c1733728ae8a073e031ebe6e3c5f677baa",
+      "description": "This host required a local CUDA 13.1/glibc compatibility header. The placeholder identifies the local include; these flags are not part of the portable project build recipe."
+    },
+    "nvidia_driver_from_recorded_host_audit": "595.91.07",
+    "native_cxx_standard": "C++20",
+    "native_cuda_standard": "C++17",
+    "helper_cxx_standard": "C++20"
+  },
+  "build_configuration": {
+    "native_target": "m31_generate",
+    "STRATA_M31": "ON",
+    "STRATA_M31_TESTS": "ON",
+    "STRATA_NATIVE_EXPERTS": "ON",
+    "STRATA_BUILD_TESTS": "OFF",
+    "STRATA_DENSE": "OFF",
+    "cuda_build": {
+      "STRATA_ENABLE_CUDA": "ON",
+      "STRATA_GGML_CUDA": "ON",
+      "CMAKE_CUDA_ARCHITECTURES": "120a"
+    },
+    "cpu_build": {
+      "STRATA_ENABLE_CUDA": "OFF",
+      "STRATA_GGML_CUDA": "OFF"
+    },
+    "vision_variants": [
+      "STRATA_M31_VISION=ON",
+      "STRATA_M31_VISION=OFF"
+    ],
+    "helper_target": "m31_vision_adapter",
+    "helper_cmake_source": "tools/m31/vision",
+    "helper_variants": [
+      "GGML_CUDA=OFF",
+      "GGML_CUDA=ON"
+    ],
+    "helper_linkage": "Standalone executable with static llama.cpp/mtmd dependencies; no shared ggml ABI with the native engine.",
+    "native_cache_recipe": "Shared upstream objects came from the owned default-OFF comparison caches; native M31 objects were compiled separately and incrementally rebuilt for the live-VRAM fix.",
+    "portable_commands": "docs/MINIMAX_M31.md"
+  },
+  "raw_elf_artifacts": {
+    "pr2-cuda": {
+      "target": "m31_generate",
+      "sha256": "3416d20e3bce8d932cd86b902840c71319050457755a89812454c0f124a1067e",
+      "bytes": 617974856
+    },
+    "pr2-cpu": {
+      "target": "m31_generate",
+      "sha256": "f9cfd9e4a215286cb4912e6abab8fb62e19e8d0785fbc789b95727fad7540ca6",
+      "bytes": 11776072
+    },
+    "pr2-cpu-vision-off": {
+      "target": "m31_generate",
+      "sha256": "6659ef0a18e2fb7b476fa2121915242d61f8d1355ee32bbd4b7ff6ee7b703d0b",
+      "bytes": 11668136
+    },
+    "pr2-cuda-vision-off": {
+      "target": "m31_generate",
+      "sha256": "e6d3916e9c3d1fb37c7e14922f7e3c61fc9cb0c39474988989141e4cbfd4258b",
+      "bytes": 617862800
+    },
+    "helper-cpu": {
+      "target": "m31_vision_adapter",
+      "sha256": "f7a040d9180f3ce68d29d3fb94a34d0a1e6253114c85c1ad8a26977aa53844d0"
+    },
+    "helper-cuda": {
+      "target": "m31_vision_adapter",
+      "sha256": "bc65d376581afd425ded8dfc9febffe209d6ae9478ba88adb8b0165e01d934d8"
+    }
+  },
+  "final_model_free_validation": {
+    "source_commit": "e5cf56e9",
+    "all_pass": true,
+    "engine_build_or_reconfigure_during_final_ctest": false,
+    "cuda_visible_devices": "",
+    "cases": {
+      "pr2-cuda": {
+        "ctest_passed": 13,
+        "ctest_total": 13,
+        "returncode": 0,
+        "worker_unchanged": true,
+        "source_hashes_unchanged": true,
+        "compiled_m31_dependencies_checked": 64,
+        "compiled_dependencies_changed": 0
+      },
+      "pr2-cpu": {
+        "ctest_passed": 13,
+        "ctest_total": 13,
+        "returncode": 0,
+        "worker_unchanged": true,
+        "source_hashes_unchanged": true,
+        "compiled_m31_dependencies_checked": 63,
+        "compiled_dependencies_changed": 0
+      },
+      "pr2-cpu-vision-off": {
+        "ctest_passed": 10,
+        "ctest_total": 10,
+        "returncode": 0,
+        "worker_unchanged": true,
+        "source_hashes_unchanged": true,
+        "compiled_m31_dependencies_checked": 61,
+        "compiled_dependencies_changed": 0
+      },
+      "pr2-cuda-vision-off": {
+        "ctest_passed": 10,
+        "ctest_total": 10,
+        "returncode": 0,
+        "worker_unchanged": true,
+        "source_hashes_unchanged": true,
+        "compiled_m31_dependencies_checked": 62,
+        "compiled_dependencies_changed": 0
+      }
+    },
+    "dependency_check": "Before each final ctest, actual M31 inputs from compiler .o.d files plus main M31 CMake files were compared with the native compiled source hashes. No compiled dependency changed after the helper update, so rebuilding the engine was unnecessary.",
+    "all_tracked_m31_code_sources_matched_final_committed_blobs": true,
+    "all_source_and_engine_hashes_unchanged_during_final_ctest": true,
+    "helper_environment_check": {
+      "script": "tools/m31/tests/test_vision_environment.py",
+      "argument": "--check-environment",
+      "backends": [
+        "CPU",
+        "CUDA"
+      ],
+      "cases_per_backend": 6,
+      "cases": [
+        {
+          "GGML_CUDA_DISABLE_FUSION": null,
+          "expected": "exit 0; fusion=1"
+        },
+        {
+          "GGML_CUDA_DISABLE_FUSION": "1",
+          "expected": "exit 0; fusion=1"
+        },
+        {
+          "GGML_CUDA_DISABLE_FUSION": "0",
+          "expected": "explicit refusal"
+        },
+        {
+          "GGML_CUDA_DISABLE_FUSION": "",
+          "expected": "explicit refusal"
+        },
+        {
+          "GGML_CUDA_DISABLE_FUSION": "true",
+          "expected": "explicit refusal"
+        },
+        {
+          "GGML_CUDA_DISABLE_FUSION": "2",
+          "expected": "explicit refusal"
+        }
+      ],
+      "model_or_backend_initialized": false,
+      "all_pass": true
+    },
+    "http_refusal_regression": "Actual VisionEncoder and Pillow/media reader: invalid explicit helper fusion setting returns HTTP 503; a following text request returns HTTP 200; FIFO is free, parent environment is unchanged, and no helper process was started."
+  },
+  "default_build_isolation": {
+    "scope": "STRATA_M31=OFF and STRATA_M31_VISION=OFF; selected existing upstream targets, not the complete M31 executable with vision disabled.",
+    "receipt": "tools/m31/bench/receipts/pr2-default-build-isolation.json",
+    "base_commit": "4499fcbca5bd9f0531036184177fd3d57df6a1d8",
+    "raw_byte_identical": true,
+    "cpu_artifacts": [
+      "libstrata_kernels_cpu.a",
+      "ds4_ref",
+      "glm_generate_cpu"
+    ],
+    "cuda_artifacts": [
+      "glm_generate",
+      "ds41_generate",
+      "libstrata_engine.a",
+      "libstrata_mmq.a",
+      "CMakeFiles/strata.dir/src/program/generate.cpp.o"
+    ],
+    "cpu_compile_commands": 87,
+    "cuda_compile_commands": 417,
+    "off_target_lists_and_compile_commands_identical": true,
+    "metadata_controls": {
+      "stable_source_build_paths_and_compiler_cwd": true,
+      "c_and_cxx_file_prefix_maps": [
+        "<SOURCE_ROOT>=/source",
+        "<BUILD_ROOT>=/build"
+      ],
+      "nvcc_distinct_decimal_31bit_seed_per_translation_unit": true,
+      "nvcc_objdir_as_tempdir": true,
+      "ccache_disabled": true,
+      "elf_or_archive_payload_normalization": false,
+      "comparison_caches_only": true,
+      "native_on_caches_inherited_metadata_controls_from_comparison_caches": true,
+      "unseeded_nvcc_whole_file_reproducibility_claimed": false
+    }
+  },
+  "limits": [
+    "This receipt contains no GPU model logits, model quality, TTFT, VRAM peak or speed acceptance result.",
+    "HIP and SYCL were not built: hipcc and icpx toolchains were unavailable.",
+    "Windows, other GPUs, multi-GPU placement and other-model inference were not validated.",
+    "Default isolation covers only the named artifacts and enabled feature selections; it is not an all-target build.",
+    "The strata executable was not linked in the default comparison; PR1 recorded the pre-existing new_pool_for_device link failure. Its entry object was compared.",
+    "The whole M31 executable with STRATA_M31_VISION=OFF differs from the upstream M31 executable because PR2 also adds parser, CLI and API code. No whole-file equality is claimed for that executable.",
+    "Raw ELF hashes identify these specific builds. The external helper was not given the comparison-only NVCC seed controls, and cross-host reproduction of its whole-file hash is not claimed."
+  ]
+}

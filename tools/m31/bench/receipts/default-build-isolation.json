@@ -1,0 +1,193 @@
+{
+  "format": "m31-default-build-isolation-v1",
+  "date": "2026-10-27",
+  "base_commit": "41c46c2f",
+  "cuda_toolchain": {
+    "gcc": "14.3",
+    "cuda": "13.1.115",
+    "architecture": "120a"
+  },
+  "cuda_configurations": {
+    "base_off": {
+      "CMAKE_BUILD_TYPE": "Release",
+      "CMAKE_CUDA_ARCHITECTURES": "120a",
+      "STRATA_ENABLE_CUDA": "ON",
+      "STRATA_GGML_CUDA": "ON",
+      "STRATA_NATIVE_EXPERTS": "ON",
+      "STRATA_DENSE": "OFF",
+      "STRATA_DSV41_FQ_OP": "OFF",
+      "STRATA_DSV41_HC_MIX": "OFF",
+      "STRATA_BUILD_TESTS": "OFF",
+      "STRATA_M31_TESTS": "OFF",
+      "STRATA_M31": "OFF"
+    },
+    "candidate_off": {
+      "CMAKE_BUILD_TYPE": "Release",
+      "CMAKE_CUDA_ARCHITECTURES": "120a",
+      "STRATA_ENABLE_CUDA": "ON",
+      "STRATA_GGML_CUDA": "ON",
+      "STRATA_NATIVE_EXPERTS": "ON",
+      "STRATA_DENSE": "OFF",
+      "STRATA_DSV41_FQ_OP": "OFF",
+      "STRATA_DSV41_HC_MIX": "OFF",
+      "STRATA_BUILD_TESTS": "OFF",
+      "STRATA_M31_TESTS": "OFF",
+      "STRATA_M31": "OFF"
+    },
+    "candidate_on": {
+      "CMAKE_BUILD_TYPE": "Release",
+      "CMAKE_CUDA_ARCHITECTURES": "120a",
+      "STRATA_ENABLE_CUDA": "ON",
+      "STRATA_GGML_CUDA": "ON",
+      "STRATA_NATIVE_EXPERTS": "ON",
+      "STRATA_DENSE": "OFF",
+      "STRATA_DSV41_FQ_OP": "OFF",
+      "STRATA_DSV41_HC_MIX": "OFF",
+      "STRATA_BUILD_TESTS": "OFF",
+      "STRATA_M31_TESTS": "OFF",
+      "STRATA_M31": "ON"
+    }
+  },
+  "cuda_artifacts": {
+    "CMakeFiles/strata.dir/src/program/generate.cpp.o": {
+      "artifacts": {
+        "base_off": {
+          "sha256": "23f286cf074704439fc880144ad46bb0e3372dd6b01e16bfbbfbdf3bfc78ebe4",
+          "bytes": 1704168
+        },
+        "candidate_off": {
+          "sha256": "23f286cf074704439fc880144ad46bb0e3372dd6b01e16bfbbfbdf3bfc78ebe4",
+          "bytes": 1704168
+        },
+        "candidate_on": {
+          "sha256": "23f286cf074704439fc880144ad46bb0e3372dd6b01e16bfbbfbdf3bfc78ebe4",
+          "bytes": 1704168
+        }
+      },
+      "all_three_raw_identical": true
+    },
+    "ds41_generate": {
+      "artifacts": {
+        "base_off": {
+          "sha256": "4c337ef62a6101ae86df98a66cf0111001688f3ad257416a8b158131e92444f0",
+          "bytes": 649563880
+        },
+        "candidate_off": {
+          "sha256": "4c337ef62a6101ae86df98a66cf0111001688f3ad257416a8b158131e92444f0",
+          "bytes": 649563880
+        },
+        "candidate_on": {
+          "sha256": "4c337ef62a6101ae86df98a66cf0111001688f3ad257416a8b158131e92444f0",
+          "bytes": 649563880
+        }
+      },
+      "all_three_raw_identical": true
+    },
+    "glm_generate": {
+      "artifacts": {
+        "base_off": {
+          "sha256": "ccf2554bdcd7446b197a462f7c7e2149af561c03d3d5ce9e19e6bdc8ee0bc4d5",
+          "bytes": 655921912
+        },
+        "candidate_off": {
+          "sha256": "ccf2554bdcd7446b197a462f7c7e2149af561c03d3d5ce9e19e6bdc8ee0bc4d5",
+          "bytes": 655921912
+        },
+        "candidate_on": {
+          "sha256": "ccf2554bdcd7446b197a462f7c7e2149af561c03d3d5ce9e19e6bdc8ee0bc4d5",
+          "bytes": 655921912
+        }
+      },
+      "all_three_raw_identical": true
+    },
+    "libstrata_engine.a": {
+      "artifacts": {
+        "base_off": {
+          "sha256": "59a7f5f12983ee1a7d16647d3a67024d94572ba1931ae9070cfbef4f1273abd7",
+          "bytes": 2877150
+        },
+        "candidate_off": {
+          "sha256": "59a7f5f12983ee1a7d16647d3a67024d94572ba1931ae9070cfbef4f1273abd7",
+          "bytes": 2877150
+        },
+        "candidate_on": {
+          "sha256": "59a7f5f12983ee1a7d16647d3a67024d94572ba1931ae9070cfbef4f1273abd7",
+          "bytes": 2877150
+        }
+      },
+      "all_three_raw_identical": true
+    },
+    "libstrata_mmq.a": {
+      "artifacts": {
+        "base_off": {
+          "sha256": "0203113747b0da1f5f72dd170b8217ebc1f3763d7c0a0a7cf832e3548c367a33",
+          "bytes": 74327680
+        },
+        "candidate_off": {
+          "sha256": "0203113747b0da1f5f72dd170b8217ebc1f3763d7c0a0a7cf832e3548c367a33",
+          "bytes": 74327680
+        },
+        "candidate_on": {
+          "sha256": "0203113747b0da1f5f72dd170b8217ebc1f3763d7c0a0a7cf832e3548c367a33",
+          "bytes": 74327680
+        }
+      },
+      "all_three_raw_identical": true
+    }
+  },
+  "cuda_raw_identical": true,
+  "binary_payload_normalization": false,
+  "gpu_execution": false,
+  "compile_commands": {
+    "candidate_off": {
+      "base_count": 417,
+      "candidate_count": 417,
+      "missing_old_entries": [],
+      "changed_old_entries": {},
+      "new_entry_count": 0,
+      "all_old_commands_identical": true
+    },
+    "candidate_on": {
+      "base_count": 417,
+      "candidate_count": 526,
+      "missing_old_entries": [],
+      "changed_old_entries": {},
+      "new_entry_count": 109,
+      "all_old_commands_identical": true
+    }
+  },
+  "target_lists": {
+    "candidate_off_same_as_base": true,
+    "candidate_on_removed_existing": []
+  },
+  "cpu_off": {
+    "backend": "cpu",
+    "source_base": "41c46c2f",
+    "m31": "OFF",
+    "base": {
+      "libstrata_kernels_cpu.a": "6c10a0b21321b99bbd6e8c06fee7bc988940fa4d48a5f9a6986a3abb834fb9a3",
+      "ds4_ref": "a4e18de17ebe1f596be4ced258102b8ad5e689b1ef2cf1aba00ecfa76a817ef5",
+      "glm_generate_cpu": "7e3a019dedd87317886cf91f8402b6fed835c083adb77b90c88f965b74206df9"
+    },
+    "candidate": {
+      "libstrata_kernels_cpu.a": "6c10a0b21321b99bbd6e8c06fee7bc988940fa4d48a5f9a6986a3abb834fb9a3",
+      "ds4_ref": "a4e18de17ebe1f596be4ced258102b8ad5e689b1ef2cf1aba00ecfa76a817ef5",
+      "glm_generate_cpu": "7e3a019dedd87317886cf91f8402b6fed835c083adb77b90c88f965b74206df9"
+    },
+    "bitwise_equal": true
+  },
+  "metadata_recipe": {
+    "stable_source_build_paths_and_compiler_cwd": true,
+    "distinct_decimal_31bit_seed_per_cuda_source": true,
+    "nvcc_objdir_as_tempdir": true,
+    "ccache_disabled": true,
+    "comparison_caches_only": true,
+    "runtime_worker_changed": false
+  },
+  "limits": [
+    "strata executable has the same pre-existing new_pool_for_device(ctx,int,int) link failure on base and candidate; its entry object was compared",
+    "Not every optional upstream feature was enabled",
+    "HIP, SYCL, Windows and other-model inference were not validated",
+    "Unseeded NVCC builds are not claimed to produce deterministic whole-file hashes"
+  ]
+}

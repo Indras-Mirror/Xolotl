@@ -1,88 +1,72 @@
-# tools/m31/cmake/m31.cmake - the MiniMax-M3.1-Flash engine (tools/m31, community port, issue #62).
-# include()d (OPTIONAL) at the end of the root CMakeLists.txt, after tools/ds4/cmake/fork.cmake and
-# tools/glm/cmake/glm.cmake - the same place and the same contract as glm.cmake.
-#
-# Opt-in and OFF by default: a model the default install does not ship must not change the default build's targets
-# or their bytes (AGENTS.md: "A new feature is opt-in, and the default path stays byte-identical").
-#   -DSTRATA_M31=ON          m31_engine (the port's sources) + m31_generate (its serve entry point)
-#   -DSTRATA_M31_VISION=ON   m31_vision too; needs an mtmd target, see the end of this file
-#
-# With STRATA_M31=OFF, or with no port sources in tools/m31 yet, this file configures nothing and says so - a
-# checkout that carries the cmake before the port still builds.  That is the state this scaffold ships in.
-
-option(STRATA_M31 "Build the MiniMax-M3.1-Flash engine (tools/m31; community port, issue #62)" OFF)
+# MiniMax-M3.1-Flash text engine. The default build is unchanged.
+option(STRATA_M31 "Build the MiniMax-M3.1-Flash text engine" OFF)
 if(NOT STRATA_M31)
   return()
 endif()
+if(STRATA_ENABLE_HIP OR STRATA_HIP_GFX906)
+  message(FATAL_ERROR "STRATA_M31 supports CPU and CUDA builds; HIP has not been validated")
+endif()
 if(NOT TARGET ggml-cpu)
-  message(STATUS "STRATA_M31=ON but ggml-cpu is not a target in this configure; skipping the M3.1 engine")
-  return()
+  message(FATAL_ERROR "STRATA_M31 requires STRATA_NATIVE_EXPERTS=ON (ggml-cpu)")
 endif()
 
 set(_m31_dir "${CMAKE_CURRENT_SOURCE_DIR}/tools/m31")
 set(_m31_main "${_m31_dir}/m31_generate.cpp")
 if(NOT EXISTS "${_m31_main}")
-  message(STATUS "STRATA_M31=ON but ${_m31_main} does not exist - the M3.1 port is not in this tree; skipping")
+  message(STATUS "STRATA_M31=ON but ${_m31_main} does not exist; skipping the engine")
   return()
 endif()
-
-# The port's own sources: everything in tools/m31/ except the serve entry point.  CONFIGURE_DEPENDS so a branch that
-# adds a file is picked up without a fresh configure.  Exactly one main() may live here (m31_generate.cpp): the
-# development probes are expected to be gone before merge (#62, plan item 2), and a second main() would collide at
-# link time.
-file(GLOB _m31_lib CONFIGURE_DEPENDS "${_m31_dir}/*.cpp")
-list(REMOVE_ITEM _m31_lib "${_m31_main}")
-
-# ggml-impl.h (graph uid): honour STRATA_GGML_DIR, as glm.cmake does, so a worktree without third_party/llama.cpp
-# still configures.
-set(_m31_ggml_src "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp/ggml/src")
-if(STRATA_GGML_DIR)
-  set(_m31_ggml_src "${STRATA_GGML_DIR}/ggml/src")
+if(NOT STRATA_GGML_DIR OR NOT EXISTS "${STRATA_GGML_DIR}/ggml/src/ggml-impl.h")
+  message(FATAL_ERROR "STRATA_M31 needs the pinned llama.cpp source used to build ggml")
 endif()
-set(_m31_inc ${CMAKE_CURRENT_SOURCE_DIR}/include ${_m31_dir})
+if(STRATA_ENABLE_CUDA AND NOT TARGET ggml-cuda)
+  message(FATAL_ERROR "STRATA_M31 CUDA requires -DSTRATA_GGML_CUDA=ON as well as -DSTRATA_ENABLE_CUDA=ON")
+endif()
+find_package(Threads REQUIRED)
+set(_m31_ggml_src "${STRATA_GGML_DIR}/ggml/src")
 
-if(_m31_lib)
-  add_library(m31_engine STATIC ${_m31_lib})
-  target_include_directories(m31_engine PUBLIC ${_m31_inc})
-  target_include_directories(m31_engine PRIVATE ${_m31_ggml_src})
-  target_link_libraries(m31_engine PUBLIC ggml ggml-cpu ggml-base)
-  if(TARGET ggml-cuda)
-    target_link_libraries(m31_engine PUBLIC ggml-cuda)
-  endif()
-  set(_m31_link m31_engine)
+# Keep the source list explicit: offline probes and optional helpers have their own main().
+add_library(m31_engine STATIC
+  "${_m31_dir}/m31_engine.cpp"
+  "${_m31_dir}/m31_config.cpp"
+  "${_m31_dir}/prefill/short/shortprefill_cuda_math_cpu.cpp"
+  "${_m31_dir}/gpu/experts.cpp"
+  "${_m31_dir}/gpu/host_executor.cpp")
+target_include_directories(m31_engine PUBLIC "${_m31_dir}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(m31_engine PRIVATE "${_m31_ggml_src}" "${_m31_ggml_src}/ggml-cpu")
+target_compile_features(m31_engine PUBLIC cxx_std_20)
+target_link_libraries(m31_engine PUBLIC ggml ggml-cpu ggml-base Threads::Threads)
+if(STRATA_ENABLE_CUDA AND TARGET ggml-cuda AND NOT STRATA_HIP_GFX906)
+  target_sources(m31_engine PRIVATE "${_m31_dir}/gpu/registered_arena.cu"
+    "${_m31_dir}/prefill/short/shortprefill_gpu_quant.cu")
+  set_source_files_properties("${_m31_dir}/prefill/short/shortprefill_gpu_quant.cu"
+    PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+  target_compile_definitions(m31_engine PUBLIC M31_ENGINE_CUDA=1 PRIVATE M31_REGISTERED_ARENA_CUDA=1)
+  target_link_libraries(m31_engine PUBLIC ggml-cuda CUDA::cudart)
+  set_target_properties(m31_engine PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
 else()
-  # a single-file port: no library target, the entry point carries everything
-  set(_m31_link "")
+  target_sources(m31_engine PRIVATE "${_m31_dir}/prefill/short/shortprefill_gpu_quant_stub.cpp")
+endif()
+if(NOT MSVC)
+  set_source_files_properties("${_m31_dir}/prefill/short/shortprefill_cuda_math_cpu.cpp"
+    PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
 endif()
 
+# Tokenization and constrained sampling use this same pinned ggml. No PR oracle is a runtime dependency.
+include("${_m31_dir}/cmake/grammar.cmake")
 add_executable(m31_generate "${_m31_main}")
-target_include_directories(m31_generate PRIVATE ${_m31_inc} ${_m31_ggml_src})
-target_link_libraries(m31_generate PRIVATE ${_m31_link} ggml ggml-cpu ggml-base)
-if(TARGET ggml-cuda)
-  target_link_libraries(m31_generate PRIVATE ggml-cuda)
-endif()
-message(STATUS "STRATA_M31: building m31_generate from ${_m31_main}")
+target_include_directories(m31_generate PRIVATE "${_m31_ggml_src}")
+target_link_libraries(m31_generate PRIVATE m31_engine m31_grammar)
+message(STATUS "STRATA_M31: building the text engine and m31_generate --serve")
 
-# Vision (#62, PR (b)): the port runs llama.cpp's mtmd encoder in a SEPARATE helper process with its own ggml build.
-# It is its own target, built only when the port's vision sources AND an mtmd target both exist - linking an encoder
-# this tree does not have would be a claim the build cannot keep.  llama.cpp PR #31192 carries the mtmd code; until it
-# lands in the pinned ggml, the documented default is the contributor's helper as an opt-in (docs/MINIMAX_M31.md),
-# not this target.
-option(STRATA_M31_VISION "Build the M3.1 vision helper (tools/m31/vision/*.cpp; needs an mtmd target)" OFF)
+option(STRATA_M31_VISION "Enable M3.1 mixed prefill with an external mtmd helper" OFF)
 if(STRATA_M31_VISION)
-  file(GLOB _m31_vision CONFIGURE_DEPENDS "${_m31_dir}/vision/*.cpp")
-  if(NOT _m31_vision)
-    message(STATUS "STRATA_M31_VISION=ON but tools/m31/vision/*.cpp is empty; skipping the vision helper")
-  elseif(NOT TARGET mtmd)
-    message(STATUS "STRATA_M31_VISION=ON but this tree has no mtmd target (llama.cpp PR #31192 is not in the pinned "
-                   "ggml); skipping the vision helper")
-  else()
-    add_executable(m31_vision ${_m31_vision})
-    target_include_directories(m31_vision PRIVATE ${_m31_inc} ${_m31_ggml_src})
-    target_link_libraries(m31_vision PRIVATE mtmd ggml ggml-base)
-    if(TARGET ggml-cuda)
-      target_link_libraries(m31_vision PRIVATE ggml-cuda)
-    endif()
-    message(STATUS "STRATA_M31_VISION: building m31_vision")
-  endif()
+  target_compile_definitions(m31_engine PUBLIC M31_ENGINE_VISION=1)
+  message(STATUS "STRATA_M31_VISION: mixed prefill enabled; build the optional mtmd helper separately")
+endif()
+
+option(STRATA_M31_TESTS "Build small model-free M31 CPU and protocol checks" ON)
+if(STRATA_M31_TESTS)
+  enable_testing()
+  include("${_m31_dir}/tests/tests.cmake")
 endif()

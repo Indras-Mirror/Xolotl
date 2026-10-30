@@ -1,0 +1,487 @@
+{
+  "format": "m31-prefill-numeric-v1",
+  "updated_utc": "2026-10-28T19:59:23Z",
+  "state": "numeric checks complete; separate speed and quality acceptance not covered by this receipt",
+  "window_utc": {
+    "started": "2026-10-28T19:16:40Z",
+    "finished": "2026-10-28T19:32:13Z"
+  },
+  "source": {
+    "base_commit": "4499fcbca5bd9f0531036184177fd3d57df6a1d8",
+    "build_source_commit": "a7305f42914c03850520e8554efdf506c22b743f",
+    "candidate_worker_sha256": "5a7d75db17e0e7fecff61a7d3a488a5eaf13872cb529eb0fc5fe20e36dfd3f2a",
+    "base_worker_sha256": "a2f47f967e01ac8c1ed3d92a241bed1cf527ab781e32787fb88ba6405a97e707",
+    "oracle_worker_sha256": "968809545b6c9c0b8869cf40cd20181fafef4d1bbd97f974d6f1d0c3405e2b5e",
+    "source_and_binary_seals_unchanged": true,
+    "tested_source_sha256": {
+      "tools/m31/gpu/hybrid_forward.hpp": "d9172c55db64e3d601af435cfd26c313020413d253386f3ccd7b4af39f7442b3",
+      "tools/m31/m31_config.cpp": "cf4bf1df744a75d69ac0878aa121e62e5084e7f9919c4edb2181719a8f96ea59",
+      "tools/m31/m31_config.hpp": "4aafc6e1a5e3a8eefb0fb0ed3c958c54005a8f40c6da7f4526dec625c0207e90",
+      "tools/m31/m31_engine.cpp": "84a61b2e5949dccc2fac28b2691a0f8aa1560a5790e85dbb98c07263535b4a63",
+      "tools/m31/m31_engine.hpp": "f78e8e2c524fa7addacc60a0a409bd1244bd0bdc1cbb74162aad6c092e645f77",
+      "tools/m31/prefill/short/policy.hpp": "a948c2527cb69465ea99f412a5ae742e0d3ee1333c64083e9a499f03be76e545",
+      "tools/m31/prefill/short/shortprefill_cost.hpp": "2762f16480fb9b73c711bcf7538607a5981afd50aa681b90f1459ce959d09fff",
+      "tools/m31/prefill/short/shortprefill_cpu_lane.hpp": "81328749dba92dbb00dbb3556896d13b301ec805459caf55e671faafcb187212",
+      "tools/m31/prefill/short/shortprefill_cuda_executor.hpp": "0f11a0f4d4f7247c1f1287af21e0962c2024db48bc1d7ffba76be68edbace7da",
+      "tools/m31/prefill/short/shortprefill_cuda_math_cpu.cpp": "0659be6f7f905a88a7310d46d709c6ff7bb0327eb3d1327223bcd7743020c369",
+      "tools/m31/prefill/short/shortprefill_cuda_math_cpu.hpp": "b217df7a3c224f4011944f8c23392d6255d603a66ad8366e43f711dc57013fa0",
+      "tools/m31/prefill/short/shortprefill_cuda_nvfp4_cpu.hpp": "d99e6bfbf30444ea36fce85faa67e1c2465dfb8dd7184c7406087968ad59553d",
+      "tools/m31/prefill/short/shortprefill_gpu_quant.cu": "c0313e010b9e76f2013c5b5426483f00f107a1ca487bcfcd504c5aed1af2f954",
+      "tools/m31/prefill/short/shortprefill_gpu_quant.hpp": "ccec657e562dbf265ea1a1dcb718f728b103cefde0ed23afb1fdd17588896ece",
+      "tools/m31/prefill/short/shortprefill_gpu_quant_stub.cpp": "aa053541062490aa4507873d807cb72dc4c36c267d7790dd13bddc657a034633"
+    }
+  },
+  "model": {
+    "repository": "unsloth/MiniMax-M3.1-Flash-GGUF",
+    "revision": "02c81e41305bf8b718ad2e288f4e52a1cd49f55f",
+    "quantization": "UD-IQ3_S",
+    "vocabulary": 200064,
+    "unmodified": true,
+    "identity_scope": "same model as PR1; shard identity is recorded in pr1-text.json; no new full-shard hash scan in this window"
+  },
+  "hardware_and_toolchain": {
+    "cpu": "AMD EPYC 9654",
+    "physical_cores": 96,
+    "logical_cpus": 192,
+    "host_ram_gib": 624,
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "gpus_used": 1,
+    "gpu_vram_gib": 32,
+    "pcie": "5.0 x16",
+    "gcc": "14.3.0",
+    "cuda": "13.1.115",
+    "cuda_architecture": "sm_120a",
+    "background": "GPU1 tts-video, ffmpeg and tslab remained running; no isolated performance inference from numerical checks"
+  },
+  "configuration": {
+    "backend": "cuda",
+    "kv": "F16 main and indexer",
+    "cuda_fusion_disabled": true,
+    "native_threads": 80,
+    "oracle_threads": 32,
+    "arena_gib": 170,
+    "gpu_expert_cache_gib": 7,
+    "register_arena": true,
+    "register_limit_gib": 176,
+    "pack_threads": 8,
+    "boundary_and_gate20_context": 4096,
+    "boundary_and_gate20_max_chunk": 2048,
+    "gate20_teacher_forced_decode_tail": 32,
+    "long_and_cache_context": 40000,
+    "long_fixed_chunk": 4096,
+    "cache_fixed_chunk": 256,
+    "profiling_scope": "enabled for boundary numerical diagnostics only; these timings are not a speed benchmark"
+  },
+  "reference": {
+    "repository": "ggml-org/llama.cpp",
+    "pull_request": 31192,
+    "commit": "6b95a9908d2c7b242817a447708aec38e937e2c0",
+    "backend": "CUDA GPU-op-offload with routed expert weights in CPU RAM",
+    "boundary_reference": "fresh oracle execution in this window, replaying every actual candidate chunk",
+    "gate20_reference": "fresh same-day PR2 oracle outputs reused; exact IDs, positions, actual chunks, KV/context, fusion and full-layer policy rechecked"
+  },
+  "input_reproduction": {
+    "pass": true,
+    "model_inference": false,
+    "gpu_used": false,
+    "generator": "python tools/m31/bench/make_prompts.py cache-text --suite cache-observatory",
+    "generator_sha256": "dd00a83717afa2ddad550c20414ec2e24c6cc4e955b94f029c3d8d3ed009a551",
+    "complete_text_sha256": "7e076aa47bd35d37a8c41ba5a90c0bc0c103f0fe455281572a67e44d5911488b",
+    "recipe": "Use the complete generated cache_observatory_1324.txt text, not its .length truncation. Tokenize with the exported M31Tokenizer, minimax-m2/NFC, parse_special=False, no BOS/chat template; take first N IDs as little-endian int32.",
+    "generated_text_tokens": 195000,
+    "observed_local_corpus_tokens": 33000,
+    "whole_observed_corpus_equals_public_prefix": true,
+    "observed_corpus_sha256": "e4fc92fde4096bb7fe852fa7d760b31d7a135dbfdd614c2201309b2a0f2af8b2",
+    "tokenizer_adapter_sha256": "42d907f56d663b5f8a530eba1cfd604c17f53c2fc44ed6315614f7519f189644",
+    "tokenizer_export_sha256": {
+      "vocab.json": "2a03162bfc2663ecdd256796dcfd2e0e5cfd4ecb83731bbbee5a2b25f0fe6720",
+      "merges.txt": "18f533f89ee5de9fed51a8ed505f9153feb5b5146b8326ed8cee2995dbb116cd",
+      "tokenizer.json": "822216d1200b843b94b71be8c83fbc8d76cae1c5f39bc4f0db1e7e427eb1ebfc",
+      "token_type.json": "ba011b9589e1365e76d161733038fe5918cb5663f812e7205c55278de5a75a5e",
+      "chat_template.jinja": "961e3f96b2c08d26555efdfeb3b384d5e81181bf0cfc04edbadc31c6e507b431"
+    },
+    "prefixes": [
+      {
+        "tokens": 1,
+        "bytes_equal": true,
+        "sha256": "12aa5a21c8f0fb5f6c2ebb45eb94ea93ebac6a3cb2e994299a964a0d4b06267d"
+      },
+      {
+        "tokens": 2,
+        "bytes_equal": true,
+        "sha256": "39ae4b80c24fb4520f732ec84fc045eb3e8358291006ff7884c82dac7820befa"
+      },
+      {
+        "tokens": 31,
+        "bytes_equal": true,
+        "sha256": "a48ab24ea997370aad49b19e8dfffbf415d9293a53bce917701f37f7ecff319e"
+      },
+      {
+        "tokens": 32,
+        "bytes_equal": true,
+        "sha256": "51b1c9d2fff8f445584a1749983a62b5d67a15a49ef776f091f58bcb108852d2"
+      },
+      {
+        "tokens": 128,
+        "bytes_equal": true,
+        "sha256": "b90311cba26ea0d382e62ada355f774c5e0ab13342b68025aaa0d957c5758ed0"
+      },
+      {
+        "tokens": 257,
+        "bytes_equal": true,
+        "sha256": "1c72837c6d4956033f91517b56cae745a9bd8f0b85abb621c07845cd6defa3b6"
+      },
+      {
+        "tokens": 515,
+        "bytes_equal": true,
+        "sha256": "d7287c9272bd09d1af3bff9b1cfb32ccdd89af9cb1485b7284d42997df5d7130"
+      },
+      {
+        "tokens": 1024,
+        "bytes_equal": true,
+        "sha256": "033b4683b5b192024c2f9f7853be2801c1c21ccd13c0b78069890b808f7ca8f4"
+      },
+      {
+        "tokens": 1025,
+        "bytes_equal": true,
+        "sha256": "9196da83da452445ef5e2014b903ded0ce8bfde07d885dd6aafab018a280e582"
+      },
+      {
+        "tokens": 1324,
+        "bytes_equal": true,
+        "sha256": "8c4cd0a69849b936edbd661c67f433856f2583934cd1d51a262f47a1a2dd4cad"
+      },
+      {
+        "tokens": 16384,
+        "bytes_equal": true,
+        "sha256": "a5d37e547c5065ebec64377b9dd650381eddca3da40ed0af34c885babd94f6d0"
+      },
+      {
+        "tokens": 32768,
+        "bytes_equal": true,
+        "sha256": "4d1864f1e8123958c02eb534a84ae5f84a1037ecc7b858258eccc4e1aa603efb"
+      },
+      {
+        "tokens": 33000,
+        "bytes_equal": true,
+        "sha256": "e4fc92fde4096bb7fe852fa7d760b31d7a135dbfdd614c2201309b2a0f2af8b2"
+      }
+    ],
+    "gate20_inputs": "Separate public make_prompts.py --suite gate20 recipe, unchanged from PR1"
+  },
+  "boundaries": {
+    "scope": "all prompt rows, full vocabulary, one actual chunk for each length",
+    "cases": [
+      {
+        "tokens": 1,
+        "actual_chunks": [
+          1
+        ],
+        "rows": 1,
+        "selected_path": "unchanged decode",
+        "declared_strict_reference": "4499fcbc same-path baseline",
+        "observed_base_bitwise": true,
+        "observed_gpu_oracle_bitwise": true,
+        "top1": 1.0,
+        "mean_kl": 0.0,
+        "max_kl": 0.0,
+        "max_abs": 0.0
+      },
+      {
+        "tokens": 2,
+        "actual_chunks": [
+          2
+        ],
+        "rows": 2,
+        "selected_path": "unchanged CPU experts",
+        "declared_strict_reference": "4499fcbc same-path baseline",
+        "observed_base_bitwise": true,
+        "observed_gpu_oracle_bitwise": true,
+        "top1": 1.0,
+        "mean_kl": 0.0,
+        "max_kl": 0.0,
+        "max_abs": 0.0
+      },
+      {
+        "tokens": 31,
+        "actual_chunks": [
+          31
+        ],
+        "rows": 31,
+        "selected_path": "unchanged CPU experts",
+        "declared_strict_reference": "4499fcbc same-path baseline",
+        "observed_base_bitwise": true,
+        "observed_gpu_oracle_bitwise": true,
+        "top1": 1.0,
+        "mean_kl": 0.0,
+        "max_kl": 0.0,
+        "max_abs": 0.0
+      },
+      {
+        "tokens": 32,
+        "actual_chunks": [
+          32
+        ],
+        "rows": 32,
+        "selected_path": "hybrid",
+        "declared_strict_reference": "PR #31192 GPU-op-offload",
+        "observed_base_bitwise": true,
+        "observed_gpu_oracle_bitwise": true,
+        "top1": 1.0,
+        "mean_kl": 0.0,
+        "max_kl": 0.0,
+        "max_abs": 0.0
+      },
+      {
+        "tokens": 128,
+        "actual_chunks": [
+          128
+        ],
+        "rows": 128,
+        "selected_path": "hybrid",
+        "declared_strict_reference": "PR #31192 GPU-op-offload",
+        "observed_base_bitwise": true,
+        "observed_gpu_oracle_bitwise": true,
+        "top1": 1.0,
+        "mean_kl": 0.0,
+        "max_kl": 0.0,
+        "max_abs": 0.0
+      },
+      {
+        "tokens": 1024,
+        "actual_chunks": [
+          1024
+        ],
+        "rows": 1024,
+        "selected_path": "hybrid",
+        "declared_strict_reference": "PR #31192 GPU-op-offload",
+        "observed_base_bitwise": true,
+        "observed_gpu_oracle_bitwise": true,
+        "top1": 1.0,
+        "mean_kl": 0.0,
+        "max_kl": 0.0,
+        "max_abs": 0.0
+      },
+      {
+        "tokens": 1025,
+        "actual_chunks": [
+          1025
+        ],
+        "rows": 1025,
+        "selected_path": "native GPU batch",
+        "declared_strict_reference": "PR #31192 GPU-op-offload",
+        "observed_base_bitwise": true,
+        "observed_gpu_oracle_bitwise": true,
+        "top1": 1.0,
+        "mean_kl": 0.0,
+        "max_kl": 0.0,
+        "max_abs": 0.0
+      }
+    ],
+    "total_rows": 2243,
+    "pass": true,
+    "cpu_contract_limit": "n1/2/31 keep the declared same-path baseline contract. Their GPU oracle rows also matched in these inputs; this observation does not promise general CPU/GPU equivalence."
+  },
+  "cuda_quant_execution": {
+    "counter_scope": "Short-prefill CUDA quant helper only; not a claim of zero allocations in the whole engine",
+    "per_prefill": [
+      {
+        "tokens": 32,
+        "hybrid_layers": 54,
+        "cpu_routes": 3085,
+        "gpu_routes": 3827,
+        "quant_calls": 108,
+        "quant_runtime_allocations": 0,
+        "retained_quant_device_bytes": 167521792
+      },
+      {
+        "tokens": 128,
+        "hybrid_layers": 54,
+        "cpu_routes": 9419,
+        "gpu_routes": 18229,
+        "quant_calls": 108,
+        "quant_runtime_allocations": 0,
+        "retained_quant_device_bytes": 167521792
+      },
+      {
+        "tokens": 1024,
+        "hybrid_layers": 54,
+        "cpu_routes": 40848,
+        "gpu_routes": 180336,
+        "quant_calls": 108,
+        "quant_runtime_allocations": 0,
+        "retained_quant_device_bytes": 167521792
+      }
+    ],
+    "cumulative": {
+      "hybrid_layers": 162,
+      "cpu_routes": 53352,
+      "gpu_routes": 202392,
+      "quant_calls": 324,
+      "quant_runtime_allocations": 0,
+      "quant_device_bytes": 167521792
+    },
+    "profiled_hybrid_layer_records": 162,
+    "device_gather_records": 162,
+    "gpu_activation_h2d_bytes": 0,
+    "tiny_gpu_subset_1_to_8_routes_positive_coverage": false,
+    "padded_layer_records": 0,
+    "resident_expert_positive_hybrid_records": 0,
+    "limit": "No positive tiny resident GPU subset/padding case occurred in these final model runs; component tests do not substitute for that model coverage."
+  },
+  "gate20": {
+    "cases": 20,
+    "rows": 28723,
+    "scope": "gate20-complete-logits",
+    "all_prompt_rows": true,
+    "oracle_contract": "gpu-offload",
+    "bitwise_identical": true,
+    "top1": 1.0,
+    "mean_kl": 0.0,
+    "max_kl": 0.0,
+    "max_abs": 0,
+    "pass": true
+  },
+  "cache_and_cancellation": {
+    "requests": 34,
+    "failures": 0,
+    "pass": true,
+    "fixed_chunk": 256,
+    "generated_budget": 8,
+    "scope": "Actual generated-ID equality to fixed-history cold controls and exact RESUME/DONE counters; not raw all-position cache logits",
+    "boundary_lengths": [
+      255,
+      256,
+      257,
+      511,
+      512,
+      513
+    ],
+    "live_append_cases": [
+      {
+        "prefix_tokens": 1024,
+        "new_tokens": 100,
+        "reused": 1024,
+        "read": 100
+      },
+      {
+        "prefix_tokens": 1024,
+        "new_tokens": 300,
+        "reused": 1024,
+        "read": 300
+      }
+    ],
+    "other_cases": [
+      "rewind after editing token300",
+      "prefill STOP and cold retry",
+      "decode STOP and cold retry",
+      "cache opt-out and no-store recovery"
+    ],
+    "cancel_prefill_prompt_tokens": 3072,
+    "latency_claim": false
+  },
+  "long_retained_helper": {
+    "reference": "4499fcbc same-chunk baseline; no new long PR oracle run",
+    "prelude_tokens": 515,
+    "retain_cuda_quant_helper": true,
+    "long_selected_rows": 512,
+    "warmup_selected_rows": 256,
+    "head_tail": 256,
+    "scope": "last256 full-vocabulary positions at16K and32K after a515-token warmup in the same Engine; not all long prompt rows",
+    "cases": [
+      {
+        "tokens": 515,
+        "rows": 256,
+        "positions": {
+          "first": 259,
+          "last": 514,
+          "count": 256,
+          "contiguous": true
+        },
+        "actual_chunks": [
+          515
+        ],
+        "bitwise_identical": true,
+        "top1": 1.0,
+        "mean_kl": 0.0,
+        "max_abs": 0.0,
+        "full_last_layer_before_crop": {
+          "reference": true,
+          "candidate": true
+        }
+      },
+      {
+        "tokens": 16384,
+        "rows": 256,
+        "positions": {
+          "first": 16128,
+          "last": 16383,
+          "count": 256,
+          "contiguous": true
+        },
+        "actual_chunks": [
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "bitwise_identical": true,
+        "top1": 1.0,
+        "mean_kl": 0.0,
+        "max_abs": 0.0,
+        "full_last_layer_before_crop": {
+          "reference": true,
+          "candidate": true
+        }
+      },
+      {
+        "tokens": 32768,
+        "rows": 256,
+        "positions": {
+          "first": 32512,
+          "last": 32767,
+          "count": 256,
+          "contiguous": true
+        },
+        "actual_chunks": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "bitwise_identical": true,
+        "top1": 1.0,
+        "mean_kl": 0.0,
+        "max_abs": 0.0,
+        "full_last_layer_before_crop": {
+          "reference": true,
+          "candidate": true
+        }
+      }
+    ],
+    "pass": true
+  },
+  "checks_not_in_this_receipt": [
+    "GSM8K100 on final worker",
+    "tools23 on final worker",
+    "ABBA speed at4K/16K/32K",
+    "ABBA live-prefix100/300 latency",
+    "HIP and SYCL builds",
+    "Windows, other GPUs, multi-GPU inference",
+    "positive tiny resident GPU subset/padding model case"
+  ],
+  "evidence_sha256": {
+    "numeric.json": "9c55ef701911f51b4b428f28be3d0fcb0b1a11296db4e316a92fa06d96da6363",
+    "boundary-compare.json": "b3ab1c5d20a98530b1297937bc87d72158e7c72c4713e66faaafde1346c092f8",
+    "boundary-native.log": "276faac41499a71d746ad89f6b55a3dd5d5bcdad8d70909c308f9a22ca70152f",
+    "gate20-compare.json": "c74f73b69638c90a8be1e792e98ec60e890abb43df7a560900b9fb2c890fa1af",
+    "prefix-fixed256/summary.json": "96132c4529b5bcc760d91135dde40f35d31e1c94516938c94676340f439de4fb"
+  },
+  "supplemental_contract_sha256": "da85d0f6785b11d68e39afcc42f9844b1b0171abb84ec7af6280f2a87bfe8a84",
+  "public_input_reproduction_sha256": "0231fb76fb89547c3ff2e4b9122e79cb0fa78ba86db8026a04ee52f49b946181",
+  "numeric_pass": true
+}

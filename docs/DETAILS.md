@@ -2021,6 +2021,75 @@ responses are unaffected. Headers are not recorded, and the monitor key is kept 
 Treat request history as sensitive input/output when exposing Strata on a network: set an API key as above.
 The page uses relative URLs and works through the existing host binding or a reverse proxy.
 
+### Request log (JSON Lines)
+
+Off by default. `serve/server.py --request-log PATH` (or `STRATA_REQUEST_LOG=PATH`, or `"request_log": "PATH"` in
+`strata-<model>.json`) appends one JSON line to PATH for every finished request to `/v1/chat/completions`,
+`/v1/messages` and `/v1/responses`: when it came, how long it waited, its time to first token, its tokens and speeds,
+and how it ended. It is meant for statistics over many requests (the gaps between requests, TTFT, how much of each
+prompt the conversation cache held). Without it nothing is written and the server works as before.
+
+With the log on, the server window's `[strata] done:` line ends with the same clock and the request's id
+(`... at 2026-10-29T11:56:22.448Z, request 3e177fcdbe68`), so a line there can be found in the log.
+
+An example line (the figures are only an example):
+
+```json
+{"time":"2026-10-29T11:56:20.112Z","id":"3e177fcdbe68","endpoint":"/v1/chat/completions","api":"openai","model":"qwen3.8-flash-next","stream":true,"client":"127.0.0.1","user_agent":"OpenAI/Python 1.99.0","status":200,"outcome":"completed","queued_at_arrival":0,"end":"2026-10-29T11:56:22.448Z","total_s":2.336,"queue_s":0.0,"start_s":0.004,"ttft_s":0.412,"finish":"stop","max_tokens":4096,"thinking":true,"prompt_tokens":12850,"cached_tokens":12610,"read_tokens":240,"output_tokens":96,"reasoning_tokens":41,"tool_calls":1,"cancelled":false,"prefill_ms":388.0,"prefill_tok_s":618.6,"decode_ms":1910.0,"decode_tok_s":50.3}
+```
+
+The fields (a field the server did not measure for a request is left out):
+
+| Field | What it is |
+| --- | --- |
+| `time`, `end` | When the request arrived (its body was read) and when it was finished, UTC |
+| `id` | The request's id (the API monitor's id when that is on too) |
+| `endpoint`, `api` | The path, and `openai`, `anthropic` or `responses` |
+| `model`, `stream` | The model name the request asked for (else the server's), and whether it streamed |
+| `client`, `user_agent` | The address that connected (a reverse proxy's own address behind one) and its `User-Agent` (200 characters at most) |
+| `status`, `outcome` | The HTTP status, and `completed`, `error` or `disconnected` (the client left) |
+| `error_type`, `error` | For an error: its type and the server's message (300 characters at most) |
+| `queued_at_arrival` | Requests already waiting for their turn when this one arrived |
+| `total_s` | Seconds from arrival to the end, on the server's monotonic clock; the times below count from arrival too |
+| `queue_s`, `load_s` | Seconds waited for the turn (including the wait while the engine started), and spent starting it |
+| `image_wait_s`, `image_encode_s` | Seconds waited for the turn to encode pictures, and spent encoding them |
+| `start_s` | When the engine began the request (after every wait) |
+| `ttft_s` | When the first token came |
+| `finish` | How the generation ended: `stop`, `length`, `cancel`, `disconnect` or `error` |
+| `stop_sequence` | `true` when one of the request's stop strings ended it (the string itself is not written) |
+| `max_tokens`, `thinking` | The output cap the request ran with, and whether it thought |
+| `prompt_tokens` | The prompt's tokens (pictures included) |
+| `cached_tokens`, `read_tokens` | Of those, the tokens the conversation cache held (reused) and the ones read now |
+| `output_tokens`, `reasoning_tokens` | Tokens written, and how many of them were thinking |
+| `tool_calls` | Tool calls written |
+| `cancelled` | The request was stopped before its end (the client left or cancelled) |
+| `prefill_ms`, `prefill_tok_s` | The engine's prompt read time and its speed over `read_tokens` |
+| `decode_ms`, `decode_tok_s` | The engine's generation time and speed |
+| `drafts_offered`, `drafts_accepted` | The speculative (MTP) drafts, where the engine reports them |
+| `runs` | Engine generations for this request, when more than one (MCP tool rounds); the token counts and times are their sums |
+| `images` | Pictures in the request |
+| `images_encoded`, `images_from_encoder_cache` | Of those, the ones encoded now and the ones the image encoder's cache already had |
+| `images_in_cached_prefix` | Pictures wholly inside the prompt prefix the conversation cache held |
+
+`--request-log-detail` (or `STRATA_REQUEST_LOG_DETAIL=1`, or `"request_log_detail": true`) adds the engine's own
+figures: `segments` (each generation's DONE line as the server reads it: times, tokens, drafts, expert cache lookups and
+hits, RAM and file blobs), `expert_hit_rate`, and `prefill_progress`, the prompt read's progress lines as
+`[tokens reached, prompt tokens, ms]` (at most 64, one request at a time only: with parallel requests the engine's
+progress is not one request's).
+
+**Privacy.** The log has no request or answer text, no tool arguments, no picture paths, and no headers except the
+`User-Agent`; API keys are never written. It does keep each client's address and when it used the server: treat it
+as you would a web server's access log.
+
+**Rotation.** The file is opened for appending and every line is written and flushed whole. At 64 MB it is renamed
+to `PATH.1` (the older ones to `PATH.2`, `PATH.3`) and a new file is started; 3 are kept. `--request-log-max-mb MB`
+(`"request_log_max_mb"`) changes the size and `--request-log-backups N` (`"request_log_backups"`) the number kept.
+`--request-log-max-mb 0` turns the rotation off, for `logrotate`: use its `copytruncate`, which is safe with this
+file. A failed write (a full disk) is said once in the server window; it never fails a request.
+
+Only requests whose body is a JSON object reach the log: one refused before that (a wrong API key, a body that is
+not JSON) is not in it. `/v1/messages/count_tokens`, `/v1/decide` and the image and voice endpoints are not logged.
+
 ### Prompt buffers: `bo` shares `emb` (#1454)
 
 The prompt path's half-output buffer `bo` reuses the embedding buffer `emb`, which is dead after the first hyper-connection broadcast: T x 2560 floats less VRAM per chunk (320 MiB at 32768 rows). The planner still counts those bytes by default, so the auto chunk and the cache slots the prompt path borrows are exactly those of 0.1.40.3 and the output bits are unchanged. `STRATA_EMB_REUSE_ACCOUNT=1` lets the planner use the saved bytes: where VRAM limits the chunk it grows (RTX 3060, IQ3_XXS: 6400 to 6656 tokens, 1652 to 1670 borrowed slots, prompt about +3.9%). A different chunk changes the prompt path's rounding, so prompt residuals are not byte-identical to the default; greedy output matched in our runs. Opt-in until it has a KL measurement.
