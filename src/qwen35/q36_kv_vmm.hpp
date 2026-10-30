@@ -68,6 +68,7 @@ class Arena {
     Driver& driver_;
     size_t heads_, ctx_, cell_, page_, stride_ = 0, reserved_ = 0, pages_ = 0;
     uintptr_t address_ = 0;
+    uint64_t mapping_generation_ = 1;
     bool healthy_ = true;
     bool page_count(size_t end, size_t& count) const {
         size_t bytes = 0, rounded = 0;
@@ -87,6 +88,7 @@ public:
     }
     void* get() const { return reinterpret_cast<void*>(address_); }
     size_t stride() const { return stride_; }
+    uint64_t mapping_generation() const { return mapping_generation_; }
     size_t committed_tokens() const { return pages_ * page_ / cell_; }
     size_t committed_bytes() const { return pages_ * page_ * heads_; }
     bool healthy() const { return healthy_; }
@@ -127,6 +129,10 @@ public:
         size_t target = 0;
         if (!healthy_ || !page_count(end, target)) return false;
         if (target >= pages_) return true;
+        // Invalidate residency BEFORE even a partially failing unmap. Growth
+        // preserves the prefix, while remapping must never resurrect old hints.
+        if(mapping_generation_==std::numeric_limits<uint64_t>::max()) {healthy_=false;return false;}
+        ++mapping_generation_;
         for (size_t p = pages_; p > target; --p) {
             for (size_t head = 0; head < heads_; ++head) {
                 if (!driver_.unmap(address_ + head * stride_ + (p - 1) * page_, page_)) {

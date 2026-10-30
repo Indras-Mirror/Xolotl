@@ -266,3 +266,53 @@ first difference in `report.json`. Request/whole-run deadlines default to30/600s
 Exact observable agreement does not prove internal RNG/logit equivalence or
 native GPU overlap. It does not compare internal token IDs, and unseeded output
 parity is not established by this check.
+
+## Optional resident prefix shortcut
+
+`--resident-prefix-reuse` is an opt-in CUDA native-batch optimization (requires
+serve mode and2..4 owners). The default restore path is unchanged. It retains a
+CPU-only description of each Engine's attention KV prefix; it allocates no extra
+GPU cache and changes neither context, MTP, sampling nor host-cache ownership.
+After admission, an exact cell prefix match on the same Engine/mapping generation
+can skip KV restore only while the selected immutable host pages also match the
+certified allocation cookies and content-write versions. Matching tokens alone
+is insufficient: recomputing a prefix with different prefill geometry can produce
+different KV bytes. The shortcut stops at the first conflicting page and restores
+the remainder normally. A different
+owner still restores its missing KV normally. The selected DeltaNet snapshot is
+always restored; resident attention KV does not reconstruct recurrence.
+
+A certificate is created only after the selected RAM prefix has been restored
+(or matched an existing byte-proven certificate). New main+MTP teacher-prefill
+rows extend it only after their KV has been mirrored to RAM and the existing
+copy completion fence has finished. Every host-page allocation/recycle gets a
+new cookie; every partial D2H or COW write gets a new version before copying and
+becomes readable only after successful completion. No extra pages are pinned.
+The existing first-sampling completion fence also bounds final publication. The single-token
+fast path that does not teacher-prefill MTP cannot certify that extra cell.
+Every main/MTP attention write clamps the valid prefix before it is enqueued;
+partial prefill, rollback or rejected speculation never promotes the bound.
+Decode cancellation can keep an unchanged prompt prefix because its writes are
+in the suffix. Mapping trim invalidates the generation before unmap, including
+failed unmaps; suffix growth alone preserves the old prefix. Identity includes
+image-key/row cell values, not just token IDs or the original publishing slot.
+
+In this opt-in mode the idle checkpoint pause/resume protocol is advertised.
+`CHECKPOINT_PAUSE` refuses busy owners and invalidates their CPU shortcuts before
+checkpointing. Host records remain available, so the first request after resume
+performs the normal KV restore. The batch path has no executable graphs; resume
+reports elapsed paused time and zero graph executions. Generic checkpoint/API
+integration still comes from PR75; no other engine's sleep code is included.
+
+With `STRATA_Q36_BATCH_TRACE` enabled, a `resident_prefix` event reports selected
+reuse, skipped/copied cells and bytes, mapping generation and certified end.
+These counters describe KV restore only. A speedup and byte-identical default
+behavior require separate same-day GPU validation; portable tests establish
+metadata/lifecycle invariants, not model numerics or a latency deadline.
+
+`--resident-prefix-verify` requires the reuse flag and is a diagnostic only. It
+compares the proposed skipped GPU bytes with the selected RAM pages, logs counts
+and hashes without raw data, and falls back to a full restore on any mismatch.
+Its synchronous staging copies add substantial overhead; it is unsuitable for
+latency comparisons. Successful qualification requires zero mismatches, not merely
+correct output after diagnostic fallback.

@@ -153,4 +153,22 @@ class Adapter(unittest.TestCase):
     def test_physical_preflight_refuses_ready(self):
         p=subprocess.run([str(MOCK_BINARY)],input='',text=True,capture_output=True,timeout=3,env={**os.environ,'MOCK_LOW_VRAM':'1'})
         self.assertNotEqual(p.returncode,0);self.assertNotIn('READY ',p.stdout)
+class ResidentCheckpoint(unittest.TestCase):
+    def test_opt_in_idle_pause_resume_and_busy_refusal(self):
+        s=Session({'MOCK_RESIDENT_PREFIX':'1'});self.addCleanup(s.close)
+        self.assertTrue(any('resident_prefix_reuse=1 checkpoint_clock=1' in line for line in s.lines))
+        s.send('BGEN 0 40 1');s.until(lambda line:line=='BADM 0 1')
+        s.send('CHECKPOINT_PAUSE');self.assertEqual(s.until(lambda line:line.startswith('ERR checkpoint:')),'ERR checkpoint: active request')
+        s.send('BSTOP 0');s.until(lambda line:line.startswith('BDONE 0 '))
+        s.send('CHECKPOINT_PAUSE');self.assertEqual(s.until(lambda line:line.startswith('CHECKPOINT_PAUSED')),'CHECKPOINT_PAUSED graph_execs=0')
+        s.send('BGEN 0 1 1');self.assertEqual(s.until(lambda line:line.startswith('ERR checkpoint:')),'ERR checkpoint: paused')
+        s.send('CHECKPOINT_RESUME');ack=s.until(lambda line:line.startswith('CHECKPOINT_RESUMED'))
+        fields=dict(item.split('=',1) for item in ack.split()[1:])
+        self.assertGreaterEqual(int(fields['paused_us']),0);self.assertEqual(fields['graph_execs'],'0')
+        s.send('BGEN 0 1 1');s.until(lambda line:line.startswith('DONE '));s.until(lambda line:line.startswith('BADM 0 '))
+    def test_default_does_not_advertise_or_handle_checkpoint(self):
+        s=Session();self.addCleanup(s.close)
+        self.assertTrue(all('resident_prefix_reuse' not in line and 'checkpoint_clock' not in line for line in s.lines))
+        s.send('CHECKPOINT_PAUSE');self.assertEqual(s.until(lambda line:line.startswith('ERR ')),'ERR expected GEN/BGEN/HAVE/BSTOP')
+
 if __name__=='__main__':unittest.main(verbosity=2)

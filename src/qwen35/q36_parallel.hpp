@@ -101,6 +101,7 @@ int serve_parallel(Engine& scratch, ImageCache& images, const std::string& model
     int device = 0; CK(cudaGetDevice(&device));
     if (scratch.m->hybrid) { std::fprintf(stderr, "strata-q36: --batch needs resident immutable experts\n"); return 2; }
     auto host_hub=std::make_shared<strata::q36::cache::Hub>((size_t)std::max(0,snapshots));
+    host_hub->track_page_versions=scratch.resident_prefix_reuse;
     struct Worker {
         std::unique_ptr<Engine> engine;
         std::mutex mutex;
@@ -135,6 +136,8 @@ int serve_parallel(Engine& scratch, ImageCache& images, const std::string& model
         Engine& engine = *owner->engine;
         engine.kv_budget = &budget; engine.kv_driver = &driver;
         engine.use_graph = false; engine.dynamic_attention = true;
+        engine.resident_prefix_reuse=scratch.resident_prefix_reuse;
+        engine.resident_prefix_verify=scratch.resident_prefix_verify;
         engine.shared_prefill=scratch.shared_prefill;
         engine.cache_hub=host_hub;
         engine.init(*scratch.m, scratch.ctx, prefill_chunk);
@@ -312,9 +315,12 @@ int serve_parallel(Engine& scratch, ImageCache& images, const std::string& model
            " slot_cache=" + std::to_string(park_bytes>0 && snapshots>0 ? 1 : 0) +
            " host_cache_shared=1 snapshots=" + std::to_string(host_hub->snaps.size()) +
            " host_park_mib=" + std::to_string((host_hub->n_pages*host_hub->page_bytes)>>20) +
+           (scratch.resident_prefix_reuse ? " resident_prefix_reuse=1 checkpoint_clock=1" : "") +
            " batch_prefill_chunk=" + std::to_string(prefill_chunk) +
            " batch_slots=" + std::to_string(count) + " batch_mtp=1 batch_pinned=1 max_request_context=" + std::to_string(scratch.ctx) + " aggregate_kv_mib=" + std::to_string(budget.cap() >> 20) + "\nREADY " + std::to_string(scratch.ctx) + " stop\n");
     int foreground = 0;
+    bool checkpoint_paused=false;
+    Clock::time_point checkpoint_begin;
     auto enqueue = [&](int slot, std::string line) {
         Worker& worker = *workers[(size_t) slot];
         { std::lock_guard<std::mutex> lock(worker.mutex); worker.input.push_back(std::move(line)); }
@@ -324,6 +330,29 @@ int serve_parallel(Engine& scratch, ImageCache& images, const std::string& model
     while (std::getline(std::cin, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line == "QUIT") break;
+        if(scratch.resident_prefix_reuse && (line=="CHECKPOINT_PAUSE" || line=="CHECKPOINT_RESUME")) {
+            // Same idle protocol used by the optional checkpoint frontend. A
+            // pause invalidates only the CPU shortcut, not the parked cache.
+            std::unique_lock<std::mutex> admission_lock(admission_mutex,std::try_to_lock);
+            if(!admission_lock.owns_lock()){output("ERR checkpoint: admission busy\n");continue;}
+            std::vector<std::unique_lock<std::mutex>> owner_locks;
+            for(auto& owner:workers)owner_locks.emplace_back(owner->mutex);
+            bool busy=false;
+            for(auto& owner:workers)busy=busy || owner->busy || owner->gpu_active;
+            if(busy){output("ERR checkpoint: active request\n");continue;}
+            if(line=="CHECKPOINT_PAUSE") {
+                for(auto& owner:workers){owner->engine->resident_prefix.invalidate();owner->engine->resident_ram_equal_end=0;}
+                if(!checkpoint_paused)checkpoint_begin=Clock::now();
+                checkpoint_paused=true;
+                output("CHECKPOINT_PAUSED graph_execs=0\n");
+            } else {
+                if(!checkpoint_paused){output("ERR checkpoint: not paused\n");continue;}
+                const auto paused_us=std::chrono::duration_cast<std::chrono::microseconds>(Clock::now()-checkpoint_begin).count();
+                checkpoint_paused=false;
+                output("CHECKPOINT_RESUMED paused_us="+std::to_string(paused_us)+" graph_execs=0\n");
+            }
+            continue;
+        }
         if (line == "STOP") { enqueue(control_slot.load(), "STOP"); continue; }
         if (line.rfind("BSTOP ",0)==0) {
             int slot = std::atoi(line.c_str()+6); if(slot>=0 && slot<count) enqueue(slot,"STOP"); continue;
@@ -343,6 +372,7 @@ int serve_parallel(Engine& scratch, ImageCache& images, const std::string& model
             }
             output(response+"\n"); continue;
         }
+        if(checkpoint_paused){output("ERR checkpoint: paused\n");continue;}
         const bool bimg = line.rfind("BGENI ",0)==0, bgen = line.rfind("BGEN ",0)==0;
         const bool img = line.rfind("GENI ",0)==0, gen = line.rfind("GEN ",0)==0;
         int slot = 0;

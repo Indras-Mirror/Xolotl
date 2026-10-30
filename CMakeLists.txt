@@ -258,7 +258,7 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
   find_package(Threads REQUIRED)
-  foreach(q36_cpu_test IN ITEMS test_q36_cache_hub test_q36_cache_hub_concurrency test_q36_kv_vmm)
+  foreach(q36_cpu_test IN ITEMS test_q36_cache_hub test_q36_cache_hub_concurrency test_q36_kv_vmm test_q36_resident_prefix test_q36_resident_verify test_q36_resident_provenance)
     add_executable(${q36_cpu_test} tests/qwen35/${q36_cpu_test}.cpp)
     target_link_libraries(${q36_cpu_test} PRIVATE Threads::Threads)
     # These portable tests use assert(), including Release configurations.
