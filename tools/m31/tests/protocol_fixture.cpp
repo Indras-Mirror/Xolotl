@@ -29,6 +29,30 @@ struct FixtureEngine {
     bool rewind(int64_t position, std::string &) { position_ = position; last_n_ = 0; return valid_; }
     void reset() { position_ = 0; last_n_ = 0; valid_ = true; bad_logits_ = false; }
 };
+// Deep sleep keeps the fixture position, as the real engine keeps its KV rows.
+struct FixturePower {
+    FixtureEngine & engine;
+    bool asleep_ = false;
+    int wake_failures = 0, sleeps = 0;
+    bool supported() const { return true; }
+    bool asleep() const { return asleep_; }
+    bool sleep(std::string & reply, std::string &) {
+        if (!asleep_) ++sleeps;
+        asleep_ = true;
+        reply = "SLEPT seconds=0 engine_seconds=0 kv_tokens=" + std::to_string(engine.position_) +
+                " kv_bytes=0 dense_bytes=0 experts=0 conversation=1 context=1";
+        return true;
+    }
+    bool wake(std::string & info, std::string & error) {
+        info.clear();
+        if (!asleep_) return true;
+        if (wake_failures > 0) { --wake_failures; error = "wake failed (still asleep): fixture"; return false; }
+        asleep_ = false;
+        engine.last_n_ = 0;
+        info = "INFO woke=1 wake_seconds=0 kv_tokens=" + std::to_string(engine.position_) + " sleeps=" + std::to_string(sleeps);
+        return true;
+    }
+};
 struct FixtureGrammar {
     bool active_ = false;
     int vocab_size() const { return 8; }
@@ -54,5 +78,7 @@ int main() {
     Lines lines;
     bool quit = false, cancelled = false;
     config.cancelled = [&] { cancelled = cancelled || lines.stopped(quit); return cancelled; };
-    serve(engine, config, cli, lines, quit, cancelled, grammar);
+    FixturePower power{engine};
+    if (const char * failures = std::getenv("M31_PROTOCOL_FIXTURE_WAKE_FAILURES")) power.wake_failures = std::atoi(failures);
+    serve(engine, config, cli, lines, quit, cancelled, grammar, power);
 }

@@ -1,8 +1,8 @@
 diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
-index 1cd81eeae..516aaccd5 100644
+index 1cd81ee..7e98030 100644
 --- a/ggml/include/ggml-cuda.h
 +++ b/ggml/include/ggml-cuda.h
-@@ -24,6 +24,14 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
+@@ -24,6 +24,22 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
  
  GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
  
@@ -14,11 +14,19 @@ index 1cd81eeae..516aaccd5 100644
 +// Call this before freeing the context.  No-op when the backend is not CUDA.
 +GGML_BACKEND_API void ggml_backend_cuda_graph_cache_clear(ggml_backend_t backend);
 +
++// Exclude an externally checkpointed idle interval from CUDA graph eviction ages.
++// The caller must prevent graph execution/cache mutation throughout that interval
++// and call this after restore/unlock, before the next graph lookup. Preserves graph
++// executables and tensor storage; no CUDA calls or allocations. Positive paused_us
++// advances nonzero age timestamps, capped at the current monotonic time. Returns
++// the number of retained executable instances (zero for non-CUDA/non-graph builds).
++GGML_BACKEND_API int64_t ggml_backend_cuda_graph_cache_shift_age(ggml_backend_t backend, int64_t paused_us);
++
  // device buffer
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
  
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index d62a63104..643e73390 100644
+index d62a631..643e733 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -586,6 +586,8 @@ extern "C" {
@@ -71,7 +79,7 @@ index d62a63104..643e73390 100644
  
      typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index fb35be352..b3ad5d4fb 100644
+index fb35be3..b3ad5d4 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -1047,7 +1047,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
@@ -86,7 +94,7 @@ index fb35be352..b3ad5d4fb 100644
              } break;
              case GGML_OP_UNARY: {
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 53d39d249..dd38a65c7 100644
+index 53d39d2..dd38a65 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -2114,6 +2114,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
@@ -114,7 +122,7 @@ index 53d39d249..dd38a65c7 100644
                  n_tasks = n_threads;
              } break;
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 5735f96f8..2231740f4 100644
+index 5735f96..2231740 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -12545,7 +12545,7 @@ void ggml_compute_forward_lightning_indexer(
@@ -239,7 +247,7 @@ index 5735f96f8..2231740f4 100644
 +    }
 +}
 diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
-index 00a2ea7dc..b409817df 100644
+index 00a2ea7..b409817 100644
 --- a/ggml/src/ggml-cpu/ops.h
 +++ b/ggml/src/ggml-cpu/ops.h
 @@ -109,6 +109,8 @@ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params
@@ -252,7 +260,7 @@ index 00a2ea7dc..b409817df 100644
  void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
-index 101afeba2..9f9ae4339 100644
+index 101afeb..9f9ae43 100644
 --- a/ggml/src/ggml-cuda/argsort.cu
 +++ b/ggml/src/ggml-cuda/argsort.cu
 @@ -227,6 +227,143 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
@@ -421,7 +429,7 @@ index 101afeba2..9f9ae4339 100644
      const int    ncols_pad      = next_power_of_2(ncols);
      const size_t shared_mem     = ncols_pad * sizeof(int);
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 6b36ca90b..79fcb0400 100644
+index 6b36ca9..79fcb04 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1549,6 +1549,10 @@ struct ggml_backend_cuda_context {
@@ -436,7 +444,7 @@ index 6b36ca90b..79fcb0400 100644
      ggml_cuda_pool & pool(int device) {
          if (pools[device][curr_stream_no] == nullptr) {
 diff --git a/ggml/src/ggml-cuda/cpy-utils.cuh b/ggml/src/ggml-cuda/cpy-utils.cuh
-index 7697c292d..f98b32a81 100644
+index 7697c29..f98b32a 100644
 --- a/ggml/src/ggml-cuda/cpy-utils.cuh
 +++ b/ggml/src/ggml-cuda/cpy-utils.cuh
 @@ -186,6 +186,98 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
@@ -539,7 +547,7 @@ index 7697c292d..f98b32a81 100644
  static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
      quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);
 diff --git a/ggml/src/ggml-cuda/dequantize.cuh b/ggml/src/ggml-cuda/dequantize.cuh
-index 651524be7..57c5b8ae7 100644
+index 651524b..57c5b8a 100644
 --- a/ggml/src/ggml-cuda/dequantize.cuh
 +++ b/ggml/src/ggml-cuda/dequantize.cuh
 @@ -435,6 +435,24 @@ static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const
@@ -568,7 +576,7 @@ index 651524be7..57c5b8ae7 100644
  static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
  
 diff --git a/ggml/src/ggml-cuda/dsv4-hc.cu b/ggml/src/ggml-cuda/dsv4-hc.cu
-index 2d0b3cfea..d6d436abc 100644
+index 2d0b3cf..d6d436a 100644
 --- a/ggml/src/ggml-cuda/dsv4-hc.cu
 +++ b/ggml/src/ggml-cuda/dsv4-hc.cu
 @@ -331,3 +331,130 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
@@ -703,7 +711,7 @@ index 2d0b3cfea..d6d436abc 100644
 +    CUDA_CHECK(cudaGetLastError());
 +}
 diff --git a/ggml/src/ggml-cuda/dsv4-hc.cuh b/ggml/src/ggml-cuda/dsv4-hc.cuh
-index 1885e7665..7e298f4f0 100644
+index 1885e76..7e298f4 100644
 --- a/ggml/src/ggml-cuda/dsv4-hc.cuh
 +++ b/ggml/src/ggml-cuda/dsv4-hc.cuh
 @@ -6,3 +6,5 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
@@ -713,7 +721,7 @@ index 1885e7665..7e298f4f0 100644
 +void ggml_cuda_op_dsv41_fake_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +void ggml_cuda_op_dsv41_hc_mixes(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 41d948335..4cb6ea0b0 100644
+index 41d9483..4cb6ea0 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -622,6 +622,28 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
@@ -755,7 +763,7 @@ index 41d948335..4cb6ea0b0 100644
          static_assert(type_V == -1, "bad type");
          return nullptr;
 diff --git a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
-index d97e8fdb0..bd0348cf5 100644
+index d97e8fd..bd0348c 100644
 --- a/ggml/src/ggml-cuda/getrows.cu
 +++ b/ggml/src/ggml-cuda/getrows.cu
 @@ -404,6 +404,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
@@ -770,7 +778,7 @@ index d97e8fdb0..bd0348cf5 100644
              GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
      }
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index aff687a9a..9f6038555 100644
+index aff687a..1f8f6ba 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -2605,6 +2605,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
@@ -812,7 +820,7 @@ index aff687a9a..9f6038555 100644
          // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
          if (node->op == GGML_OP_MUL_MAT_ID) {
              const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -5395,6 +5413,21 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
+@@ -5395,6 +5413,52 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
  }
  
@@ -831,10 +839,41 @@ index aff687a9a..9f6038555 100644
 +#endif
 +}
 +
++
++// Metadata only: do not use cuda_graph(), which would evict old entries before
++// their paused interval is excluded, and do not touch CUDA objects or buffers.
++int64_t ggml_backend_cuda_graph_cache_shift_age(ggml_backend_t backend, int64_t paused_us) {
++    if (!ggml_backend_is_cuda(backend)) {
++        return 0;
++    }
++#ifdef USE_CUDA_GRAPH
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    const int64_t now = ggml_time_us();
++    auto shift = [&](int64_t & timestamp) {
++        if (timestamp <= 0 || paused_us <= 0) {
++            return; // zero is an uninitialized sentinel, not an old graph
++        }
++        timestamp = std::min(timestamp, now);
++        // Subtract before adding to avoid overflow, and never create a future age.
++        timestamp = paused_us >= now - timestamp ? now : timestamp + paused_us;
++    };
++    int64_t instances = 0;
++    for (const auto & entry : ctx->cuda_graphs) {
++        shift(entry.second->last_used_time);
++        instances += (int64_t) entry.second->instances.size();
++    }
++    shift(ctx->last_graph_eviction_sweep);
++    return instances;
++#else
++    (void) paused_us;
++    return 0;
++#endif
++}
++
  int ggml_backend_cuda_get_device_count() {
      return ggml_cuda_info().device_count;
  }
-@@ -5815,6 +5848,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5815,6 +5879,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          return true;
                      case GGML_TYPE_IQ4_NL:
                      case GGML_TYPE_MXFP4:
@@ -842,7 +881,7 @@ index aff687a9a..9f6038555 100644
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
                          return op->src[0]->ne[0] % QK_K == 0;
-@@ -5830,7 +5864,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5830,7 +5895,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                             (
                                 (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                 op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
@@ -852,7 +891,7 @@ index aff687a9a..9f6038555 100644
                                 op->src[0]->type == GGML_TYPE_F32
                             ) || (
                                 op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
-@@ -6109,6 +6144,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6109,6 +6175,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -865,7 +904,7 @@ index aff687a9a..9f6038555 100644
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_CROSS_ENTROPY_LOSS:
 diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
-index 429d2e200..cd9965321 100644
+index 429d2e2..cd99653 100644
 --- a/ggml/src/ggml-cuda/lightning-indexer.cu
 +++ b/ggml/src/ggml-cuda/lightning-indexer.cu
 @@ -3,6 +3,18 @@
@@ -1234,7 +1273,7 @@ index 429d2e200..cd9965321 100644
          default:
              return false;
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index 565ed1481..838e2f1a5 100644
+index 565ed14..838e2f1 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
 @@ -264,6 +264,12 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
@@ -1284,7 +1323,7 @@ index 565ed1481..838e2f1a5 100644
      template void mul_mat_q_case<type, GGML_PREC_Q8>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
  
 diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
-index 465997065..57cdad285 100644
+index 4659970..57cdad2 100644
 --- a/ggml/src/ggml-cuda/set-rows.cu
 +++ b/ggml/src/ggml-cuda/set-rows.cu
 @@ -317,6 +317,26 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
@@ -1315,7 +1354,7 @@ index 465997065..57cdad285 100644
          GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
      }
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 33936acae..cb6ff367c 100644
+index 33936ac..cb6ff36 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -16029,7 +16029,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
@@ -1328,7 +1367,7 @@ index 33936acae..cb6ff367c 100644
                  }
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index ed8554b14..048374591 100644
+index ed8554b..0483745 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1093,6 +1093,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {

@@ -156,7 +156,8 @@ hides reasoning from the response; it does not guarantee that the model skips
 internal reasoning. Streaming with visible reasoning can therefore produce its
 first delta earlier than streaming with reasoning hidden.
 Generation is serialized to one active sequence. The engine uses the common
-`GEN`/`BGEN`/`STOP`/`QUIT` line protocol. Stdout is reserved for that protocol.
+`GEN`/`BGEN`/`STOP`/`QUIT` line protocol, plus `SLEEP`/`WAKE` for the
+[deep sleep](#deep-sleep). Stdout is reserved for that protocol.
 Prefix reuse reports the number actually reused with `RESUME`; cancellation is
 checked at prefill boundaries and decode steps. The controller keeps stdin open
 while serving. Closing stdin cancels the current request at the next boundary
@@ -540,6 +541,78 @@ ctest --test-dir build-m31 --output-on-failure -R '^m31_'
 python tools/m31/tests/test_vision_helper.py -v
 python tools/m31/tests/test_vision_serve.py -v
 ```
+
+## Arena startup
+
+`--arena-fill-threads N` controls copies from GGUF mappings into the packed RAM
+arena (default `min(16, hardware threads)`; use `1` for serial copying). Each
+work item copies one complete expert in arena order. With `--register-arena 1`,
+a registration piece is published only after every byte it covers has been
+filled. Registration can then overlap subsequent copying; packed bytes,
+per-expert alignment and the configured registration chunk geometry do not change.
+The final publication wakes every waiting registration worker so startup can join
+all workers, including when there are fewer pieces than workers.
+
+Earlier controlled measurements used one RTX 5090 32 GB, an EPYC 9654, 624 GB RAM,
+local NVMe/ext4 and UD-IQ3_S with a 163.75 GB arena. Options were
+`--threads 80 --arena-gib 170 --gpu-experts-gib 7 --register-arena 1
+--register-limit-gib 176 --gpu-pack-threads 8 --ctx 4096 --chunk 2048`.
+Fresh warm processes reached `READY` in 50.4–52.4 s with the serial implementation
+and 15.0–15.5 s with overlapping fill/registration (three alternating runs each).
+A later warm session measured 11.3–11.4 s for three starts. One cold run per side,
+with model pages removed from the OS cache, took 67.7 s and 30.5 s respectively.
+These figures predate this rebase; they are not a new current-main benchmark.
+Other storage and thread settings were not qualified by those measurements.
+
+## Deep sleep
+
+The common server's [`POST /sleep` and `/wake`](DEEP_SLEEP.md), or `SLEEP` and
+`WAKE` on the native pipe, return the GPU between requests while retaining the
+model and conversation in host RAM. Sleep must be requested explicitly.
+
+The CUDA engine saves valid KV/index rows and expert residency, frees device
+weights, caches and scratch, unregisters the arena and releases its backend and
+primary context. The arena stays in RAM. A host copy of immutable dense device
+buffers is made at the first sleep and reused. Wake recreates the allocation
+order, restores those buffers and KV/index rows, and seeds the same expert-cache
+slots. The prompt planner preserves its load-time free-memory limit (or a smaller
+wake-time limit). The next request still follows normal prefix matching.
+
+After wake, arena registration resumes in the background in 1 GiB pieces after
+250 ms without forward/logits work. Uploads use the existing staging path until
+registration is complete. No extra model warmup is inserted. A second sleep
+stops pending registration before releasing its storage.
+
+Earlier CUDA validation on the configuration above measured:
+
+| Operation | Result |
+| --- | --- |
+| first sleep, including a 10.7 GB dense host copy | 4.42 s |
+| subsequent sleep with a fully registered arena | 2.72–2.88 s, 24 runs |
+| wake to `READY` | 1.42–1.47 s, 25 runs |
+| sleeping model VRAM | no model process reported; background device usage 20 MiB |
+| sleep/wake during numerical boundary and gate20 fixtures | bitwise equal to saved GPU references |
+| growing conversation with six sleeps | same output tokens, prefix reuse and prompt reads as without sleep |
+| 20 cycles in one process | no growth in thread, descriptor or mapping counts; some host-heap growth remained |
+
+The first prefill after wake has a measured cost. A later unprofiled 4K ABBA
+(two fresh processes per arm) measured first-prompt throughput **3.54% lower**
+than the awake control, exceeding the chosen 3% tolerance. The second prompt was
++0.17%, effectively unchanged in that window. An equal-idle control retained the
+first-prompt difference. This is a known limitation, not an established noise
+result or a passed performance gate.
+
+Wake acknowledgement is not first-response latency. A focused image test measured
+1.87 s for HTTP wake and 15.38 s for the following image request, including 11.24 s
+of prompt work while registration completed. Dense host storage adds about
+10.7 GB in this profile, in addition to the retained arena. Long prompts can be
+slower while uploads still use staging. Sleep/wake also showed a few MB of host
+heap growth per cycle; its source was not isolated.
+
+Native sleep requires the CUDA build; unsupported builds return `ERR` and the
+server returns 501. Only one engine per card and one active sequence were tested.
+A failed wake remains asleep and returns 503, allowing a later retry. HIP, SYCL,
+Windows and other GPUs or quantizations were not validated by these runs.
 
 ## Numerical contract
 
@@ -1972,8 +2045,8 @@ Numerical acceptance covers the 20 short prompts and selected rows at 16K and
 32K, not every possible input or every row above 32K. The model's advertised
 context capacity is not a tested port capacity. F16 main and index KV consume
 substantial VRAM; memory planning can split a prompt into several expert passes.
-Arena population and optional host registration add startup work and require
-free host memory. A single active sequence is supported. Feature-specific build
+Arena population and optional host registration add startup work (see
+[Arena startup](#arena-startup)) and require free host memory. A single active sequence is supported. Feature-specific build
 requirements and validation are stated in the vision and short-prefill sections
 when those follow-ups are present. Speculative decode and the Q2 experiments
 are not included. HIP and SYCL toolchains were unavailable, so those backends were

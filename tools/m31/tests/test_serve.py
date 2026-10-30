@@ -18,6 +18,7 @@ from m31_tok import M31Tokenizer  # noqa: E402
 import m31_parser as P  # noqa: E402
 import serve_m31 as M  # noqa: E402
 from serve import server as S  # noqa: E402
+from serve import deep_sleep as D  # noqa: E402
 import strata_tokenizer as ST  # noqa: E402
 
 
@@ -320,6 +321,139 @@ for line in sys.stdin:
             events = list(service.run([1], False, [], 100, {}, threading.Event()))
         self.assertTrue(self.engine.alive())
         self.assertEqual("".join(value.text for kind, value in events if kind == "event"), "ok")
+
+
+class SleepProtocolTests(unittest.TestCase):
+    """SLEEP/WAKE through the real common pipe with a fake engine process."""
+    def engine(self, capable=True):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        script = Path(tmp.name) / "fake_engine.py"
+        script.write_text("#!" + sys.executable + "\n" + f'''
+import sys
+from pathlib import Path
+here = Path(__file__)
+print("INFO prefix_cache=1 sleep={int(capable)}", flush=True)
+print("READY 4096 stop", flush=True)
+for line in sys.stdin:
+    with here.with_suffix(".log").open("a") as log:
+        log.write(line.split()[0] + "\\n")
+    if line.startswith("QUIT"):
+        break
+    if line.startswith("SLEEP"):
+        print("SLEPT seconds=0.5 kv_tokens=3 kv_bytes=96 dense_bytes=10 experts=2 conversation=1 context=1", flush=True)
+    elif line.startswith("WAKE"):
+        if here.with_suffix(".refuse").exists():
+            print("ERR wake failed (still asleep): out of memory", flush=True)
+        else:
+            print("INFO woke=1 wake_seconds=1.25 kv_tokens=3", flush=True)
+            print("READY 4096 stop", flush=True)
+    elif line.startswith("GEN"):
+        print("T 111\\nT 107\\nDONE 2 1 1 1 stop 0 0 0 0 0", flush=True)
+''', encoding="utf-8")
+        script.chmod(0o700)
+        patch = mock.patch.object(D, "driver", lambda: None)   # no CUDA checkpoint fallback: native sleep only
+        patch.start()
+        self.addCleanup(patch.stop)
+        engine = M.M31Engine(str(script), [])
+        engine.silence_s = 5
+        self.addCleanup(engine.close)
+        return engine, script
+
+    def test_sleep_figures_then_generation_wakes_first(self):
+        engine, script = self.engine()
+        figures = engine.sleep()
+        self.assertTrue(engine.sleeping)
+        self.assertEqual(figures["kv_tokens"], 3)
+        self.assertEqual(figures["seconds"], 0.5)
+        self.assertEqual(list(engine.generate([1], 4, {}, threading.Event())), [111, 107])
+        self.assertFalse(engine.sleeping)
+        self.assertEqual(engine.info["wake"]["wake_seconds"], 1.25)
+        self.assertEqual(script.with_suffix(".log").read_text().split(), ["SLEEP", "WAKE", "GEN"])
+
+    def test_failed_wake_is_gpu_busy_and_stays_asleep(self):
+        engine, script = self.engine()
+        engine.sleep()
+        script.with_suffix(".refuse").touch()
+        with self.assertRaises(S.GpuBusy):
+            engine.wake()
+        self.assertTrue(engine.sleeping)
+        script.with_suffix(".refuse").unlink()
+        self.assertEqual(engine.wake()["kv_tokens"], 3)
+        self.assertFalse(engine.sleeping)
+
+    def test_engine_without_sleep_support_is_refused_before_any_command(self):
+        engine, script = self.engine(capable=False)
+        with self.assertRaisesRegex(ValueError, "cannot sleep"):
+            engine.sleep()
+        self.assertFalse(script.with_suffix(".log").exists())
+
+
+class HttpSleepTests(unittest.TestCase):
+    def setUp(self):
+        class Engine(S.MockEngine):
+            sleeping, sleeps, wakes = False, 0, 0
+            info = {}
+            def alive(self):
+                return True
+            def sleep(self):
+                self.sleeping, self.sleeps = True, self.sleeps + 1
+                return {"seconds": 0.5, "kv_tokens": 3}
+            def wake(self):
+                self.sleeping, self.wakes = False, self.wakes + 1
+                self.info["wake"] = {"wake_seconds": 1.25}
+                return self.info["wake"]
+            def generate(self, ids, maximum, sampling, cancel, embeddings=None):
+                assert not self.sleeping, "generation reached a sleeping engine"
+                yield from super().generate(ids, maximum, sampling, cancel, embeddings)
+        class Template:
+            def render(self, *args, **kwargs):
+                return "abc"
+        for patch in (mock.patch.object(S, "OutputParser", P.M31OutputParser),):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.engine = Engine(S.ByteTokenizer(), "ok", max_context=256)
+        self.service = M.M31Service(self.engine, S.ByteTokenizer(), Template())
+        self.service.free_vram_mib = lambda: None
+        self.httpd = S.serve(self.service, port=0)
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def call(self, path, body=None, content_type="application/json"):
+        request = urllib.request.Request(self.base + path, data=json.dumps(body or {}).encode(),
+                                         headers={"Content-Type": content_type})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, json.loads(error.read())
+
+    def test_sleep_then_request_wakes_and_answers(self):
+        self.assertEqual(self.call("/sleep"), (200, {"status": "asleep", "seconds": 0.5, "kv_tokens": 3}))
+        self.assertTrue(self.service.v1_status()["asleep"])
+        status, body = self.call("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual((self.engine.sleeps, self.engine.wakes), (1, 1))
+        self.assertFalse(self.service.v1_status()["asleep"])
+
+    def test_wake_endpoint_and_states(self):
+        self.assertEqual(self.call("/wake"), (200, {"status": "not asleep"}))
+        self.call("/sleep")
+        self.assertEqual(self.call("/wake"), (200, {"status": "awake", "wake_seconds": 1.25}))
+        self.assertEqual(self.engine.wakes, 1)
+
+    def test_control_rules_match_unload(self):
+        self.assertEqual(self.call("/sleep", content_type="application/x-www-form-urlencoded")[0], 415)
+        self.assertEqual(self.engine.sleeps, 0)
+        with self.service.fifo:
+            self.assertEqual(self.call("/sleep"), (409, {"status": "busy"}))
+        self.assertEqual(self.engine.sleeps, 0)
+
+    def test_engine_without_sleep_is_unsupported(self):
+        del type(self.engine).sleep
+        self.assertEqual(self.call("/sleep"), (501, {"status": "unsupported"}))
 
 
 class HttpTests(unittest.TestCase):

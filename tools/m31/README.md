@@ -24,12 +24,17 @@ in : GEN <max_new> [key=value ...] <ids csv>
      GENI <max_new> [key=value ...] <SVE1-file> <ids csv>
      BGENI <slot> <max_new> [key=value ...] <SVE1-file> <ids csv>
      STOP
+     SLEEP
+     WAKE
      QUIT
-out: READY <ctx> stop
+out: INFO key=value ...                  (startup: ... sleep=0|1)
+     READY <ctx> stop
      RESUME <reused>
      PP <read> <total> <ms> <tok/s>
      T <id>
      DONE <generated> <prompt> <prompt_ms> <decode_ms> <finish> ... <reused> ...
+     SLEPT seconds=<s> kv_tokens=<n> kv_bytes=<b> dense_bytes=<b> experts=<n> conversation=0|1 ...
+     INFO woke=1 wake_seconds=<s> ...    (then READY, or before a woken request's lines)
      ERR <text>
 ```
 
@@ -67,6 +72,20 @@ it. Text requests remain available. Build, configuration, content-part examples
 and portable oracle commands are in the
 [vision section](../../docs/MINIMAX_M31.md#vision-separate-opt-in).
 Adaptive short-chunk prefill remains a separate contribution.
+
+`SLEEP` (CUDA backend, between requests) is a deep sleep: the engine frees all of
+its VRAM (dense weights, expert cache, KV/index rows, scratch), unregisters the
+RAM arena and resets the device's CUDA context, so the process holds no GPU
+memory and another program can use the whole card. The arena, a host copy of
+the dense device buffers and the valid KV/index rows stay in RAM. `WAKE`
+creates a new context, uploads dense weights and KV rows, seeds the expert cache
+with the same experts in the same slots, and answers `READY`; the arena then
+registers in the background. A `GEN` while asleep wakes first (an `INFO woke=1`
+line precedes its output). The conversation continues without a new prompt
+read: the same prefix is reused as without the sleep, and logits are bitwise
+equal. `SLEEP` while asleep and `WAKE` while awake are idempotent. A failed
+wake answers `ERR` and leaves the engine asleep; `conversation=0` in `SLEPT`
+reports that the KV rows could not be kept (the next request reads its prompt).
 
 ## Layout
 

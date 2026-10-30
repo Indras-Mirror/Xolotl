@@ -8,6 +8,7 @@
 #endif
 #ifdef M31_ENGINE_CUDA
 #include "ggml-cuda.h"
+#include "gpu/device_context.hpp"
 #endif
 #include <chrono>
 #include <condition_variable>
@@ -15,6 +16,7 @@
 #include <iostream>
 #include <mutex>
 #include <thread>
+#include <sstream>
 #include <cerrno>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -34,6 +36,9 @@ struct Cli {
     bool serve = false;
     int device = 0;
     std::string stop, suppress;
+    // Offline lifecycle check: none, case (before each case) or chunk:K
+    // (after the K-th forward of each case, with that chunk's logits read).
+    std::string sleep_wake = "none";
     run::Args args;
     Config config;
 };
@@ -54,8 +59,8 @@ struct Cli {
         if (key == "--serve") continue;
         if (key == "--help" || key == "-h") throw std::runtime_error(
             "usage: m31_generate --serve -m MODEL [--backend cpu|cuda --device N --ctx N --chunk N --threads N "
-            "--arena-gib N --gpu-experts-gib N --register-arena 0|1 --register-limit-gib N --stop id,id]\n"
-            "offline: m31_generate -m MODEL (--ids-file x.i32|--cases DIR) --out NEW-DIR [--rows all|last|last:N|stride:N]");
+            "--arena-gib N --gpu-experts-gib N --register-arena 0|1 --register-limit-gib N --arena-fill-threads N --stop id,id]\n"
+            "offline: m31_generate -m MODEL (--ids-file x.i32|--cases DIR) --out NEW-DIR [--rows all|last|last:N|stride:N --sleep-wake none|case|chunk:K]");
         if (i + 1 >= argc) throw std::runtime_error("missing value for " + key);
         const std::string value = argv[++i];
         auto pos = [&](int high = std::numeric_limits<int>::max()) { return int(protocol::integer(value, 1, high, key.c_str())); };
@@ -66,6 +71,14 @@ struct Cli {
         else if (key == "--register-limit-gib") cli.config.register_limit_bytes = uint64_t(protocol::real(value, 0, 65536, "register-limit-gib") * double(uint64_t(1) << 30));
         else if (key == "--register-chunk-mib") cli.config.register_chunk_bytes = uint64_t(pos()) << 20;
         else if (key == "--register-threads") cli.config.register_threads = unsigned(pos(64));
+        else if (key == "--arena-fill-threads") cli.config.arena_fill_threads = unsigned(pos(256));
+        else if (key == "--sleep-wake") {
+            if (cli.serve) throw std::runtime_error("--sleep-wake is an offline check; --serve uses SLEEP/WAKE");
+            if (value != "none" && value != "case" && (value.rfind("chunk:", 0) != 0 ||
+                protocol::integer(value.substr(6), 1, 1 << 20, "sleep-wake chunk") < 1))
+                throw std::runtime_error("--sleep-wake must be none, case or chunk:K");
+            cli.sleep_wake = value;
+        }
         else if (key == "--gpu-pack-threads") cli.config.gpu_pack_threads = unsigned(pos(4096));
         else if (key == "--upload-depth") cli.config.upload_depth = unsigned(pos(128));
         else if (key == "--upload-streams") cli.config.upload_streams = unsigned(pos(128));
@@ -215,8 +228,80 @@ void done(int generated, int prompt, double prompt_ms, double decode_ms, const c
     if (slot >= 0) std::cout << "BADM " << slot << " 0\n";
     std::cout << std::flush;
 }
-template<class EngineType, class GrammarType>
-void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines, bool & quit, bool & cancelled, GrammarType & grammar) {
+#ifndef M31_PROTOCOL_TEST_ONLY
+// Deep sleep of the real engine: the engine frees its device allocations, then
+// this process frees the backend and the device's primary context.
+class DevicePower {
+    Engine & engine_;
+    ggml_backend_t & backend_;
+    int device_;
+public:
+    DevicePower(Engine & engine, ggml_backend_t & backend, int device) : engine_(engine), backend_(backend), device_(device) {}
+    bool supported() const {
+#ifdef M31_ENGINE_CUDA
+        return backend_ && ggml_backend_is_cuda(backend_);
+#else
+        return false;
+#endif
+    }
+    bool asleep() const { return engine_.asleep(); }
+    // True when asleep afterwards; reply is the SLEPT line. Otherwise error.
+    bool sleep(std::string & reply, std::string & error) {
+        const auto started = Clock::now();
+        Engine::SleepStats stats;
+        std::string engine_error;
+        const bool complete = engine_.sleep(stats, engine_error);
+        if (!engine_.asleep()) { error = engine_error; return false; }
+        std::string release;
+#ifdef M31_ENGINE_CUDA
+        if (backend_) { ggml_backend_free(backend_); backend_ = nullptr; release = release_cuda_device(device_); }
+#endif
+        if (!complete) std::cerr << "m31 sleep: " << engine_error << '\n';
+        if (!release.empty()) std::cerr << "m31 sleep: " << release << '\n';
+        std::ostringstream line;
+        line << "SLEPT seconds=" << elapsed_ms(started) / 1000.0 << " engine_seconds=" << stats.seconds
+             << " kv_seconds=" << stats.kv_seconds << " dense_seconds=" << stats.dense_seconds
+             << " kv_tokens=" << stats.kv_tokens << " kv_bytes=" << stats.kv_bytes << " dense_bytes=" << stats.dense_bytes
+             << " dense_copied=" << int(stats.dense_copied) << " experts=" << stats.cached_experts
+             << " conversation=" << int(complete) << " context=" << int(release.empty());
+        reply = line.str();
+        return true;
+    }
+    // True when awake afterwards; info is an INFO line when this call woke it.
+    bool wake(std::string & info, std::string & error) {
+        info.clear();
+        if (!engine_.asleep()) return true;
+#ifdef M31_ENGINE_CUDA
+        const auto started = Clock::now();
+        backend_ = ggml_backend_cuda_init(device_);
+        if (!backend_) { error = "wake: cannot initialize CUDA device " + std::to_string(device_); return false; }
+        const double context_seconds = elapsed_ms(started) / 1000.0;
+        Engine::WakeStats stats;
+        if (!engine_.wake(backend_, stats, error)) {
+            ggml_backend_free(backend_); backend_ = nullptr;
+            const auto release = release_cuda_device(device_);
+            if (!release.empty()) error += "; " + release;
+            error = "wake failed (still asleep): " + error;
+            return false;
+        }
+        std::ostringstream line;
+        line << "INFO woke=1 wake_seconds=" << elapsed_ms(started) / 1000.0 << " context_seconds=" << context_seconds
+             << " dense_seconds=" << stats.dense_seconds << " dense_pinned=" << int(stats.dense_pinned)
+             << " kv_seconds=" << stats.kv_seconds << " experts_seconds=" << stats.experts_seconds
+             << " kv_tokens=" << stats.kv_tokens << " experts=" << stats.cached_experts << " expert_bytes=" << stats.expert_bytes
+             << " registration=" << (stats.registration_background ? "background" : "none");
+        info = line.str();
+        return true;
+#else
+        error = "wake requires the CUDA backend";
+        return false;
+#endif
+    }
+};
+#endif
+template<class EngineType, class GrammarType, class PowerType>
+void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines, bool & quit, bool & cancelled, GrammarType & grammar,
+           PowerType & power) {
     if (grammar.vocab_size() && grammar.vocab_size() != engine.geometry().vocab) throw std::runtime_error("grammar vocabulary size mismatch");
     auto stops = grammar.stops(), suppress = grammar.suppress();
     const auto vocab = int(engine.geometry().vocab);
@@ -234,6 +319,7 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
 #else
               << 0
 #endif
+              << " sleep=" << int(power.supported())
               << "\nREADY " << config.context << " stop\n" << std::flush;
     std::vector<int32_t> history;
     MixedInput history_mixed;
@@ -241,6 +327,24 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
     while (!quit && lines.next(line)) {
         if (line == "QUIT") break;
         if (line.empty() || line == "STOP" || line.rfind("BSTOP ", 0) == 0) continue;
+        if (line == "SLEEP" || line == "WAKE") {
+            std::string reply, error;
+            if (line == "SLEEP" && !power.supported() && !power.asleep()) error_line("sleep unavailable: requires the CUDA backend");
+            else if (line == "SLEEP") {
+                if (power.sleep(reply, error)) std::cout << reply << '\n' << std::flush;
+                else error_line(error);
+            } else if (power.wake(reply, error)) {
+                if (!reply.empty()) std::cout << reply << '\n';
+                std::cout << "READY " << config.context << " stop\n" << std::flush;
+            } else error_line(error);
+            continue;
+        }
+        if (power.asleep()) {
+            // A request wakes the engine first; the conversation continues.
+            std::string info, error;
+            if (!power.wake(info, error)) { error_line(error); continue; }
+            std::cout << info << '\n' << std::flush;
+        }
         protocol::Request request;
         MixedInput mixed;
         try {
@@ -365,8 +469,15 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
     }
 }
 #ifndef M31_PROTOCOL_TEST_ONLY
-void offline(Engine & engine, const run::Args & args, run::Dump * & active_dump) {
+void offline(Engine & engine, const run::Args & args, run::Dump * & active_dump, DevicePower & power, const std::string & sleep_wake) {
     if (!run::fs::create_directory(args.out)) throw std::runtime_error("output directory exists; use a new path");
+    const int sleep_chunk = sleep_wake.rfind("chunk:", 0) == 0 ? int(protocol::integer(sleep_wake.substr(6), 1, 1 << 20, "sleep-wake chunk")) : 0;
+    if (sleep_wake != "none" && !power.supported()) throw std::runtime_error("--sleep-wake requires the CUDA backend");
+    auto cycle = [&](const std::string & where) {
+        std::string reply, info, error;
+        if (!power.sleep(reply, error) || !power.wake(info, error)) throw std::runtime_error("sleep/wake: " + error);
+        std::cerr << "m31 offline sleep-wake " << where << ": " << reply << " | " << info << '\n';
+    };
     for (const auto & path : run::cases(args)) {
         MixedInput mixed;
 #ifdef M31_ENGINE_VISION
@@ -375,8 +486,10 @@ void offline(Engine & engine, const run::Args & args, run::Dump * & active_dump)
         const auto ids = args.mixed_manifest.empty() ? run::read_ids(path) : mixed.tokens;
         if (ids.size() > size_t(args.context)) throw std::runtime_error("case exceeds configured context");
         engine.reset();
+        if (sleep_wake == "case") cycle(path.stem().string());
         run::Dump dump(run::fs::path(args.out) / path.stem(), args, ids, int(engine.geometry().vocab));
         active_dump = &dump;
+        int forwards = 0;
         for (int pos = 0; pos < int(ids.size());) {
             std::string error;
             const int n = engine.prefill_chunk(run::chunk_size(args, int(ids.size()), pos), error);
@@ -395,6 +508,8 @@ void offline(Engine & engine, const run::Args & args, run::Dump * & active_dump)
             for (int row = first; row < n; ++row) if (dump.wants(pos + row))
                 dump.row(pos + row, logits.data() + size_t(row - first) * engine.geometry().vocab);
             pos += n;
+            if (++forwards == sleep_chunk && pos < int(ids.size()))
+                cycle(path.stem().string() + " after forward " + std::to_string(forwards) + " at " + std::to_string(pos));
         }
         dump.finish("xolotl-m31", int(ids.size()));
         active_dump = nullptr;
@@ -408,8 +523,10 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
         std::cout << "m31_generate --serve -m MODEL [--backend cpu|cuda --device N --ctx N --chunk N --threads N]\n"
                      "             [--arena-gib N --gpu-experts-gib N --register-arena 0|1 --register-limit-gib N]\n"
+                     "             [--arena-fill-threads N]\n"
                      "m31_generate -m MODEL (--ids-file CASE.i32|--cases DIR|--mixed-manifest manifest.json) --out NEW-DIR\n"
-                     "             [--rows all|last|last:N|stride:N --head-tail N --decode-tail N]\n";
+                     "             [--rows all|last|last:N|stride:N --head-tail N --decode-tail N]\n"
+                     "             [--sleep-wake none|case|chunk:K]\n";
         return 0;
     }
     ggml_backend_t backend = nullptr;
@@ -445,11 +562,12 @@ int main(int argc, char ** argv) {
             Engine engine;
             std::string error;
             if (!engine.init(cli.args.model, cli.config, error)) throw std::runtime_error(error);
+            DevicePower power(engine, backend, cli.device);
             if (cli.serve) {
                 ChatGrammar grammar(cli.args.model);
-                serve(engine, cli.config, cli, *lines, quit, cancelled, grammar);
+                serve(engine, cli.config, cli, *lines, quit, cancelled, grammar, power);
             }
-            else offline(engine, cli.args, active_dump);
+            else offline(engine, cli.args, active_dump, power, cli.sleep_wake);
         }
         if (backend) ggml_backend_free(backend);
         return 0;

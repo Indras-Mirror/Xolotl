@@ -244,7 +244,8 @@ def _svc_init_note(self, *a, **k):
 S.Service.__init__ = _svc_init_note
 
 
-def _expand_images_ds41(self, ids, encoded):
+def _expand_images_ds41(self, ids, encoded, ends=None):
+    """One marker token per encoder row.  `ends` (a list, the request log): each picture's end position is appended."""
     marker = self.tok.encode(E.IMAGE_PLACEHOLDER, parse_special=True)
     if len(marker) != 1:
         raise ValueError("the tokenizer must encode the image marker as one token")
@@ -255,6 +256,8 @@ def _expand_images_ds41(self, ids, encoded):
                 raise ValueError("the prompt and its images do not match")
             out.extend([token] * encoded[k][1])
             k += 1
+            if ends is not None:
+                ends.append(len(out))
         else:
             out.append(token)
     if k != len(encoded):
