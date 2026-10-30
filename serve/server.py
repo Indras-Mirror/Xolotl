@@ -57,14 +57,14 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
+from serve.frontend import (CACHE_MARK_KEY, THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+                            forced_call, image_ids_of, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
-from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
+from serve.structured import StructuredOutputError, prepare_format, validated_json, normalize_request, format_grammar  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve.voice import VoiceServer, start_lazy_voice  # noqa: E402  local: the voice sidecar (ASR/TTS)
@@ -127,12 +127,31 @@ def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
 
 
 def write_temporary(path: Path, parts: list) -> None:
-    """#874: write `parts` (files) one after the other into `path`; on Windows with FILE_ATTRIBUTE_TEMPORARY
-    (os.O_SHORT_LIVED), so the file normally never reaches the drive before it is deleted."""
+    """#874: write `parts` (files, or bytes written as they are) one after the other into `path`; on Windows with
+    FILE_ATTRIBUTE_TEMPORARY (os.O_SHORT_LIVED), so the file normally never reaches the drive before it is deleted."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0) | getattr(os, "O_SHORT_LIVED", 0)
     with os.fdopen(os.open(path, flags, 0o600), "wb") as f:
         for part in parts:
-            f.write(Path(part).read_bytes())
+            f.write(part if isinstance(part, (bytes, bytearray)) else Path(part).read_bytes())
+
+
+WATCH_CLIENT_S = 0.002  # how often a request looks for its client's hang-up (and its engine read for a cancel)
+SVR1 = 0x31525653      # an embeddings-file record that names a picture the engine holds (header only, no rows)
+
+
+class ImageCacheMiss(ValueError):
+    """A picture sent by its id alone ("uuid" with no image data) that this server does not hold: vLLM's 400, word for
+    word ("Cache miss for image at index {idx} but data is not provided.") - a client retries with the pictures' data
+    when it reads "Cache miss"."""
+
+
+def sve_header(path) -> tuple[int, int, int, int]:
+    """(n, nx, ny, n_embd) of a strata-vision record file."""
+    with open(path, "rb") as f:
+        magic, n, nx, ny, width = struct.unpack("<5i", f.read(20))
+    if magic != 0x31455653:
+        raise ValueError(f"{path} is not a strata-vision record")
+    return n, nx, ny, width
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
@@ -1151,6 +1170,51 @@ class StrataEngine:
                     self.slot_cv.notify_all()    # new engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
 
+    refill = None   # q36 (img_refs): rewrites this request's embeddings file with every picture's rows (NEED_IMAGES)
+    _running_cancel = None
+
+    def stop_if_running(self, cancel) -> None:
+        """The client of the request the engine is running (its `cancel`) hung up: STOP now, from the watcher's thread -
+        not at the request thread's next engine line (a token, or a prompt chunk 0.1-0.3 s later).  The request thread
+        still drains to DONE as before."""
+        if self._running_cancel is cancel and self.can_stop and self.alive():
+            try:
+                with self.wlock:
+                    if self._running_cancel is not cancel:
+                        return
+                    self.proc.stdin.write("STOP\n")
+                    self.proc.stdin.flush()
+            except (OSError, AttributeError):
+                pass
+
+    def have(self, keys: list[str], timeout: float = 30.0) -> list[tuple[int, int, int] | None]:
+        """`HAVE <key,...>` between requests (the caller holds the FIFO): which pictures the engine holds by their keys
+        (img_refs engines) -> (n, nx, ny) or None for each."""
+        if not keys:
+            return []
+        self._send("HAVE " + ",".join(keys))
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer HAVE") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip())
+            if line.startswith("HAVE"):
+                out = []
+                for item in (line[5:].split(",") if len(line) > 5 else []):
+                    f = item.split(":")
+                    out.append((int(f[0]), int(f[1]), int(f[2])) if len(f) == 3 else None)
+                if len(out) != len(keys):
+                    raise ValueError("the engine's HAVE answer does not match the question")
+                return out
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer HAVE")
+
     def _parse_done(self, line):
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
@@ -1262,6 +1326,9 @@ class StrataEngine:
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
         # #2228: the pictures' keys (hex, in prompt order): the engine matches a picture by them, not by its embeddings
+        sn = sampling.get("strata_snaps")                # the client's snapshot points (cells), q36: snap=
+        if isinstance(sn, list) and sn and all(isinstance(x, int) and not isinstance(x, bool) and x > 0 for x in sn):
+            keys += " snap=" + ",".join(str(x) for x in sn[-4:])
         ik = sampling.get("strata_img_keys")
         if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)
                                                for k in ik):
@@ -1277,6 +1344,15 @@ class StrataEngine:
         if isinstance(score, list) and score and all(isinstance(t, int) and not isinstance(t, bool) and t >= 0
                                                      for t in score):
             keys += " score=" + ",".join(str(t) for t in score)
+        # These private keys are constructed by Service, never from a public path.
+        grammar = sampling.get("_grammar_path")
+        if grammar is not None:
+            if not isinstance(grammar, str) or any(c.isspace() or ord(c) < 32 for c in grammar):
+                raise ValueError("grammar temporary path cannot contain whitespace or control characters")
+            keys += f" grammar={grammar}"
+            after = sampling.get("_grammar_after")
+            if after is not None:
+                keys += f" grammar_after={int(after)}"
         return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
 
     @staticmethod
@@ -1948,9 +2024,14 @@ class StrataEngine:
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        command = f"{head} {','.join(str(int(t)) for t in ids)}\n"
         try:
-            self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
-            self.proc.stdin.flush()
+            with getattr(self, "wlock", None) or contextlib.nullcontext():
+                if cancel.is_set():
+                    return
+                self._running_cancel = cancel
+                self.proc.stdin.write(command)
+                self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
@@ -1972,7 +2053,7 @@ class StrataEngine:
                         raise self._silent(f"the engine said nothing for {time.monotonic() - heard:.0f} s during "
                                            "the request")
                 try:
-                    line = self.lines.get(timeout=min(wait, 0.5))
+                    line = self.lines.get(timeout=min(wait, WATCH_CLIENT_S))
                 except queue.Empty:
                     if cancel.is_set():
                         return
@@ -2030,14 +2111,28 @@ class StrataEngine:
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     return
                 elif line.startswith("ERR"):
+                    refill, self.refill = self.refill, None
+                    if line.startswith("ERR NEED_IMAGES") and refill is not None and embeddings:
+                        # q36: a picture sent by reference is no longer in the engine (nothing was read yet): the
+                        # same request once more, every picture with its rows
+                        print("[strata] the engine no longer holds a picture sent by reference: sending the rows",
+                              flush=True)
+                        embeddings = refill()
+                        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}"
+                        self._send(f"{head} {','.join(str(int(t)) for t in ids)}")
+                        continue
                     done = True
                     raise ValueError(line[4:].strip())
         finally:
+            with getattr(self, "wlock", None) or contextlib.nullcontext():
+                if self._running_cancel is cancel:
+                    self._running_cancel = None
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
                     try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
+                        with getattr(self, "wlock", None) or contextlib.nullcontext():   # (the watcher may STOP too)
+                            self.proc.stdin.write("STOP\n")
+                            self.proc.stdin.flush()
                     except OSError:
                         pass
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
@@ -2544,11 +2639,27 @@ class Vision:
             out.append(self.encode(src, keep=[p for p, _ in out]))
         return out
 
+    @staticmethod
+    def key_of(data: bytes) -> str:
+        """A normalized picture's key: what the cache, the files and the engine's img_keys name it by."""
+        return hashlib.sha256(data).hexdigest()[:32]
+
+    def lookup(self, key: str) -> tuple[Path, int] | None:
+        """The cached encoding of the picture `key`, or None (nothing is encoded)."""
+        with self.lock:
+            if key in self.cache and Path(self.cache[key][0]).exists():
+                self.cache[key] = self.cache.pop(key)
+                return self.cache[key]
+            return None
+
     def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
         `keep`: files the caller still needs (never evicted by this call)."""
         data = self.normalize(source if isinstance(source, bytes) else self.load(source))
-        key = hashlib.sha256(data).hexdigest()[:32]
+        return self.encode_keyed(self.key_of(data), data, keep)
+
+    def encode_keyed(self, key: str, data: bytes, keep=()) -> tuple[Path, int]:
+        """encode() of normalized bytes whose key_of() is `key`."""
         with self.lock:
             if key in self.cache:
                 self.cache[key] = self.cache.pop(key)                  # most recently used last
@@ -3175,6 +3286,7 @@ class Service:
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
+        self.structured_compact = False                 # config: no inter-token JSON whitespace
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
@@ -3183,10 +3295,17 @@ class Service:
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
+        # vLLM-style picture ids ("uuid" on a content part) -> the picture's key (Vision.key_of): a client may send
+        # a picture once and then only its id; the newest IMAGE_IDS_MAX are kept
+        self.image_ids: collections.OrderedDict[str, str] = collections.OrderedDict()
+        self._raw_keys: collections.OrderedDict[bytes, str] = collections.OrderedDict()   # sha256(raw bytes) -> key
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
+        # the config's "preserve_thinking" (true / false): the template flag's default for requests that do not set it
+        # in chat_template_kwargs; None leaves the template's own default
+        self.preserve_thinking = None
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
@@ -3971,8 +4090,10 @@ class Service:
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
-            "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
-                                  "constrained_decoding": False, "stream_buffered": True},
+            "structured_output": {"formats": ["json_object", "json_schema"],
+                                  "method": "grammar" if str((getattr(self.engine, "info", {}) or {}).get("grammar")) == "1" else "prompt_and_validate",
+                                  "constrained_decoding": str((getattr(self.engine, "info", {}) or {}).get("grammar")) == "1",
+                                  "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
@@ -4001,6 +4122,9 @@ class Service:
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        kwargs = {k: v for k, v in kwargs.items() if k != CACHE_MARK_KEY}
+        if self.preserve_thinking is not None and "preserve_thinking" not in kwargs:
+            kwargs = {**kwargs, "preserve_thinking": self.preserve_thinking}   # the config's default for the flag
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -4021,10 +4145,34 @@ class Service:
         the control tokens the template writes are control tokens."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
-        if not changed:
-            return self.tok.encode(prompt, parse_special=True)
-        prompt, plain = unmark_think_literals(prompt, self.literals)
-        return self.tok.encode(prompt, parse_special=True, plain=plain)
+        plain = ()
+        if changed:
+            prompt, plain = unmark_think_literals(prompt, self.literals)
+        self.embeddings.snaps = None
+        cache_marker = kwargs.get(CACHE_MARK_KEY)
+        if cache_marker and cache_marker in prompt:
+            # the client's snapshot points: the marks out of the prompt, their token positions (each at a token frontier
+            # at or before it) for the engine - the latest four (NInfer's / Anthropic's limit)
+            raw_offs, offs, out, last = [], [], [], 0
+            while True:
+                i = prompt.find(cache_marker, last)
+                if i < 0:
+                    break
+                out.append(prompt[last:i])
+                raw_offs.append(i)
+                offs.append(i - len(offs) * len(cache_marker))
+                last = i + len(cache_marker)
+            out.append(prompt[last:])
+            prompt = "".join(out)
+            plain = [(a - len(cache_marker) * sum(o < a for o in raw_offs),
+                      b - len(cache_marker) * sum(o < b for o in raw_offs)) for a, b in plain]
+            if hasattr(self.tok, "encode_marked"):
+                ids, pos = self.tok.encode_marked(prompt, offs[-4:], parse_special=True, plain=plain)
+                self.embeddings.snaps = sorted(set(p for p in pos if 0 < p < len(ids)))
+                return ids
+        if plain:
+            return self.tok.encode(prompt, parse_special=True, plain=plain)
+        return self.tok.encode(prompt, parse_special=True)
 
     @contextlib.contextmanager
     def _turn(self, cancel=None):
@@ -4072,6 +4220,93 @@ class Service:
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
+    IMAGE_IDS_MAX = 4096
+
+    def _pictures(self, images, image_ids, cancel=None, by_reference=True):
+        """The request's pictures (the caller holds the FIFO) -> (encoded, refs): encoded[k] = (embeddings file or
+        None, image tokens); refs[k] = (key, SVR1 header) for a picture the engine already holds (its rows are not
+        sent and it is not encoded), else None.  A picture is its normalized bytes' key; a part with an id ("uuid")
+        records id -> key, and a part with only an id is found by it - an unknown id is a 400 asking for the bytes."""
+        if not hasattr(self.vision, "encode_keyed"):     # an encoder without keyed lookups (a stand-in): as before
+            if any(src is None for src in images):
+                raise ValueError("this server's image encoder takes no picture ids: send the image bytes (image_url)")
+            self._vision_up()
+            encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
+                       else [self.vision.encode(src) for src in images])
+            return encoded, [None] * len(encoded)
+        # vLLM's multimodal uuid: a picture with a uuid is that uuid (its cache key), data or not; one the server holds
+        # by its uuid is not read again (the data, when sent too, is ignored, as vLLM ignores it); an unknown uuid
+        # without data is vLLM's "Cache miss" 400.  A picture without a uuid is its normalized bytes' hash.
+        keys, datas = [], []
+        for idx, (src, uid) in enumerate(zip(images, image_ids)):
+            if cancel is not None and cancel.is_set():
+                raise ClientGone()
+            if uid:   # (the key is the uuid's hash, never a picture's bytes': a picture sent without one is another)
+                key = self.image_ids.get(uid)
+                if key is not None:                          # held by its uuid: data, if any, only should it be needed
+                    self.image_ids.move_to_end(uid)
+                    keys.append(key)
+                    datas.append(None if src is None else src if isinstance(src, bytes) else Vision.load(src))
+                    continue
+                if src is None:
+                    raise ImageCacheMiss(f"Cache miss for image at index {idx} but data is not provided.")
+                raw = src if isinstance(src, bytes) else Vision.load(src)
+                data = Vision.normalize(raw)
+                key = hashlib.sha256(("uuid\0" + uid).encode("utf-8", "surrogatepass")).hexdigest()[:32]
+                self.image_ids[uid] = key
+                self.image_ids.move_to_end(uid)
+                while len(self.image_ids) > self.IMAGE_IDS_MAX:
+                    self.image_ids.popitem(last=False)
+                keys.append(key)
+                datas.append(data)
+                continue
+            if src is None:
+                raise ValueError("an image part has no picture: give image_url (a data: or http(s) URL) or the uuid "
+                                 "of a picture sent before")
+            raw = src if isinstance(src, bytes) else Vision.load(src)
+            memo = hashlib.sha256(raw).digest()
+            key = self._raw_keys.get(memo)       # a picture sent again as the same bytes: no decode, no hash
+            if key is None or not by_reference:   # (a refill re-reads every picture)
+                data = Vision.normalize(raw)
+                key = Vision.key_of(data)
+                self._raw_keys[memo] = key
+                while len(self._raw_keys) > self.IMAGE_IDS_MAX:
+                    self._raw_keys.popitem(last=False)
+            else:
+                self._raw_keys.move_to_end(memo)
+                data = raw                           # normalized only should it have to be encoded (below)
+            keys.append(key)
+            datas.append(data)
+        held = [None] * len(keys)
+        eng = self.engine
+        if by_reference and getattr(eng, "info", {}).get("img_refs") and hasattr(eng, "have") and eng.alive():
+            try:
+                held = eng.have([k[:16] for k in keys])
+            except (EngineDied, ValueError, OSError) as e:
+                print(f"[strata] the engine's picture check failed ({e}); every picture is encoded", flush=True)
+                held = [None] * len(keys)
+        width = int(getattr(eng, "info", {}).get("n_embd") or 0)
+        encoded, refs, started = [], [], False
+        for key, data, h, uid in zip(keys, datas, held, image_ids):
+            if h is not None and width > 0:
+                n, nx, ny = h
+                encoded.append((None, n))
+                refs.append((key, struct.pack("<5i", SVR1, n, nx, ny, width)))
+                continue
+            hit = self.vision.lookup(key)
+            if hit is None and data is not None:
+                data = Vision.normalize(data)            # idempotent for an already normalized picture
+            if hit is None:
+                if data is None:                         # held by its uuid no longer (the encoder's cache dropped it)
+                    raise ImageCacheMiss(f"Cache miss for image at index {len(encoded)} but data is not provided.")
+                if not started:
+                    self._vision_up()
+                    started = True
+                hit = self.vision.encode_keyed(key, data, keep=[p for p, _ in encoded if p is not None])
+            encoded.append(hit)
+            refs.append(None)
+        return encoded, refs
+
     def expand_image_tokens(self, ids, encoded, ends=None):
         """Expand the template's image markers into one token per encoder row.  `ends` (a list): each picture's end
         position in the expanded prompt is appended to it (the request log)."""
@@ -4107,16 +4342,20 @@ class Service:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
         self.embeddings.keys = None
+        self.embeddings.refill = None
         images = images_of(messages)
+        image_ids = image_ids_of(messages)
         if images:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
-            # for as long as urlopen waited.
+            # for as long as urlopen waited.  A part with only an id ("image_url": null and a "uuid") has no source.
             def fetch(src):
                 if cancel is not None and cancel.is_set():
                     raise ClientGone()
+                if not src:
+                    return None
                 return fetched[src] if src in fetched else Vision.download(src) \
                     if src.startswith(("http://", "https://")) else src
             images = [fetch(src) for src in images]
@@ -4129,10 +4368,8 @@ class Service:
             with self._turn(cancel):
                 encoding = time.perf_counter()
                 fresh = getattr(self.vision, "encodes", None)  # the encoder's count of pictures it encoded
-                self._vision_up()
                 try:
-                    encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
-                               else [self.vision.encode(src) for src in images])
+                    encoded, refs = self._pictures(images, image_ids, cancel)
                 finally:
                     self.last_image_at = time.time()
                     if stats is not None:
@@ -4143,10 +4380,23 @@ class Service:
                 if fresh is not None and getattr(self.vision, "encodes", None) is not None:
                     stats["images_encoded"] = self.vision.encodes - fresh
                     stats["images_from_encoder_cache"] = len(encoded) - stats["images_encoded"]
+                stats["images_by_reference"] = sum(r is not None for r in refs)
                 stats["image_ends"] = []
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
+            snaps = getattr(self.embeddings, "snaps", None)
+            if snaps:   # the marks after the pictures move by their rows
+                pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
+                start = self.tok.encode(VISION_START, parse_special=True)[0]
+                shifted, k, extra = [], 0, 0
+                for j, t in enumerate(ids):
+                    while snaps and snaps[0] <= j:
+                        shifted.append(snaps.pop(0) + extra)
+                    if t == pad and j > 0 and ids[j - 1] == start and k < len(encoded):
+                        extra += encoded[k][1] - 1
+                        k += 1
+                self.embeddings.snaps = shifted + [x + extra for x in snaps]
             ids = self.expand_image_tokens(ids, encoded, None if stats is None else stats["image_ends"])
         ctx = self.engine.max_context
         if ctx <= 0:
@@ -4176,13 +4426,22 @@ class Service:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
             # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
-            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
+            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded
+                                                                     if p is not None))
             self.embeddings.path = combined             # first, so a half-written one is found as well
             # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
             # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
-            self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
-            write_temporary(combined, [p for p, _ in encoded])
+            self.embeddings.keys = [r[0][:16] if r is not None else Path(p).stem[:16] for (p, _), r in zip(encoded, refs)]
+            write_temporary(combined, [p if r is None else r[1] for (p, _), r in zip(encoded, refs)])
+            if any(r is not None for r in refs):
+                # the engine said it holds those pictures; should it no longer (another request's pictures pushed them
+                # out meanwhile) it answers NEED_IMAGES and the request is sent once more with every picture's rows
+                def refill(images=images, image_ids=image_ids, combined=combined):
+                    full, _ = self._pictures(images, image_ids, None, by_reference=False)
+                    write_temporary(combined, [p for p, _ in full])
+                    return str(combined)
+                self.embeddings.refill = refill
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
@@ -4226,8 +4485,11 @@ class Service:
             off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
             kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
                   if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
+            marker = kw.pop(CACHE_MARK_KEY, None)
             kw["add_generation_prompt"] = False
             text = self.template.render(marked, tools=marked_tools, **kw)
+            if marker:
+                text = text.replace(marker, "")
             cut = text.find(self.PREFIX_END)
             if cut >= 0:
                 text = text[:cut]
@@ -4378,13 +4640,33 @@ class Service:
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
+        snaps, self.embeddings.snaps = getattr(self.embeddings, "snaps", None), None
+        if snaps:
+            sampling = {**(sampling or {}), "strata_snaps": snaps}
+        refill, self.embeddings.refill = getattr(self.embeddings, "refill", None), None
+        if emb and hasattr(self.engine, "refill"):
+            self.engine.refill = refill
         if emb and img_keys:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
         # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
         # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
         # so the generated reasoning must not become this request's cached input (#615).
+        grammar_path = None
+        grammar_trigger = None
+        grammar_text = (sampling or {}).get("_grammar_text")
+        if grammar_text is not None:
+            fd, grammar_path = tempfile.mkstemp(prefix="strata-grammar-", suffix=".gbnf",
+                                                dir=os.environ.get("STRATA_GRAMMAR_TMPDIR"))
+            with os.fdopen(fd, "w", encoding="utf-8") as grammar_file:
+                grammar_file.write(grammar_text)
+            if thinking:
+                trigger_ids = self.tok.encode(THINK_END, parse_special=True)
+                if len(trigger_ids) != 1:
+                    raise ValueError("grammar_after needs a single-token </think>")
+                grammar_trigger = trigger_ids[0]
         segments = []
+        done_log = []   # snapshot under the turn; stdout may block, so write after both locks are released
         trace = getattr(self.request_trace, "record", None)
         stats = None if trace is None else trace.get("_log")   # the request log's figures (None: it is off)
         calls, start_s = 0, None                        # the tool calls written; when the turn began (request log)
@@ -4473,8 +4755,15 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        segment_sampling = sampling
+                        if grammar_path is not None:
+                            segment_sampling = {**(sampling or {}), "_grammar_path": grammar_path}
+                            # An injected reasoning close is in raw_ids as well. A new
+                            # native segment then starts with the grammar already active.
+                            if grammar_trigger is not None and grammar_trigger not in raw_ids:
+                                segment_sampling["_grammar_after"] = grammar_trigger
+                        gen = self.engine.generate(prompt, max_new - n, segment_sampling, cancel, embeddings=emb) if emb \
+                            else self.engine.generate(prompt, max_new - n, segment_sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -4761,15 +5050,14 @@ class Service:
                                                segments=segments, start_s=start_s)
                                 if hit_rate is not None and "segments" in stats:
                                     stats["expert_hit_rate"] = hit_rate
-                            print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
-                                  f"({finish}, cancel={cancel.is_set()}){hit_msg}{reqlog.done_suffix(trace)}",
-                                  flush=True)
+                            done_log.append(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
+                                            f"({finish}, cancel={cancel.is_set()}){hit_msg}{reqlog.done_suffix(trace)}")
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
-                                print("[strata] the reply reached max tokens while still thinking, so it has no "
-                                      "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
-                                      "strata-<model>.json for every request) leaves room to answer", flush=True)
+                                done_log.append("[strata] the reply reached max tokens while still thinking, so it has no "
+                                                "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
+                                                "strata-<model>.json for every request) leaves room to answer")
                             if os.environ.get("STRATA_DEBUG") and raw_ids:
-                                print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                                done_log.append(f"[strata] raw: {self.tok.decode(raw_ids)!r}")
                         st["busy"] = False
                         st.pop("tail", None)                     # #212: the answer's end is not kept once it is done
                         st.pop("tool", None)
@@ -4782,8 +5070,16 @@ class Service:
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
         finally:
+            if hasattr(self.engine, "refill"):
+                self.engine.refill = None
             if emb:
                 Path(emb).unlink(missing_ok=True)
+            if grammar_path and not os.environ.get("STRATA_KEEP_GRAMMAR_FILES"):
+                Path(grammar_path).unlink(missing_ok=True)
+            # ExitStack released the FIFO and status_lock above, including on GeneratorExit/errors.
+            # Each line already owns its request's figures/id/time; concurrent log lines may interleave.
+            for message in done_log:
+                print(message, flush=True)
         for ev in cut(parser.finish(finish)):
             calls += ev.kind == "tool_call"
             yield "event", ev
@@ -5084,6 +5380,19 @@ def _is_json(text: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def openai_stream_usage(chunks):
+    """OpenAI include_usage: a separate final chunk with an empty choices list."""
+    try:
+        for chunk in chunks:
+            if chunk is None or "usage" not in chunk:
+                yield chunk
+                continue
+            yield {k: v for k, v in chunk.items() if k != "usage"}
+            yield {**chunk, "choices": []}
+    finally:
+        chunks.close()
 
 
 def openai_collect(chunks) -> dict:
@@ -5451,9 +5760,12 @@ def make_handler(svc: Service):
             sock = self.connection
 
             def watch():
-                while not done.wait(0.5) and not cancel.is_set():
+                # select wakes immediately on EOF; poll engine cancellation every 2 ms
+                while not done.is_set() and not cancel.is_set():
                     try:
-                        readable, _, _ = select.select([sock], [], [], 0)
+                        readable, _, _ = select.select([sock], [], [], WATCH_CLIENT_S)
+                        if not readable:
+                            continue
                         gone = bool(readable) and sock.recv(1, socket.MSG_PEEK) == b""
                     except (ConnectionError, TimeoutError):
                         gone = True
@@ -5462,7 +5774,11 @@ def make_handler(svc: Service):
                     if gone:
                         self._note(outcome="disconnected")
                         cancel.set()
+                        stopper = getattr(svc.engine, "stop_if_running", None)
+                        if stopper is not None:
+                            stopper(cancel)
                         return
+                    done.wait(WATCH_CLIENT_S)                # bytes to read (not a hang-up): look again later
 
             threading.Thread(target=watch, daemon=True, name="strata-client-watch").start()
 
@@ -5863,6 +6179,9 @@ def make_handler(svc: Service):
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
                            else {"error": {"type": "server_error", "message": str(e)}})
+            except ImageCacheMiss as e:                     # vLLM's own 400 (a client retries on "Cache miss")
+                print(f"[strata] 400 invalid request: {e}", flush=True)
+                self._json(400, {"error": {"message": str(e), "type": "BadRequestError", "param": None, "code": 400}})
             except ValueError as e:
                 print(f"[strata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
@@ -6069,7 +6388,7 @@ def make_handler(svc: Service):
             in (["*"]: every page) could name any file and, CORS allowing, read what the model says about it.  data:
             and http(s) images are the page's own to send; files come from Strata's own page, a trusted origin or a
             client that is no browser.  ValueError (a 400)."""
-            if self._foreign_origin() and any(not src.startswith(("data:", "http://", "https://"))
+            if self._foreign_origin() and any(src and not src.startswith(("data:", "http://", "https://"))
                                               for src in images_of(messages)):
                 raise ValueError("a web page of another origin cannot have a file on this computer read as an "
                                  "image: send it as a data: URL (or add the page's origin to the config's "
@@ -6184,16 +6503,30 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            stream_options = req.get("stream_options")
+            if stream_options is not None:
+                if not isinstance(stream_options, dict):
+                    raise ValueError("stream_options must be an object")
+                if "include_usage" in stream_options and not isinstance(stream_options["include_usage"], bool):
+                    raise ValueError("stream_options.include_usage must be boolean")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
-            messages, validator = prepare_format(req.get("response_format"), messages)
-            if validator is not None and (tools or req.get("strata_mcp")):
+            req = {k: v for k, v in req.items() if not k.startswith("_grammar")}
+            grammar, fmt = normalize_request(req)
+            messages, validator = prepare_format(fmt, messages)
+            if (validator is not None or grammar is not None) and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
+            native_grammar = str((getattr(svc.engine, "info", {}) or {}).get("grammar", 0)) == "1"
+            if grammar is not None and not native_grammar:
+                raise ValueError("this engine does not support GBNF grammar")
+            if native_grammar and (grammar is not None or validator is not None):
+                compact = (req.get("structured_outputs") or {}).get("disable_any_whitespace", svc.structured_compact)
+                req["_grammar_text"] = grammar if grammar is not None else format_grammar(fmt, compact)
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
@@ -6222,6 +6555,8 @@ def make_handler(svc: Service):
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
+            if (req.get("stream_options") or {}).get("include_usage") is True:
+                chunks = openai_stream_usage(chunks)
             self._sse()
             try:
                 for c in chunks:
@@ -7198,6 +7533,7 @@ def main() -> int:
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    svc.structured_compact = cfg.get("structured_compact") is True
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     # the name the dashboard shows beside the model id, e.g. "DeepSeek-V4.1-Flash-1017 · dsx 2-bit" (optional)
     dn = cfg.get("display_name")
@@ -7323,6 +7659,8 @@ def main() -> int:
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
+    if isinstance(cfg.get("preserve_thinking"), bool):
+        svc.preserve_thinking = cfg["preserve_thinking"]
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
