@@ -160,4 +160,3 @@ inline int draw(const std::vector<std::pair<int, double>>& d, std::mt19937_64& r
     }
     return last;
 }
-
