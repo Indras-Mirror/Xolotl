@@ -104,6 +104,7 @@ bool batch_layer(const Layer& L, size_t li, const std::vector<BatchGroup>& group
             const int32_t* dp = mtp ? s.pos0_m : s.pos0;
             const size_t qo = (size_t) b.first * H * HD;
             const size_t ko = (size_t) b.first * HKV * HD;
+            s.resident_before_write(b.pos);
             k_attn_prep<<<dim3(H + HKV, b.count), kThreads, 0, st>>>(
                 qg + 2 * qo, kx + ko, vx + ko, L.q_norm, L.k_norm, q + qo, gate + qo,
                 s.kc[li], s.vc[li], H, HKV, HD, m->n_rot, dp, s.ctx, m->rope_base, m->eps,

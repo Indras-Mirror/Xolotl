@@ -1,4 +1,5 @@
 #pragma once
+#include "q36_page_provenance.hpp"
 // Shared host-cache metadata only. No CUDA calls. The owner allocates buffers
 // once, joins every worker and destroys every lease before destroying the Hub.
 // Native code accessing the public compatibility fields must hold mutex.
@@ -42,6 +43,44 @@ public:
     size_t n_pages = 0, snapshot_bytes = 0, page_bytes = 0;
     bool snaps_initialized = false, pages_initialized = false;
     uint64_t snap_clock = 0, conv_clock = 0, next_id = 0;
+    bool track_page_versions=false;
+    struct PageVersion { uint64_t cookie=0,version=0;bool ready=false; };
+    std::map<uint8_t*,PageVersion> page_versions;
+    uint64_t page_clock=0;
+    uint64_t next_page_version() {
+        if(page_clock==UINT64_MAX)throw std::overflow_error("cache page version exhausted");
+        return ++page_clock;
+    }
+    strata::q36::resident::PageStamp begin_page_write(uint8_t* page) {
+        if(!track_page_versions)return {};
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        if(page_refs.count(page)==0 || page_refs.at(page)!=1 || !page_versions.count(page))
+            throw std::logic_error("cache write needs an exclusively owned page");
+        auto& v=page_versions.at(page);v.ready=false;v.version=next_page_version();
+        return {uint64_t(reinterpret_cast<uintptr_t>(page)),v.cookie,v.version};
+    }
+    bool finish_page_write(strata::q36::resident::PageStamp ticket) {
+        if(!track_page_versions)return true;
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        auto* page=reinterpret_cast<uint8_t*>(uintptr_t(ticket.page));
+        auto found=page_versions.find(page);
+        if(!ticket.valid() || !page_refs.count(page) || page_refs.at(page)!=1 || found==page_versions.end() ||
+           found->second.ready || found->second.cookie!=ticket.cookie || found->second.version!=ticket.version)return false;
+        found->second.ready=true;return true;
+    }
+    strata::q36::resident::PageStamp page_stamp(uint8_t* page) {
+        if(!track_page_versions)return {};
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        auto found=page_versions.find(page);
+        if(!page_refs.count(page) || found==page_versions.end() || !found->second.ready)return {};
+        return {uint64_t(reinterpret_cast<uintptr_t>(page)),found->second.cookie,found->second.version};
+    }
+    std::vector<strata::q36::resident::PageStamp> page_stamps(const std::vector<uint8_t*>& pages) {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
+        std::vector<strata::q36::resident::PageStamp> stamps;stamps.reserve(pages.size());
+        for(auto page:pages)stamps.push_back(page_stamp(page));
+        return stamps;
+    }
     explicit Hub(size_t snapshots = 128): snaps(snapshots) {}
     Hub(const Hub&) = delete;
     Hub& operator=(const Hub&) = delete;
@@ -91,14 +130,18 @@ public:
     uint8_t* take_page() {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         if (free_pages.empty()) return nullptr;
+        const uint64_t cookie=track_page_versions?next_page_version():0;
         auto* page = free_pages.back(); free_pages.pop_back();
         if (!page || page_refs.count(page)) throw std::logic_error("cache free page is still owned");
-        page_refs.emplace(page, 1); return page;
+        page_refs.emplace(page, 1);
+        if(track_page_versions)page_versions[page]={cookie,0,false};
+        return page;
     }
     // Copy takes place outside metadata locks. The extra source reference keeps
     // the original immutable and alive until the callback has COMPLETED its copy.
     template<class Copy> uint8_t* cow_page(uint8_t* source, Copy copy) {
         uint8_t* destination = nullptr;
+        strata::q36::resident::PageStamp write_ticket;
         {
             std::lock_guard<std::recursive_mutex> lock(mutex);
             auto found = page_refs.find(source);
@@ -106,6 +149,7 @@ public:
             destination = take_page();
             if (!destination) return nullptr;
             ++found->second;
+            write_ticket=begin_page_write(destination);
         }
         bool complete = false;
         try { complete = copy(destination, source, page_bytes); }
@@ -115,6 +159,7 @@ public:
         }
         std::vector<uint8_t*> source_pin{source}; release_pages(source_pin);
         if (!complete) { std::vector<uint8_t*> failed{destination}; release_pages(failed); return nullptr; }
+        if(!finish_page_write(write_ticket))throw std::logic_error("cache COW completion is stale");
         return destination; // one owned reference, not yet published
     }
     // All page writes must already be complete. This transfers, rather than
@@ -126,6 +171,7 @@ public:
         for (auto* page : conv.pages) {
             auto found = page_refs.find(page);
             if (found == page_refs.end() || found->second <= 0) throw std::logic_error("publish unknown cache page");
+            if(track_page_versions && !page_stamp(page).valid())throw std::logic_error("publish unfinished cache page");
         }
         for (auto* state : conv.states)
             if (!owns(state) || !ready(*state) || !state->refs || state->pos > conv.mirrored)

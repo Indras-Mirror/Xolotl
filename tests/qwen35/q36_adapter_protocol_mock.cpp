@@ -27,10 +27,14 @@ std::vector<int> parse_ids(const char* s){std::vector<int> r; std::istringstream
 std::atomic<size_t> mock_used{0};
 namespace strata::q36::kv { struct Budget {size_t cap(){return std::getenv("MOCK_SMALL_CAP")?1024:(std::getenv("MOCK_RECLAIM")?2400000:(1ull<<30));} size_t used(){return std::getenv("MOCK_PRESSURE")?cap():(std::getenv("MOCK_RECLAIM")?mock_used.load():0);}}; struct Driver {}; }
 #include "../../src/qwen35/q36_cache_hub.hpp"
+#include "../../src/qwen35/q36_resident_prefix.hpp"
 std::atomic<int> mock_snap_allocations{0},mock_page_allocations{0};
 struct Model{bool hybrid=false;struct{long long n_embd=2048;}g;};
 struct Arena {size_t held=0;size_t committed_bytes(){return held;} size_t bytes_for(size_t n){return n*16;} bool trim(size_t){if(std::getenv("MOCK_RECLAIM"))mock_used.fetch_sub(held);held=0;return true;}};
 struct Engine {
+    bool resident_prefix_reuse=false, resident_prefix_verify=false;
+    int64_t resident_ram_equal_end=0;
+    strata::q36::resident::Prefix resident_prefix;
     std::shared_ptr<strata::q36::cache::Hub> cache_hub;std::shared_ptr<int> shared_prefill;Model* m=nullptr; int ctx=262144,tmax=512,st=0,mtp_d=3,max_snaps=0,batch_slot=-1; bool use_graph=false,dynamic_attention=false;unsigned long long batch_epoch=0;
     strata::q36::kv::Budget* kv_budget=nullptr; strata::q36::kv::Driver* kv_driver=nullptr;
     std::unique_ptr<Arena> kv_arena=std::make_unique<Arena>(); std::atomic<bool> cancellation{false}; std::atomic<bool>* cancel=&cancellation;
@@ -88,4 +92,4 @@ void serve(Engine& e,ImageCache&,int,size_t park_bytes,const std::string&){
     e.cancel->store(true);if(generating.joinable())generating.join();
 }
 #include "../../src/qwen35/q36_parallel.hpp"
-int main(){std::set_terminate([]{std::_Exit(86);});Model model;Engine scratch;scratch.init(model,262144,512);ImageCache images;strata::q36::kv::Budget budget;strata::q36::kv::Driver driver;int result=serve_parallel(scratch,images,"mock",std::getenv("MOCK_SLOTS")?std::atoi(std::getenv("MOCK_SLOTS")):4,1,std::getenv("MOCK_PREFILL_CHUNK")?std::atoi(std::getenv("MOCK_PREFILL_CHUNK")):64,std::getenv("MOCK_HOST_PARK")?1048576:0,std::getenv("MOCK_NO_SNAPS")?0:1,budget,driver,false);std::fprintf(stderr,"MOCK_HUB_ALLOCS snapshots=%d pages=%d\n",mock_snap_allocations.load(),mock_page_allocations.load());return result;}
+int main(){std::set_terminate([]{std::_Exit(86);});Model model;Engine scratch;scratch.init(model,262144,512);scratch.resident_prefix_reuse=std::getenv("MOCK_RESIDENT_PREFIX")!=nullptr;ImageCache images;strata::q36::kv::Budget budget;strata::q36::kv::Driver driver;int result=serve_parallel(scratch,images,"mock",std::getenv("MOCK_SLOTS")?std::atoi(std::getenv("MOCK_SLOTS")):4,1,std::getenv("MOCK_PREFILL_CHUNK")?std::atoi(std::getenv("MOCK_PREFILL_CHUNK")):64,std::getenv("MOCK_HOST_PARK")?1048576:0,std::getenv("MOCK_NO_SNAPS")?0:1,budget,driver,false);std::fprintf(stderr,"MOCK_HUB_ALLOCS snapshots=%d pages=%d\n",mock_snap_allocations.load(),mock_page_allocations.load());return result;}

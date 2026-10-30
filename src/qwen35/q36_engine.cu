@@ -39,6 +39,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include "q36_cache_hub.hpp"
+#include "q36_resident_prefix.hpp"
+#include "q36_resident_verify.hpp"
 #ifndef __HIP_PLATFORM_AMD__
 #include "q36_kv_vmm_cuda.hpp"
 #endif
@@ -1252,6 +1254,30 @@ struct Q36SharedPrefill {
     }
 };
 struct Engine {
+    bool resident_prefix_reuse=false, resident_prefix_verify=false;
+    strata::q36::resident::Prefix resident_prefix;
+    int64_t resident_teacher_end=0, resident_ram_equal_end=0;
+    std::vector<strata::q36::resident::PageStamp> resident_ram_stamps;
+    std::vector<strata::q36::resident::PageStamp> resident_host_writes;
+    void finish_resident_host_writes() {
+        if(!resident_prefix_reuse)return;
+        for(const auto& ticket:resident_host_writes)
+            if(!cache_hub->finish_page_write(ticket))std::abort();
+        resident_host_writes.clear();
+    }
+    strata::q36::resident::Identity resident_identity() const {
+#ifndef __HIP_PLATFORM_AMD__
+        if(kv_arena) return {uint64_t(reinterpret_cast<uintptr_t>(this)),
+            uint64_t(reinterpret_cast<uintptr_t>(kv_arena->get())),kv_arena->mapping_generation()};
+#endif
+        return {};
+    }
+    void resident_before_write(int64_t first) {
+        if(resident_prefix_reuse) {
+            if(first<0){resident_prefix.invalidate();resident_ram_equal_end=0;}
+            else {resident_prefix.before_write((size_t)first);resident_ram_equal_end=std::min(resident_ram_equal_end,first);}
+        }
+    }
     std::shared_ptr<strata::q36::cache::Hub> cache_hub;
     bool batch_coordinator=false;
     std::shared_ptr<Q36SharedPrefill> shared_prefill;
@@ -1730,6 +1756,7 @@ struct Engine {
             apply(L.wq, xq, qg, T);
             apply(L.wk, xq, kx, T);
             apply(L.wv, xq, vx, T);
+            resident_before_write(p0);
             k_attn_prep<<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, kc[li], vc[li], H,
                                                               HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps,
                                                               m->has_mrope && !mrope_off() ? mrope : nullptr);
@@ -2448,6 +2475,11 @@ struct Engine {
         }
 #endif
         const size_t HD = (size_t) m->g.head_dim, HKV = (size_t) m->g.n_head_kv, cb = HD * sizeof(__half);
+        if(resident_prefix_reuse && to_host && b>a) {
+            if(!resident_host_writes.empty())std::abort();
+            for(size_t pg=(size_t)a/kPage;pg<=((size_t)b-1)/kPage;++pg)
+                resident_host_writes.push_back(cache_hub->begin_page_write(pages[pg]));
+        }
 #ifndef __HIP_PLATFORM_AMD__
         if(kv_arena) {
             // Sparse mapped prefixes are separate regions. A pitched 2D
@@ -2484,6 +2516,48 @@ struct Engine {
         }
     }
 
+    bool verify_resident_prefix(const std::vector<uint8_t*>& pages,size_t end) {
+#ifndef __HIP_PLATFORM_AMD__
+        if(!resident_prefix_verify || !end)return true;
+        const size_t HD=(size_t)m->g.head_dim,HKV=(size_t)m->g.n_head_kv,cb=HD*sizeof(__half);
+        uint8_t* staging=nullptr;
+        CK(cudaHostAlloc((void**)&staging,kPage*cb,cudaHostAllocDefault));
+        struct HostBuffer { uint8_t* p;~HostBuffer(){if(p)cudaFreeHost(p);} } buffer{staging};
+        std::vector<strata::q36::resident::Difference> differences(att_li.size()*2*HKV);
+        for(size_t j=0;j<att_li.size();++j)for(int kv=0;kv<2;++kv) {
+            const auto* device=reinterpret_cast<const uint8_t*>((kv?vc:kc)[(size_t)att_li[j]]);
+            const bool valid=strata::q36::kv::for_each_copy_row((size_t)ctx,cb,HKV,kPage,
+                kv_arena->committed_tokens(),0,end,
+                [&](size_t pg,size_t device_offset,size_t host_offset,size_t bytes) {
+                    const size_t head=host_offset/(kPage*cb);
+                    const size_t first=(device_offset-head*(size_t)ctx*cb)/cb;
+                    const auto* expected=pages[pg]+(j*2+(size_t)kv)*HKV*kPage*cb+host_offset;
+                    CK(cudaMemcpyAsync(staging,device+device_offset,bytes,cudaMemcpyDeviceToHost,st));
+                    // Diagnostic only: each bounded staging segment must be
+                    // complete before CPU comparison or buffer reuse.
+                    CK(cudaStreamSynchronize(st));
+                    differences[(j*2+(size_t)kv)*HKV+head].observe(first,staging,expected,bytes,cb);
+                });
+            if(!valid)std::abort();
+        }
+        uint64_t bad_bytes=0;
+        for(size_t plane=0;plane<differences.size();++plane) {
+            const auto& diff=differences[plane];bad_bytes+=diff.different_bytes;
+            const size_t head=plane%HKV,j=(plane/HKV)/2,kv=(plane/HKV)%2;
+            std::fprintf(stderr,"Q36_RESIDENT_VERIFY {\"event\":\"plane\",\"slot_id\":%d,\"request_epoch\":%llu,\"layer\":%d,\"kv\":%zu,\"head\":%zu,\"cells\":%zu,\"bytes\":%llu,\"different_bytes\":%llu,\"different_cells\":%llu,\"first_cell\":%lld,\"first_byte_in_cell\":%zu,\"last_cell\":%lld,\"gpu_fnv1a64\":%llu,\"ram_fnv1a64\":%llu}\n",
+                batch_slot,batch_epoch,att_li[j],kv,head,end,(unsigned long long)diff.bytes,
+                (unsigned long long)diff.different_bytes,(unsigned long long)diff.different_cells,
+                diff.same()?-1LL:(long long)diff.first_cell,diff.first_byte_in_cell,
+                diff.same()?-1LL:(long long)diff.last_cell,(unsigned long long)diff.gpu_hash,(unsigned long long)diff.ram_hash);
+        }
+        std::fprintf(stderr,"Q36_RESIDENT_VERIFY {\"event\":\"decision\",\"slot_id\":%d,\"request_epoch\":%llu,\"proposed_skip_cells\":%zu,\"effective_skip_cells\":%zu,\"different_bytes\":%llu,\"fallback_full_ram\":%s}\n",
+            batch_slot,batch_epoch,end,bad_bytes?size_t(0):end,(unsigned long long)bad_bytes,bad_bytes?"true":"false");
+        return !bad_bytes;
+#else
+        (void)pages;(void)end;return false;
+#endif
+    }
+
     /// Set while a request runs (serve's STOP). Eager resident prefill rolls back an interrupted chunk;
     /// decode graphs and hybrid inference retain their complete-step / complete-chunk boundaries.
     const std::atomic<bool>* cancel = nullptr;
@@ -2505,6 +2579,7 @@ struct Engine {
     void process(const int32_t* toks, int64_t n, F on_chunk, const float* const* img = nullptr,
                  const std::vector<Cut>* cuts = nullptr) {
         prefill_aborted = false;
+        if(resident_prefix_reuse) resident_teacher_end=pos;
         if (!ensure_kv((size_t) (pos + n))) { std::fprintf(stderr, "strata-q36: unreserved KV operation\n"); std::abort(); }
         const int N = (int) m->g.n_embd;
         if (n == 1 && (img == nullptr || img[0] == nullptr) && (cuts == nullptr || cuts->empty())) {
@@ -2518,6 +2593,7 @@ struct Engine {
             rows_deferred = false;
             CK(cudaMemcpyAsync(hlast, hmain, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             pos += 1;
+            if(resident_prefix_reuse && !(m->has_mtp && mtp_d>0))resident_teacher_end=pos;
             after_rows(1);
             on_chunk(1);
             return;
@@ -2572,6 +2648,7 @@ struct Engine {
                 break;
             }
             pos += T;
+            if(resident_prefix_reuse)resident_teacher_end=pos;
             i = end;
             while (cuts && ci < cuts->size() && (*cuts)[ci].pos <= pos) {
                 if ((*cuts)[ci].pos == pos) save_snap((*cuts)[ci].hash, (*cuts)[ci].prio);
@@ -3352,6 +3429,14 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         if(E.cache_hub) {
             if(E.host_page_count()==0) return;
             const int64_t want=E.pos;
+            if(E.resident_prefix_reuse && E.resident_ram_equal_end>0) {
+                const auto current=E.cache_hub->page_stamps(act_pages);
+                for(size_t start=0;start<(size_t)E.resident_ram_equal_end;start+=Engine::kPage) {
+                    const size_t pg=start/Engine::kPage;
+                    if(pg>=current.size() || pg>=E.resident_ram_stamps.size() || !current[pg].valid() ||
+                       !(current[pg]==E.resident_ram_stamps[pg])){E.resident_ram_equal_end=(int64_t)start;break;}
+                }
+            }
             for(int64_t pg=act_mirrored/Engine::kPage;pg<(int64_t)act_pages.size() && pg*Engine::kPage<want;++pg) {
                 uint8_t* source=act_pages[(size_t)pg]; bool shared=false;
                 { auto lock=E.host_lock(); shared=page_refs.at(source)>1; }
@@ -3374,10 +3459,15 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             }
             const int64_t end=std::min<int64_t>(want,(int64_t)act_pages.size()*Engine::kPage);
             if(end>act_mirrored) {
-                E.kv_copy(act_pages,act_mirrored,end,true);
+                const int64_t begin=act_mirrored;
+                E.kv_copy(act_pages,begin,end,true);
                 CK(cudaStreamSynchronize(E.st));
+                E.finish_resident_host_writes();
+                if(E.resident_prefix_reuse && begin<=E.resident_ram_equal_end)
+                    E.resident_ram_equal_end=std::max(E.resident_ram_equal_end,end);
                 act_mirrored=end;
             }
+            if(E.resident_prefix_reuse)E.resident_ram_stamps=E.cache_hub->page_stamps(act_pages);
             return;
         }
         if (E.host_page_count() == 0) return;
@@ -3835,6 +3925,8 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                              (int) will_park, (long long) n);
         };
         int64_t brought = 0;
+        size_t resident_skipped=0;
+        std::vector<strata::q36::resident::PageStamp> resident_selected_stamps;
         strata::q36::cache::Hub::SnapPin selected_pin;
         uint64_t restored_record_id=0;
         int restored_origin_slot=-1;
@@ -3855,8 +3947,28 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                 brought=reuse; ++switches; cells_brought+=brought;
             } else if(from || reuse) std::abort();
             selection_lock.unlock();
-            if(src>=0) E.kv_copy(act_pages,0,reuse,false);
+            if(src>=0) {
+#ifndef __HIP_PLATFORM_AMD__
+                if(E.resident_prefix_reuse) {
+                    resident_selected_stamps=E.cache_hub->page_stamps(act_pages);
+                    resident_skipped=E.resident_prefix.reusable(E.resident_identity(),cell,(size_t)reuse,
+                        E.kv_arena->committed_tokens(),resident_selected_stamps,Engine::kPage);
+                }
+#endif
+                if(E.resident_prefix_verify && resident_skipped && !E.verify_resident_prefix(act_pages,resident_skipped)) {
+                    E.resident_prefix.invalidate();resident_skipped=0;
+                }
+                E.resident_before_write((int64_t)resident_skipped);
+                if((int64_t)resident_skipped<reuse)E.kv_copy(act_pages,(int64_t)resident_skipped,reuse,false);
+            }
             if(from) E.restore_snap(*from); else E.reset();
+            if(E.resident_prefix_reuse) {
+                // The skip was certified against THESE immutable pages; the
+                // remaining range has now completed H2D at restore_snap's fence.
+                E.resident_ram_equal_end=reuse;
+                E.resident_ram_stamps=resident_selected_stamps;
+                E.resident_prefix.publish(E.resident_identity(),cell,(size_t)reuse,resident_selected_stamps,Engine::kPage);
+            }
             selected_pin.reset();
             if(src>=0 && std::getenv("STRATA_Q36_BATCH_TRACE")) {
                 auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
@@ -3972,6 +4084,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         q36_printf("RESUME %lld\n", (long long) reuse);
         q36_flush();
         std::fprintf(stderr, "strata-q36: prompt from cell %lld of %lld at %.3f\n", (long long) reuse, (long long) n, wall_ms());
+        E.resident_before_write(reuse);
         E.process(ids.data() + reuse, fresh, [&](int64_t done) {
             // Each callback publishes only a fully committed chunk. Incremental host mirroring
             // prevents a later cancellation/switch from inheriting an entire prompt's KV copy.
@@ -4116,6 +4229,16 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         };
         const bool canceled = cut_short || stop.load();
         int nx = canceled ? -1 : sampled || constrained ? next_sampled() : E.greedy();
+        if(E.resident_prefix_reuse && !canceled && !E.prefill_aborted) {
+            const size_t valid=(size_t)std::min({E.pos,E.resident_teacher_end,act_mirrored,E.resident_ram_equal_end});
+            E.resident_prefix.publish(E.resident_identity(),cell,valid,E.resident_ram_stamps,Engine::kPage);
+        }
+        if(E.resident_prefix_reuse && std::getenv("STRATA_Q36_BATCH_TRACE")) {
+            const auto stamp=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+            std::fprintf(stderr,"Q36_BATCH_EVENT {\"event\":\"resident_prefix\",\"monotonic_ns\":%lld,\"slot_id\":%d,\"request_epoch\":%llu,\"mapping_generation\":%llu,\"reuse_cells\":%lld,\"skipped_cells\":%zu,\"copied_cells\":%lld,\"skipped_bytes\":%zu,\"copied_bytes\":%zu,\"valid_end\":%zu}\n",
+                (long long)stamp,E.batch_slot,E.batch_epoch,(unsigned long long)E.resident_identity().generation,(long long)reuse,resident_skipped,(long long)reuse-(long long)resident_skipped,
+                resident_skipped*(E.page_bytes()/Engine::kPage),((size_t)reuse-resident_skipped)*(E.page_bytes()/Engine::kPage),E.resident_prefix.valid_end());
+        }
         bool done = canceled;
         if (canceled) finish = "cancel";
         auto keep = [&](int32_t t) { live.push_back(t); live_v.push_back((uint64_t) (uint32_t) t); };
@@ -4227,7 +4350,7 @@ int strata::qwen35::run(int argc, char** argv) {
     bool warm = true;
     int expert_slots = 0;
     int snapshots = 0, snap_every = 512, image_cache_mib = 2048, park_mib = 0;
-    bool serve_mode = false, graph = true;
+    bool serve_mode = false, graph = true, resident_prefix_reuse = false, resident_prefix_verify = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -4244,6 +4367,8 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--serve") serve_mode = true;
         else if (a == "--batch") batch = std::atoi(next().c_str());
         else if (a == "--batch-kv-mib") batch_kv_mib = std::atoi(next().c_str());
+        else if (a == "--resident-prefix-reuse") resident_prefix_reuse = true;
+        else if (a == "--resident-prefix-verify") resident_prefix_verify = true;
         else if (a == "--batch-prefill-chunk") batch_prefill_chunk = std::atoi(next().c_str());
         else if (a == "--max-context" || a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--chunk" || a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 0 : std::atoi(v.c_str()); }
@@ -4289,6 +4414,12 @@ int strata::qwen35::run(int argc, char** argv) {
                          "       --tokens @FILE reads comma/space separated token IDs from a file\n");
             return 2;
         }
+    }
+    if(resident_prefix_verify && !resident_prefix_reuse) {
+        std::fprintf(stderr,"strata-q36: --resident-prefix-verify requires --resident-prefix-reuse\n");return 2;
+    }
+    if(resident_prefix_reuse && (!serve_mode || batch<2 || batch>4)) {
+        std::fprintf(stderr,"strata-q36: --resident-prefix-reuse needs --serve --batch 2..4\n");return 2;
     }
     if (model.empty()) { std::fprintf(stderr, "strata-q36: --model is required\n"); return 2; }
 #if !defined(_WIN32)
@@ -4336,6 +4467,8 @@ int strata::qwen35::run(int argc, char** argv) {
     }
     Engine E;
     E.batch_coordinator=batch>1;
+    E.resident_prefix_reuse=resident_prefix_reuse;
+    E.resident_prefix_verify=resident_prefix_verify;
     if(batch>1) E.shared_prefill=std::make_shared<Q36SharedPrefill>();
 #ifndef __HIP_PLATFORM_AMD__
     E.kv_budget = batch_budget.get(); E.kv_driver = batch_driver.get();
