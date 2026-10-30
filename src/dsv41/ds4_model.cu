@@ -3129,6 +3129,21 @@ struct Model::Impl {
         calibrate_paths();
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
+        // On by default for a Windows HIP build on an APU (Strix Halo: measured +7.5% decode, no change in the prompt); DS4_NO_VIEW=1 forces it
+        // on anywhere, DS4_NO_VIEW=0 turns it off
+        bool no_view = std::getenv("DS4_NO_VIEW") != nullptr && std::atoi(std::getenv("DS4_NO_VIEW")) != 0;
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+        if (std::getenv("DS4_NO_VIEW") == nullptr && !devs.empty()) {
+            cudaDeviceProp vp{};
+            no_view = cudaGetDeviceProperties(&vp, devs[0].id) == cudaSuccess && vp.integrated != 0;
+        }
+#endif
+        if (no_view && store && pk.gguf) {
+            pk.drop_views();
+            store->set_pfds(pk.pfds);
+            views = false;
+            std::fprintf(stderr, "ds4: no view of the model's files after the load: unbuffered reads at the drive's rate\n");
+        }
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         if (chunk > 0) (void) pick_flow_min();   // (the startup line)
         reset();
