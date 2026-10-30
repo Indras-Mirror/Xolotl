@@ -97,6 +97,9 @@ prefill 289-297 / 395-409 tok/s at 6.1K / 16.5K; full HumanEval (164) 162/164. H
 - **Qwen3.6 vision, shared prefix cache and batched sampled MTP** (#76, NektoDron): text and image prefixes are reused
   across callers and owners, native continuous batches keep each request's DeltaNet state, KV, grammar and MTP
   separate, and GBNF / JSON-schema output is native: [docs/Q36_SERVING.md](docs/Q36_SERVING.md).
+- **Qwen3.6 resident prefix reuse** (#80, NektoDron, opt-in `--resident-prefix-reuse`): when the immutable host pages
+  still describe exactly the KV already on the card, it is kept instead of copied back (an image follow-up copied
+  14.7 MiB instead of 872.7 MiB; first content 195 -> 162 ms). `--resident-prefix-verify` byte-checks it.
 - **No more lost control-queue wakeups** (#79, NektoDron): a fairness waiter could miss its notification and sit out the
   500 ms timeout; it now rechecks under the lock.
 - **GLM-5.3-Flash long conversations no longer crash** (#46, vthomasino): when the graph pool fills and gets rebuilt,
@@ -212,7 +215,7 @@ peasantsmith, ukisai, d0xin and gcsa-abliterix.
 Contributors, with thanks: [NektoDron](https://github.com/NektoDron) (MMQ id slack, forced tool calls, the arena pipe
 and indexer WMMA opt-ins, #48-#52; checked #55; the Q3_K + GPTQ Q2_0 lite calibration and allocation tooling, #58;
 the ggml 6050b467 pool-hook link fix, #72; the control-queue wakeup fix, #79; Qwen3.6 vision, prefix cache and
-batched MTP, #76; deep sleep, #75),
+batched MTP, #76; deep sleep, #75; resident prefix reuse, #80),
 [paul123637-lab](https://github.com/paul123637-lab) (the DSpark seed fixes, #54 and #56; RTX 5080 and 5060 Ti helper
 numbers), [kelheor](https://github.com/kelheor) (the vision `pread` fix, #51), [exye137](https://github.com/exye137)
 (the thread-local CUDA stream leak, #57) [penink-WH](https://github.com/penink-WH) (AC922 rig) and [cpacsm75](https://github.com/cpacsm75) (192 GB
