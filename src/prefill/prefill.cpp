@@ -3377,15 +3377,39 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                         // Diagnostics: STRATA_DUMP_MOE_INPUT=path, STRATA_DUMP_MOE_LAYER=l - the first chunk's MoE input
-                        // of layer l ({T, N, K} int64, T x N floats, T x K expert ids) for testing products on real rows
+                        // of layer l ({T, N, K} int64, T x N floats, T x K expert ids) for testing products on real rows.
+                        // STRATA_DUMP_MOE_ALL=dir dumps EVERY layer of EVERY chunk as dir/moe_L<NN>_c<NNNN>.bin
+                        // (same header layout), for per-expert checks: a per-expert error can only be measured on
+                        // the tokens that route to that expert.
                         static const char* dump_moe = std::getenv("STRATA_DUMP_MOE_INPUT");
+                        static const char* dump_all = std::getenv("STRATA_DUMP_MOE_ALL");
                         static bool dumped_moe = false;
-                        if (dump_moe && !dumped_moe && l == std::atoi(std::getenv("STRATA_DUMP_MOE_LAYER") ? std::getenv("STRATA_DUMP_MOE_LAYER") : "0")) {
-                            dumped_moe = true;
+                        // The layer loop (LB..LE) is INSIDE this per-chunk call, so a counter keyed on a layer-change
+                        // would reset on every layer and each chunk would overwrite the previous chunk's files. Keep
+                        // one monotonic counter PER LAYER instead: c0000, c0001, ... then never collide across chunks,
+                        // and each layer's files stay in chunk order. Guarded: run_impl can serve concurrent sessions.
+                        static std::map<int64_t, int64_t> dump_chunk_by_layer;
+                        static std::mutex dump_mu;
+                        const bool want_layer = dump_moe != nullptr && !dumped_moe &&
+                            l == std::atoi(std::getenv("STRATA_DUMP_MOE_LAYER") ? std::getenv("STRATA_DUMP_MOE_LAYER") : "0");
+                        if (dump_all != nullptr || want_layer) {
+                            if (want_layer) dumped_moe = true;
                             std::vector<float> x((size_t) (T * N));
                             cudaMemcpyAsync(x.data(), m.mixed, x.size() * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
                             cudaStreamSynchronize(m.cs);
-                            if (std::FILE* f = std::fopen(dump_moe, "wb")) {
+                            char path[4096];
+                            if (dump_all != nullptr) {
+                                int64_t chunk;
+                                {
+                                    const std::lock_guard<std::mutex> lk(dump_mu);
+                                    chunk = dump_chunk_by_layer[l]++;
+                                }
+                                std::snprintf(path, sizeof path, "%s/moe_L%02lld_c%04lld.bin",
+                                              dump_all, (long long) l, (long long) chunk);
+                            } else {
+                                std::snprintf(path, sizeof path, "%s", dump_moe);
+                            }
+                            if (std::FILE* f = std::fopen(path, "wb")) {
                                 const int64_t hdr[3] = {(int64_t) T, (int64_t) N, (int64_t) K};
                                 std::fwrite(hdr, sizeof hdr, 1, f);
                                 std::fwrite(x.data(), sizeof(float), x.size(), f);

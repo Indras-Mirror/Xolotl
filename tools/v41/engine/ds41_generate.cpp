@@ -3165,6 +3165,13 @@ int main(int argc, char ** argv) {
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
                          (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
             if (st.remote > 0) std::fprintf(stderr, ", %lld remote", (long long) st.remote);   // STRATA_DS41_REMOTE
+            // INSTRUMENT (no behaviour change): the file tier's real cost per request, and whether it is re-reading
+            // experts the vram_lru rule would admit.  `blocked` is the host's pure wait in the read pool (the ports
+            // 'fwait'); `block` also spans the HIT launches, which overlap the reads.
+            if (st.fileg > 0)
+                std::fprintf(stderr, "; file tier %lld staged, %lld recurring (%.0f%%), blocked %.1f ms of %.1f ms",
+                             (long long) st.fileg, (long long) st.fileg_recurring,
+                             100.0 * (double) st.fileg_recurring / (double) st.fileg, st.fwait_ms, st.file_ms);
             std::fprintf(stderr, "\n");
             if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
                 size_t tf = 0, tt = 0;
@@ -3196,9 +3203,11 @@ int main(int argc, char ** argv) {
             if (rq_pass > 0) {
                 const double n = (double) rq_pass;
                 std::fprintf(stderr, "serve: pass split %.2f ms/pass = verify %.2f (dense %.2f, tier %.2f, taps %.2f, logits %.2f) "
-                             "+ sample %.2f + draft %.2f + other %.2f\n", dec_ms / n, sq_ms[0] / n, (pv_ms[0] - pv0[0]) / n,
+                             "+ sample %.2f + draft %.2f + other %.2f; file blocked %.2f ms/pass (%.1f%% of the pass)\n",
+                             dec_ms / n, sq_ms[0] / n, (pv_ms[0] - pv0[0]) / n,
                              (pv_ms[1] - pv0[1]) / n, (pv_ms[2] - pv0[2]) / n, (pv_ms[3] - pv0[3]) / n, sq_ms[1] / n,
-                             sq_ms[2] / n, (dec_ms - sq_ms[0] - sq_ms[1] - sq_ms[2]) / n);
+                             sq_ms[2] / n, (dec_ms - sq_ms[0] - sq_ms[1] - sq_ms[2]) / n,
+                             st.fwait_ms / n, 100.0 * (st.fwait_ms / n) / std::max(1e-9, dec_ms / n));
             }
 #endif
             tier.rebalance_tick(true);   // the gap until the next request: retire a large batch for the reader

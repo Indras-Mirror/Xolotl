@@ -485,7 +485,12 @@ void ptq1_0_rows_q8_0(const uint8_t* w, size_t row_bytes, int n, const void* con
     // the CPU pool shares the host-RAM bus with the PCIe/NVMe traffic there; more RAM bandwidth (2666+ MT/s) or a pool
     // running alone should show the kernel's own gain.
     static const bool r3 = !(std::getenv("STRATA_PTQ1_ROWS3") && std::getenv("STRATA_PTQ1_ROWS3")[0] == '0');
-    if (avx2 && r3 && n >= 4 * kPtq1Block) {   // rows3 (above): tokens in groups of <= 4, activations permuted per call
+    // rows3 changes the FP32 reduction tree when nt changes. Qwen4Exp's
+    // down projection is only 640 columns (five PTQ1 blocks), and decode must
+    // give the same row bits for a token alone or in a verify window. The
+    // older AVX2 path decodes each block once for all tokens and preserves
+    // this invariant; use it for short rows, including Flash-Next down.
+    if (avx2 && r3 && n >= 4 * kPtq1Block && n > 640) {
         // the prepared activations are kept per thread and reused while the same bytes come back (memcmp, exact): the
         // pool hands a thread 50-100-row slices of one or two experts, all against the same token rows in a gate/up
         // phase, and a fresh prep per call (~6.5 us at 5120) made 8-row slices 2.4x SLOWER than rows_avx2

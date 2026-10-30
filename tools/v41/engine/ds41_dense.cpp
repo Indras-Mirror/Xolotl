@@ -928,8 +928,14 @@ static ggml_tensor * attn_core_slab(Ds41Dense::Impl & im, ggml_context * gc, con
     int64_t M = Kall->ne[1];
     if (!im.cpu && M % 256) {
         const int64_t pad = 256 - M % 256;
-        Kall = f16 ? ggml_concat(gc, Kall, ggml_reshape_3d(gc, rows_as(gc, im.zpad16, ggml_view_1d(gc, im.zidx, pad * n, 0), true),
-                                                           DH, pad, n), 1)
+        // The F32 pad kernel clamps its grid at 65,535 rows (ggml-cuda/pad.cu: min(ne1, 65535)) and leaves every row
+        // past that unwritten, so a slab pass whose visible key count crosses 65,535 would attend to uninitialised
+        // device memory.  Same guard as the two sites below; past the limit build the pad rows explicitly (the same
+        // zeros, no pad kernel).
+        Kall = (f16 || M + pad > 65535)
+             ? ggml_concat(gc, Kall, f16
+                   ? ggml_reshape_3d(gc, rows_as(gc, im.zpad16, ggml_view_1d(gc, im.zidx, pad * n, 0), true), DH, pad, n)
+                   : ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, DH, pad, n), 0.0f), 1)
              : ggml_pad(gc, Kall, 0, (int) pad, 0, 0);
         Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, n), NEG_INF), 0);
         M += pad;
@@ -1189,9 +1195,15 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         int64_t M = Kall->ne[1];
         if (!im.cpu && M % 256) {   // ggml-cuda's flash-attn for d 512 wants the key count a multiple of 256
             const int64_t pad = 256 - M % 256;
-            // F16 has no CUDA pad: concat zeros gathered from the one zero row (F16 -> F16, exact) - the same zeros
-            Kall = f16 ? ggml_concat(gc, Kall, ggml_reshape_3d(gc, rows_as(gc, im.zpad16, ggml_view_1d(gc, im.zidx, pad * gk, 0), true),
-                                                               DH, pad, gk), 1)
+            // F16 has no CUDA pad: concat zeros gathered from the one zero row (F16 -> F16, exact) - the same zeros.
+            // The F32 pad kernel clamps its grid at 65,535 rows (ggml-cuda/pad.cu: min(ne1, 65535)), so it leaves
+            // every row past that unwritten: a prompt whose visible key count crosses 65,535 would attend to
+            // uninitialised device memory.  Past the limit build the pad rows explicitly too - the same zeros, no
+            // pad kernel.  (mab776's 251k-token 1017 run hit this on the other pad site; same class of bug.)
+            Kall = (f16 || M + pad > 65535)
+                 ? ggml_concat(gc, Kall, f16
+                       ? ggml_reshape_3d(gc, rows_as(gc, im.zpad16, ggml_view_1d(gc, im.zidx, pad * gk, 0), true), DH, pad, gk)
+                       : ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, DH, pad, gk), 0.0f), 1)
                  : ggml_pad(gc, Kall, 0, (int) pad, 0, 0);
             Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, gk), NEG_INF), 0);
             M += pad;
@@ -1214,9 +1226,11 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
             ggml_tensor * K = kp.K, * Mk = kp.M;
             const int64_t pad = Mx - K->ne[1];
             if (pad > 0) {
-                K = kp.f16 ? ggml_concat(gc, K, ggml_reshape_3d(gc, rows_as(gc, im.zpad16, ggml_view_1d(gc, im.zidx, pad * kp.k, 0), true),
-                                                                DH, pad, kp.k), 1)
-                           : ggml_pad(gc, K, 0, (int) pad, 0, 0);
+                K = (kp.f16 || Mx > 65535)   // the pad kernel's 65,535-row grid clamp - see the site above
+                    ? ggml_concat(gc, K, kp.f16
+                          ? ggml_reshape_3d(gc, rows_as(gc, im.zpad16, ggml_view_1d(gc, im.zidx, pad * kp.k, 0), true), DH, pad, kp.k)
+                          : ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, DH, pad, kp.k), 0.0f), 1)
+                    : ggml_pad(gc, K, 0, (int) pad, 0, 0);
                 Mk = ggml_concat(gc, Mk, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, kp.k), NEG_INF), 0);
             }
             if (Kx && K->type != Kx->type) K = ggml_cast(gc, K, Kx->type);

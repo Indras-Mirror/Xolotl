@@ -379,6 +379,9 @@ struct Ds41MoeStats {
     int64_t file_tier = 0;          ///< reads served by the blob source instead of the arena
     double gap_ms = 0, hit_ms = 0, pcie_ms = 0, cpu_ms = 0, wall_ms = 0;
     double file_ms = 0;             ///< time spent reading file-tier blobs (inside run / prefetch)
+    double fwait_ms = 0;            ///< gpu_run_n_ex: host time BLOCKED in the file-tier read pool (the ports 'fwait')
+    int64_t fileg = 0;              ///< gpu_run_n_ex: file-tier (NVMe) experts staged onto the card this request
+    int64_t fileg_recurring = 0;    ///< ...of which the vram_lru admission rule would admit (so FILEG re-reads them)
     int64_t arena_swaps = 0;        ///< arena_adapt: file-tier experts moved into the arena
     int64_t vram_swaps = 0;         ///< vram_lru: misses / prefetches moved into a VRAM slot
     int64_t vram_demotes = 0;       ///< ...of which the victim went back to the arena (it had no arena copy)

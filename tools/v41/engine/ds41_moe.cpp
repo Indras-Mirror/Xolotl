@@ -4451,6 +4451,16 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         lc = ++im.lcalls[(size_t) layer];
         for (int u = 0; u < nu; ++u) im.vlast[(size_t) (layer * NXL + ue[u])] = im.tick;
     }
+    // INSTRUMENT (no behaviour change): the NVMe experts this call stages, and how many of them the vram_lru
+    // admission rule would have admitted.  A recurring one passes admit_ok every pass but FILEG is excluded from
+    // admission below (cls[u] == PCIE only), so its blob is read from the drive again and again; this is the number
+    // that says whether the file tier's cost is re-reading the same hot experts (fixable) or one-off misses.
+    if (nfg > 0) {
+        st.fileg += nfg;
+        if (lru)
+            for (int b = 0; b < nfg; ++b)
+                if (admit_ok(ue[fg_u[b]])) ++st.fileg_recurring;
+    }
     // The launches' metadata goes into the pinned h_meta block at monotonic offsets (never reused within this call;
     // the call ends with a stream sync, so the next call can start over) and up in ONE async copy per launch - it was
     // five pageable cudaMemcpyAsync per launch, each staged synchronously by the driver.  Offsets [0, kMetaW) hold the
@@ -4539,8 +4549,19 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                         while (fg_u[b] != u) ++b;
                         src = fg_src[b];
                     }
-                    // LRU admission (arena-held PCIe misses only, as gpu_run)
-                    int32_t v = (lru && cls[u] == PCIE && admit_ok(e)) ? lru_victim(e) : -1;
+                    // LRU admission (arena-held PCIe misses, as gpu_run).  STRATA_FILEG_ADMIT=1 (opt-in): a
+                    // FILE-tier miss that RECURS (admit_ok: it also missed within the last kLruWin calls) is
+                    // admitted the same way - its pinned staging copy is DMA'd into the victim's VRAM slot
+                    // instead of a d_stage slot, so the next pass is an ordinary HIT and the NVMe read is not
+                    // repeated.  Until now FILEG was excluded, so a hot file-tier expert was re-read every pass.
+                    // Only when the victim keeps an arena copy (the demote path would need an arena slot for
+                    // `e`, and a file-tier expert has none - the existing guard rejects that case).  This
+                    // changes routing indirectly: residency feeds the route bias, so gate it on short34.
+                    static const bool fileg_admit = std::getenv("STRATA_FILEG_ADMIT") &&
+                                                    std::getenv("STRATA_FILEG_ADMIT")[0] != '0';
+                    int32_t v = (lru && (cls[u] == PCIE || (fileg_admit && cls[u] == FILEG)) && admit_ok(e))
+                                    ? lru_victim(e)
+                                    : -1;
                     if (v >= 0 && arena_slot(v) < 0 && arena_slot(e) < 0) v = -1;   // nowhere to demote to
                     const bool demote = v >= 0 && arena_slot(v) < 0;
                     if (v < 0 || demote) {   // through a d_stage slot (the kernel reads it there)
@@ -4608,7 +4629,9 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         }
     }
     if (nfg > 0) {   // the file-tier blobs must be home before their DMAs are queued
+        const double tw = nfr > 0 ? now_ms() : 0.0;
         if (nfr > 0) gp.rpool->wait();
+        if (nfr > 0) im.st.fwait_ms += now_ms() - tw;   // INSTRUMENT: the block on NVMe alone (not the HIT launches)
         im.st.file_tier += nfg;
         im.st.file_ms += now_ms() - tfg;
     }
@@ -6961,6 +6984,9 @@ void Ds41MoeStats::add(const Ds41MoeStats& o) {
     pcie += o.pcie;
     file_tier += o.file_tier;
     file_ms += o.file_ms;
+    fwait_ms += o.fwait_ms;
+    fileg += o.fileg;
+    fileg_recurring += o.fileg_recurring;
     arena_swaps += o.arena_swaps;
     vram_swaps += o.vram_swaps;
     vram_demotes += o.vram_demotes;

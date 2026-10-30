@@ -17,6 +17,7 @@
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/ptq1_0.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
 
@@ -54,14 +55,17 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
                cudaStream_t s) {
     int failures = 0;
     // (a) the float reference
-    const auto* tg = ggml_get_type_traits((ggml_type) f.gu_type);
-    const auto* td = ggml_get_type_traits((ggml_type) f.d_type);
+    // PTQ1_0 is Strata's type 143, deliberately outside vendored ggml's enum.
+    auto dequant = [](int type, const uint8_t* src, float* dst, int64_t n) {
+        if (type == cpu::kPtq1Type) cpu::ptq1_0_dequant(src, dst, n);
+        else ggml_get_type_traits((ggml_type) type)->to_float(src, dst, n);
+    };
     std::vector<float> G((size_t) FF * H), U((size_t) FF * H), D((size_t) H * FF);
     for (int64_t r = 0; r < FF; ++r) {
-        tg->to_float(blob.data() + r * f.gu_row, G.data() + r * H, H);
-        tg->to_float(blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
+        dequant(f.gu_type, blob.data() + r * f.gu_row, G.data() + r * H, H);
+        dequant(f.gu_type, blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
     }
-    for (int64_t r = 0; r < H; ++r) td->to_float(blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
+    for (int64_t r = 0; r < H; ++r) dequant(f.d_type, blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
     if (f.tail_off) {   // the blob's scales, as the engine applies them (gate and up as read, down on its output)
         float tail[4];
         std::memcpy(tail, blob.data() + f.tail_off, sizeof tail);
@@ -178,7 +182,12 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
                 const void* h1[1] = {hp[k]};
                 float* o1[1] = {one_out.data()};
                 cpu::native_down_rows(f, blob.data(), h1, 1, o1, 0, (int) H);
-                for (int64_t r = 0; r < H; ++r) dn_diff += std::memcmp(&one_out[r], &got_c[k * H + r], 4) != 0;
+                for (int64_t r = 0; r < H; ++r) {
+                    if (std::memcmp(&one_out[r], &got_c[k * H + r], 4) != 0 && dn_diff < 8)
+                        std::printf("          PTQ down mismatch token %d row %lld: one=% .9g three=% .9g\n", k,
+                                    (long long) r, one_out[r], got_c[k * H + r]);
+                    dn_diff += std::memcmp(&one_out[r], &got_c[k * H + r], 4) != 0;
+                }
             }
             std::printf("          width invariance (1 vs %d tokens): gate/up %zu, down %zu rows differ\n", NT,
                         gu_diff, dn_diff);
@@ -377,13 +386,14 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
     const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
     const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
     std::printf("%-9s %-8s/%-7s blob %8zu  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n", label.c_str(),
-                ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), f.bytes, ec, eg, ecg,
+                strata::ggml_type_name((uint32_t) f.gu_type), strata::ggml_type_name((uint32_t) f.d_type), f.bytes, ec, eg, ecg,
                 ok ? "ok" : "FAIL");
     return failures + (ok ? 0 : 1);
 }
 
 int type_of(std::string name) {
     for (auto& c : name) c = (char) std::tolower((unsigned char) c);
+    if (name == "ptq1_0" || name == "ptq1") return cpu::kPtq1Type;
     for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
         const char* n = ggml_type_name((ggml_type) t);
         if (n == nullptr) continue;
@@ -406,8 +416,9 @@ std::vector<uint8_t> synthetic_blob(const cpu::NativeFmt& f, int seed) {
             for (int64_t c = 0; c < cols; ++c) w[(size_t) (r * cols + c)] = scale * nd(rng);
         }
         const std::vector<float> imatrix((size_t) cols, 1.0f);
-        ggml_quantize_chunk((ggml_type) type, w.data(), dst, 0, rows, cols,
-                            ggml_quantize_requires_imatrix((ggml_type) type) ? imatrix.data() : nullptr);
+        if (type == cpu::kPtq1Type) cpu::ptq1_0_quantize_ref(w.data(), dst, w.size());
+        else ggml_quantize_chunk((ggml_type) type, w.data(), dst, 0, rows, cols,
+                                ggml_quantize_requires_imatrix((ggml_type) type) ? imatrix.data() : nullptr);
     };
     quant(f.gu_type, FF, H, blob.data());
     quant(f.gu_type, FF, H, blob.data() + f.up_off);
