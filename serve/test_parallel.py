@@ -40,7 +40,7 @@ def reader():
     lines.put(None)
 threading.Thread(target=reader, daemon=True).start()
 print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
-      (" slot_cache=1" if "--slotcache" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
+      (" slot_cache=1" if "--slotcache" in args else "") + (" batch_pinned=1" if "--pinned" in args else "") + (f" batch_groups={groups}" if groups > 1 else ""), flush=True)
 print("READY 4096 stop", flush=True)
 LONG = list(b"LONGREPLY")
 def continued(ids):        # (the whole reply, how much of it the prompt already ends with: a request continued)
@@ -233,6 +233,48 @@ class PickSlot(unittest.TestCase):
         e.slot_live = [None] * n
         e.slot_group = [0] * n
         return e
+
+    def test_pinned_relative_affinity_does_not_cluster_new_users_on_shared_system(self):
+        e = self.engine(4)
+        e.info = {"batch_pinned": "1"}
+        e.slot_histories = [[] for _ in range(4)]
+        system = list(range(5000))
+        prompts = [system + [100000 + client] + [200000] * (39935 - 5001) for client in range(4)]
+        for client, prompt in enumerate(prompts):
+            owner = e.pick_slot(prompt)
+            self.assertEqual(owner, client)      # shared5K is not own39K history
+            e.slot_held[owner] = prompt + [900000]
+            e.slot_histories[owner] = [list(e.slot_held[owner])]
+            e.slot_used[owner] = client + 1
+        edited = prompts[1][:-2034] + [300000] * 2034
+        self.assertEqual(e.pick_slot(edited), 1)  # own37901-token prefix keeps its owner
+        # Even an entirely shared, short held stream must not bypass the
+        # relative rule through the old nonpinned held_prefix fallback.
+        e.slot_held = [system, [], [], []]
+        e.slot_histories = [[system], [], [], []]
+        self.assertEqual(e.pick_slot(prompts[0]), 1)
+        e.info = {}                             # other engines retain their established policy
+        self.assertEqual(e.pick_slot(prompts[0]), 0)
+
+    def test_slot_done_optional_mtp_counters_are_request_local(self):
+        e = self.engine(2)
+        barrier = threading.Barrier(2)
+        results = {}
+        def finish(slot, accepted, offered):
+            e.last = {"generated": 1, "drafts_accepted": 0, "drafts_offered": 0}
+            barrier.wait()
+            e._apply_bdone(f"BDONE {slot} 41 stop 12.5 accepted={accepted} offered={offered}".split())
+            results[slot] = dict(e.last)
+        threads = [threading.Thread(target=finish,args=(0,21,30)), threading.Thread(target=finish,args=(1,8,18))]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(5)
+        self.assertEqual((results[0]["drafts_accepted"],results[0]["drafts_offered"]),(21,30))
+        self.assertEqual((results[1]["drafts_accepted"],results[1]["drafts_offered"]),(8,18))
+        e.last = {"generated": 1, "drafts_accepted": 3, "drafts_offered": 6}
+        e._apply_bdone("BDONE 0 9 length 2.0".split())
+        self.assertEqual((e.last["drafts_accepted"],e.last["drafts_offered"]),(3,6))
+        e._apply_bdone("BDONE 0 9 length 2.0 accepted=bad offered=-1 future=99".split())
+        self.assertEqual((e.last["drafts_accepted"],e.last["drafts_offered"]),(3,6))
 
     def test_the_slot_that_holds_the_conversation(self):
         e = self.engine(3)
@@ -632,6 +674,25 @@ class ParallelService(unittest.TestCase):
         slot = self.engine.slot_held.index(mine[0])
         self.assertEqual(self.engine.pick_slot(mine[0] + [10, 11]), slot)
         self.assertEqual(first["choices"][0]["message"]["content"], "ok, done.")
+
+    def test_native_mtp_pinned_owner_never_restarts_a_request(self):
+        # Native slot grammar and RNG are continuation state, while a fresh
+        # GEN/BGEN prompt starts them again. A late waiter and a later departure
+        # must not trigger either migration for an engine with this capability.
+        self.start(2, slot_cache=True, more=("--pinned",))
+        expected = "ok, " + "la " * 15 + "done."
+        self.assertEqual(self.chat("alone LONGREPLY", 200)["choices"][0]["message"]["content"], expected)
+        result = {}
+        long = threading.Thread(target=lambda: result.setdefault("long", self.chat("late waiter LONGREPLY", 200)))
+        long.start()
+        time.sleep(0.15)
+        self.assertEqual(self.chat("short", 200)["choices"][0]["message"]["content"], "ok, done.")
+        long.join(30)
+        self.assertFalse(long.is_alive())
+        self.assertEqual(result["long"]["choices"][0]["message"]["content"], expected)
+        kinds = [line.split()[0] for line in self.log.read_text().splitlines()]
+        self.assertNotIn("GEN", kinds)
+        self.assertEqual(kinds.count("BGEN"), 3, kinds)  # exactly one admission per request
 
     def test_a_failed_window_names_its_error(self):
         # #997 #890: a batch window fails while every request reads its own slot's lines, so no request reads the

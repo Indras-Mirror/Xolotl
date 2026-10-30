@@ -1017,6 +1017,7 @@ class StrataEngine:
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
+        self.slot_histories: list[list[list[int]]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
@@ -1170,13 +1171,38 @@ class StrataEngine:
                     self.slot_cv.notify_all()    # new engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
 
-    refill = None   # q36 (img_refs): rewrites this request's embeddings file with every picture's rows (NEED_IMAGES)
+    @property
+    def refill(self):
+        # Image reference fallback belongs to the request thread, just like
+        # batch statistics. Another request must never replace its file writer.
+        tl = self.__dict__.setdefault("_tl", threading.local())
+        return getattr(tl, "refill", None)
+
+    @refill.setter
+    def refill(self, callback):
+        self.__dict__.setdefault("_tl", threading.local()).refill = callback
+
     _running_cancel = None
 
     def stop_if_running(self, cancel) -> None:
         """The client of the request the engine is running (its `cancel`) hung up: STOP now, from the watcher's thread -
         not at the request thread's next engine line (a token, or a prompt chunk 0.1-0.3 s later).  The request thread
         still drains to DONE as before."""
+        # Pinned native slots keep their request identity through admission and decode.
+        # Inspect and write under the same lock as slot reuse/BGEN registration.
+        with getattr(self, "wlock", None) or contextlib.nullcontext():
+            owner = getattr(self, "_slot_cancel_owners", {}).get(cancel)
+            if owner is not None:
+                slot, born, proc, token = owner
+                current = getattr(self, "_slot_cancel_tokens", {}).get(slot)
+                if (current is token and self.gen == born and self.proc is proc
+                        and self.can_stop and self.alive()):
+                    try:
+                        proc.stdin.write(f"BSTOP {slot}\n")
+                        proc.stdin.flush()
+                    except (OSError, AttributeError):
+                        pass
+                return
         if self._running_cancel is cancel and self.can_stop and self.alive():
             try:
                 with self.wlock:
@@ -1187,16 +1213,92 @@ class StrataEngine:
             except (OSError, AttributeError):
                 pass
 
-    def have(self, keys: list[str], timeout: float = 30.0) -> list[tuple[int, int, int] | None]:
+    def _send_owned_batch(self, text, cancel, slot, born):
+        """Publish a pinned slot owner and its BGEN atomically against watcher BSTOP.
+
+        Q36's per-worker input accepts BSTOP during admission as well as decode.
+        Other batch engines retain their existing admission cancellation protocol.
+        """
+        with self.wlock:
+            if cancel.is_set():
+                return None
+            if self.gen != born or not self.alive():
+                raise EngineDied("the engine changed before this request was sent")
+            owner = (slot, born, self.proc, object())
+            if str((self.info or {}).get("batch_pinned", 0)) == "1":
+                if not hasattr(self, "_slot_cancel_owners"):
+                    self._slot_cancel_owners, self._slot_cancel_tokens = {}, {}
+                self._slot_cancel_owners[cancel] = owner
+                self._slot_cancel_tokens[slot] = owner[3]
+            try:
+                self.proc.stdin.write(text + "\n")
+                self.proc.stdin.flush()
+            except (OSError, AttributeError):
+                # The caller has not received owner yet, so undo publication here.
+                owners = getattr(self, "_slot_cancel_owners", {})
+                tokens = getattr(self, "_slot_cancel_tokens", {})
+                if owners.get(cancel) is owner:
+                    owners.pop(cancel, None)
+                if tokens.get(slot) is owner[3]:
+                    tokens.pop(slot, None)
+                raise EngineDied("the engine stopped before this request was sent") from None
+            return owner
+
+    def _forget_batch_owner(self, cancel, owner):
+        if owner is None:
+            return
+        with self.wlock:
+            owners = getattr(self, "_slot_cancel_owners", {})
+            tokens = getattr(self, "_slot_cancel_tokens", {})
+            if owners.get(cancel) is owner:
+                owners.pop(cancel, None)
+            if tokens.get(owner[0]) is owner[3]:
+                tokens.pop(owner[0], None)
+
+    HAVE_ADMISSION_WAIT_S = 300.0   # queued behind a legal long prefill, not a silent native HAVE reply
+
+    def have(self, keys: list[str], timeout: float = 30.0, cancel=None) -> list[tuple[int, int, int] | None]:
+        """HAVE is a control exchange: batch decodes may continue, admission may not steal its reply."""
+        if not keys:
+            return []
+        ctl = getattr(self, "ctl", None) if getattr(self, "batch", 0) else None
+        admission_deadline = time.monotonic() + self.HAVE_ADMISSION_WAIT_S
+        acquired = False
+        try:
+            if ctl is not None:
+                while not acquired:
+                    if cancel is not None and cancel.is_set():
+                        raise ClientGone()
+                    remaining = admission_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ModelBusy("a prompt is still being admitted; try the image again shortly")
+                    acquired = ctl.acquire(timeout=min(0.05, remaining))
+            born, proc = getattr(self, "gen", None), self.proc
+            if cancel is not None and cancel.is_set():
+                raise ClientGone()
+            # This reply deadline starts only once this exchange owns ctl.
+            # Admission can legitimately queue behind a full-context prefill.
+            result = self._have_idle(keys, timeout)
+            if getattr(self, "gen", None) != born or self.proc is not proc:
+                raise EngineDied("the engine changed during its HAVE answer")
+            return result
+        finally:
+            if acquired:
+                ctl.release()
+
+    def _have_idle(self, keys: list[str], timeout: float = 30.0) -> list[tuple[int, int, int] | None]:
         """`HAVE <key,...>` between requests (the caller holds the FIFO): which pictures the engine holds by their keys
         (img_refs engines) -> (n, nx, ny) or None for each."""
         if not keys:
             return []
+        proc, born, lines = self.proc, getattr(self, "gen", None), self.lines
         self._send("HAVE " + ",".join(keys))
         deadline = time.time() + timeout
         while True:
+            if self.proc is not proc or getattr(self, "gen", None) != born:
+                raise EngineDied("the engine changed during its HAVE answer")
             try:
-                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+                line = lines.get(timeout=max(0.1, deadline - time.time()))
             except queue.Empty:
                 raise EngineDied("the engine did not answer HAVE") from None
             if line is None:
@@ -1466,6 +1568,14 @@ class StrataEngine:
         if len(f) >= 5 and isinstance(self.last, dict):
             self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
                          "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+            # Optional named counters preserve the five-field protocol used by
+            # older engines. A native MTP slot reports its complete request,
+            # rather than the admission's first-token draft count of zero.
+            names = {"accepted": "drafts_accepted", "offered": "drafts_offered"}
+            for field in f[5:]:
+                key, sep, value = field.partition("=")
+                if sep and key in names and value.isdigit():
+                    self.last = {**self.last, names[key]: int(value)}
 
     def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
@@ -1498,11 +1608,13 @@ class StrataEngine:
             pass
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
         releasing = self.slot_releasing
+        histories = getattr(self, "slot_histories", None)
         releasing.add(slot)
 
         def wait():
             end = time.monotonic() + 600.0
             tail = list(stream or [])
+            completed = False
             while time.monotonic() < end:
                 try:
                     line = q.get(timeout=5.0)
@@ -1517,11 +1629,14 @@ class StrataEngine:
                     except (IndexError, ValueError):
                         tail = []
                 if line.startswith("BDONE "):
+                    completed = True
                     if line.split()[3:4] == ["nonfinite"]:   # #879: the engine dropped the slot's state
                         tail = []
                     break
-            held[slot] = tail[:-1] if stream and tail else []
+            held[slot] = tail[:-1] if completed and stream and tail else []
             with self.slot_cv:
+                if completed and histories is not None:
+                    self._remember_slot_history(slot, held[slot], histories)
                 busy[slot] = False
                 releasing.discard(slot)
                 self.slot_cv.notify_all()
@@ -1621,7 +1736,8 @@ class StrataEngine:
         """A request decoding in a slot that is alone now (no other slot busy, nobody waiting) goes back to the solo
         path with its MTP drafts: the engine continues it from the slot's sessions (its slot cache; INFO
         slot_cache=1).  STRATA_PARALLEL_SOLO=0 keeps it in the slot."""
-        if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
+        if (str((self.info or {}).get("batch_pinned", 0)) == "1" or
+                embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
                 not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
             return False
         with self.slot_cv:
@@ -1659,6 +1775,8 @@ class StrataEngine:
         slot, gen0, reserved = None, None, None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
+        cancel_owner = None
+        slot_completed = False
         yields, solo_again, refused = 0, 0, 0
         admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
         try:
@@ -1670,7 +1788,10 @@ class StrataEngine:
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
-                if alone and left > 1:
+                # Native MTP slots retain grammar/RNG state for the entire
+                # request. Replaying generated text as a fresh GEN/BGEN prompt
+                # would restart that state, so this capability pins the owner.
+                if alone and left > 1 and str((self.info or {}).get("batch_pinned", 0)) != "1":
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
@@ -1788,7 +1909,11 @@ class StrataEngine:
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
                     self._last_done = None                  # (#879: this admission's DONE decides below)
-                    self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
+                    self._forget_batch_owner(cancel, cancel_owner)
+                    cancel_owner = self._send_owned_batch(
+                        f"{head} {','.join(str(int(t)) for t in prompt)}", cancel, slot, born)
+                    if cancel_owner is None:   # cancellation won before admission: no command was sent
+                        return
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
@@ -1811,6 +1936,39 @@ class StrataEngine:
                                 ask()
                                 yield None
                     except ValueError as e:
+                        refill = self.refill
+                        if (self._ctl_erred and str(e).startswith("NEED_IMAGES") and embeddings
+                                and refill is not None and not out and not pending):
+                            # The rejected admission read no tokens. Keep this
+                            # reserved slot, but remove the old native cancel
+                            # owner before rebuilding its request-local file.
+                            self.refill = None           # one retry, even if the full-row admission is refused
+                            refill_proc = cancel_owner[2] if cancel_owner is not None else self.proc
+                            self._forget_batch_owner(cancel, cancel_owner)
+                            cancel_owner = None
+                            phase = "none"
+                            self._ctl_erred = False
+                            self.slot_live[slot] = None
+                            self.ctl.release()
+                            holding = False
+                            try:
+                                if cancel.is_set():
+                                    return
+                                # A prepare thread can hold FIFO while waiting
+                                # for HAVE's ctl. Never call this under ctl.
+                                embeddings = refill()
+                                if cancel.is_set():
+                                    return
+                                ok = yield from self._take_control(cancel, len(prompt))
+                                if not ok:
+                                    return
+                                holding = True
+                                if self.gen != born or self.proc is not refill_proc:
+                                    raise EngineDied("the engine changed while this request's images were refilled")
+                            finally:
+                                if self.gen != born or self.proc is not refill_proc:
+                                    slot = None          # old claims must not free a restarted process's slot
+                            continue                    # fresh grammar/RNG is valid: no output was emitted
                         # #1994: the engine says this slot is not free (its view and ours differ for a moment, or a
                         # slot it still holds).  That is not the request's fault and nothing was read: park the slot
                         # for a moment (busy here too), and wait for another one - never a 400 for the conversation.
@@ -1875,6 +2033,7 @@ class StrataEngine:
                             going_solo = True
                     elif line.startswith("BDONE "):
                         phase = "none"
+                        slot_completed = True
                         f = line.split()
                         self._apply_bdone(f)
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
@@ -1902,6 +2061,8 @@ class StrataEngine:
                             break
                         return
         finally:
+            # Unpublish before a slot can be freed/reused. An old watcher cannot stop its successor.
+            self._forget_batch_owner(cancel, cancel_owner)
             # a consumer that left early (or an error): keep the engine and this server in step
             btrace("finally phase", phase, "slot", slot, "holding", holding)
             try:
@@ -1945,6 +2106,8 @@ class StrataEngine:
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self.slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
                     with self.slot_cv:
+                        if self.gen == born:
+                            self._remember_slot_history(slot, self.slot_held[slot])
                         self.slot_busy[slot] = False
                         self.slot_claims.discard(slot)
                         self.slot_cv.notify_all()
@@ -1955,9 +2118,41 @@ class StrataEngine:
                     self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
                     with self.slot_cv:
+                        if self.gen == born and slot_completed:
+                            self._remember_slot_history(slot, self.slot_held[slot])
                         self.slot_busy[slot] = False
                         self.slot_claims.discard(slot)
                         self.slot_cv.notify_all()
+
+    SLOT_HISTORY_LIMIT = 12
+
+    def _remember_slot_history(self, slot, held, histories=None):
+        """Affinity hints only: native independently validates and accounts for its cache.
+        The caller holds slot_cv; histories belongs to the completing process, never a restart.
+        """
+        if str((self.info or {}).get("batch_pinned", 0)) != "1" or not held:
+            return
+        histories = getattr(self, "slot_histories", None) if histories is None else histories
+        if histories is None or slot >= len(histories):
+            return
+        previous = histories[slot]
+        previous[:] = [h for h in previous if h != held]
+        previous.append(list(held))
+        del previous[:-self.SLOT_HISTORY_LIMIT]
+
+    @staticmethod
+    def _common_prefix(a, b):
+        # Compare long prefixes in C; Python only scans the first differing block.
+        # This keeps 256K contexts with several histories out of a per-token Python loop.
+        size = min(len(a), len(b))
+        for start in range(0, size, 1024):
+            end = min(size, start + 1024)
+            left, right = a[start:end], b[start:end]
+            if left != right:
+                for offset, (x, y) in enumerate(zip(left, right)):
+                    if x != y:
+                        return start + offset
+        return size
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
@@ -1969,6 +2164,24 @@ class StrataEngine:
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
+        pinned = str((getattr(self, "info", None) or {}).get("batch_pinned", 0)) == "1"
+        if pinned:
+            histories = getattr(self, "slot_histories", [[] for _ in range(self.batch)])
+            def affinity(b):
+                best = 0
+                for held in [self.slot_held[b], *reversed(histories[b])]:
+                    if len(held) > best:
+                        best = max(best, self._common_prefix(prompt, held))
+                        if best == len(prompt):
+                            break
+                return best
+            scores = {b: affinity(b) for b in free}
+            best = max(free, key=lambda b: (scores[b], -self.slot_used[b]))
+            # A shared chat-template header is not a conversation affinity. Keep
+            # unrelated owners distributed; full short repeats still match exactly.
+            meaningful = min(len(prompt), max(64, (len(prompt) + 1) // 2))
+            if scores[best] >= meaningful and scores[best] > 0:
+                return best
         gs = getattr(self, "slot_gs", 0)
         if gs:
             # pipelined groups: the engine keeps no pipelined slot as a conversation cache, so nothing is worth keeping
@@ -1984,7 +2197,7 @@ class StrataEngine:
             return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
         best = max(free, key=held_prefix)
         # without --batch-groups a held prefix of any length is taken, as before
-        if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
+        if not pinned and held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
             return best
         # with --batch-groups: the group with the fewest busy slots first, so the requests spread over the
         # pipeline's stages (two requests in one group leave the other stage idle); then empty, then least recent
@@ -1993,7 +2206,7 @@ class StrataEngine:
             if self.slot_busy[b]:
                 busy_in[self.slot_group[b]] = busy_in.get(self.slot_group[b], 0) + 1
         return min(free, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
-                                        bool(self.slot_held[b]), self.slot_used[b]))
+                                        bool(self.slot_held[b]) or (pinned and bool(histories[b])), self.slot_used[b]))
 
     def slots_view(self) -> list[dict]:
         """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
@@ -4281,7 +4494,7 @@ class Service:
         eng = self.engine
         if by_reference and getattr(eng, "info", {}).get("img_refs") and hasattr(eng, "have") and eng.alive():
             try:
-                held = eng.have([k[:16] for k in keys])
+                held = eng.have([k[:16] for k in keys], cancel=cancel) if isinstance(eng, StrataEngine) else eng.have([k[:16] for k in keys])
             except (EngineDied, ValueError, OSError) as e:
                 print(f"[strata] the engine's picture check failed ({e}); every picture is encoded", flush=True)
                 held = [None] * len(keys)
@@ -4437,10 +4650,15 @@ class Service:
             if any(r is not None for r in refs):
                 # the engine said it holds those pictures; should it no longer (another request's pictures pushed them
                 # out meanwhile) it answers NEED_IMAGES and the request is sent once more with every picture's rows
-                def refill(images=images, image_ids=image_ids, combined=combined):
-                    full, _ = self._pictures(images, image_ids, None, by_reference=False)
-                    write_temporary(combined, [p for p, _ in full])
-                    return str(combined)
+                def refill(images=images, image_ids=image_ids, combined=combined, cancel=cancel):
+                    def write_full_rows():
+                        full, _ = self._pictures(images, image_ids, cancel, by_reference=False)
+                        write_temporary(combined, [p for p, _ in full])
+                        return str(combined)
+                    if getattr(self.engine, "batch", 0):
+                        with self._turn(cancel):          # batch retries released admission ctl before FIFO
+                            return write_full_rows()
+                    return write_full_rows()             # a single GEN already owns its FIFO turn
                 self.embeddings.refill = refill
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
