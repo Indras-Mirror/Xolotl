@@ -14,8 +14,10 @@
 //   * the prompt read in chunks of --chunk tokens through the same driver (batched matmuls, ncols <= 8 per launch);
 //   * decode one token at a time from a captured graph (positions on the device), or with --no-graph eagerly.
 //
-// Modes: --serve (serve/server.py's engine protocol: READY / GEN / T / DONE / STOP / PP), --tokens IDS [--n N]
-// [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
+// Modes: --serve (serve/server.py's engine protocol: READY / GEN / GENI / HAVE / RESUME / PP / T / DONE / STOP; the held
+// state is reused at the longest common start, from a GDN state snapshot when the request leaves it; GENI's pictures
+// take M-RoPE positions), --tokens IDS [--n N] [--force IDS] [--embeddings F] [--dump-full-logits F]
+// (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/fused_gdn.hpp"
@@ -26,6 +28,8 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/engine.hpp"
+#include "strata/qwen35/flash.hpp"
+#include "q36_sampling.hpp"
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -36,6 +40,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <atomic>
 #include <chrono>
@@ -46,6 +51,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -71,6 +77,9 @@ namespace MMQ = strata::prefill::mmq;
     } while (0)
 
 using Clock = std::chrono::steady_clock;
+double wall_ms() {   // the epoch in ms (log lines a client compares with its own clock)
+    return std::chrono::duration<double, std::milli>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
 constexpr int kThreads = 256;
@@ -232,12 +241,17 @@ __global__ void k_gate_rows(float* sh, const float* gate, int n, int T) {
     sh[i] *= sigm(gate[i / n]);
 }
 
-/// The attention layer's per-token preparation for T rows at positions *pos0 + t: q (from the [q | gate] pairs) and k
-/// RMS-normed per head with their weights, NEOX RoPE over the first n_rot dims, k / v into the cache, the gate kept.
-/// grid (H + HKV, T), block 256 (HD <= 256).
+/// M-RoPE (ggml's IMROPE, rope.dimension_sections): which position stream (0 t, 1 h, 2 w, 3 e) rotary pair i takes.
+/// Set once at load from the GGUF's sections; with t = h = w (text) every stream is the cell's own position.
+__constant__ int8_t c_mrope_stream[64];
+
+/// The attention layer's per-token preparation for T rows at cells *pos0 + t: q (from the [q | gate] pairs) and k
+/// RMS-normed per head with their weights, NEOX RoPE over the first n_rot dims, k / v into the FP16 cache, the gate
+/// kept.  `mrope` (nullable): the per-cell rotary positions [cells][3] (t, h, w) - an image's cells share t and differ
+/// in h / w, the text after it continues past them; null = the cell index.  grid (H + HKV, T), block 256 (HD <= 256).
 __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, const float* qw, const float* kw,
-                            float* q, float* gate, float* kc, float* vc, int H, int HKV, int HD, int n_rot,
-                            const int32_t* pos0, int ctx, float base, float eps) {
+                            float* q, float* gate, __half* kc, __half* vc, int H, int HKV, int HD, int n_rot,
+                            const int32_t* pos0, int ctx, float base, float eps, const int32_t* mrope) {
     __shared__ float sh[kThreads];
     __shared__ float buf[256];
     const int head = blockIdx.x, t = blockIdx.y;
@@ -255,7 +269,8 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
     const int half = n_rot / 2;
     if (i < n_rot) {
         const int p = i < half ? i : i - half;
-        const float theta = (float) pos * powf(base, -2.0f * (float) p / (float) n_rot);
+        const int rp = mrope ? mrope[(size_t) pos * 3 + min(2, (int) c_mrope_stream[p])] : pos;
+        const float theta = (float) rp * powf(base, -2.0f * (float) p / (float) n_rot);
         float sn, cs;
         sincosf(theta, &sn, &cs);
         v = i < half ? buf[i] * cs - buf[i + half] * sn : buf[i - half] * sn + buf[i] * cs;
@@ -265,49 +280,103 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
         gate[((size_t) t * H + head) * HD + i] = qg[((size_t) t * H + head) * 2 * HD + HD + i];
     } else {
         const int kh = head - H;
-        kc[((size_t) kh * ctx + pos) * HD + i] = v;
-        vc[((size_t) kh * ctx + pos) * HD + i] = vx[((size_t) t * HKV + kh) * HD + i];
+        kc[((size_t) kh * ctx + pos) * HD + i] = __float2half(v);
+        vc[((size_t) kh * ctx + pos) * HD + i] = __float2half(vx[((size_t) t * HKV + kh) * HD + i]);
     }
 }
 
-/// Split-K attention, one block per (chunk of 256 cells, query row): query row qi = t * H + h (t from t0) sees the
-/// cells [0, *pos0 + t].  Writes the chunk's partial accumulator, max and sum; chunks past the query's cells write
-/// nothing (the merge stops before them).  grid (n_chunk, n_rows), block 256, HD == 256.
-__global__ void k_attn_part(const float* q, const float* kc, const float* vc, const int32_t* pos0, int t0, int H,
-                            int HKV, int ctx, float scale, int n_chunk, float* pacc, float* pm, float* pl) {
+/// Split-K decode attention over the FP16 cache, a KV head's G query heads per block (the cells read once for all of
+/// them): block (chunk c of 256 cells, query t0 + y / HKV, KV head y % HKV), 8 warps.  Scores: warp w takes cells
+/// w, w + 8, ..; its 32 lanes each 8 dims of a cell (coalesced 512-byte rows), the G dot products reduced across the
+/// warp.  Then per head the chunk's max / sum, and out[d] = sum_p e_p V[p][d] with thread d.  Writes the same partials
+/// as before (row t * H + h): the merge is unchanged.  G <= 16, HD == 256.
+template <int G>
+__global__ void __launch_bounds__(256) k_attn_part_gqa(const float* q, const __half* kc, const __half* vc,
+                                                       const int32_t* pos0, int t0, int H, int HKV, int ctx, float scale,
+                                                       int n_chunk, float* pacc, float* pm, float* pl) {
     constexpr int HD = 256;
-    __shared__ float qs[HD], sc[kChunkCells], sh[kThreads];
-    const int c = blockIdx.x, row = blockIdx.y;
-    const int t = t0 + row / H, h = row % H, kvh = h / (H / HKV);
+    __shared__ __align__(16) float qs[G][HD];
+    __shared__ float sc[G][kChunkCells];
+    __shared__ float smx[G], ssum[G];
+    const int c = blockIdx.x, t = t0 + blockIdx.y / HKV, kvh = blockIdx.y % HKV;
     const int npos = *pos0 + t + 1;
     const int p0 = c * kChunkCells;
     if (p0 >= npos) return;
-    const int j = threadIdx.x;
-    qs[j] = q[((size_t) t * H + h) * HD + j];
-    __syncthreads();
-    const int p = p0 + j;
-    float s = -INFINITY;
-    if (p < npos) {
-        const float* kp = kc + ((size_t) kvh * ctx + p) * HD;
-        float a = 0.f;
-        for (int i = 0; i < HD; ++i) a += qs[i] * kp[i];
-        s = a * scale;
-    }
-    const float m = block_max(s, sh);
-    const float e = p < npos ? expf(s - m) : 0.f;
-    sc[j] = e;
-    const float l = block_sum(e, sh);
     const int n = min(kChunkCells, npos - p0);
-    float acc = 0.f;
-    const float* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
-    for (int k = 0; k < n; ++k) acc += sc[k] * vp[(size_t) k * HD];
-    const size_t o = (size_t) row * n_chunk + c;
-    pacc[o * HD + j] = acc;
-    if (j == 0) {
-        pm[o] = m;
-        pl[o] = l;
+    const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    for (int i = tid; i < G * HD; i += 256) qs[i / HD][i % HD] = q[((size_t) t * H + kvh * G + i / HD) * HD + i % HD];
+    __syncthreads();
+    const __half* kbase = kc + ((size_t) kvh * ctx + p0) * HD;
+    for (int k = warp; k < kChunkCells; k += 8) {
+        float a[G];
+#pragma unroll
+        for (int g = 0; g < G; ++g) a[g] = 0.f;
+        if (k < n) {
+            const uint4 raw = *(const uint4*) (kbase + (size_t) k * HD + lane * 8);
+            const __half2* h2 = (const __half2*) &raw;
+            float kv[8];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float2 f = __half22float2(h2[j]);
+                kv[2 * j] = f.x;
+                kv[2 * j + 1] = f.y;
+            }
+#pragma unroll
+            for (int g = 0; g < G; ++g) {
+                const float4 q0 = *(const float4*) &qs[g][lane * 8], q1 = *(const float4*) &qs[g][lane * 8 + 4];
+                a[g] = q0.x * kv[0] + q0.y * kv[1] + q0.z * kv[2] + q0.w * kv[3] + q1.x * kv[4] + q1.y * kv[5] +
+                       q1.z * kv[6] + q1.w * kv[7];
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < G; ++g)
+            for (int m = 16; m > 0; m >>= 1) a[g] += __shfl_xor_sync(0xffffffffu, a[g], m);
+        if (lane < G) {
+            float v = 0.f;
+#pragma unroll
+            for (int g = 0; g < G; ++g)
+                if (g == lane) v = a[g];
+            sc[lane][k] = k < n ? v * scale : -INFINITY;
+        }
+    }
+    __syncthreads();
+    for (int g = warp; g < G; g += 8) {   // per head: the chunk's max, the exponentials, their sum
+        float mx = -INFINITY;
+        for (int k = lane; k < kChunkCells; k += 32) mx = fmaxf(mx, sc[g][k]);
+        for (int m = 16; m > 0; m >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, m));
+        float s = 0.f;
+        for (int k = lane; k < kChunkCells; k += 32) {
+            const float e = k < n ? expf(sc[g][k] - mx) : 0.f;
+            sc[g][k] = e;
+            s += e;
+        }
+        for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+        if (lane == 0) {
+            smx[g] = mx;
+            ssum[g] = s;
+        }
+    }
+    __syncthreads();
+    float acc[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) acc[g] = 0.f;
+    const __half* vp = vc + ((size_t) kvh * ctx + p0) * HD + tid;
+    for (int k = 0; k < n; ++k) {
+        const float v = __half2float(vp[(size_t) k * HD]);
+#pragma unroll
+        for (int g = 0; g < G; ++g) acc[g] = fmaf(sc[g][k], v, acc[g]);
+    }
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const size_t o = (size_t) ((blockIdx.y / HKV) * H + kvh * G + g) * n_chunk + c;   // rows from t0, as the merge
+        pacc[o * HD + tid] = acc[g];
+        if (tid == 0) {
+            pm[o] = smx[g];
+            pl[o] = ssum[g];
+        }
     }
 }
+
 /// The chunks merged, times sigmoid(gate): grid (n_rows), block HD.
 __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl, const float* gate,
                              const int32_t* pos0, int t0, int H, int n_chunk, float* out) {
@@ -393,17 +462,6 @@ __global__ void k_merge_cpu(float* parts, const float* cpu, const int32_t* miss,
     const int e = blockIdx.x;
     if (!miss[e]) return;
     for (int i = threadIdx.x; i < n; i += blockDim.x) parts[(size_t) e * n + i] = cpu[(size_t) e * n + i];
-}
-/// The prompt attention's FP16 operands: cells [0, P) of each KV head's K / V (cache rows ctx apart) into compact
-/// [kvh][P][HD] halves.  grid1(HKV * P * HD).
-__global__ void k_kv_f16(const float* kc, const float* vc, __half* k16, __half* v16, int ctx, int P, int HD, int HKV) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (int64_t) HKV * P * HD) return;
-    const int64_t per = (int64_t) P * HD;
-    const int64_t kvh = i / per, rest = i % per;
-    const size_t src = (size_t) kvh * ctx * HD + rest;
-    k16[i] = __float2half(kc[src]);
-    v16[i] = __float2half(vc[src]);
 }
 /// The prompt's causal softmax: row (h, t) of S (ld floats, P cells) -> softmax(S * scale) over the cells
 /// [0, pos0 + t], 0 past them, as FP16 probabilities (S16, the same row offsets, ld halves).  grid (T, H), block 256.
@@ -496,6 +554,67 @@ __global__ void k_argmax(const float* x, int n, int32_t* out, float* pv, int32_t
     }
 }
 constexpr int kArgBlocks = 128;   // (the row stride of k_argmax's partials)
+
+// ---- the sampled path's candidates: each logits row's kTopK largest (value, id), in descending order (ties: the lower
+// id first), found on the device so that a sampled token (and a speculative window's rows) costs kTopK values over
+// PCIe instead of the vocabulary.  Stage 1: kTopBlocks blocks per row, each sorts its slice (<= 4096 cells) in
+// shared memory (bitonic); stage 2: one block per row sorts the kTopBlocks x kTopK candidates.
+constexpr int kTopK = 128, kTopBlocks = 64, kTopSeg = 4096;
+__device__ __forceinline__ bool top_before(float va, int ia, float vb, int ib) { return va > vb || (va == vb && ia < ib); }
+template <int N>
+__device__ void bitonic_desc(float* v, int* id) {
+    for (int k = 2; k <= N; k <<= 1)
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = threadIdx.x; i < N; i += blockDim.x) {
+                const int l = i ^ j;
+                if (l > i) {
+                    const bool up = (i & k) == 0;   // this pair's run sorts descending when `up`
+                    const bool sw = up ? top_before(v[l], id[l], v[i], id[i]) : top_before(v[i], id[i], v[l], id[l]);
+                    if (sw) {
+                        const float tv = v[i]; v[i] = v[l]; v[l] = tv;
+                        const int ti = id[i]; id[i] = id[l]; id[l] = ti;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+}
+__global__ void __launch_bounds__(512) k_topk1(const float* lg, int V, float* pv, int* pi) {
+    __shared__ float v[kTopSeg];
+    __shared__ int id[kTopSeg];
+    const int row = blockIdx.y, b = blockIdx.x;
+    const int seg = (V + kTopBlocks - 1) / kTopBlocks, a0 = b * seg;
+    const float* x = lg + (size_t) row * V;
+    for (int i = threadIdx.x; i < kTopSeg; i += blockDim.x) {
+        const int c = a0 + i;
+        const bool ok = i < seg && c < V;
+        v[i] = ok ? x[c] : -INFINITY;
+        id[i] = ok ? c : 0x7fffffff;
+    }
+    __syncthreads();
+    bitonic_desc<kTopSeg>(v, id);
+    for (int i = threadIdx.x; i < kTopK; i += blockDim.x) {
+        pv[((size_t) row * kTopBlocks + b) * kTopK + i] = v[i];
+        pi[((size_t) row * kTopBlocks + b) * kTopK + i] = id[i];
+    }
+}
+__global__ void __launch_bounds__(1024) k_topk2(const float* pv, const int* pi, float* ov, int* oi) {
+    extern __shared__ float sm[];
+    constexpr int M = kTopBlocks * kTopK;
+    float* v = sm;
+    int* id = (int*) (sm + M);
+    const int row = blockIdx.x;
+    for (int i = threadIdx.x; i < M; i += blockDim.x) {
+        v[i] = pv[(size_t) row * M + i];
+        id[i] = pi[(size_t) row * M + i];
+    }
+    __syncthreads();
+    bitonic_desc<M>(v, id);
+    for (int i = threadIdx.x; i < kTopK; i += blockDim.x) {
+        ov[(size_t) row * kTopK + i] = v[i];
+        oi[(size_t) row * kTopK + i] = id[i];
+    }
+}
 
 unsigned grid1(int64_t n, int b = kThreads) { return (unsigned) ((n + b - 1) / b); }
 
@@ -767,6 +886,8 @@ struct Model {
     Mat eh_proj;
     const float *mtp_enorm = nullptr, *mtp_hnorm = nullptr, *mtp_shnorm = nullptr;
     int64_t top_k = 8;
+    bool has_mrope = false;                                   // rope.dimension_sections given (the vision path)
+    int tok_im_start = -1, tok_im_end = -1, tok_image_pad = -1, tok_video_pad = -1;   // from the GGUF vocabulary (-1: none)
     float eps = 1e-6f, rope_base = 1e7f;
     int n_rot = 64;
     std::vector<Layer> layers;
@@ -853,6 +974,52 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
     return d;
 }
 
+/// The ids of `names` in a GGUF's tokenizer.ggml.tokens (read straight from the file's header; absent ones left out).
+std::map<std::string, int> vocab_ids(const std::string& path, const std::vector<std::string>& names) {
+    std::map<std::string, int> out;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return out;
+    auto rd = [&](void* p, size_t n) { return std::fread(p, 1, n, f) == n; };
+    auto u32 = [&]() { uint32_t v = 0; rd(&v, 4); return v; };
+    auto u64 = [&]() { uint64_t v = 0; rd(&v, 8); return v; };
+    auto str = [&]() { const uint64_t n = u64(); std::string s(n < (1u << 20) ? n : 0, '\0'); if (n < (1u << 20)) rd(s.data(), n); else std::fseek(f, (long) n, SEEK_CUR); return s; };
+    auto scalar = [](uint32_t t) -> int { switch (t) { case 0: case 1: case 7: return 1; case 2: case 3: return 2;
+                                                    case 4: case 5: case 6: return 4; case 10: case 11: case 12: return 8; default: return 0; } };
+    std::function<bool(uint32_t)> skip = [&](uint32_t t) -> bool {
+        if (t == 8) { str(); return true; }
+        if (t == 9) {
+            const uint32_t et = u32();
+            const uint64_t n = u64();
+            if (scalar(et)) return std::fseek(f, (long) (n * (uint64_t) scalar(et)), SEEK_CUR) == 0;
+            for (uint64_t i = 0; i < n; ++i) if (!skip(et)) return false;
+            return true;
+        }
+        const int b = scalar(t);
+        return b > 0 && std::fseek(f, b, SEEK_CUR) == 0;
+    };
+    if (u32() != 0x46554747u) { std::fclose(f); return out; }   // 'GGUF'
+    (void) u32();
+    (void) u64();
+    const uint64_t n_kv = u64();
+    for (uint64_t k = 0; k < n_kv && !std::feof(f); ++k) {
+        const std::string key = str();
+        const uint32_t t = u32();
+        if (key == "tokenizer.ggml.tokens" && t == 9) {
+            const uint32_t et = u32();
+            const uint64_t n = u64();
+            for (uint64_t i = 0; i < n && et == 8; ++i) {
+                const std::string tok = str();
+                for (const std::string& want : names)
+                    if (tok == want) out[want] = (int) i;
+            }
+            break;
+        }
+        if (!skip(t)) break;
+    }
+    std::fclose(f);
+    return out;
+}
+
 bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     const auto t0 = Clock::now();
     m.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
@@ -865,14 +1032,45 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     size_t checked = 0;
     if (!strata::core::check_gguf_layout(gm, m.g, err, &checked)) return false;
     const auto& g = m.g;
-    if (g.head_dim != 256 || g.ssm_state_size != 128 || g.ssm_d_conv != 4 || g.n_expert > 512 || m.top_k > 15) {
-        err = "a geometry this driver's kernels do not take (head 256, state 128, conv 4, <= 512 experts, top-k <= 15)";
+    const int64_t gqa = g.n_head_kv > 0 ? g.n_head / g.n_head_kv : 0;
+    if (g.head_dim != 256 || g.ssm_state_size != 128 || g.ssm_d_conv != 4 || g.n_expert > 512 || m.top_k > 15 ||
+        g.n_head_kv < 1 || g.n_head % g.n_head_kv != 0 || (gqa != 1 && gqa != 2 && gqa != 4 && gqa != 8 && gqa != 16)) {
+        err = "a geometry this driver's kernels do not take (head 256, state 128, conv 4, <= 512 experts, top-k <= 15, "
+              "1 / 2 / 4 / 8 / 16 query heads per KV head)";
         return false;
     }
     const std::string p = "qwen35moe.";
     if (const strata::MetaValue* v = gm.meta().get(p + "attention.layer_norm_rms_epsilon")) m.eps = (float) v->num();
     if (const strata::MetaValue* v = gm.meta().get(p + "rope.freq_base")) m.rope_base = (float) v->num();
     if (const strata::MetaValue* v = gm.meta().get(p + "rope.dimension_count")) m.n_rot = (int) v->u;
+    {   // M-RoPE: ggml's IMROPE pair -> stream map from rope.dimension_sections (absent: every pair the t stream)
+        int sec[4] = {0, 0, 0, 0};
+        if (const strata::MetaValue* v = gm.meta().get(p + "rope.dimension_sections"))
+            for (size_t i = 0; i < 4 && i < v->items.size(); ++i) sec[i] = (int) v->items[i].u;
+        const int dims = sec[0] + sec[1] + sec[2] + sec[3];
+        int8_t map[64] = {};
+        for (int pr = 0; pr < 64; ++pr) {
+            const int sector = dims > 0 ? pr % dims : 0;
+            map[pr] = dims == 0 ? 0 : (sector % 3 == 1 && sector < 3 * sec[1]) ? 1 : (sector % 3 == 2 && sector < 3 * sec[2]) ? 2
+                    : (sector % 3 == 0 && sector < 3 * sec[0]) ? 0 : 3;
+        }
+        m.has_mrope = dims > 0;
+        CK(cudaMemcpyToSymbol(c_mrope_stream, map, sizeof map));
+    }
+    if (m.n_rot > 128) {
+        err = "rope.dimension_count above 128";
+        return false;
+    }
+    {   // the chat / vision markers' ids, from the file's vocabulary (the reader keeps only a sample of the list)
+        const std::map<std::string, int> ids = vocab_ids(path, {"<|im_start|>", "<|im_end|>", "<|image_pad|>", "<|video_pad|>"});
+        auto get = [&](const char* k) { auto it = ids.find(k); return it == ids.end() ? -1 : it->second; };
+        m.tok_im_start = get("<|im_start|>");
+        m.tok_im_end = get("<|im_end|>");
+        m.tok_image_pad = get("<|image_pad|>");
+        m.tok_video_pad = get("<|video_pad|>");
+        std::fprintf(stderr, "strata-q36: <|im_start|> %d, <|image_pad|> %d (message-start snapshots, pictures)\n",
+                     m.tok_im_start, m.tok_image_pad);
+    }
     uint64_t bytes = 0;
     auto find = [&](const std::string& name, size_t& s) -> const strata::TensorInfo* {
         const strata::TensorInfo* t = gm.find(name, &s);
@@ -1042,14 +1240,21 @@ struct Engine {
         *sg, *su, *shh, *sy, *sgate, *ewts, *logits;
     float* hmain = nullptr;   // [tmax][N] the main model's final normed hidden of each row (the MTP seeds)
     float* hlast = nullptr;   // [N] that of the last processed position (zeros before the first)
+    // Eager prefill is a transaction: one device copy of the recurrent state before each chunk.
+    // KV writes at/above the chunk's logical end are discarded by leaving pos unchanged on abort.
+    std::unique_ptr<uint8_t, decltype(&cudaFree)> prefill_rollback{nullptr, cudaFree};
     void *q8, *xq, *escr;
     int32_t *ids, *grp_start, *n_groups, *ent_dst, *ent_tok, *tok, *pos0, *pick;
     int32_t* hpin = nullptr;   // pinned staging: [0] decode token, [1] position, [2..9] picks, [10] max rows, [16..] tokens
     unsigned long long* grp_ptr;
     float *pacc, *pm, *pl, *amv;
+    float *top_pv = nullptr, *top_ov = nullptr;   // the candidates (k_topk1 / k_topk2) and their host copy
+    int *top_pi = nullptr, *top_oi = nullptr;
+    uint8_t* top_h = nullptr;                     // pinned: [kVerify][kTopK] floats, then [kVerify][kTopK] ids
     int32_t* ami;
     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
-    std::vector<float*> conv, S, kc, vc;   // per layer; the MTP block's K / V at index n_layers
+    std::vector<float*> conv, S;           // per GDN layer (null for an attention layer)
+    std::vector<__half*> kc, vc;           // per attention layer, FP16 [HKV][ctx][HD]; the MTP block's at n_layers
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
     static constexpr int kVerify = 8;
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
@@ -1058,14 +1263,22 @@ struct Engine {
     int32_t *tok_m = nullptr, *pos0_m = nullptr, *pick_m = nullptr;
     // graphs: [0] the decode step, [T] a verify window of T rows, mtp1 the MTP draft step
     cudaGraphExec_t g1 = nullptr, gv[kVerify + 1] = {}, gm1 = nullptr;
+    // Resident verify windows are split only at layer boundaries, with STOP checked
+    // after each completed graph. Activations stay in the same x/h buffers throughout.
+    static constexpr size_t kVerifyLayersPerGraph = 8;
+    std::vector<cudaGraphExec_t> gv_parts[kVerify + 1];
     strata::prefill::Gemm gemm;
     cublasHandle_t blas = nullptr;
     float* att_s = nullptr;            // the prompt attention's scores / probabilities, kAttScoreFloats floats
     static constexpr int kSplitK = 16;
     float* sk_part = nullptr;          // the split-K partials of the F32 projections: [kSplitK][tmax][<= 257]
     __half* att_p16 = nullptr;         // the probabilities in FP16 (kAttScoreFloats halves)
-    __half *k16 = nullptr, *v16 = nullptr, *q16 = nullptr;   // the prompt attention's FP16 operands
+    __half* q16 = nullptr;             // the prompt attention's FP16 queries (K / V are read from the FP16 cache)
+    int32_t* mrope = nullptr;          // [ctx][3] the cells' rotary positions (t, h, w): see build_positions
     size_t kAttScoreFloats = (size_t) 64 << 20;   // 256 MB (16 M floats when the experts' fit is close)
+    bool use_flash = false, flash_dumped = false;
+    void* flash_work = nullptr;
+    int flash_sms = 0;
     // the prompt's MMQ experts
     bool use_mmq = false;
     std::unique_ptr<MMQ::Context> mctx;
@@ -1159,12 +1372,29 @@ struct Engine {
             std::fprintf(stderr, "strata-q36: cuBLAS handle failed\n");
             std::exit(1);
         }
-        att_s = dalloc(kAttScoreFloats);
+        const char* fa = std::getenv("STRATA_Q36_FA");
+        use_flash = (!fa || std::strcmp(fa, "0") != 0) && strata::qwen35::flash_available();
+        if (use_flash) {
+            int dev = 0;
+            CK(cudaGetDevice(&dev));
+            CK(cudaDeviceGetAttribute(&flash_sms, cudaDevAttrMultiProcessorCount, dev));
+            const size_t bytes = strata::qwen35::flash_workspace_bytes(tmax, (int) g.n_head, (int) g.n_head_kv, ctx, flash_sms);
+            if (bytes) CK(cudaMalloc(&flash_work, bytes));
+            kAttScoreFloats = 0;
+            std::fprintf(stderr, "strata-q36: flash prefill (GQA, split-K), scratch %.1f MiB, %d SMs\n", bytes / 1048576.0, flash_sms);
+        } else {
+            att_s = dalloc(kAttScoreFloats);
+            att_p16 = dalloc_t<__half>(kAttScoreFloats);
+            q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
+            std::fprintf(stderr, "strata-q36: cuBLAS prefill (STRATA_Q36_FA=0 or unsupported device)\n");
+        }
         sk_part = dalloc((size_t) kSplitK * T * (g.n_expert + 1));
-        att_p16 = dalloc_t<__half>(kAttScoreFloats);
-        k16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
-        v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
-        q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
+        mrope = dalloc_t<int32_t>((size_t) ctx * 3);
+        {   // the identity until a request with pictures sets its own
+            std::vector<int32_t> id3((size_t) ctx * 3);
+            for (size_t c = 0; c < (size_t) ctx; ++c) id3[c * 3] = id3[c * 3 + 1] = id3[c * 3 + 2] = (int32_t) c;
+            CK(cudaMemcpy(mrope, id3.data(), id3.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+        }
         use_mmq = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
         auto mmq_ok = [&](const Layer& L) {
             return MMQ::supported(L.L.gu_type) && MMQ::supported(L.L.d_type) && MMQ::fits(L.L.gu_type, 2 * g.n_ff) &&
@@ -1217,10 +1447,16 @@ struct Engine {
         pos0 = dalloc_t<int32_t>(1);
         pick = dalloc_t<int32_t>(kVerify);
         amv = dalloc((size_t) kArgBlocks * kVerify);
+        top_pv = dalloc((size_t) kVerify * kTopBlocks * kTopK);
+        top_pi = dalloc_t<int>((size_t) kVerify * kTopBlocks * kTopK);
+        top_ov = dalloc((size_t) kVerify * kTopK);
+        top_oi = dalloc_t<int>((size_t) kVerify * kTopK);
+        CK(cudaHostAlloc((void**) &top_h, (size_t) kVerify * kTopK * 8, cudaHostAllocDefault));
+        CK(cudaFuncSetAttribute(k_topk2, cudaFuncAttributeMaxDynamicSharedMemorySize, kTopBlocks * kTopK * 8));
         ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
         n_chunk = (ctx + kChunkCells - 1) / kChunkCells;
-        att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, 64));   // 64 query tokens per attention batch
+        att_rows = (int) (g.n_head * kGemmT);   // the decode / verify path's rows (T <= kGemmT; a chunk runs GEMMs)
         pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
         pm = dalloc((size_t) att_rows * n_chunk);
         pl = dalloc((size_t) att_rows * n_chunk);
@@ -1228,8 +1464,8 @@ struct Engine {
             if (L.attn) {
                 conv.push_back(nullptr);
                 S.push_back(nullptr);
-                kc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
-                vc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+                kc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
+                vc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
                 for (auto* v : {&v_qkv, &v_hc, &v_alpha, &v_beta}) v->push_back(nullptr);
             } else {
                 conv.push_back(dalloc(C * (g.ssm_d_conv - 1)));
@@ -1245,8 +1481,8 @@ struct Engine {
         if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
             conv.push_back(nullptr);
             S.push_back(nullptr);
-            kc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
-            vc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+            kc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
+            vc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
             mtp_cat = dalloc(T * 2 * N);
             hmtp = dalloc(T * N);
             logits_m = dalloc((size_t) g.n_vocab);
@@ -1332,11 +1568,28 @@ struct Engine {
         }
     }
 
+    /// STRATA_Q36_MROPE_OFF=1 (a check only): every cell rotates by its index, pictures too (the positions ignored)
+    static bool mrope_off() {
+        static const bool off = std::getenv("STRATA_Q36_MROPE_OFF") != nullptr;
+        return off;
+    }
+    /// The decode attention's partials for G query heads per KV head (load() admits G in {1, 2, 4, 8, 16}).
+    void attn_part(int G, dim3 grid, const float* qq, const __half* k, const __half* v, const int32_t* dpos, int t0, int H,
+                   int HKV, int ctx_, float scale, int nch) {
+        switch (G) {
+        case 1: k_attn_part_gqa<1><<<grid, 256, 0, st>>>(qq, k, v, dpos, t0, H, HKV, ctx_, scale, nch, pacc, pm, pl); break;
+        case 2: k_attn_part_gqa<2><<<grid, 256, 0, st>>>(qq, k, v, dpos, t0, H, HKV, ctx_, scale, nch, pacc, pm, pl); break;
+        case 4: k_attn_part_gqa<4><<<grid, 256, 0, st>>>(qq, k, v, dpos, t0, H, HKV, ctx_, scale, nch, pacc, pm, pl); break;
+        case 8: k_attn_part_gqa<8><<<grid, 256, 0, st>>>(qq, k, v, dpos, t0, H, HKV, ctx_, scale, nch, pacc, pm, pl); break;
+        default: k_attn_part_gqa<16><<<grid, 256, 0, st>>>(qq, k, v, dpos, t0, H, HKV, ctx_, scale, nch, pacc, pm, pl); break;
+        }
+    }
+
     /// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
     /// `li` indexes the layer's state; positions *dpos .. + T - 1 (device), p0 the same on the host (eager grids);
     /// `verify`: a verify window - the GDN state is read, not written (commit() writes it for the kept rows).
-    void layer(const Layer& L, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, bool verify,
-               const float* wn, float* hout) {
+    bool layer(const Layer& L, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, bool verify,
+               const float* wn, float* hout, bool interruptible = false) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kp = (int) m->top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
         const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, D = (int) g.ssm_state_size;
@@ -1379,8 +1632,13 @@ struct Engine {
             apply(L.wk, xq, kx, T);
             apply(L.wv, xq, vx, T);
             k_attn_prep<<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, kc[li], vc[li], H,
-                                                              HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps);
-            if (T > kGemmT) {
+                                                              HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps,
+                                                              m->has_mrope && !mrope_off() ? mrope : nullptr);
+            if (T > kGemmT) dump_flash_inputs(li, T, (int) p0);
+            if (T > kGemmT && use_flash) {
+                strata::qwen35::flash_prefill(q, kc[li], vc[li], gate, att, flash_work,
+                                            T, H, HKV, ctx, (int) p0, flash_sms, st);
+            } else if (T > kGemmT) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
                 // FP16 probabilities; the queries in slices whose scores fit
@@ -1389,12 +1647,11 @@ struct Engine {
                 const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
                 const int G = H / HKV;
                 const float one = 1.0f, zero = 0.0f;
-                k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
                 for (int t0 = 0; t0 < T; t0 += tq) {
                     const int nt = std::min(tq, T - t0);
                     for (int kvh = 0; kvh < HKV; ++kvh) {
-                        const __half* Kh = k16 + (size_t) kvh * P * HD;
+                        const __half* Kh = kc[li] + (size_t) kvh * ctx * HD;   // cells [0, P) of the cache
                         const __half* Qh = q16 + ((size_t) t0 * H + kvh * G) * HD;
                         float* Sh = att_s + (size_t) kvh * G * nt * ldp;
                         if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, nt, HD, &one, Kh, CUDA_R_16F, HD,
@@ -1408,7 +1665,7 @@ struct Engine {
                     k_attn_softmax16<<<dim3(nt, H), kThreads, 0, st>>>(att_s, att_p16, ldp, nt, P, (int) p0 + t0,
                                                                        1.0f / sqrtf((float) HD));
                     for (int kvh = 0; kvh < HKV; ++kvh) {
-                        const __half* Vh = v16 + (size_t) kvh * P * HD;
+                        const __half* Vh = vc[li] + (size_t) kvh * ctx * HD;
                         const __half* Sh = att_p16 + (size_t) kvh * G * nt * ldp;
                         float* Oh = att + ((size_t) t0 * H + kvh * G) * HD;
                         if (cublasGemmStridedBatchedEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, nt, P, &one, Vh, CUDA_R_16F, HD,
@@ -1429,8 +1686,8 @@ struct Engine {
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
-                    k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, kc[li], vc[li], dpos, t0, H, HKV, ctx,
-                                                                         1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl);
+                    attn_part(H / HKV, dim3(nc, nt * HKV), q, kc[li], vc[li], dpos, t0, H, HKV, ctx,
+                              1.0f / sqrtf((float) HD), n_chunk);
                     k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att);
                 }
             }
@@ -1447,6 +1704,12 @@ struct Engine {
         // the hybrid rows path: a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch
         // (its prompt pass too: no staging buffers then)
         const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
+        // MMQ already fences at its router below. The grouped path has no host read there:
+        // fence only for a prefill transaction, never during decode/verify graph capture.
+        if (interruptible && !(T > kGemmT && use_mmq)) {
+            CK(cudaStreamSynchronize(st));
+            if (cancel && cancel->load()) return false;
+        }
         if (hy_rows) {
             moe_hybrid_gpu(L, li, T);
         } else if (T > kGemmT && use_mmq) {
@@ -1461,6 +1724,7 @@ struct Engine {
             CK(cudaMemcpyAsync(hpin + 10, rmax, 4, cudaMemcpyDeviceToHost, st));
             if (lhy(li)) CK(cudaMemcpyAsync(h_cnt + li * g.n_expert, rcnt, (size_t) ne * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
+            if (interruptible && cancel && cancel->load()) return false;
             if (lhy(li))
                 for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
             const int64_t maxr = hpin[10];
@@ -1503,28 +1767,39 @@ struct Engine {
         // the combine, the shared expert's gate, the residual add and the next norm in one launch
         k_moe_out<<<T, kThreads, 0, st>>>(x, eparts, prow, ewts, Kp, sy, one ? logits_r + g.n_expert : sgate, 1, wn, hout,
                                           N, m->eps);
+        return true;
     }
 
     /// The main model over T rows (device `tok`, positions p0 .. p0 + T - 1, also at *pos0): hmain gets every row's
     /// final normed hidden; `heads` rows from the end get logits (rows [T - heads, T): logits row r - (T - heads)) and
     /// their greedy picks (`pick`).  `verify`: a verify window (the GDN state left for commit()).
-    void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
+    bool forward_span(int T, int64_t p0, int heads, bool graph_mode, bool verify, size_t begin, size_t end,
+                      const float* const* img = nullptr, bool interruptible = false) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
-        if (main_hybrid && T > hybrid_t && use_mmq) {
-            std::vector<int> seq;
-            for (size_t l = 0; l < m->layers.size(); ++l)
-                if (lhy(l)) seq.push_back((int) l);
-            stream_begin(seq);
+        if (begin == 0) {
+            if (main_hybrid && T > hybrid_t && use_mmq) {
+                std::vector<int> seq;
+                for (size_t l = 0; l < m->layers.size(); ++l)
+                    if (lhy(l)) seq.push_back((int) l);
+                stream_begin(seq);
+            }
+            K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
+            put_image_rows(img, T, x);
+            k_rms<<<T, kThreads, 0, st>>>(x, m->layers[0].attn_norm, h, N, m->eps);   // later layers: from k_moe_out
         }
-        K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
-        k_rms<<<T, kThreads, 0, st>>>(x, m->layers[0].attn_norm, h, N, m->eps);   // later layers: from k_moe_out
-        for (size_t l = 0; l < m->layers.size(); ++l) {
+        for (size_t l = begin; l < end; ++l) {
             const bool last = l + 1 == m->layers.size();
-            layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
-                  last ? hmain : h);
+            if (!layer(m->layers[l], l, T, p0, pos0, graph_mode, verify,
+                       last ? m->out_norm : m->layers[l + 1].attn_norm, last ? hmain : h, interruptible)) return false;
         }
-        if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+        if (interruptible && cancel && cancel->load()) return false;
+        if (end == m->layers.size() && heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
+        return true;
+    }
+    bool forward(int T, int64_t p0, int heads, bool graph_mode, bool verify, const float* const* img = nullptr,
+                 bool interruptible = false) {
+        return forward_span(T, p0, heads, graph_mode, verify, 0, m->layers.size(), img, interruptible);
     }
     /// logits [n][V] = W_out hn rows, and each row's greedy pick.
     void head_rows(const float* hn, int n, float* lg, int32_t* pk) {
@@ -1537,17 +1812,22 @@ struct Engine {
     /// The MTP block over T rows: row t reads token tok_m[t] at position p0 + t (also at *pos0_m) and the seed hidden
     /// seeds[t] (the main model's normed hidden of the position before, or the block's own for a chained draft);
     /// hmtp gets each row's normed output.  `draft`: logits of the last row and its pick (`pick_m`).
-    void forward_mtp(int T, int64_t p0, const float* seeds, bool draft, bool graph_mode) {
+    bool forward_mtp(int T, int64_t p0, const float* seeds, bool draft, bool graph_mode,
+                     const float* const* img = nullptr, bool interruptible = false) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
         if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq) stream_begin({(int) m->layers.size()});
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
+        put_image_rows(img, T, y);   // an image cell's e input is its embedding row (llama.cpp's MTP does the same)
         k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);              // [e | ...]
         k_rms_ld<<<T, kThreads, 0, st>>>(seeds, N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, m->eps);      // [... | h]
         mm(m->eh_proj, mtp_cat, x, T);
         k_rms<<<T, kThreads, 0, st>>>(x, m->mtp.attn_norm, h, N, m->eps);
-        layer(m->mtp, m->layers.size(), T, p0, pos0_m, graph_mode, false, m->mtp_shnorm, hmtp);
+        if (!layer(m->mtp, m->layers.size(), T, p0, pos0_m, graph_mode, false, m->mtp_shnorm, hmtp,
+                   interruptible)) return false;
+        if (interruptible && cancel && cancel->load()) return false;
         if (draft) head_rows(hmtp + (size_t) (T - 1) * N, 1, logits_m, pick_m);
+        return true;
     }
 
     /// After a verify window of T rows: the GDN state takes the first n_keep rows (conv history and recurrence run
@@ -1748,7 +2028,41 @@ struct Engine {
         CK(cudaStreamSynchronize(st));   // slot_of's host copy is pageable: the upload is done before it changes
     }
 
+    // STRATA_Q36_FA_DUMP=path, _DUMP_P=P, _DUMP_LAYER=li captures one real prefill activation.
+    // Compact binary: int32 {T,H,HKV,P}, float Q/gate, half K/V [HKV,P,256]. No graph/decode capture.
+    void dump_flash_inputs(size_t li, int T, int p0) {
+        const char* path = std::getenv("STRATA_Q36_FA_DUMP");
+        if (!path || warming || flash_dumped) return;
+        const char* ps = std::getenv("STRATA_Q36_FA_DUMP_P");
+        const char* ls = std::getenv("STRATA_Q36_FA_DUMP_LAYER");
+        const int P = p0 + T;
+        if ((ps && P != std::atoi(ps)) || li != (size_t) (ls ? std::atoi(ls) : 3)) return;
+        CK(cudaStreamSynchronize(st));
+        FILE* f = std::fopen(path, "wb");
+        if (!f) { std::perror(path); std::exit(1); }
+        const int H = (int) m->g.n_head, HKV = (int) m->g.n_head_kv;
+        const int32_t header[] = {T, H, HKV, P};
+        std::fwrite(header, sizeof(header), 1, f);
+        auto save = [&](const void* data, size_t bytes) {
+            std::vector<unsigned char> host(bytes);
+            CK(cudaMemcpy(host.data(), data, bytes, cudaMemcpyDeviceToHost));
+            if (std::fwrite(host.data(), 1, bytes, f) != bytes) { std::perror(path); std::exit(1); }
+        };
+        save(q, (size_t) T * H * 256 * 4);
+        save(gate, (size_t) T * H * 256 * 4);
+        for (const __half* cache : {kc[li], vc[li]})
+            for (int h = 0; h < HKV; ++h) save(cache + (size_t) h * ctx * 256, (size_t) P * 256 * 2);
+        std::fclose(f);
+        flash_dumped = true;
+        std::fprintf(stderr, "strata-q36: captured attention layer %zu, T=%d P=%d to %s\n", li, T, P, path);
+    }
+
+    size_t att_shrink_bytes() const {
+        const size_t small = (size_t) 16 << 20;
+        return kAttScoreFloats > small ? (kAttScoreFloats - small) * 6 : 0;
+    }
     void shrink_att(size_t floats) {
+        if (use_flash) return;
         CK(cudaDeviceSynchronize());
         CK(cudaFree(att_s));
         CK(cudaFree(att_p16));
@@ -1762,6 +2076,9 @@ struct Engine {
             if (*g) { CK(cudaGraphExecDestroy(*g)); *g = nullptr; }
         for (auto& g : gv)
             if (g) { CK(cudaGraphExecDestroy(g)); g = nullptr; }
+        for (auto& parts : gv_parts)
+            for (auto& g : parts)
+                if (g) { CK(cudaGraphExecDestroy(g)); g = nullptr; }
     }
 
     template <class F> void graph_run(cudaGraphExec_t& gx, F body) {
@@ -1777,12 +2094,226 @@ struct Engine {
         CK(cudaGraphLaunch(gx, st));
     }
 
+    /// An image's rows in place of its cells' token embeddings: rows r of the batch with img[r] set get that host row
+    /// (runs of consecutive rows of one picture in one copy).
+    void put_image_rows(const float* const* img, int T, float* dst) {
+        if (img == nullptr) return;
+        const size_t N = (size_t) m->g.n_embd;
+        for (int r = 0; r < T;) {
+            if (img[r] == nullptr) { ++r; continue; }
+            int e = r + 1;
+            while (e < T && img[e] == img[e - 1] + N) ++e;
+            CK(cudaMemcpyAsync(dst + (size_t) r * N, img[r], (size_t) (e - r) * N * 4, cudaMemcpyHostToDevice, st));
+            r = e;
+        }
+    }
+
+    // ---- state snapshots: the GDN layers' conv history and recurrence (the attention layers' K / V are per cell and
+    // stay valid for every cell below the position) and hlast (the MTP seed), at chosen positions of a prompt.  A
+    // snapshot is valid for a request whose first `pos` cells hash to `hash` while those cells are still the ones
+    // the cache holds (pos <= the common start with `live`, checked by the caller).  Kept in pinned host memory.
+    struct Snap {
+        int64_t pos = -1;
+        uint64_t hash = 0, used = 0;
+        int prio = 0;   // 0 the periodic grid, 1 a message start, 2 where a request left / ended / stopped, 3 a client's
+        uint8_t* host = nullptr;
+        size_t refs = 0;   // retained active/parked prefixes owning this state, independent of recency
+    };
+    static constexpr uint64_t kPrioAge = 96;   // a snapshot of priority p is kept as if used p * kPrioAge saves later
+    std::vector<Snap> snaps;
+    const Snap* pinned_snap = nullptr;
+    std::function<bool()> evict_snapshot_owner;   // evicts one whole LRU parked prefix (KV and state refs)
+    std::function<void(Snap&)> snapshot_saved;    // bounded ownership of the current prefix's useful anchors
+    int max_snaps = 128;
+    uint64_t snap_clock = 0;
+    long long snaps_saved = 0, snaps_restored = 0;
+    size_t snap_bytes() const {
+        const auto& g = m->g;
+        size_t b = (size_t) g.n_embd * 4;
+        for (size_t l = 0; l < conv.size(); ++l)
+            if (conv[l])
+                b += (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * 4 +
+                     (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4;
+        return b;
+    }
+    template <class Copy> void snap_walk(uint8_t* host, Copy cp) {
+        const auto& g = m->g;
+        const size_t cb = (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * 4;
+        const size_t sb = (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4;
+        size_t off = 0;
+        for (size_t l = 0; l < conv.size(); ++l) {
+            if (!conv[l]) continue;
+            cp((void*) conv[l], host + off, cb);
+            off += cb;
+            cp((void*) S[l], host + off, sb);
+            off += sb;
+        }
+        cp((void*) hlast, host + off, (size_t) m->g.n_embd * 4);
+    }
+    void alloc_prefill_rollback() {
+        uint8_t* saved = nullptr;
+        CK(cudaMalloc(&saved, snap_bytes()));   // every byte is overwritten before the first possible restore
+        prefill_rollback.reset(saved);
+        std::fprintf(stderr, "strata-q36: transactional prefill rollback %.1f MiB in VRAM\n",
+                     snap_bytes() / 1048576.0);
+    }
+    void prefill_state_copy(bool restore) {
+        snap_walk(prefill_rollback.get(), [&](void* state, uint8_t* saved, size_t bytes) {
+            CK(cudaMemcpyAsync(restore ? state : saved, restore ? saved : state, bytes,
+                               cudaMemcpyDeviceToDevice, st));
+        });
+    }
+    void touch_snap(Snap& sn, int prio) {
+        sn.prio = std::max(sn.prio, prio);
+        sn.used = ++snap_clock;
+    }
+    // Only unowned states may be overwritten. A retained KV prefix and its GDN anchors
+    // have one lifetime; priority only chooses among entries nobody currently owns.
+    Snap* snapshot_victim() {
+        Snap* v = nullptr;
+        for (Snap& sn : snaps) {
+            if (&sn == pinned_snap || sn.refs != 0) continue;
+            if (sn.pos < 0) return &sn;
+            if (!v || std::make_pair(sn.prio, sn.used) < std::make_pair(v->prio, v->used)) v = &sn;
+        }
+        return v;
+    }
+    /// The current state: reclaim an unowned slot, else evict an entire parked prefix.
+    void save_snap(uint64_t hash, int prio = 0) {
+        if (max_snaps <= 0) return;
+        for (Snap& sn : snaps)
+            if (sn.pos == pos && sn.hash == hash) {
+                touch_snap(sn, prio);
+                if (snapshot_saved) snapshot_saved(sn);
+                return;
+            }
+        if (snaps.empty()) snaps.resize((size_t) max_snaps);
+        Snap* v = snapshot_victim();
+        while (!v && evict_snapshot_owner && evict_snapshot_owner()) v = snapshot_victim();
+        if (!v) return;   // e.g. a one-entry ring whose source is pinned; keep it correct
+        if (!v->host && cudaHostAlloc((void**) &v->host, snap_bytes(), cudaHostAllocDefault) != cudaSuccess) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "strata-q36: no pinned memory for a state snapshot (%.0f MiB): snapshots off\n",
+                         snap_bytes() / 1048576.0);
+            max_snaps = 0;
+            return;
+        }
+        snap_walk(v->host, [&](void* d, uint8_t* hst, size_t b) {
+            CK(cudaMemcpyAsync(hst, d, b, cudaMemcpyDeviceToHost, st));
+        });
+        v->pos = pos;
+        v->hash = hash;
+        v->prio = prio;
+        v->used = ++snap_clock;
+        ++snaps_saved;
+        if (snapshot_saved) snapshot_saved(*v);
+    }
+    void restore_snap(Snap& sn) {
+        CK(cudaStreamSynchronize(st));
+        snap_walk(sn.host, [&](void* d, uint8_t* hst, size_t b) {
+            CK(cudaMemcpyAsync(d, hst, b, cudaMemcpyHostToDevice, st));
+        });
+        pos = sn.pos;
+        sn.used = ++snap_clock;
+        ++snaps_restored;
+    }
+    void drop_snaps() {
+        for (Snap& sn : snaps) sn.pos = -1;
+    }
+    /// The snapshot ring's pinned memory, all at once (at load: a 63 MiB cudaHostAlloc inside a prompt costs ~20 ms)
+    void alloc_snaps() {
+        if (max_snaps <= 0) return;
+        const auto t0 = Clock::now();
+        snaps.resize((size_t) max_snaps);
+        int got = 0;
+        for (Snap& sn : snaps) {
+            if (!sn.host && cudaHostAlloc((void**) &sn.host, snap_bytes(), cudaHostAllocDefault) != cudaSuccess) {
+                (void) cudaGetLastError();
+                break;
+            }
+            ++got;
+        }
+        if (got < max_snaps) {
+            snaps.resize((size_t) got);
+            max_snaps = got;
+        }
+        std::fprintf(stderr, "strata-q36: %d state snapshots of %.1f MiB in pinned host memory (%.1f GiB) in %.1f s\n",
+                     max_snaps, snap_bytes() / 1048576.0, max_snaps * (double) snap_bytes() / (1 << 30), ms_since(t0) / 1000.0);
+    }
+
+    // ---- parked conversations: every conversation's attention cells mirrored in pinned host pages, so that a request
+    // of another conversation (another caller with its own long prompt) brings its cells back with one copy instead of
+    // reading them again.  A page is kPage cells of every attention layer's K and V ([layer][K|V][HKV][kPage][HD]).
+    static constexpr int kPage = 1024;
+    std::vector<int> att_li;            // the attention layers' state indices (the MTP block's too)
+    std::vector<uint8_t*> free_pages;   // the pool (allocated at load, --park-mib)
+    size_t n_pages = 0;
+    size_t page_bytes() const {
+        return att_li.size() * 2 * (size_t) m->g.n_head_kv * kPage * (size_t) m->g.head_dim * sizeof(__half);
+    }
+    void alloc_pages(size_t budget) {
+        att_li.clear();
+        for (size_t l = 0; l < kc.size(); ++l)
+            if (kc[l]) att_li.push_back((int) l);
+        if (budget == 0 || att_li.empty()) return;
+        const auto t0 = Clock::now();
+        const size_t want = budget / page_bytes();
+        for (size_t i = 0; i < want; ++i) {
+            uint8_t* p = nullptr;
+            if (cudaHostAlloc((void**) &p, page_bytes(), cudaHostAllocDefault) != cudaSuccess) {
+                (void) cudaGetLastError();
+                break;
+            }
+            free_pages.push_back(p);
+        }
+        n_pages = free_pages.size();
+        std::fprintf(stderr, "strata-q36: %zu conversation pages of %d cells (%.1f MiB each, %.1f GiB) in pinned host "
+                     "memory in %.1f s\n", n_pages, kPage, page_bytes() / 1048576.0,
+                     n_pages * (double) page_bytes() / (1 << 30), ms_since(t0) / 1000.0);
+    }
+    /// Cells [a, b) between the cache and `pages` (page i holds cells [i kPage, (i + 1) kPage)), on the stream.
+    void kv_copy(const std::vector<uint8_t*>& pages, int64_t a, int64_t b, bool to_host) {
+        const size_t HD = (size_t) m->g.head_dim, HKV = (size_t) m->g.n_head_kv, cb = HD * sizeof(__half);
+        for (int64_t c = a; c < b;) {
+            const int64_t pg = c / kPage, o = c - pg * kPage, e = std::min<int64_t>(b, (pg + 1) * kPage);
+            uint8_t* page = pages[(size_t) pg];
+            for (size_t j = 0; j < att_li.size(); ++j)
+                for (int kv = 0; kv < 2; ++kv) {
+                    __half* dev = (kv ? vc : kc)[(size_t) att_li[j]] + (size_t) c * HD;
+                    uint8_t* host = page + ((j * 2 + (size_t) kv) * HKV * kPage + (size_t) o) * cb;
+                    const size_t w = (size_t) (e - c) * cb;
+                    if (to_host)
+                        CK(cudaMemcpy2DAsync(host, kPage * cb, dev, (size_t) ctx * cb, w, HKV, cudaMemcpyDeviceToHost, st));
+                    else
+                        CK(cudaMemcpy2DAsync(dev, (size_t) ctx * cb, host, kPage * cb, w, HKV, cudaMemcpyHostToDevice, st));
+                }
+            c = e;
+        }
+    }
+
+    /// Set while a request runs (serve's STOP). Eager resident prefill rolls back an interrupted chunk;
+    /// decode graphs and hybrid inference retain their complete-step / complete-chunk boundaries.
+    const std::atomic<bool>* cancel = nullptr;
+    bool prefill_aborted = false;   // no post-cancel host snapshot: the valid state remains live on the device
+
+    /// A prompt chunk must end at this position, and the state there be kept as a snapshot of this hash.
+    struct Cut {
+        int64_t pos;
+        uint64_t hash;
+        int prio = 0;
+    };
+
     /// The tokens at the current position: a prompt in chunks (eager), one token from the decode graph.  The last
     /// token's logits stay in `logits` (its greedy pick in `pick`), hlast its normed hidden.  With the MTP block the
-    /// prompt also runs through it (its K / V for every position: row q reads h_{q-1} and token q).
-    template <class F> void process(const int32_t* toks, int64_t n, F on_chunk) {
+    /// prompt also runs through it (its K / V for every position: row q reads h_{q-1} and token q).  `img` (nullable,
+    /// n entries): the host embedding row of an image cell, null for a token.  `cuts`: ascending positions in
+    /// (pos, pos + n] where a chunk ends and a snapshot is taken.
+    template <class F>
+    void process(const int32_t* toks, int64_t n, F on_chunk, const float* const* img = nullptr,
+                 const std::vector<Cut>* cuts = nullptr) {
+        prefill_aborted = false;
         const int N = (int) m->g.n_embd;
-        if (n == 1) {
+        if (n == 1 && (img == nullptr || img[0] == nullptr) && (cuts == nullptr || cuts->empty())) {
             CK(cudaStreamSynchronize(st));   // the pinned staging is free again
             hpin[0] = toks[0];
             hpin[1] = (int32_t) pos;
@@ -1797,28 +2328,69 @@ struct Engine {
             on_chunk(1);
             return;
         }
-        for (int64_t i = 0; i < n; i += tmax) {
-            const int T = (int) std::min<int64_t>(tmax, n - i);
+        const int64_t start = pos;
+        // Hybrid inference also mutates routing scores, the CPU pool and a prefetch stream.
+        // Until those are transactional too, keep its existing whole-chunk cancellation.
+        const bool transaction = cancel && prefill_rollback && !m->hybrid;
+        size_t ci = 0;
+        while (cuts && ci < cuts->size() && (*cuts)[ci].pos <= start) ++ci;
+        for (int64_t i = 0; i < n;) {
+            if (cancel && cancel->load()) {
+                // A preceding cache restore may still be queued even before the first chunk.
+                CK(cudaStreamSynchronize(st));
+                prefill_aborted = transaction;
+                break;
+            }
+            int64_t end = std::min<int64_t>(i + tmax, n);
+            if (cuts && ci < cuts->size() && (*cuts)[ci].pos - start < end) end = (*cuts)[ci].pos - start;
+            const int T = (int) (end - i);
+            const float* const* im = img ? img + i : nullptr;
             CK(cudaStreamSynchronize(st));
+            if (transaction) prefill_state_copy(false);
             hpin[1] = (int32_t) pos;
             CK(cudaMemcpyAsync(tok, toks + i, (size_t) T * 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
-            forward(T, pos, i + T == n ? 1 : 0, false, false);
-            if (m->has_mtp && mtp_d > 0) {
+            bool complete = forward(T, pos, end == n ? 1 : 0, false, false, im, transaction);
+            if (complete && transaction && cancel->load()) complete = false;
+            if (complete && m->has_mtp && mtp_d > 0) {
                 // seeds: h_{q-1} for each row q: hlast, then this chunk's rows 0 .. T - 2 (in `y`, free here)
                 CK(cudaMemcpyAsync(mtp_seed(), hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
                 if (T > 1)
                     CK(cudaMemcpyAsync(mtp_seed() + N, hmain, (size_t) (T - 1) * N * 4, cudaMemcpyDeviceToDevice, st));
                 CK(cudaMemcpyAsync(tok_m, toks + i, (size_t) T * 4, cudaMemcpyHostToDevice, st));
                 CK(cudaMemcpyAsync(pos0_m, hpin + 1, 4, cudaMemcpyHostToDevice, st));
-                forward_mtp(T, pos, mtp_seed(), false, false);
+                complete = forward_mtp(T, pos, mtp_seed(), false, false, im, transaction);
             }
-            CK(cudaMemcpyAsync(hlast, hmain + (size_t) (T - 1) * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+            if (complete) {
+                CK(cudaMemcpyAsync(hlast, hmain + (size_t) (T - 1) * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+                if (transaction) {
+                    CK(cudaStreamSynchronize(st));
+                    if (cancel->load()) complete = false;
+                }
+            }
+            if (!complete) {
+                // The same stream orders rollback after every already queued kernel. No head/MTP
+                // continuation, published position or snapshot may escape a partial transaction.
+                prefill_state_copy(true);
+                CK(cudaStreamSynchronize(st));
+                prefill_aborted = true;
+                std::fprintf(stderr, "strata-q36: prefill rolled back to cell %lld at %.3f\n", (long long) pos, wall_ms());
+                break;
+            }
             pos += T;
+            i = end;
+            while (cuts && ci < cuts->size() && (*cuts)[ci].pos <= pos) {
+                if ((*cuts)[ci].pos == pos) save_snap((*cuts)[ci].hash, (*cuts)[ci].prio);
+                ++ci;
+            }
             CK(cudaStreamSynchronize(st));
-            on_chunk(i + T);
+            on_chunk(i);
+            if (cancel && cancel->load() && i < n) {
+                prefill_aborted = transaction;   // this complete chunk stays committed; no extra host snapshot
+                break;
+            }
         }
-        if (m->hybrid) rebalance(hybrid_swaps_after_prompt);
+        if (m->hybrid && !(cancel && cancel->load())) rebalance(hybrid_swaps_after_prompt);
     }
     int hybrid_swaps_after_prompt = 2048;
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
@@ -1828,11 +2400,37 @@ struct Engine {
     /// tokens of the rows the block must redo first (the drafts the last window accepted, seeded by hmain rows
     /// 0 .. fix.size() - 1 of that window).  Drafts d1 .. dD, then the window [x, d1 .. dD] through the main model;
     /// returns the accepted count a and writes the picks of rows 0 .. a (row a's pick is the token after them).
-    int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks) {
+    /// `judge` (sampled requests): decides the window from its rows' logits (in `logits`) instead of the greedy picks:
+    /// returns the accepted count a and writes picks[a], the token after them.
+    /// Returns -1 on STOP before commit: pos/GDN/hlast are unchanged, picks must not be read.
+    const bool cancel_trace = std::getenv("STRATA_Q36_CANCEL_TRACE") != nullptr;
+    double cancel_abort_at = 0;
+    const char* cancel_abort_stage = "none";
+    int64_t cancel_abort_pos = -1;
+    int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
+                  const std::function<int(int, const std::vector<int32_t>&, int32_t*)>* judge = nullptr,
+                  const std::function<int(int)>* draft_pick = nullptr) {
         const int N = (int) m->g.n_embd;
+        // MTP attention only changes KV rows (uncommitted rows >=pos are ignored). Hybrid
+        // routing/CPU work and a future recurrent MTP block would need their own rollback.
+        // Serve warmup must capture the same segmented graphs before READY, before cancel is attached.
+        const bool interruptible = (cancel || (warming && prefill_rollback)) && !m->hybrid && m->mtp.attn;
+        auto stopped = [&](const char* phase = "draft") {
+            if (!interruptible || !cancel || !cancel->load()) return false;
+            CK(cudaStreamSynchronize(st));   // include all queued draft/verify work before reporting DONE
+            // No synchronous log write on the cancellation path. The optional
+            // summary after cancelled reports this already-drained abort boundary.
+            if (cancel_trace) {
+                cancel_abort_at = wall_ms();
+                cancel_abort_stage = phase;
+                cancel_abort_pos = pos;
+            }
+            return true;
+        };
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         CK(cudaStreamSynchronize(st));
+        if (stopped("before_draft")) return -1;
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
         for (int i = 0; i < (int) fix.size(); ++i) hpin[16 + i] = fix[(size_t) i];
         hpin[16 + fix.size()] = x_tok;
@@ -1849,10 +2447,12 @@ struct Engine {
         if (D > 0) {
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
-            drafts[0] = hpin[2];
+            if (stopped()) return -1;
+            drafts[0] = draft_pick ? (*draft_pick)(hpin[2]) : hpin[2];
         }
         int last_row = T0 - 1;   // the row of the previous MTP call whose output seeds the next draft
         for (int d = 1; d < D; ++d) {   // chained: (the block's own output, the last draft) at the next position
+            if (stopped()) return -1;
             hpin[0] = drafts[(size_t) d - 1];
             hpin[1] = (int32_t) (pos + d);
             CK(cudaMemcpyAsync(tok_m, hpin, 4, cudaMemcpyHostToDevice, st));
@@ -1863,8 +2463,10 @@ struct Engine {
             else forward_mtp(1, pos + d, seeds, true, false);
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
-            drafts[(size_t) d] = hpin[2];
+            if (stopped()) return -1;
+            drafts[(size_t) d] = draft_pick ? (*draft_pick)(hpin[2]) : hpin[2];
         }
+        if (stopped("before_verify")) return -1;
         // the verify window
         const int T = D + 1;
         hpin[16] = x_tok;
@@ -1873,13 +2475,32 @@ struct Engine {
         CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
         rows_deferred = true;
-        graph_run(gv[T], [&] { forward(T, pos, T, use_graph, true); });
+        if (interruptible) {
+            auto& parts = gv_parts[T];
+            const size_t np = (m->layers.size() + kVerifyLayersPerGraph - 1) / kVerifyLayersPerGraph;
+            if (parts.empty()) parts.resize(np, nullptr);
+            for (size_t part = 0; part < np; ++part) {
+                const size_t begin = part * kVerifyLayersPerGraph;
+                const size_t end = std::min(m->layers.size(), begin + kVerifyLayersPerGraph);
+                graph_run(parts[part], [&] { forward_span(T, pos, T, use_graph, true, begin, end); });
+                CK(cudaStreamSynchronize(st));
+                if (stopped("verify")) { rows_deferred = false; return -1; }
+            }
+        } else {
+            graph_run(gv[T], [&] { forward(T, pos, T, use_graph, true); });
+        }
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        if (stopped("after_verify")) return -1;
         int a = 0;
-        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
-        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        if (judge) {
+            a = (*judge)(T, drafts, picks);
+        } else {
+            while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+            for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        }
+        if (stopped("before_commit")) return -1;
         commit(a + 1);
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         pos += a + 1;
@@ -1913,6 +2534,17 @@ struct Engine {
         reset();
         std::fprintf(stderr, "strata-q36: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
                      ms_since(t0) / 1000.0, mtp_d > 0 ? ", a speculative step" : "");
+    }
+
+    /// Logits rows [0, n) (n <= kVerify) -> each row's kTopK largest (value, id), descending, in `vals` / `ids`.
+    void topk_rows(int n, std::vector<float>& vals, std::vector<int>& ids, const float* source = nullptr) {
+        k_topk1<<<dim3(kTopBlocks, n), 512, 0, st>>>(source ? source : logits, (int) m->g.n_vocab, top_pv, top_pi);
+        k_topk2<<<n, 1024, kTopBlocks * kTopK * 8, st>>>(top_pv, top_pi, top_ov, top_oi);
+        CK(cudaMemcpyAsync(top_h, top_ov, (size_t) n * kTopK * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(top_h + (size_t) kVerify * kTopK * 4, top_oi, (size_t) n * kTopK * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        vals.assign((const float*) top_h, (const float*) top_h + (size_t) n * kTopK);
+        ids.assign((const int*) (top_h + (size_t) kVerify * kTopK * 4), (const int*) (top_h + (size_t) kVerify * kTopK * 4) + (size_t) n * kTopK);
     }
 
     int greedy() {
@@ -1957,7 +2589,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     for (const auto& pk : m.packed) packed_bytes += std::get<2>(pk);
     size_t main_need = 0;   // the main layers' experts (the MTP block's can go to the CPU, see below)
     for (Layer& L : m.layers) main_need += L.stride * (size_t) ne + kMmqTail;
-    const size_t slack = ((size_t) 512 << 20) + (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6;   // reserve + scores
+    const size_t slack = ((size_t) 512 << 20) + E.att_shrink_bytes();   // reserve + reclaimable scores
     const bool mtp_cpu_ok = m.has_mtp && std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr;
     if (slots <= 0 && vram_gib < 0 && total > budget && packed_bytes > 0 &&
         (total <= budget + packed_bytes || (mtp_cpu_ok && main_need <= budget + packed_bytes + slack)) &&
@@ -1984,7 +2616,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     for (Layer& L : m.layers) total_main += L.stride * (size_t) ne + kMmqTail;
     bool mtp_only = false;
     if (slots <= 0 && vram_gib < 0 && m.has_mtp && total > budget2 && std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr) {
-        const size_t att_save = (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6;   // att_s (4 B) + att_p16 (2 B)
+        const size_t att_save = E.att_shrink_bytes();   // zero for flash; att_s (4 B) + att_p16 (2 B) otherwise
         const size_t small_reserve = (size_t) 256 << 20;
         const size_t room = fr + att_save > small_reserve ? fr + att_save - small_reserve : 0;
         if (total_main + ((size_t) 64 << 20) <= budget2) {
@@ -1994,10 +2626,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             CK(cudaMemGetInfo(&fr, &tot));
             budget2 = fr > small_reserve ? fr - small_reserve : 0;
             mtp_only = total_main + ((size_t) 64 << 20) <= budget2;
-            std::fprintf(stderr, "strata-q36: the experts nearly fit: the attention scores buffer at 64 MB and the VRAM "
+            std::fprintf(stderr, "strata-q36: the experts nearly fit: %sthe VRAM "
                          "reserve at 256 MiB (instead of 768) so that every main layer's experts fit; a driver or "
                          "another program needing more VRAM later can make it fail - --expert-vram GiB sets the experts' "
-                         "budget instead\n");
+                         "budget instead\n", E.use_flash ? "flash prefill keeps its scratch, " : "the attention scores buffer at 64 MB and ");
         }
     }
     if (slots <= 0 && total <= budget2 && total + ((size_t) 256 << 20) <= fr) {
@@ -2131,52 +2763,6 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
 }
 
 // ------------------------------------------------------------------------------------------------ sampling
-struct Sampling {
-    float temperature = 0.f, top_p = 1.f, min_p = 0.f, repeat = 1.f, freq = 0.f, present = 0.f;
-    int top_k = 20, last_n = 0;
-    unsigned long long seed = 0;
-    bool needs_logits() const { return temperature > 0.f || repeat != 1.f || freq != 0.f || present != 0.f; }
-};
-
-int sample(std::vector<float>& lg, const Sampling& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
-    if (s.last_n != 0 && (s.repeat != 1.f || s.freq != 0.f || s.present != 0.f)) {
-        std::map<int, int> cnt;
-        const size_t from = s.last_n < 0 || (size_t) s.last_n >= hist.size() ? 0 : hist.size() - (size_t) s.last_n;
-        for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
-        for (const auto& [id, c] : cnt) {
-            float& v = lg[(size_t) id];
-            if (s.repeat != 1.f) v = v > 0 ? v / s.repeat : v * s.repeat;
-            v -= (float) c * s.freq + s.present;
-        }
-    }
-    if (s.temperature <= 0.f) return (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
-    const int kk = std::max(1, std::min(s.top_k > 0 ? s.top_k : 64, (int) lg.size()));
-    std::vector<int> idx(lg.size());
-    for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int) i;
-    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
-    idx.resize((size_t) kk);
-    std::vector<double> p(idx.size());
-    const double mx = lg[(size_t) idx[0]];
-    double sum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) sum += (p[i] = std::exp((lg[(size_t) idx[i]] - mx) / s.temperature));
-    size_t keep = idx.size();
-    double cum = 0;
-    for (size_t i = 0; i < idx.size(); ++i) {
-        if (p[i] / sum < s.min_p * (p[0] / sum)) { keep = i; break; }
-        cum += p[i] / sum;
-        if (cum >= s.top_p) { keep = i + 1; break; }
-    }
-    keep = std::max<size_t>(1, keep);
-    double tot = 0;
-    for (size_t i = 0; i < keep; ++i) tot += p[i];
-    std::uniform_real_distribution<double> u(0.0, tot);
-    double r = u(rng);
-    for (size_t i = 0; i < keep; ++i) {
-        if ((r -= p[i]) <= 0) return idx[i];
-    }
-    return idx[keep - 1];
-}
-
 std::vector<int32_t> parse_ids(const char* s) {
     std::vector<int32_t> v;
     while (*s) {
@@ -2193,8 +2779,178 @@ std::vector<int32_t> parse_ids(const char* s) {
 
 bool is_eos(int t) { return t == 248044 || t == 248046; }
 
+// ------------------------------------------------------------------------------------------------ images
+/// The engine's own copy of the pictures it was sent (pinned host rows), by the server's key: a later request can
+/// name a picture by its key alone (an `SVR1` record) and the server need not encode it again.  Least recently used
+/// go first past `budget` bytes; the pictures of the request being read are never dropped.
+struct ImageCache {
+    struct Entry {
+        float* rows = nullptr;
+        int64_t n = 0, nx = 0, ny = 0;
+        uint64_t used = 0;
+    };
+    std::map<uint64_t, Entry> m;
+    size_t bytes = 0, budget = (size_t) 2048 << 20;
+    uint64_t clock = 0;
+    int64_t width = 0;
+    Entry* find(uint64_t key) {
+        auto it = m.find(key);
+        if (it == m.end()) return nullptr;
+        it->second.used = ++clock;
+        return &it->second;
+    }
+    Entry* put(uint64_t key, const float* rows, int64_t n, int64_t nx, int64_t ny, const std::vector<uint64_t>& keep) {
+        if (Entry* e = find(key)) {
+            if (e->n == n && e->nx == nx && e->ny == ny) return e;
+            drop(key);
+        }
+        const size_t b = (size_t) n * (size_t) width * 4;
+        while (bytes + b > budget && !m.empty()) {   // the least recently used that this request does not hold
+            auto v = m.end();
+            for (auto it = m.begin(); it != m.end(); ++it)
+                if (std::find(keep.begin(), keep.end(), it->first) == keep.end() && (v == m.end() || it->second.used < v->second.used))
+                    v = it;
+            if (v == m.end()) break;
+            drop(v->first);
+        }
+        Entry e;
+        if (cudaHostAlloc((void**) &e.rows, b, cudaHostAllocDefault) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        std::memcpy(e.rows, rows, b);
+        e.n = n; e.nx = nx; e.ny = ny; e.used = ++clock;
+        bytes += b;
+        return &(m[key] = e);
+    }
+    void drop(uint64_t key) {
+        auto it = m.find(key);
+        if (it == m.end()) return;
+        bytes -= (size_t) it->second.n * (size_t) width * 4;
+        cudaFreeHost(it->second.rows);
+        m.erase(it);
+    }
+};
+
+uint64_t fnv_mix(uint64_t h, uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+        h ^= (v >> (8 * i)) & 0xff;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+constexpr uint64_t kFnvSeed = 1469598103934665603ull;
+constexpr uint64_t kImageCell = 1ull << 63;   // a cell value with this bit is an image row (its key and row), else a token
+
+/// A picture of a request: its grid and key, and its rows (host), or null for a reference the engine does not hold.
+struct Pic {
+    int64_t n, nx, ny;
+    uint64_t key;
+    const float* rows;
+};
+/// A request's cells: each one's value (a token, or kImageCell | hash(picture key, row)), its image row (null for a
+/// token) and picture index (-1).
+struct Cells {
+    std::vector<uint64_t> cell;
+    std::vector<const float*> rowp;
+    std::vector<int> pic_of;
+};
+/// The cells of `ids` with the pictures `pics` at their runs of <|image_pad|> (only with `geni`), and `table` [ctx][3]
+/// their rotary positions: a token at the next text position p; picture k's row j at (p, p + j / nx, p + j % nx), the
+/// text after it from p + max(nx, ny) (mtmd's M-RoPE positions); the cells after the prompt continue the text.
+/// -> "" or why the request is refused.
+std::string build_cells(const Model& m, const std::vector<int32_t>& ids, const std::vector<Pic>& pics, bool geni,
+                        int ctx, Cells& cl, std::vector<int32_t>& table) {
+    const int64_t n = (int64_t) ids.size(), N = m.g.n_embd;
+    const int pad = m.tok_image_pad;
+    cl.cell.assign((size_t) n, 0);
+    cl.rowp.assign((size_t) n, nullptr);
+    cl.pic_of.assign((size_t) n, -1);
+    table.assign((size_t) ctx * 3, 0);
+    int64_t rp = 0, i = 0;
+    size_t k = 0;
+    while (i < n) {
+        if (!geni || ids[(size_t) i] != pad) {
+            cl.cell[(size_t) i] = (uint64_t) (uint32_t) ids[(size_t) i];
+            table[(size_t) i * 3] = table[(size_t) i * 3 + 1] = table[(size_t) i * 3 + 2] = (int32_t) rp;
+            ++rp;
+            ++i;
+            continue;
+        }
+        if (k >= pics.size()) return "the prompt has more pictures than the embeddings file";
+        const Pic& pc = pics[k];
+        for (int64_t j = 0; j < pc.n; ++j)
+            if (i + j >= n || ids[(size_t) (i + j)] != pad)
+                return "image " + std::to_string(k + 1) + " has " + std::to_string((long long) pc.n) +
+                       " rows but fewer image-pad tokens";
+        for (int64_t j = 0; j < pc.n; ++j) {
+            const size_t c = (size_t) (i + j);
+            cl.cell[c] = kImageCell | (fnv_mix(fnv_mix(kFnvSeed, pc.key), (uint64_t) j) >> 1);
+            cl.rowp[c] = pc.rows ? pc.rows + (size_t) j * (size_t) N : nullptr;
+            cl.pic_of[c] = (int) k;
+            table[c * 3] = (int32_t) rp;
+            table[c * 3 + 1] = (int32_t) (rp + j / pc.nx);
+            table[c * 3 + 2] = (int32_t) (rp + j % pc.nx);
+        }
+        i += pc.n;
+        rp += std::max(pc.nx, pc.ny);
+        ++k;
+    }
+    if (k != pics.size()) return "the embeddings file has more pictures than the prompt";
+    if (n > 0 && cl.pic_of[(size_t) (n - 1)] >= 0) return "the prompt cannot end in an image";
+    for (int64_t c = n; c < ctx; ++c)
+        table[(size_t) c * 3] = table[(size_t) c * 3 + 1] = table[(size_t) c * 3 + 2] = (int32_t) (rp + (c - n));
+    return "";
+}
+
+/// An embeddings file (strata-vision records) read whole: (n, nx, ny, has rows) per record, and the rows.
+std::string read_embeddings(const std::string& path, int64_t N, std::vector<std::tuple<int64_t, int64_t, int64_t, bool>>& heads,
+                            std::vector<std::vector<float>>& bodies) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return "cannot open " + path;
+    std::string ve;
+    for (;;) {
+        int32_t hdr[5];
+        const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
+        if (got == 0) break;
+        const bool ref = hdr[0] == 0x31525653;   // 'SVR1': a picture by its key alone (no rows)
+        if (got != 5 || (hdr[0] != 0x31455653 && !ref) || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 ||
+            (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] != (int32_t) N) {
+            ve = "bad embeddings file (expected strata-vision records of width " + std::to_string((long long) N) + ")";
+            break;
+        }
+        bodies.emplace_back();
+        if (!ref) {
+            bodies.back().resize((size_t) hdr[1] * (size_t) N);
+            if (std::fread(bodies.back().data(), sizeof(float), bodies.back().size(), f) != bodies.back().size()) {
+                ve = "short embeddings file";
+                break;
+            }
+        }
+        heads.emplace_back(hdr[1], hdr[2], hdr[3], !ref);
+    }
+    std::fclose(f);
+    return ve;
+}
+
 // ------------------------------------------------------------------------------------------------ serve
-int serve(Engine& E) {
+// The engine protocol (serve/server.py): READY <ctx> stop; GEN / GENI requests; HAVE <key,...> -> HAVE <n:nx:ny | 0,...>
+// (which pictures the engine holds, so the server encodes only the others); STOP.  The held conversation is reused at
+// the longest common start of the request and `live` the engine can return to: all of it when the request extends it,
+// else the latest state snapshot inside the common start (the attention layers' cells are kept as they are, the
+// GDN state comes back from the snapshot).  Snapshots are taken at the request's last message starts and every
+// `snap_every` cells near its end.
+int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, const std::string& model_path) {
+    Q36Vocabulary vocabulary(model_path);
+#ifdef STRATA_Q36_GRAMMAR
+    std::printf("INFO grammar=1\n");
+#endif
+    const auto& g = E.m->g;
+    const int64_t N = g.n_embd;
+    E.alloc_snaps();
+    E.alloc_pages(park_bytes);
+    std::printf("INFO engine=q36 img_refs=1 snapshots=%d snapshot_every=%d snapshot_mib=%.0f image_cache_mib=%zu n_embd=%lld park_pages=%zu\n",
+                E.max_snaps, snap_every, E.snap_bytes() / 1048576.0, icache.budget >> 20, (long long) N, E.n_pages);
     std::printf("READY %d stop\n", E.ctx);
     std::fflush(stdout);
     std::mutex mu;
@@ -2202,23 +2958,336 @@ int serve(Engine& E) {
     std::deque<std::string> lines;
     bool eof = false;
     std::atomic<bool> stop{false};
+    E.cancel = &stop;
+    const bool phase_trace = std::getenv("STRATA_Q36_PHASE_TRACE") != nullptr;
     std::thread reader([&] {
         std::string l;
         while (std::getline(std::cin, l)) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
-            if (l == "STOP") { stop.store(true); continue; }
-            std::lock_guard<std::mutex> lk(mu);
-            lines.push_back(l);
+            if (l == "STOP") {
+                if (!stop.exchange(true))
+                    std::fprintf(stderr, "strata-q36: STOP at %.3f\n", wall_ms());   // (the cancel latency, see DONE)
+                continue;
+            }
+            const bool gen = l.rfind("GEN ", 0) == 0 || l.rfind("GENI ", 0) == 0;
+            const double arrived_at = gen && phase_trace ? wall_ms() : 0;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                if (gen) stop.store(false);
+                lines.push_back(l);
+            }
             cv.notify_one();
+            // Diagnostics must not delay publishing a ready request. The captured
+            // timestamp is its arrival; log line ordering can lag engine execution.
+            if (gen && phase_trace) std::fprintf(stderr, "strata-q36: GEN arrived at %.3f\n", arrived_at);
         }
         std::lock_guard<std::mutex> lk(mu);
         eof = true;
         cv.notify_one();
     });
     reader.detach();
-    std::vector<int32_t> live;   // the tokens whose state the engine holds (cell i = live[i])
+    // ---- conversations: the active one (live, its cells in the cache) and the parked ones (their cells only in host
+    // pages).  Pages are shared between conversations for a common start (reference counts; a page written while
+    // shared is copied first).
+    struct Conv {
+        std::vector<int32_t> tok;
+        std::vector<uint64_t> val;
+        std::vector<uint8_t*> pages;
+        std::vector<Engine::Snap*> states;   // references into the fixed, shared state pool
+        int64_t mirrored = 0;   // cells [0, mirrored) are in the pages
+        uint64_t used = 0;
+    };
+    std::vector<Conv> parked;
+    std::vector<Engine::Snap*> act_states;
+    auto release_states = [](std::vector<Engine::Snap*>& states) {
+        for (Engine::Snap* sn : states) { assert(sn->refs > 0); --sn->refs; }
+        states.clear();
+    };
+    // At most twelve anchors per retained prefix: explicit points, recently reused
+    // divergence/end states, then the newest automatic grid/message states. Without
+    // explicit marks, at most four non-grid anchors leave eight 512-cell grid states:
+    // a 4K suffix window, enough to discover a changed 1-3K tail inside ONE message.
+    // This is a RAM admission budget, not a caller ID or a device slot. Shared states
+    // count once. An explicit 128-state pool covers six such prefixes plus replacement;
+    // smaller user-selected pools still evict whole LRU prefixes rather than corrupt state.
+    // Leave at least half of a tiny ring unowned for ordinary replacement. A one-entry
+    // ring has no owner quota: it is still usable as the original best-effort cache.
+    const size_t state_limit = std::min<size_t>(12, E.snaps.size() / 2);
+    auto retain_state = [&](std::vector<Engine::Snap*>& states, Engine::Snap& sn) {
+        if (state_limit == 0 || std::find(states.begin(), states.end(), &sn) != states.end()) return;
+        states.push_back(&sn);
+        ++sn.refs;
+        // Do not let old end states crowd out the unchanged message boundary.
+        // Cap metadata anchors so they cannot consume the automatic suffix window.
+        // Explicit points already name the client's boundary and may use four entries;
+        // divergence/end and message boundaries use at most two each.
+        for (int kind = 3; kind >= 1; --kind) {
+            const size_t cap = kind == 3 ? 4 : 2;
+            for (;;) {
+                size_t count = 0;
+                auto worst = states.end();
+                for (auto it = states.begin(); it != states.end(); ++it)
+                    if (std::min((*it)->prio, 3) == kind) {
+                        ++count;
+                        // Structural anchors keep the latest positions, not the
+                        // most globally used states: a shared root touched by another
+                        // caller must not replace this owner's first-image boundary.
+                        if (worst == states.end() ||
+                            (kind == 1 ? std::make_pair((*it)->pos, (*it)->used) < std::make_pair((*worst)->pos, (*worst)->used)
+                                       : (*it)->used < (*worst)->used)) worst = it;
+                    }
+                if (count <= cap) break;
+                assert((*worst)->refs > 0); --(*worst)->refs; states.erase(worst);
+            }
+        }
+        while (states.size() > state_limit) {
+            auto worst = std::min_element(states.begin(), states.end(), [](const Engine::Snap* a, const Engine::Snap* b) {
+                return std::make_pair(a->prio, a->used) < std::make_pair(b->prio, b->used);
+            });
+            assert((*worst)->refs > 0);
+            --(*worst)->refs;
+            states.erase(worst);
+        }
+    };
+    std::map<uint8_t*, int> page_refs;
+    std::vector<uint8_t*> act_pages;
+    int64_t act_mirrored = 0;
+    uint64_t conv_clock = 0;
+    const size_t max_parked = 16;
+    const bool cache_trace = std::getenv("STRATA_Q36_CACHE_TRACE") != nullptr;
+    auto trace_states = [&](const char* owner, int index, size_t cells, const std::vector<Engine::Snap*>& states) {
+        if (!cache_trace) return;
+        std::fprintf(stderr, "strata-q36: cache owner=%s index=%d cells=%zu states=", owner, index, cells);
+        for (const Engine::Snap* sn : states)
+            std::fprintf(stderr, "%lld/%d/%zu,", (long long) sn->pos, sn->prio, sn->refs);
+        std::fprintf(stderr, "\n");
+    };
+    long long switches = 0, cells_brought = 0;
+    auto unref = [&](std::vector<uint8_t*>& pages) {
+        for (uint8_t* pg : pages)
+            if (--page_refs[pg] == 0) {
+                page_refs.erase(pg);
+                E.free_pages.push_back(pg);
+            }
+        pages.clear();
+    };
+    auto drop_lru_parked = [&]() {
+        if (parked.empty()) return false;
+        size_t v = 0;
+        for (size_t i = 1; i < parked.size(); ++i)
+            if (parked[i].used < parked[v].used) v = i;
+        unref(parked[v].pages);
+        release_states(parked[v].states);
+        parked.erase(parked.begin() + (long) v);
+        return true;
+    };
+    E.evict_snapshot_owner = drop_lru_parked;
+    E.snapshot_saved = [&](Engine::Snap& sn) { retain_state(act_states, sn); };
+    struct SnapshotCallbacks {
+        Engine& e;
+        std::function<void()> release;
+        ~SnapshotCallbacks() {
+            e.evict_snapshot_owner = {}; e.snapshot_saved = {};
+            release();
+        }
+    } snapshot_callbacks{E, [&] {
+        release_states(act_states);
+        for (Conv& c : parked) release_states(c.states);
+    }};
+    auto take_page = [&]() -> uint8_t* {
+        while (E.free_pages.empty())
+            if (!drop_lru_parked()) return nullptr;
+        uint8_t* pg = E.free_pages.back();
+        E.free_pages.pop_back();
+        page_refs[pg] = 1;
+        return pg;
+    };
+    std::vector<int32_t> live;       // the tokens whose state the engine holds (cell i = live[i])
+    std::vector<uint64_t> live_v;    // the same cells' values (a token, or an image row: kImageCell | hash(key, row))
+    int64_t live_prefill_end = 0;   // committed prompt boundary, excluding any generated answer rows
+    bool live_cancelled = false;    // engine-thread state: a new GEN resets stop, but must not erase the old outcome
+    // the active conversation's cells [act_mirrored, pos) into its pages (a shared page copied before it is written)
+    auto mirror_active = [&]() {
+        if (E.n_pages == 0) return;
+        const int64_t upto_want = E.pos;
+        for (int64_t pg = act_mirrored / Engine::kPage; pg < (int64_t) act_pages.size() && pg * Engine::kPage < upto_want; ++pg)
+            if (page_refs[act_pages[(size_t) pg]] > 1) {   // shared with a parked conversation: this one's own copy
+                uint8_t* own = take_page();
+                // A selected conversation can own this page outside parked while being restored.
+                // No private page means no writes: retain only the already mirrored prefix.
+                if (!own) return;
+                if (page_refs[act_pages[(size_t) pg]] == 1) {
+                    page_refs.erase(own);
+                    E.free_pages.push_back(own);
+                    continue;
+                }
+                std::memcpy(own, act_pages[(size_t) pg], E.page_bytes());
+                --page_refs[act_pages[(size_t) pg]];
+                act_pages[(size_t) pg] = own;
+            }
+        while ((int64_t) act_pages.size() * Engine::kPage < upto_want) {
+            uint8_t* pg = take_page();
+            if (!pg) break;
+            act_pages.push_back(pg);
+        }
+        const int64_t upto = std::min<int64_t>(upto_want, (int64_t) act_pages.size() * Engine::kPage);
+        if (upto > act_mirrored) {
+            E.kv_copy(act_pages, act_mirrored, upto, true);
+            CK(cudaStreamSynchronize(E.st));
+            act_mirrored = upto;
+        }
+    };
+    auto prefix_hash = [](const std::vector<uint64_t>& v, size_t n) {
+        uint64_t h = kFnvSeed;
+        for (size_t i = 0; i < n; ++i) h = fnv_mix(h, v[i]);
+        return h;
+    };
+    // Park the active prefix without changing its device state. A cancelled caller may
+    // retain an already-owned, mirrored checkpoint instead of copying a new end state.
+    // share=true retains the active handles; share=false transfers only the retained subset.
+    auto park_active = [&](bool share) {
+        if (phase_trace) std::fprintf(stderr, "strata-q36: park start at %.3f cells=%zu cancelled=%d share=%d\n",
+                     wall_ms(), live_v.size(), (int) live_cancelled, (int) share);
+        if (live_v.empty() || E.n_pages == 0) return;
+        Engine::Snap* checkpoint = nullptr;
+        std::vector<Engine::Snap*> checkpoint_states;
+        if (live_cancelled) {
+            const size_t limit = std::min({live.size(), live_v.size(),
+                (size_t) std::max<int64_t>(0, act_mirrored), act_pages.size() * (size_t) Engine::kPage});
+            std::vector<Engine::Snap*> candidates;
+            for (Engine::Snap* sn : act_states)
+                if (sn->refs > 0 && sn->pos > 0 && (size_t) sn->pos <= limit) candidates.push_back(sn);
+            std::sort(candidates.begin(), candidates.end(), [](const Engine::Snap* a, const Engine::Snap* b) {
+                return a->pos < b->pos;
+            });
+            // One prefix-hash pass for all owned candidates, not one full pass per state.
+            size_t at = 0;
+            uint64_t hash = kFnvSeed;
+            for (Engine::Snap* sn : candidates) {
+                while (at < (size_t) sn->pos) hash = fnv_mix(hash, live_v[at++]);
+                if (sn->hash == hash) { checkpoint_states.push_back(sn); checkpoint = sn; }
+            }
+            // Early cold prefill can have only a root checkpoint. Do not throw away a
+            // large completed history just to avoid its snapshot: use the honest old path.
+            constexpr size_t max_trim_cells = 512;
+            // The replay bound protects the committed PROMPT. A long generated tail
+            // may be discarded after cancellation without forcing a new GPU snapshot.
+            if (checkpoint && live_prefill_end > checkpoint->pos &&
+                (uint64_t) (live_prefill_end - checkpoint->pos) > max_trim_cells) checkpoint = nullptr;
+        }
+        const bool checkpoint_only = checkpoint != nullptr;
+        const char* mode = checkpoint_only ? "owned-checkpoint" : "end-snapshot";
+        Conv c;
+        if (checkpoint_only) {
+            const size_t kept = (size_t) checkpoint->pos;
+            const size_t pages = (kept + Engine::kPage - 1) / Engine::kPage;
+            c.tok.assign(live.begin(), live.begin() + kept);
+            c.val.assign(live_v.begin(), live_v.begin() + kept);
+            c.pages.assign(act_pages.begin(), act_pages.begin() + pages);
+            c.states = checkpoint_states;
+            c.mirrored = (int64_t) kept;
+            if (share) {
+                for (uint8_t* pg : c.pages) ++page_refs[pg];
+                for (Engine::Snap* sn : c.states) ++sn->refs;
+            } else {
+                // No ref increment for the transferred subset; release the omitted tails.
+                std::vector<uint8_t*> tail_pages(act_pages.begin() + pages, act_pages.end());
+                unref(tail_pages);
+                for (Engine::Snap* sn : act_states)
+                    if (std::find(c.states.begin(), c.states.end(), sn) == c.states.end()) {
+                        assert(sn->refs > 0); --sn->refs;
+                    }
+                act_pages.clear(); act_states.clear(); act_mirrored = 0;
+            }
+            if (phase_trace) std::fprintf(stderr, "strata-q36: park mirror end at %.3f mode=%s skipped=1 kept=%zu trimmed=%zu\n",
+                         wall_ms(), mode, kept, live_v.size() - kept);
+            if (phase_trace) std::fprintf(stderr, "strata-q36: park snapshot end at %.3f mode=%s skipped=1\n", wall_ms(), mode);
+        } else {
+            mirror_active();
+            if (phase_trace) std::fprintf(stderr, "strata-q36: park mirror end at %.3f mode=%s mirrored=%lld\n",
+                         wall_ms(), mode, (long long) act_mirrored);
+            if (act_mirrored < (int64_t) live_v.size()) {
+                std::fprintf(stderr, "strata-q36: park declined at %.3f reason=insufficient-pages\n", wall_ms());
+                return;
+            }
+            E.save_snap(prefix_hash(live_v, live_v.size()), 2);
+            c.tok = live;
+            c.val = live_v;
+            c.pages = act_pages;
+            c.mirrored = act_mirrored;
+            if (share) {
+                c.states = act_states;
+                for (Engine::Snap* sn : c.states) ++sn->refs;
+                for (uint8_t* pg : c.pages) ++page_refs[pg];
+            } else {
+                c.states = std::move(act_states);
+                act_states.clear(); act_pages.clear(); act_mirrored = 0;
+            }
+        }
+        c.used = ++conv_clock;
+        // A longer retained prefix contains every KV cell of its exact ancestors.
+        // Transfer their useful anchors, then drop those redundant records. Divergent
+        // branches remain separate, even when they share the same explicit breakpoint.
+        for (size_t i = 0; i < parked.size();) {
+            Conv& old = parked[i];
+            if (old.val.size() <= c.val.size() && std::equal(old.val.begin(), old.val.end(), c.val.begin())) {
+                for (Engine::Snap* sn : old.states) retain_state(c.states, *sn);
+                unref(old.pages);
+                release_states(old.states);
+                parked.erase(parked.begin() + (long) i);
+            } else ++i;
+        }
+        // Ancestor admission may replace a low-priority grid entry. Keep the selected
+        // logical endpoint owned even then; total ownership remains within state_limit.
+        if (checkpoint_only && std::find(c.states.begin(), c.states.end(), checkpoint) == c.states.end()) {
+            assert(state_limit > 0);
+            if (c.states.size() >= state_limit) {
+                auto victim = std::min_element(c.states.begin(), c.states.end(), [](const Engine::Snap* a, const Engine::Snap* b) {
+                    return std::make_pair(a->prio, a->used) < std::make_pair(b->prio, b->used);
+                });
+                assert((*victim)->refs > 0); --(*victim)->refs; c.states.erase(victim);
+            }
+            c.states.push_back(checkpoint); ++checkpoint->refs;
+        }
+        parked.push_back(std::move(c));
+        while (parked.size() > max_parked) drop_lru_parked();
+        if (!checkpoint_only) {
+            CK(cudaStreamSynchronize(E.st));   // observe the old end-snapshot completion before new KV restore
+            if (phase_trace) std::fprintf(stderr, "strata-q36: park snapshot end at %.3f mode=%s observed=1\n", wall_ms(), mode);
+        }
+        // The checkpoint-only branch enqueues no GPU work. Cancel DONE already drained
+        // the old stream; neither E.pos nor live tokens were changed by parking.
+        std::fprintf(stderr, "strata-q36: parked at %.3f cells=%zu mode=%s retained=%lld\n",
+                     wall_ms(), live_v.size(), mode, (long long) parked.back().mirrored);
+        trace_states("parked-new", (int) parked.size() - 1, parked.back().val.size(), parked.back().states);
+    };
     std::vector<float> lg;
+    std::vector<int32_t> table;      // [ctx][3] the rotary positions of the request's cells (and the cells after them)
+    const int pad = E.m->tok_image_pad;
+    auto parse_hex = [](const std::string& h, uint64_t& out) {
+        if (h.empty() || h.size() > 16) return false;
+        uint64_t v = 0;
+        for (char c : h) {
+            const int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (d < 0) return false;
+            v = v * 16 + (uint64_t) d;
+        }
+        out = v;
+        return true;
+    };
+    auto split = [](const std::string& v, char sep) {
+        std::vector<std::string> out;
+        size_t a = 0;
+        while (a <= v.size()) {
+            const size_t b = v.find(sep, a);
+            out.push_back(v.substr(a, b == std::string::npos ? std::string::npos : b - a));
+            if (b == std::string::npos) break;
+            a = b + 1;
+        }
+        return out;
+    };
     for (;;) {
+        const double phase_loop = phase_trace ? wall_ms() : 0; // prior iteration locals have been destroyed
         std::string line;
         {
             std::unique_lock<std::mutex> lk(mu);
@@ -2227,15 +3296,42 @@ int serve(Engine& E) {
             line = lines.front();
             lines.pop_front();
         }
+        const double phase_dequeue = phase_trace ? wall_ms() : 0;
         if (line.empty()) continue;
-        if (line.rfind("GEN ", 0) != 0) {
-            std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n");
+        if (line.rfind("HAVE", 0) == 0) {   // HAVE <hex key>,... -> HAVE n:nx:ny or 0 per key, in order
+            std::string out = "HAVE";
+            const std::string rest = line.size() > 5 ? line.substr(5) : "";
+            bool first = true;
+            for (const std::string& k : split(rest, ',')) {
+                if (k.empty()) continue;
+                uint64_t key = 0;
+                const ImageCache::Entry* e = parse_hex(k, key) ? icache.find(key) : nullptr;
+                out += first ? " " : ",";
+                first = false;
+                out += e ? std::to_string((long long) e->n) + ":" + std::to_string((long long) e->nx) + ":" +
+                               std::to_string((long long) e->ny)
+                         : std::string("0");
+            }
+            std::printf("%s\n", out.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        if (!geni && line.rfind("GEN ", 0) != 0) {
+            std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...> or GENI <max_new> [key=value ...] "
+                        "<file> <id,id,...>\n");
             std::fflush(stdout);
             continue;
         }
         char* p = nullptr;
-        const long long max_new = std::strtoll(line.c_str() + 4, &p, 10);
+        const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &p, 10);
         Sampling smp;
+        std::string grammar_path;
+        int grammar_after = -1;
+        bool grammar_bad = false;
+        std::vector<uint64_t> img_keys;
+        std::vector<int64_t> snap_at;   // snap=<cell>,...: the client's snapshot points (at most 4)
+        bool keys_bad = false;
         for (;;) {
             while (*p == ' ') ++p;
             const char* st0 = p;
@@ -2254,60 +3350,447 @@ int serve(Engine& E) {
             else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
             else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
             else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
+            else if (key == "snap") {
+                for (const std::string& c : split(v, ','))
+                    if (!c.empty() && snap_at.size() < 4) snap_at.push_back(std::atoll(c.c_str()));
+            }
+            else if (key == "grammar") {
+                grammar_path = v;
+                if (grammar_path.empty()) grammar_bad = true;
+            } else if (key == "grammar_after") {
+                char* end = nullptr;
+                const long id = std::strtol(v, &end, 10);
+                if (end == v || *end || id < 0 || id >= g.n_vocab) grammar_bad = true;
+                else grammar_after = (int) id;
+            }
+            else if (key == "img_keys") {
+                for (const std::string& h : split(v, ',')) {
+                    uint64_t x = 0;
+                    if (!parse_hex(h, x)) { keys_bad = true; break; }
+                    img_keys.push_back(x);
+                }
+            }
+        }
+        std::string emb_path;
+        if (geni) {
+            while (*p == ' ') ++p;
+            const char* st0 = p;
+            while (*p && *p != ' ') ++p;
+            emb_path.assign(st0, (size_t) (p - st0));
         }
         const std::vector<int32_t> ids = parse_ids(p);
-        if (max_new < 1 || ids.empty()) {
-            std::printf("ERR bad request: max_new or the ids\n");
+        auto fail = [&](const std::string& why) {
+            std::printf("ERR %s\n", why.c_str());
             std::fflush(stdout);
-            continue;
-        }
+        };
+        if (grammar_bad) { fail("grammar: invalid grammar path or grammar_after token id"); continue; }
+        Q36Grammar grammar;
+        try { vocabulary.prepare(grammar, grammar_path, grammar_after); }
+        catch (const std::exception& e) { fail(std::string("grammar: ") + e.what()); continue; }
+        if (max_new < 1 || ids.empty()) { fail("bad request: max_new or the ids"); continue; }
         if ((int64_t) ids.size() + max_new > E.ctx) {
-            std::printf("ERR prompt (%zu tokens) + max_new (%lld) exceeds the context (%d)\n", ids.size(), max_new, E.ctx);
-            std::fflush(stdout);
+            fail("prompt (" + std::to_string(ids.size()) + " tokens) + max_new (" + std::to_string(max_new) +
+                 ") exceeds the context (" + std::to_string(E.ctx) + ")");
             continue;
         }
         bool bad = false;
-        for (int32_t t : ids) bad |= t < 0 || t >= (int32_t) E.m->g.n_vocab;
-        if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); std::fflush(stdout); continue; }
-        stop.store(false);
-        // the held state continues when the request extends it (the recurrent state cannot step back)
-        size_t reuse = 0;
-        if (live.size() < ids.size() && std::equal(live.begin(), live.end(), ids.begin())) reuse = live.size();
-        else {
+        for (int32_t t : ids) bad |= t < 0 || t >= (int32_t) g.n_vocab;
+        if (bad) { fail("a token id is outside the vocabulary"); continue; }
+        const double phase_parse = phase_trace ? wall_ms() : 0;
+        const int64_t n = (int64_t) ids.size();
+        // ---- the pictures: the file's records (SVE1 rows, SVR1 a key the engine holds), each to its run of pads
+        std::vector<Pic> pics;
+        std::string ve;
+        if (keys_bad) ve = "img_keys: hex keys separated by commas";
+        if (geni && ve.empty()) {
+            std::vector<std::tuple<int64_t, int64_t, int64_t, bool>> heads;   // n, nx, ny, has rows
+            std::vector<std::vector<float>> bodies;
+            ve = read_embeddings(emb_path, N, heads, bodies);
+            if (ve.empty() && !img_keys.empty() && img_keys.size() != heads.size())
+                ve = "img_keys names " + std::to_string(img_keys.size()) + " pictures, the file has " + std::to_string(heads.size());
+            std::vector<uint64_t> keep;
+            for (size_t k = 0; ve.empty() && k < heads.size(); ++k) {
+                const auto [pn, nx, ny, has] = heads[k];
+                uint64_t key = 0;
+                if (!img_keys.empty()) key = img_keys[k];
+                else if (has) {   // no key from the server: the grid and the rows' bits
+                    key = fnv_mix(fnv_mix(fnv_mix(kFnvSeed, (uint64_t) pn), (uint64_t) nx), (uint64_t) ny);
+                    const uint8_t* b = (const uint8_t*) bodies[k].data();
+                    for (size_t i = 0; i < bodies[k].size() * 4; ++i) key = (key ^ b[i]) * 1099511628211ull;
+                } else {
+                    ve = "a picture by reference (SVR1) needs its key in img_keys";
+                    break;
+                }
+                keep.push_back(key);
+                const float* rows = nullptr;
+                if (has) {
+                    const ImageCache::Entry* e = icache.put(key, bodies[k].data(), pn, nx, ny, keep);
+                    if (!e) { ve = "no host memory for a picture's rows"; break; }
+                    rows = e->rows;
+                } else if (const ImageCache::Entry* e = icache.find(key)) {
+                    if (e->n != pn || e->nx != nx || e->ny != ny) { ve = "a picture's reference does not match its grid"; break; }
+                    rows = e->rows;
+                }
+                pics.push_back({pn, nx, ny, key, rows});
+            }
+        }
+        // ---- the cells: their values, image rows and rotary positions
+        Cells cl;
+        if (ve.empty()) ve = build_cells(*E.m, ids, pics, geni, E.ctx, cl, table);
+        if (!ve.empty()) { fail(ve); continue; }
+        const double phase_cells = phase_trace ? wall_ms() : 0;
+        const std::vector<uint64_t>& cell = cl.cell;
+        std::vector<const float*>& rowp = cl.rowp;
+        const std::vector<int>& pic_of = cl.pic_of;
+        std::vector<uint64_t> ph((size_t) n + 1);   // ph[i]: the hash of cells [0, i)
+        ph[0] = kFnvSeed;
+        for (int64_t i = 0; i < n; ++i) ph[(size_t) i + 1] = fnv_mix(ph[(size_t) i], cell[(size_t) i]);
+        // Refresh personal breakpoints even when reuse selects a deeper periodic state.
+        // A cache-control marker newly added to a held state can promote it without recompute.
+        for (Engine::Snap& sn : E.snaps)
+            if (sn.pos > 0 && sn.pos < n && sn.hash == ph[(size_t) sn.pos]) {
+                const bool explicit_now = std::find(snap_at.begin(), snap_at.end(), sn.pos) != snap_at.end();
+                if (explicit_now || sn.prio >= 3) E.touch_snap(sn, explicit_now ? 3 : sn.prio);
+            }
+        // ---- what the engine can keep: the longest common start with the active conversation and with every parked
+        // one, then the state that reaches furthest into it (the request extending the active one, else a snapshot)
+        auto common = [&](const std::vector<uint64_t>& v, size_t len) {
+            size_t k = 0;
+            while (k < len && k < (size_t) n && v[k] == cell[k]) ++k;
+            return k;
+        };
+        auto best_snap = [&](int64_t limit) {
+            Engine::Snap* f = nullptr;
+            for (Engine::Snap& sn : E.snaps)
+                if (sn.pos > 0 && sn.pos <= limit && sn.pos < n && sn.hash == ph[(size_t) sn.pos] &&
+                    (f == nullptr || sn.pos > f->pos))
+                    f = &sn;
+            return f;
+        };
+        size_t L = common(live_v, live_v.size());
+        size_t held_n = live_v.size();   // what the selected source of this request held before it
+        // Learning a changed suffix is independent of finding a reusable state. A parked
+        // caller can match far beyond its last surviving snapshot (or tie the active root).
+        // Keep that real LCP even when the source chosen for restoration does not change.
+        size_t max_lcp = L, max_lcp_held = held_n;
+        int64_t reuse = 0;
+        Engine::Snap* from = nullptr;
+        int src = -1;                    // -1: the active conversation, else a parked one
+        if (L == live_v.size() && L < (size_t) n && L == (size_t) E.pos) {
+            reuse = (int64_t) L;         // the request extends the held state
+        } else {
+            from = best_snap((int64_t) L);
+            reuse = from ? from->pos : 0;
+        }
+        for (size_t i = 0; i < parked.size(); ++i) {
+            const size_t Lc = common(parked[i].val, (size_t) parked[i].mirrored);
+            if (Lc > max_lcp) {
+                max_lcp = Lc;
+                max_lcp_held = parked[i].val.size();
+            } else if (Lc == max_lcp) {
+                max_lcp_held = std::max(max_lcp_held, parked[i].val.size());
+            }
+            if ((int64_t) Lc <= reuse) continue;
+            Engine::Snap* f = best_snap((int64_t) Lc);
+            if (f && f->pos > reuse) {
+                src = (int) i;
+                from = f;
+                reuse = f->pos;
+                L = Lc;
+                held_n = parked[i].val.size();
+            }
+        }
+        const double phase_match = phase_trace ? wall_ms() : 0;
+        if (cache_trace) {
+            std::fprintf(stderr, "strata-q36: cache match cells=%lld reuse=%lld src=%d selected_lcp=%zu max_lcp=%zu max_held=%zu\n",
+                         (long long) n, (long long) reuse, src, L, max_lcp, max_lcp_held);
+            trace_states("active", -1, live_v.size(), act_states);
+            for (size_t i = 0; i < parked.size(); ++i)
+                trace_states("parked", (int) i, parked[i].val.size(), parked[i].states);
+        }
+        {   // the pictures that must be read again need their rows
+            std::string need;
+            int last = -1;
+            for (int64_t c = reuse; c < n; ++c)
+                if (pic_of[(size_t) c] >= 0 && rowp[(size_t) c] == nullptr && pic_of[(size_t) c] != last) {
+                    last = pic_of[(size_t) c];
+                    need += (need.empty() ? "" : ",") + std::to_string(last + 1);
+                }
+            if (!need.empty()) { fail("NEED_IMAGES " + need + " (the engine does not hold these pictures: send their rows)"); continue; }
+        }
+        // One diagnostic line per accepted GEN, immediately before parking (or
+        // restoration if no park is needed). No token contents or paths are logged.
+        auto trace_phase = [&](bool will_park) {
+            if (phase_trace)
+                std::fprintf(stderr, "strata-q36: phases loop_top=%.3f dequeue_after=%.3f parse_validate_after=%.3f build_cells_after=%.3f match_after=%.3f park_before=%.3f park=%d cells=%lld\n",
+                             phase_loop, phase_dequeue, phase_parse, phase_cells, phase_match, wall_ms(),
+                             (int) will_park, (long long) n);
+        };
+        E.pinned_snap = from;
+        int64_t brought = 0;
+        if (src >= 0) {
+            // another conversation: the active one parked (whole), the chosen one's cells beyond the common start of
+            // the two brought from its pages, its state from the snapshot
+            const size_t same = [&] {   // the cells the cache already holds for it: the two conversations' common start
+                size_t k = 0;
+                const Conv& c = parked[(size_t) src];
+                while (k < live_v.size() && k < c.val.size() && live_v[k] == c.val[k]) ++k;
+                return k;
+            }();
+            from->used = ++E.snap_clock;   // (the parked one's end snapshot must not take the slot it is restored from)
+            Conv c = std::move(parked[(size_t) src]);
+            parked.erase(parked.begin() + src);
+            trace_phase(true);
+            park_active(false);
+            unref(act_pages);
+            release_states(act_states);   // park can fail when its KV could not be mirrored
+            act_states = std::move(c.states);
+            live = std::move(c.tok);
+            live_v = std::move(c.val);
+            act_pages = std::move(c.pages);
+            act_mirrored = c.mirrored;
+            const int64_t lo = std::min<int64_t>((int64_t) same, reuse);
+            if (reuse > lo) E.kv_copy(act_pages, lo, reuse, false);
+            brought = reuse - lo;
+            ++switches;
+            cells_brought += brought;
+        } else if ((int64_t) held_n - reuse >= 4096) {
+            if (from) from->used = ++E.snap_clock;
+            trace_phase(true);
+            park_active(true);   // a long conversation the request leaves early: kept for its caller's next turn
+        } else {
+            trace_phase(false);
+        }
+        if (reuse == 0) {
             E.reset();
-            live.clear();
+        } else if (from != nullptr) {
+            E.restore_snap(*from);
+        }
+        E.pinned_snap = nullptr;
+        live_cancelled = false;   // the previous outcome was used by park_active; this request now owns the state
+        live.resize((size_t) reuse);
+        live_v.resize((size_t) reuse);
+        act_mirrored = std::min<int64_t>(act_mirrored, reuse);
+        // Release anchors outside the new prefix. The hashes describe the complete
+        // incoming prompt: matching anchors ahead of reuse remain valid while we redo
+        // that unchanged part. An abort prunes them to the committed position below.
+        for (auto it = act_states.begin(); it != act_states.end();) {
+            Engine::Snap* sn = *it;
+            if (sn->pos <= 0 || sn->pos > n || sn->hash != ph[(size_t) sn->pos]) {
+                assert(sn->refs > 0); --sn->refs; it = act_states.erase(it);
+            } else ++it;
+        }
+        // Admit useful states already in the shared pool (including a newly marked
+        // held prefix), not only states created during this particular request.
+        for (Engine::Snap& sn : E.snaps)
+            if (sn.pos > 0 && sn.pos <= n && sn.hash == ph[(size_t) sn.pos]) retain_state(act_states, sn);
+        if (E.m->has_mrope)
+            CK(cudaMemcpyAsync(E.mrope + (size_t) reuse * 3, table.data() + (size_t) reuse * 3,
+                               ((size_t) E.ctx - (size_t) reuse) * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, E.st));
+        // the snapshots this prompt leaves: its last message starts and, near its end, every snap_every cells
+        std::vector<Engine::Cut> cuts;
+        {
+            std::vector<std::pair<int64_t, int>> at;   // position, priority
+            int bounds = 0;
+            for (int64_t c = n - 1; c > reuse && bounds < 3; --c)
+                if (ids[(size_t) c] == E.m->tok_im_start && pic_of[(size_t) c] < 0) { at.push_back({c, 1}); ++bounds; }
+            // Preserve the text prefix of a multimodal message independently of its
+            // photo memory. A removed/changed image can invalidate the whole suffix
+            // window while every text cell before the first image is unchanged.
+            // pic_of marks actual embedding rows (including cached references).
+            // Look back eight cells, as for learned divergence, to precede image
+            // delimiters and tokenization changes when text is appended before photos.
+            for (int64_t c = 0; c < n; ++c)
+                if (pic_of[(size_t) c] >= 0) {
+                    const int64_t anchor = c > 8 ? c - 8 : c;
+                    if (anchor > reuse) at.push_back({anchor, 1});
+                    break;
+                }
+            if (snap_every > 0) {
+                const int64_t window = (int64_t) std::max(0, E.max_snaps - 4) * snap_every;
+                for (int64_t c = (reuse / snap_every + 1) * snap_every; c < n; c += snap_every)
+                    if (c >= n - window) at.push_back({c, 0});
+            }
+            // where this request left the held one: a client that keeps a long start and replaces its tail every time
+            // (a replaceable state message) leaves the next request at the same place - a snapshot a few cells before it
+            // (the tokenizer can merge the first cells of a new tail differently) makes that one read its tail alone
+            if ((int64_t) max_lcp > reuse + 8 && (int64_t) max_lcp < n && max_lcp < max_lcp_held)
+                at.push_back({(int64_t) max_lcp - 8, 2});
+            // the end of the last message's body (before its <|im_end|>): a client that grows that message (and sends
+            // the same start again) continues from there
+            for (int64_t c = n - 1; c > reuse; --c)
+                if (ids[(size_t) c] == E.m->tok_im_end && pic_of[(size_t) c] < 0) { at.push_back({c, 0}); break; }
+            for (int64_t c : snap_at)   // the client's own points (cache_control / prompt_cache_breakpoint)
+                if (c > reuse && c < n) at.push_back({c, 3});
+            std::sort(at.begin(), at.end());
+            for (const auto& [c, pr] : at)   // one cut a position, the highest priority asked for it
+                if (!cuts.empty() && cuts.back().pos == c) cuts.back().prio = std::max(cuts.back().prio, pr);
+                else cuts.push_back({c, ph[(size_t) c], pr});
         }
         const auto t0 = Clock::now();
-        const int64_t fresh = (int64_t) (ids.size() - reuse);
+        int64_t fresh = n - reuse;
+        std::printf("RESUME %lld\n", (long long) reuse);
+        std::fflush(stdout);
+        std::fprintf(stderr, "strata-q36: prompt from cell %lld of %lld at %.3f\n", (long long) reuse, (long long) n, wall_ms());
         E.process(ids.data() + reuse, fresh, [&](int64_t done) {
-            std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) fresh, ms_since(t0),
+            // Each callback publishes only a fully committed chunk. Incremental host mirroring
+            // prevents a later cancellation/switch from inheriting an entire prompt's KV copy.
+            // mirror_active uses E.pos, not live: the vectors are appended once below process().
+            mirror_active();
+            std::printf("PP %lld %lld %.0f %.1f\n", (long long) (reuse + done), (long long) n, ms_since(t0),
                         (double) done / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
-        });
-        live.insert(live.end(), ids.begin() + (long) reuse, ids.end());
+        }, geni ? rowp.data() + reuse : nullptr, &cuts);
+        live_prefill_end = E.pos;   // committed full/partial prompt, before decoding any answer rows
+        const bool cut_short = E.pos < n;   // STOP while the prompt was read: what it read stays held
+        live.insert(live.end(), ids.begin() + (long) reuse, ids.begin() + (long) E.pos);
+        live_v.insert(live_v.end(), cell.begin() + (long) reuse, cell.begin() + (long) E.pos);
+        if (cut_short) {
+            fresh = E.pos - reuse;
+            // Transactional abort already restored a consistent live state. A host snapshot here
+            // would enqueue another 63 MiB copy after rollback; park_active saves it only if needed.
+            if (E.pos > 0 && !E.prefill_aborted) E.save_snap(ph[(size_t) E.pos], 2);
+        }
+        for (auto it = act_states.begin(); it != act_states.end();) {
+            if ((*it)->pos > E.pos) {
+                assert((*it)->refs > 0); --(*it)->refs; it = act_states.erase(it);
+            } else ++it;
+        }
         const double prompt_ms = ms_since(t0);
         std::mt19937_64 rng(smp.seed);
         std::vector<int32_t> hist = ids;
         const auto d0 = Clock::now();
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
-        // greedy requests with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
-        // text); sampled ones one token at a time
-        const bool spec = E.mtp_d > 0 && !smp.needs_logits();
+        // with the MTP block, speculative steps of mtp_d drafts: a greedy request keeps the drafts the greedy picks
+        // confirm (the text is the greedy text); a sampled one keeps draft d of a row with the probability the row's
+        // sampling distribution p gives it and otherwise draws from p without d - exactly the distribution of drawing
+        // every token in turn (the drafts are the block's greedy picks, so their own distribution is a point mass).
+        // STRATA_Q36_SPEC_SAMPLED=0: sampled requests one token at a time, as before.
+        static const bool spec_sampled = [] {
+            const char* e = std::getenv("STRATA_Q36_SPEC_SAMPLED");
+            return e == nullptr || std::strcmp(e, "0") != 0;
+        }();
+        const bool sampled = smp.needs_logits();
+        const bool constrained = grammar.active();
+        const bool spec = E.mtp_d > 0 && (!sampled || spec_sampled);
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
-        int nx = smp.needs_logits() ? -1 : E.greedy();
-        bool done = false;
-        while (!done) {
-            if (smp.needs_logits()) {
-                E.host_logits(lg);
-                nx = sample(lg, smp, hist, rng);
+        std::vector<float> cv;
+        std::vector<int> ci, all_ids;
+        std::vector<std::pair<int, double>> dist;
+        long long grammar_fast = 0, grammar_full = 0;
+        const bool greedy_unpenalized = smp.temperature <= 0.f &&
+            (smp.last_n == 0 || (smp.repeat == 1.f && smp.freq == 0.f && smp.present == 0.f));
+        auto allowed_by = [&](const Q36Grammar& gr, int id) {
+            if (id < 0 || id >= g.n_vocab) return false;
+            float value = 0.f;
+            gr.mask(&value, &id, 1);
+            return std::isfinite(value);
+        };
+        // row r of `logits` -> dist under history h: on its candidates when that is exact, else on the whole row
+        auto row_dist = [&](int r, const std::vector<int32_t>& h, const Q36Grammar* gr) {
+            if (cand_dist(cv.data() + (size_t) r * kTopK, ci.data() + (size_t) r * kTopK, kTopK, false, smp, h, dist, gr)) {
+                if (constrained) ++grammar_fast;
+                return;
             }
+            if (constrained) ++grammar_full;
+            std::vector<float> row((size_t) g.n_vocab);
+            CK(cudaMemcpy(row.data(), E.logits + (size_t) r * g.n_vocab, row.size() * 4, cudaMemcpyDeviceToHost));
+            if (all_ids.empty()) {
+                all_ids.resize((size_t) g.n_vocab);
+                for (size_t i = 0; i < all_ids.size(); ++i) all_ids[i] = (int) i;
+            }
+            cand_dist(row.data(), all_ids.data(), (int) g.n_vocab, true, smp, h, dist, gr);
+        };
+        auto next_sampled = [&]() {   // the token after the last processed row (logits row 0)
+            if (constrained && greedy_unpenalized) {
+                const int raw = E.greedy();
+                if (allowed_by(grammar, raw)) {
+                    ++grammar_fast;
+                    dist.assign(1, {raw, 1.0});
+                    return draw(dist, rng);
+                }
+            }
+            E.topk_rows(1, cv, ci);
+            row_dist(0, hist, &grammar);
+            return draw(dist, rng);
+        };
+        std::uniform_real_distribution<double> unit(0.0, 1.0);
+        const std::function<int(int, const std::vector<int32_t>&, int32_t*)> judge =
+            [&](int T, const std::vector<int32_t>& dr, int32_t* pk) {
+                bool have_topk = false;
+                Q36Grammar window(grammar);
+                std::vector<int32_t> h = hist;   // the emitted tokens (the window's first row, x, among them)
+                for (int i = 0; i < T; ++i) {
+                    // spec_step has already copied every row's raw argmax to
+                    // hpin[2+i]. If it is allowed and no penalties apply, it is
+                    // also the exact grammar-first greedy choice (including ties).
+                    const int raw = E.hpin[2 + i];
+                    if (constrained && greedy_unpenalized && allowed_by(window, raw)) {
+                        ++grammar_fast;
+                        dist.assign(1, {raw, 1.0});
+                    } else {
+                        if (!have_topk) { E.topk_rows(T, cv, ci); have_topk = true; }
+                        row_dist(i, h, &window);
+                    }
+                    if (i == T - 1) { pk[i] = draw(dist, rng); return i; }
+                    double pd = 0;
+                    for (const auto& [id, q] : dist)
+                        if (id == dr[(size_t) i]) pd = q;
+                    if (smp.temperature <= 0.f ? pd == 1.0 : unit(rng) < pd) {
+                        pk[i] = dr[(size_t) i];
+                        h.push_back(dr[(size_t) i]); window.accept(dr[(size_t) i]); continue;
+                    }
+                    pk[i] = draw(dist, rng, dr[(size_t) i]);
+                    return i;
+                }
+                return T - 1;
+            };
+        // The draft state starts AFTER nx, which emit() has already accepted.
+        std::unique_ptr<Q36Grammar> draft_state;
+        const std::function<int(int)> draft_pick = [&](int raw) {
+            // The global argmax is also the best allowed top-128 candidate
+            // whenever it is allowed. Avoid three extra device top-k passes
+            // per window in the common case, without changing the proposal.
+            if (allowed_by(*draft_state, raw)) {
+                draft_state->accept(raw);
+                return raw;
+            }
+            std::vector<float> values;
+            std::vector<int> ids_m;
+            E.topk_rows(1, values, ids_m, E.logits_m);
+            const int fallback = ids_m.front();
+            draft_state->mask(values.data(), ids_m.data(), (int) values.size());
+            int chosen = fallback;
+            for (size_t i = 0; i < values.size(); ++i)
+                if (std::isfinite(values[i])) { chosen = ids_m[i]; break; }
+            // A disallowed fallback will be rejected by the verifier. Do not feed
+            // it to llama.cpp (which asserts on an impossible grammar transition).
+            float allowed = 0.f;
+            draft_state->mask(&allowed, &chosen, 1);
+            if (std::isfinite(allowed)) draft_state->accept(chosen);
+            return chosen;
+        };
+        const bool canceled = cut_short || stop.load();
+        int nx = canceled ? -1 : sampled || constrained ? next_sampled() : E.greedy();
+        bool done = canceled;
+        if (canceled) finish = "cancel";
+        auto keep = [&](int32_t t) { live.push_back(t); live_v.push_back((uint64_t) (uint32_t) t); };
+        double cancel_returned = 0;
+        if (E.cancel_trace) {
+            E.cancel_abort_at = 0;
+            E.cancel_abort_stage = "none";
+            E.cancel_abort_pos = -1;
+        }
+        while (!done) {
+            if (stop.load()) { finish = "cancel"; break; }
             auto emit = [&](int t) {   // false: the answer ends here
                 std::printf("T %d\n", t);
                 std::fflush(stdout);
                 ++produced;
                 hist.push_back(t);
+                grammar.accept(t);
                 if (is_eos(t)) { finish = "stop"; return false; }
                 if (produced >= max_new) return false;
                 if (stop.load()) { finish = "cancel"; return false; }
@@ -2315,40 +3798,78 @@ int serve(Engine& E) {
             };
             if (!emit(nx)) break;
             if (spec && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks);
+                if (constrained) draft_state = std::make_unique<Q36Grammar>(grammar);
+                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks,
+                                          sampled || constrained ? &judge : nullptr, constrained ? &draft_pick : nullptr);
+                if (a < 0) {
+                    if (E.cancel_trace) cancel_returned = wall_ms();
+                    finish = "cancel"; break;   // no main-state commit, no live append or picks[-1]
+                }
                 offered += E.mtp_d;
                 accepted += a;
-                live.push_back(nx);
+                keep(nx);   // the window's kept rows are all in the state, whatever the answer keeps of them
+                for (int i = 0; i < a; ++i) keep(drafts[(size_t) i]);
                 fix.assign(drafts.begin(), drafts.begin() + a);
-                for (int i = 0; i < a; ++i) {
-                    live.push_back(drafts[(size_t) i]);
+                for (int i = 0; i < a; ++i)
                     if (!emit(drafts[(size_t) i])) { done = true; break; }
-                }
                 nx = picks[a];
                 continue;
             }
             if (E.pos + 1 > E.ctx) break;
             const int32_t one = nx;
             E.process(&one, 1, [](int64_t) {});
-            live.push_back(nx);
+            keep(nx);
             fix.clear();
-            if (!smp.needs_logits()) nx = E.greedy();
+            nx = sampled || constrained ? next_sampled() : E.greedy();
         }
+        const bool trace_cancel = E.cancel_trace && std::strcmp(finish, "cancel") == 0;
+        const double cancel_sync_before = trace_cancel ? wall_ms() : 0;
+        double cancel_st_after = 0, cancel_cst_after = 0;
+        if (std::strcmp(finish, "cancel") == 0) {
+            CK(cudaStreamSynchronize(E.st));   // a STOP after commit must not hide its queued GPU writes after DONE
+            if (trace_cancel) cancel_st_after = wall_ms();
+            if (E.cst) CK(cudaStreamSynchronize(E.cst));
+            if (trace_cancel) cancel_cst_after = wall_ms();
+        }
+        live_cancelled = std::strcmp(finish, "cancel") == 0;
         const double decode_ms = ms_since(d0);
-        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
-                    decode_ms, finish, accepted, offered, reuse, (long long) fresh);
+        if (constrained) std::fprintf(stderr, "strata-q36: grammar target rows: fast=%lld full=%lld\n", grammar_fast, grammar_full);
+        const double cancel_done_before = trace_cancel ? wall_ms() : 0;
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %lld 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
+                    decode_ms, finish, accepted, offered, (long long) reuse, (long long) fresh);
+        const double cancel_printf_after = trace_cancel ? wall_ms() : 0;
         std::fflush(stdout);
+        const double cancel_flush_after = trace_cancel ? wall_ms() : 0;
+        const double cancel_log_before = trace_cancel ? wall_ms() : 0;
+        if (std::strcmp(finish, "cancel") == 0) std::fprintf(stderr, "strata-q36: cancelled at %.3f\n", wall_ms());
+        const double cancel_log_after = trace_cancel ? wall_ms() : 0;
+        if (trace_cancel)
+            std::fprintf(stderr, "strata-q36: cancel trace abort_at=%.3f abort_stage=%s abort_pos=%lld caller_return=%.3f sync_before=%.3f st_after=%.3f cst_after=%.3f done_before=%.3f printf_after=%.3f flush_after=%.3f cancelled_log_before=%.3f cancelled_log_after=%.3f\n",
+                         E.cancel_abort_at, E.cancel_abort_stage, (long long) E.cancel_abort_pos, cancel_returned, cancel_sync_before,
+                         cancel_st_after, cancel_cst_after, cancel_done_before, cancel_printf_after,
+                         cancel_flush_after, cancel_log_before, cancel_log_after);
+        // Cancelled live state stays on the device. A switch prefers its existing owned
+        // checkpoint; the fallback can still copy, so measure park completion separately.
+        if (!live_cancelled) mirror_active();
+        std::fprintf(stderr, "strata-q36: request %lld cells: reused %lld (%s%s), read %lld in %.1f ms, %zu pictures, %zu "
+                     "snapshots taken; %lld tokens in %.1f ms (%s); conversations: %zu parked, %zu of %zu pages free\n",
+                     (long long) n, (long long) reuse, reuse == 0 ? "fresh" : from ? "snapshot" : "held state",
+                     src >= 0 ? (", another conversation: " + std::to_string((long long) brought) + " cells brought back").c_str() : "",
+                     (long long) fresh, prompt_ms, pics.size(), cuts.size(), produced, decode_ms, finish, parked.size(),
+                     E.free_pages.size(), E.n_pages);
     }
 }
 
 }  // namespace
 
 int strata::qwen35::run(int argc, char** argv) {
-    std::string model, tokens, force, dump_full;
-    int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
+    std::string model, tokens, force, dump_full, embeddings;
+    int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_at = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
+    int bench_reps = 3;
     double expert_vram = -1.0;
     bool warm = true;
     int expert_slots = 0;
+    int snapshots = 0, snap_every = 512, image_cache_mib = 2048, park_mib = 0;
     bool serve_mode = false, graph = true;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -2370,7 +3891,10 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--n") n_gen = std::atoi(next().c_str());
         else if (a == "--force") force = next();
         else if (a == "--dump-full-logits") dump_full = next();
+        else if (a == "--embeddings") embeddings = next();   // --tokens with pictures: strata-vision records (GENI's file)
         else if (a == "--bench-pp") bench_pp = std::atoi(next().c_str());
+        else if (a == "--bench-pp-at") bench_at = std::atoi(next().c_str());
+        else if (a == "--bench-reps") bench_reps = std::atoi(next().c_str());
         else if (a == "--bench-tg") bench_tg = std::atoi(next().c_str());
         else if (a == "--no-graph") graph = false;
         else if (a == "--no-warmup") warm = false;
@@ -2385,6 +3909,11 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
+        else if (a == "--snapshots") snapshots = std::atoi(next().c_str());              // state snapshots kept (0: off)
+        else if (a == "--snapshot-every") snap_every = std::atoi(next().c_str());       // cells between snapshots
+        else if (a == "--image-cache-mib") image_cache_mib = std::atoi(next().c_str()); // pictures held by key
+        else if (a == "--park-mib") park_mib = std::atoi(next().c_str());   // conversations' cells in host memory (0: off)
+        else if (a == "--vision") {}   // the serve path always takes GENI (the pictures' rows come from strata-vision)
         else if (serve_mode && a.rfind("--", 0) == 0) {
             // serve passes the config's args plus a few of its own: one this engine does not have is said and skipped
             // (with its value), not fatal
@@ -2396,7 +3925,8 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr,
                          "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
-                         "--bench-tg N)\n");
+                         "--bench-tg N [--bench-pp-at P0])\n"
+                         "       --tokens @FILE reads comma/space separated token IDs from a file\n");
             return 2;
         }
     }
@@ -2440,7 +3970,12 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr, "strata-q36: chunk rule: free %.2f GiB (with %.2f packed), main experts %.2f GiB\n",
                          fr / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0);
     }
-    E.init(m, ctx, chunk);
+    // Full-context PP followed by TG needs a small cache tail for the requested generated tokens.
+    if (bench_at < 0 || bench_tg < 0 || bench_reps < 1 || (int64_t) bench_at + bench_pp > ctx || (int64_t) ctx + bench_tg > INT32_MAX) {
+        std::fprintf(stderr, "strata-q36: benchmark prompt exceeds --max-context\n"); return 2;
+    }
+    E.init(m, ctx + ((bench_pp > 0 || bench_tg > 0) ? bench_tg : 0), chunk);
+    if (serve_mode) E.alloc_prefill_rollback();   // include the rollback reservation in expert placement
     if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
@@ -2457,15 +3992,27 @@ int strata::qwen35::run(int argc, char** argv) {
     } report{E};
     E.reset();
     E.mtp_d = m.has_mtp ? mtp_d : 0;
+    E.max_snaps = std::max(0, snapshots);
     if (warm) E.warmup();
-    if (serve_mode) return serve(E);
+    if (serve_mode) {
+        ImageCache icache;
+        icache.width = m.g.n_embd;
+        icache.budget = (size_t) std::max(64, image_cache_mib) << 20;
+        return serve(E, icache, snap_every, (size_t) std::max(0, park_mib) << 20, model);
+    }
     if (bench_pp > 0 || bench_tg > 0) {
         // llama-bench's shapes: a prompt of bench_pp tokens from a fresh state, then bench_tg tokens one at a time
         std::vector<int32_t> toks((size_t) std::max(bench_pp, 1));
         std::mt19937 rng(1234);
         for (auto& t : toks) t = (int32_t) (rng() % 200000u);
-        for (int rep = 0; rep < 3; ++rep) {
+        std::vector<int32_t> history((size_t) bench_at);
+        for (auto& t : history) t = (int32_t) (rng() % 200000u);
+        for (int rep = 0; rep < bench_reps; ++rep) {
             E.reset();
+            if (!history.empty()) {
+                E.process(history.data(), (int64_t) history.size(), [](int64_t) {});
+                CK(cudaStreamSynchronize(E.st));
+            }
             const auto t0 = Clock::now();
             E.process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
             CK(cudaStreamSynchronize(E.st));
@@ -2485,14 +4032,45 @@ int strata::qwen35::run(int argc, char** argv) {
         }
         return 0;
     }
+    if (!tokens.empty() && tokens[0] == '@') {
+        const std::string path = tokens.substr(1);
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) { std::perror(path.c_str()); return 2; }
+        std::string contents;
+        char buf[8192];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof(buf), f))) contents.append(buf, n);
+        const bool ok = !std::ferror(f);
+        std::fclose(f);
+        if (!ok) { std::fprintf(stderr, "strata-q36: cannot read token file %s\n", path.c_str()); return 2; }
+        for (char& ch : contents) if (std::isspace((unsigned char) ch)) ch = ' ';
+        tokens = std::move(contents);
+    }
     const std::vector<int32_t> prompt = parse_ids(tokens.c_str()), forced = parse_ids(force.c_str());
     if (prompt.empty()) { std::fprintf(stderr, "strata-q36: --tokens, --serve or --bench-pp is required\n"); return 2; }
     if (!forced.empty()) n_gen = (int) forced.size() + 1;
     FILE* ff = dump_full.empty() ? nullptr : std::fopen(dump_full.c_str(), "wb");
     std::vector<float> lg;
     std::vector<int32_t> gen;
+    std::vector<std::tuple<int64_t, int64_t, int64_t, bool>> heads;
+    std::vector<std::vector<float>> bodies;
+    Cells cl;
+    if (!embeddings.empty()) {   // the pictures at their pads, their rows and M-RoPE positions as in the serve path
+        std::string ve = read_embeddings(embeddings, m.g.n_embd, heads, bodies);
+        std::vector<Pic> pics;
+        for (size_t k = 0; ve.empty() && k < heads.size(); ++k) {
+            if (!std::get<3>(heads[k])) ve = "a reference record (SVR1) in --embeddings";
+            pics.push_back({std::get<0>(heads[k]), std::get<1>(heads[k]), std::get<2>(heads[k]), (uint64_t) k + 1,
+                            bodies[k].data()});
+        }
+        std::vector<int32_t> table;
+        if (ve.empty()) ve = build_cells(m, prompt, pics, true, E.ctx, cl, table);
+        if (!ve.empty()) { std::fprintf(stderr, "strata-q36: %s\n", ve.c_str()); return 1; }
+        CK(cudaMemcpy(E.mrope, table.data(), table.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+        std::fprintf(stderr, "strata-q36: %zu pictures in the prompt\n", pics.size());
+    }
     const auto t0 = Clock::now();
-    E.process(prompt.data(), (int64_t) prompt.size(), [](int64_t) {});
+    E.process(prompt.data(), (int64_t) prompt.size(), [](int64_t) {}, embeddings.empty() ? nullptr : cl.rowp.data());
     const double pp_ms = ms_since(t0);
     const auto t1 = Clock::now();
     if (E.mtp_d > 0 && forced.empty() && !ff) {
@@ -2504,6 +4082,7 @@ int strata::qwen35::run(int argc, char** argv) {
             gen.push_back(nx);
             if ((int) gen.size() >= n_gen) break;
             const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks);
+            if (a < 0) break;
             offered += E.mtp_d;
             accepted += a;
             fix.assign(drafts.begin(), drafts.begin() + a);

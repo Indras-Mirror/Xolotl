@@ -659,7 +659,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # the engine path for the same family (serve protocol, prompt chunks, decode graph): src/qwen35/q36_engine.cu, a
   # library that `strata` switches to for a qwen35moe model (the family switch at the top of its main) and that
   # strata-q36 wraps on its own
-  add_library(strata_qwen35 STATIC src/qwen35/q36_engine.cu)
+  add_library(strata_qwen35 STATIC src/qwen35/q36_engine.cu src/qwen35/q36_flash.cu)
   target_include_directories(strata_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata_qwen35 PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   if(STRATA_NATIVE_EXPERTS)
@@ -669,6 +669,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
   add_executable(strata-q36 src/qwen35/q36_main.cpp)
   target_link_libraries(strata-q36 PRIVATE strata_qwen35 ${_strata_gpu_runtime_target})
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+    add_executable(q36-flash-check EXCLUDE_FROM_ALL tools/qwen35/flash_check.cu src/qwen35/q36_flash.cu)
+    target_include_directories(q36-flash-check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(q36-flash-check PRIVATE CUDA::cudart CUDA::cublas)
+    add_executable(q36-flash-check64 EXCLUDE_FROM_ALL tools/qwen35/flash_check.cu src/qwen35/q36_flash.cu)
+    target_include_directories(q36-flash-check64 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(q36-flash-check64 PRIVATE STRATA_Q36_FA_ROWS=64)
+    target_link_libraries(q36-flash-check64 PRIVATE CUDA::cudart CUDA::cublas)
+  endif()
   target_link_libraries(strata PRIVATE strata_qwen35)
   target_compile_definitions(strata PRIVATE STRATA_HAVE_QWEN35=1)
 
@@ -1927,6 +1936,20 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/fork.cmake OPTIONAL)
 # the GLM-5.3-Flash engine (GlmDense + the shared Ds4MoeTier) - needs the ds4 slices above
 include(${CMAKE_CURRENT_SOURCE_DIR}/tools/glm/cmake/glm.cmake OPTIONAL)
 
-# the MiniMax-M3.1-Flash engine (community port, issue #62) - opt-in (-DSTRATA_M31=ON) and does nothing until the
-# port's own sources are in tools/m31/, so a default configure is unchanged
+# q36 GBNF uses the same vocab-only llama library as M31, without common/chat.
+if(TARGET strata_qwen35)
+  option(STRATA_Q36_GRAMMAR "Enable q36 GBNF constrained decoding" OFF)
+  if(STRATA_Q36_GRAMMAR)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/tools/m31/cmake/grammar.cmake)
+    target_link_libraries(strata_qwen35 PRIVATE q36_llama)
+    target_compile_definitions(strata_qwen35 PRIVATE STRATA_Q36_GRAMMAR=1)
+    add_executable(q36-grammar-check EXCLUDE_FROM_ALL tools/q36_grammar_check.cpp)
+    target_include_directories(q36-grammar-check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
+    target_compile_definitions(q36-grammar-check PRIVATE STRATA_Q36_GRAMMAR=1)
+    target_link_libraries(q36-grammar-check PRIVATE q36_llama)
+  endif()
+endif()
+
+# the MiniMax-M3.1-Flash engine (community port, issue #62) - opt-in (-DSTRATA_M31=ON).
+# Include after q36's option so their shared grammar targets are created once.
 include(${CMAKE_CURRENT_SOURCE_DIR}/tools/m31/cmake/m31.cmake OPTIONAL)
