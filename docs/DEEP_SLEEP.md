@@ -1,5 +1,10 @@
 # Deep sleep: POST /sleep and /wake
 
+> **Status: draft (merged 2026-10-31 for testing, #75).** The GPU measurements below predate the rebase onto current
+> main. On the merged tree only the model-free checks were run (39/39 deep-sleep tests, the rest of serve/ passing); the
+> DeepSeek-V4.1 checkpoint/restore and the M3.1 native wake still need a GPU run on current main before this is
+> considered done. Off by default, so normal serving is unaffected. Tracking: #74.
+
 A sleeping engine keeps its model and conversation state in host RAM while
 releasing its device resources. It must be put to sleep explicitly: ordinary
 requests do not trigger sleep or a new idle policy. The next request wakes a

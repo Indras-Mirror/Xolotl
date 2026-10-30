@@ -91,7 +91,9 @@ prefill 289-297 / 395-409 tok/s at 6.1K / 16.5K; full HumanEval (164) 162/164. H
 - **Deep sleep** for MiniMax-M3.1 and DeepSeek-V4.1 (#75, NektoDron): opt-in `"deep_sleep": "auto" | "native" |
   "checkpoint"` plus authenticated `POST /sleep` and `/wake` gives the GPU back while the loaded model and conversations
   stay in host RAM. M3.1 sleeps natively (wake ~1.4-1.9 s); DeepSeek-V4.1 uses the CUDA driver checkpoint (restore
-  ~19-21 s). Off by default: [docs/DEEP_SLEEP.md](docs/DEEP_SLEEP.md).
+  ~19-21 s). Off by default: [docs/DEEP_SLEEP.md](docs/DEEP_SLEEP.md). **Draft:** merged for testing, the GPU
+  numbers predate the rebase and the DeepSeek checkpoint/restore has not been re-run on current main yet (#74 stays
+  open until it is).
 - **Qwen3.6 vision, shared prefix cache and batched sampled MTP** (#76, NektoDron): text and image prefixes are reused
   across callers and owners, native continuous batches keep each request's DeltaNet state, KV, grammar and MTP
   separate, and GBNF / JSON-schema output is native: [docs/Q36_SERVING.md](docs/Q36_SERVING.md).
