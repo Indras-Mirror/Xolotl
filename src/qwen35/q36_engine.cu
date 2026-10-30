@@ -38,6 +38,10 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "q36_cache_hub.hpp"
+#ifndef __HIP_PLATFORM_AMD__
+#include "q36_kv_vmm_cuda.hpp"
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -48,6 +52,8 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdarg>
+#include <future>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -1230,7 +1236,40 @@ template <class T> T* dalloc_t(size_t n) {
     return p;
 }
 
+// Only prompt prefill uses these buffers. The batch admission gate is held
+// until that prefill has fully drained; draft/decode never borrow them.
+struct Q36SharedPrefill {
+    uint16_t* dequant=nullptr;
+    int64_t dequant_elems=0;
+    void* workspace=nullptr;
+    void* flash=nullptr;
+    size_t flash_bytes=0;
+    uint8_t* rollback=nullptr;
+    size_t rollback_bytes=0;
+    ~Q36SharedPrefill() {
+        if(dequant) cudaFree(dequant); if(workspace) cudaFree(workspace);
+        if(flash) cudaFree(flash); if(rollback) cudaFree(rollback);
+    }
+};
 struct Engine {
+    std::shared_ptr<strata::q36::cache::Hub> cache_hub;
+    bool batch_coordinator=false;
+    std::shared_ptr<Q36SharedPrefill> shared_prefill;
+    uint8_t* borrowed_rollback=nullptr;
+    uint8_t* rollback_data() const { return borrowed_rollback?borrowed_rollback:prefill_rollback.get(); }
+
+#ifndef __HIP_PLATFORM_AMD__
+    strata::q36::kv::Budget* kv_budget = nullptr;
+    strata::q36::kv::Driver* kv_driver = nullptr;
+    std::unique_ptr<strata::q36::kv::Arena> kv_arena;
+#endif
+    bool ensure_kv(size_t end) {
+#ifndef __HIP_PLATFORM_AMD__
+        return !kv_arena || kv_arena->ensure(end);
+#else
+        return true;
+#endif
+    }
     const Model* m = nullptr;
     cudaStream_t st = nullptr;
     int ctx = 32768, tmax = 512;
@@ -1247,7 +1286,8 @@ struct Engine {
     int32_t *ids, *grp_start, *n_groups, *ent_dst, *ent_tok, *tok, *pos0, *pick;
     int32_t* hpin = nullptr;   // pinned staging: [0] decode token, [1] position, [2..9] picks, [10] max rows, [16..] tokens
     unsigned long long* grp_ptr;
-    float *pacc, *pm, *pl, *amv;
+    float *pacc = nullptr, *pm = nullptr, *pl = nullptr, *amv = nullptr;
+    bool dynamic_attention = false;
     float *top_pv = nullptr, *top_ov = nullptr;   // the candidates (k_topk1 / k_topk2) and their host copy
     int *top_pi = nullptr, *top_oi = nullptr;
     uint8_t* top_h = nullptr;                     // pinned: [kVerify][kTopK] floats, then [kVerify][kTopK] ids
@@ -1379,7 +1419,15 @@ struct Engine {
             CK(cudaGetDevice(&dev));
             CK(cudaDeviceGetAttribute(&flash_sms, cudaDevAttrMultiProcessorCount, dev));
             const size_t bytes = strata::qwen35::flash_workspace_bytes(tmax, (int) g.n_head, (int) g.n_head_kv, ctx, flash_sms);
-            if (bytes) CK(cudaMalloc(&flash_work, bytes));
+            if (bytes && !batch_coordinator) {
+                if(shared_prefill) {
+                    if(!shared_prefill->flash) {
+                        CK(cudaMalloc(&shared_prefill->flash,bytes)); shared_prefill->flash_bytes=bytes;
+                    }
+                    if(bytes>shared_prefill->flash_bytes) { std::fprintf(stderr,"strata-q36: shared flash workspace too small\n"); std::exit(1); }
+                    flash_work=shared_prefill->flash;
+                } else CK(cudaMalloc(&flash_work,bytes));
+            }
             kAttScoreFloats = 0;
             std::fprintf(stderr, "strata-q36: flash prefill (GQA, split-K), scratch %.1f MiB, %d SMs\n", bytes / 1048576.0, flash_sms);
         } else {
@@ -1395,7 +1443,7 @@ struct Engine {
             for (size_t c = 0; c < (size_t) ctx; ++c) id3[c * 3] = id3[c * 3 + 1] = id3[c * 3 + 2] = (int32_t) c;
             CK(cudaMemcpy(mrope, id3.data(), id3.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
         }
-        use_mmq = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
+        use_mmq = !batch_coordinator && MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
         auto mmq_ok = [&](const Layer& L) {
             return MMQ::supported(L.L.gu_type) && MMQ::supported(L.L.d_type) && MMQ::fits(L.L.gu_type, 2 * g.n_ff) &&
                    MMQ::fits(L.L.d_type, g.n_embd);
@@ -1431,7 +1479,19 @@ struct Engine {
                 take(m->mtp);
                 big = std::max<int64_t>(big, (int64_t) m->eh_proj.n_in * m->eh_proj.n_out);
             }
-            if (!gemm.init(st, big, gerr)) {
+            bool gemm_ok=true;
+            if(!batch_coordinator) {
+                if(shared_prefill) {
+                    if(!shared_prefill->dequant) {
+                        CK(cudaMalloc((void**)&shared_prefill->dequant,(size_t)big*2));
+                        shared_prefill->dequant_elems=big;
+                        CK(cudaMalloc(&shared_prefill->workspace,size_t(32)<<20));
+                    }
+                    gemm_ok=big<=shared_prefill->dequant_elems && gemm.init_external(st,shared_prefill->dequant,
+                        shared_prefill->dequant_elems,shared_prefill->workspace,size_t(32)<<20,gerr);
+                } else gemm_ok=gemm.init(st,big,gerr);
+            }
+            if (!gemm_ok) {
                 std::fprintf(stderr, "strata-q36: prompt GEMM: %s\n", gerr.c_str());
                 std::exit(1);
             }
@@ -1455,34 +1515,54 @@ struct Engine {
         CK(cudaFuncSetAttribute(k_topk2, cudaFuncAttributeMaxDynamicSharedMemorySize, kTopBlocks * kTopK * 8));
         ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
-        n_chunk = (ctx + kChunkCells - 1) / kChunkCells;
-        att_rows = (int) (g.n_head * kGemmT);   // the decode / verify path's rows (T <= kGemmT; a chunk runs GEMMs)
+        n_chunk = ((dynamic_attention ? std::min(ctx, 128) : ctx) + kChunkCells - 1) / kChunkCells;
+        att_rows = (int) (g.n_head * (batch_coordinator ? 4 : kGemmT));   // the decode / verify path's rows (T <= kGemmT; a chunk runs GEMMs)
         pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
         pm = dalloc((size_t) att_rows * n_chunk);
         pl = dalloc((size_t) att_rows * n_chunk);
+        size_t kv_plane = 0;
+#ifndef __HIP_PLATFORM_AMD__
+        if (kv_budget) {
+            size_t planes = m->has_mtp ? 2 : 0;
+            for (const Layer& L : m->layers) if (L.attn) planes += 2;
+            kv_arena = std::make_unique<strata::q36::kv::Arena>(*kv_budget, *kv_driver,
+                planes * (size_t) g.n_head_kv, ctx, (size_t) g.head_dim * sizeof(__half));
+            if (!kv_arena->init()) { std::fprintf(stderr, "strata-q36: KV virtual reservation failed\n"); std::exit(1); }
+        }
+#endif
+        auto allocate_kv = [&]() -> __half* {
+#ifndef __HIP_PLATFORM_AMD__
+            if (kv_arena) {
+                auto* p = reinterpret_cast<__half*>(kv_arena->get()) + kv_plane * (size_t) ctx * g.head_dim;
+                kv_plane += (size_t) g.n_head_kv;
+                return p;
+            }
+#endif
+            return dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
+        };
         for (const Layer& L : m->layers) {
             if (L.attn) {
                 conv.push_back(nullptr);
                 S.push_back(nullptr);
-                kc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
-                vc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
+                kc.push_back(allocate_kv());
+                vc.push_back(allocate_kv());
                 for (auto* v : {&v_qkv, &v_hc, &v_alpha, &v_beta}) v->push_back(nullptr);
             } else {
-                conv.push_back(dalloc(C * (g.ssm_d_conv - 1)));
-                S.push_back(dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
+                conv.push_back(batch_coordinator?nullptr:dalloc(C * (g.ssm_d_conv - 1)));
+                S.push_back(batch_coordinator?nullptr:dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
                 kc.push_back(nullptr);
                 vc.push_back(nullptr);
-                v_qkv.push_back(dalloc((size_t) kVerify * C));
-                v_hc.push_back(dalloc((size_t) kVerify * C));
-                v_alpha.push_back(dalloc((size_t) kVerify * g.ssm_v_heads));
-                v_beta.push_back(dalloc((size_t) kVerify * g.ssm_v_heads));
+                v_qkv.push_back(batch_coordinator?nullptr:dalloc((size_t) kVerify * C));
+                v_hc.push_back(batch_coordinator?nullptr:dalloc((size_t) kVerify * C));
+                v_alpha.push_back(batch_coordinator?nullptr:dalloc((size_t) kVerify * g.ssm_v_heads));
+                v_beta.push_back(batch_coordinator?nullptr:dalloc((size_t) kVerify * g.ssm_v_heads));
             }
         }
         if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
             conv.push_back(nullptr);
             S.push_back(nullptr);
-            kc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
-            vc.push_back(dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim));
+            kc.push_back(allocate_kv());
+            vc.push_back(allocate_kv());
             mtp_cat = dalloc(T * 2 * N);
             hmtp = dalloc(T * N);
             logits_m = dalloc((size_t) g.n_vocab);
@@ -1497,6 +1577,25 @@ struct Engine {
                      m->has_mtp ? ", MTP block loaded" : "", (double) fr / (1 << 30));
     }
 
+    // Batch owners have graph-free attention and can size partial reductions
+    // for the admitted request, rather than reserve full-context scratch four
+    // times. The caller owns this idle Engine and has fenced its stream.
+    bool resize_attention(size_t cells) {
+        if (!dynamic_attention) return true;
+        const int chunks=(int)((std::max<size_t>(1,cells)+kChunkCells-1)/kChunkCells);
+        if (chunks == n_chunk && pacc && pm && pl) return true;
+        CK(cudaStreamSynchronize(st));
+        CK(cudaFree(pacc)); CK(cudaFree(pm)); CK(cudaFree(pl));
+        pacc=pm=pl=nullptr;
+        const size_t rows=(size_t)att_rows*chunks;
+        if (cudaMalloc((void**)&pacc, rows*(size_t)m->g.head_dim*4)!=cudaSuccess ||
+            cudaMalloc((void**)&pm, rows*4)!=cudaSuccess || cudaMalloc((void**)&pl,rows*4)!=cudaSuccess) {
+            (void)cudaGetLastError();
+            if(pacc) cudaFree(pacc); if(pm) cudaFree(pm); if(pl) cudaFree(pl);
+            pacc=pm=pl=nullptr; return false;
+        }
+        n_chunk=chunks; return true;
+    }
     /// The recurrent state and the cache to a fresh sequence.
     void reset() {
         const auto& g = m->g;
@@ -1797,8 +1896,17 @@ struct Engine {
         if (end == m->layers.size() && heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
         return true;
     }
+    std::function<bool(int, int64_t, int, bool, const float* const*)> batch_dispatch;
+    int batch_slot = -1;
+    unsigned long long batch_epoch = 0;
+    std::function<void()> batch_begin;
+    std::function<void(long long,size_t)> batch_parsed;
+    std::function<bool(size_t)> batch_admit;
+    std::function<void()> batch_idle;
     bool forward(int T, int64_t p0, int heads, bool graph_mode, bool verify, const float* const* img = nullptr,
                  bool interruptible = false) {
+        if (batch_dispatch && T <= kVerify && !interruptible)
+            return batch_dispatch(T, p0, heads, verify, img);
         return forward_span(T, p0, heads, graph_mode, verify, 0, m->layers.size(), img, interruptible);
     }
     /// logits [n][V] = W_out hn rows, and each row's greedy pick.
@@ -1829,6 +1937,8 @@ struct Engine {
         if (draft) head_rows(hmtp + (size_t) (T - 1) * N, 1, logits_m, pick_m);
         return true;
     }
+
+    #include "q36_batch_forward.hpp"
 
     /// After a verify window of T rows: the GDN state takes the first n_keep rows (conv history and recurrence run
     /// again over the rows' kept inputs).
@@ -2112,13 +2222,7 @@ struct Engine {
     // stay valid for every cell below the position) and hlast (the MTP seed), at chosen positions of a prompt.  A
     // snapshot is valid for a request whose first `pos` cells hash to `hash` while those cells are still the ones
     // the cache holds (pos <= the common start with `live`, checked by the caller).  Kept in pinned host memory.
-    struct Snap {
-        int64_t pos = -1;
-        uint64_t hash = 0, used = 0;
-        int prio = 0;   // 0 the periodic grid, 1 a message start, 2 where a request left / ended / stopped, 3 a client's
-        uint8_t* host = nullptr;
-        size_t refs = 0;   // retained active/parked prefixes owning this state, independent of recency
-    };
+    using Snap = strata::q36::cache::Snapshot;
     static constexpr uint64_t kPrioAge = 96;   // a snapshot of priority p is kept as if used p * kPrioAge saves later
     std::vector<Snap> snaps;
     const Snap* pinned_snap = nullptr;
@@ -2127,6 +2231,14 @@ struct Engine {
     int max_snaps = 128;
     uint64_t snap_clock = 0;
     long long snaps_saved = 0, snaps_restored = 0;
+    std::vector<Snap>& snapshot_pool() { return cache_hub ? cache_hub->snaps : snaps; }
+    uint64_t& snapshot_clock() { return cache_hub ? cache_hub->snap_clock : snap_clock; }
+    std::vector<uint8_t*>& page_pool() { return cache_hub ? cache_hub->free_pages : free_pages; }
+    size_t& host_page_count() { return cache_hub ? cache_hub->n_pages : n_pages; }
+    std::unique_lock<std::recursive_mutex> host_lock() {
+        return cache_hub ? std::unique_lock<std::recursive_mutex>(cache_hub->mutex)
+                         : std::unique_lock<std::recursive_mutex>();
+    }
     size_t snap_bytes() const {
         const auto& g = m->g;
         size_t b = (size_t) g.n_embd * 4;
@@ -2151,6 +2263,14 @@ struct Engine {
         cp((void*) hlast, host + off, (size_t) m->g.n_embd * 4);
     }
     void alloc_prefill_rollback() {
+        if(shared_prefill) {
+            if(!shared_prefill->rollback) {
+                CK(cudaMalloc((void**)&shared_prefill->rollback,snap_bytes()));
+                shared_prefill->rollback_bytes=snap_bytes();
+            }
+            if(shared_prefill->rollback_bytes!=snap_bytes()) { std::fprintf(stderr,"strata-q36: shared rollback shape mismatch\n"); std::exit(1); }
+            borrowed_rollback=shared_prefill->rollback; return;
+        }
         uint8_t* saved = nullptr;
         CK(cudaMalloc(&saved, snap_bytes()));   // every byte is overwritten before the first possible restore
         prefill_rollback.reset(saved);
@@ -2158,21 +2278,22 @@ struct Engine {
                      snap_bytes() / 1048576.0);
     }
     void prefill_state_copy(bool restore) {
-        snap_walk(prefill_rollback.get(), [&](void* state, uint8_t* saved, size_t bytes) {
+        snap_walk(rollback_data(), [&](void* state, uint8_t* saved, size_t bytes) {
             CK(cudaMemcpyAsync(restore ? state : saved, restore ? saved : state, bytes,
                                cudaMemcpyDeviceToDevice, st));
         });
     }
     void touch_snap(Snap& sn, int prio) {
+        auto lock=host_lock();
         sn.prio = std::max(sn.prio, prio);
-        sn.used = ++snap_clock;
+        sn.used = ++snapshot_clock();
     }
     // Only unowned states may be overwritten. A retained KV prefix and its GDN anchors
     // have one lifetime; priority only chooses among entries nobody currently owns.
     Snap* snapshot_victim() {
         Snap* v = nullptr;
-        for (Snap& sn : snaps) {
-            if (&sn == pinned_snap || sn.refs != 0) continue;
+        for (Snap& sn : snapshot_pool()) {
+            if (&sn == pinned_snap || sn.refs != 0 || sn.pins != 0 || sn.writing) continue;
             if (sn.pos < 0) return &sn;
             if (!v || std::make_pair(sn.prio, sn.used) < std::make_pair(v->prio, v->used)) v = &sn;
         }
@@ -2180,14 +2301,44 @@ struct Engine {
     }
     /// The current state: reclaim an unowned slot, else evict an entire parked prefix.
     void save_snap(uint64_t hash, int prio = 0) {
+        if(cache_hub) {
+            if(max_snaps<=0) return;
+            strata::q36::cache::Hub::SnapshotWrite writer;
+            Snap* victim=nullptr;
+            {
+                auto lock=host_lock();
+                for(Snap& sn:snapshot_pool())
+                    if(!sn.writing && sn.pos==pos && sn.hash==hash) {
+                        touch_snap(sn,prio); if(snapshot_saved) snapshot_saved(sn); return;
+                    }
+                victim=snapshot_victim();
+                while(!victim && evict_snapshot_owner && evict_snapshot_owner()) victim=snapshot_victim();
+                if(!victim) return;
+                writer=cache_hub->reserve_snapshot(*victim);
+                if(!writer || !writer.data()) { std::fprintf(stderr,"strata-q36: shared snapshot reservation failed\n"); std::abort(); }
+            }
+            // A writer reservation remains unavailable globally until every
+            // D2H byte is complete. No CUDA wait is inside the metadata mutex.
+            snap_walk(writer.data(),[&](void* device,uint8_t* host,size_t bytes) {
+                CK(cudaMemcpyAsync(host,device,bytes,cudaMemcpyDeviceToHost,st));
+            });
+            CK(cudaStreamSynchronize(st));
+            {
+                auto lock=host_lock();
+                if(!writer.commit(pos,hash,prio,[] { return true; })) std::abort();
+                ++snaps_saved;
+                if(snapshot_saved) snapshot_saved(*victim);
+            }
+            return;
+        }
         if (max_snaps <= 0) return;
-        for (Snap& sn : snaps)
+        for (Snap& sn : snapshot_pool())
             if (sn.pos == pos && sn.hash == hash) {
                 touch_snap(sn, prio);
                 if (snapshot_saved) snapshot_saved(sn);
                 return;
             }
-        if (snaps.empty()) snaps.resize((size_t) max_snaps);
+        if (snapshot_pool().empty()) snapshot_pool().resize((size_t) max_snaps);
         Snap* v = snapshot_victim();
         while (!v && evict_snapshot_owner && evict_snapshot_owner()) v = snapshot_victim();
         if (!v) return;   // e.g. a one-entry ring whose source is pinned; keep it correct
@@ -2204,37 +2355,50 @@ struct Engine {
         v->pos = pos;
         v->hash = hash;
         v->prio = prio;
-        v->used = ++snap_clock;
+        v->used = ++snapshot_clock();
         ++snaps_saved;
         if (snapshot_saved) snapshot_saved(*v);
     }
     void restore_snap(Snap& sn) {
+        strata::q36::cache::Hub::SnapPin read_pin;
+        if(cache_hub) read_pin=strata::q36::cache::Hub::SnapPin(*cache_hub,sn);
         CK(cudaStreamSynchronize(st));
         snap_walk(sn.host, [&](void* d, uint8_t* hst, size_t b) {
             CK(cudaMemcpyAsync(d, hst, b, cudaMemcpyHostToDevice, st));
         });
+        if(cache_hub) CK(cudaStreamSynchronize(st));
+        auto lock=host_lock();
         pos = sn.pos;
-        sn.used = ++snap_clock;
+        sn.used = ++snapshot_clock();
         ++snaps_restored;
     }
     void drop_snaps() {
-        for (Snap& sn : snaps) sn.pos = -1;
+        auto lock=host_lock();
+        for(Snap& sn:snapshot_pool()) if(!cache_hub || (sn.refs==0 && sn.pins==0 && !sn.writing)) sn.pos=-1;
     }
     /// The snapshot ring's pinned memory, all at once (at load: a 63 MiB cudaHostAlloc inside a prompt costs ~20 ms)
     void alloc_snaps() {
+        if(cache_hub && cache_hub->snaps_initialized) {
+            if(cache_hub->snapshot_bytes!=snap_bytes()) { std::fprintf(stderr,"strata-q36: shared snapshot shape mismatch\n"); std::abort(); }
+            max_snaps=(int)snapshot_pool().size(); return;
+        }
         if (max_snaps <= 0) return;
         const auto t0 = Clock::now();
-        snaps.resize((size_t) max_snaps);
+        if(!cache_hub) snapshot_pool().resize((size_t) max_snaps);
         int got = 0;
-        for (Snap& sn : snaps) {
+        for (Snap& sn : snapshot_pool()) {
             if (!sn.host && cudaHostAlloc((void**) &sn.host, snap_bytes(), cudaHostAllocDefault) != cudaSuccess) {
                 (void) cudaGetLastError();
                 break;
             }
             ++got;
         }
+        if(cache_hub) {
+            if(got!=max_snaps) { std::fprintf(stderr,"strata-q36: shared snapshot pool could not allocate requested budget\n"); std::abort(); }
+            cache_hub->snapshot_bytes=snap_bytes(); cache_hub->snaps_initialized=true;
+        }
         if (got < max_snaps) {
-            snaps.resize((size_t) got);
+            snapshot_pool().resize((size_t) got);
             max_snaps = got;
         }
         std::fprintf(stderr, "strata-q36: %d state snapshots of %.1f MiB in pinned host memory (%.1f GiB) in %.1f s\n",
@@ -2255,6 +2419,10 @@ struct Engine {
         att_li.clear();
         for (size_t l = 0; l < kc.size(); ++l)
             if (kc[l]) att_li.push_back((int) l);
+        if(cache_hub && cache_hub->pages_initialized) {
+            if(cache_hub->page_bytes!=page_bytes()) { std::fprintf(stderr,"strata-q36: shared KV page shape mismatch\n"); std::abort(); }
+            return;
+        }
         if (budget == 0 || att_li.empty()) return;
         const auto t0 = Clock::now();
         const size_t want = budget / page_bytes();
@@ -2264,16 +2432,41 @@ struct Engine {
                 (void) cudaGetLastError();
                 break;
             }
-            free_pages.push_back(p);
+            page_pool().push_back(p);
         }
-        n_pages = free_pages.size();
+        host_page_count() = page_pool().size();
+        if(cache_hub) { cache_hub->page_bytes=page_bytes(); cache_hub->pages_initialized=true; }
         std::fprintf(stderr, "strata-q36: %zu conversation pages of %d cells (%.1f MiB each, %.1f GiB) in pinned host "
-                     "memory in %.1f s\n", n_pages, kPage, page_bytes() / 1048576.0,
-                     n_pages * (double) page_bytes() / (1 << 30), ms_since(t0) / 1000.0);
+                     "memory in %.1f s\n", host_page_count(), kPage, page_bytes() / 1048576.0,
+                     host_page_count() * (double) page_bytes() / (1 << 30), ms_since(t0) / 1000.0);
     }
     /// Cells [a, b) between the cache and `pages` (page i holds cells [i kPage, (i + 1) kPage)), on the stream.
     void kv_copy(const std::vector<uint8_t*>& pages, int64_t a, int64_t b, bool to_host) {
+#ifndef __HIP_PLATFORM_AMD__
+        if(kv_arena && (a<0 || b<a || b>ctx || (size_t)b>kv_arena->committed_tokens())) {
+            std::fprintf(stderr,"strata-q36: parked KV copy outside mapped prefix\n"); std::abort();
+        }
+#endif
         const size_t HD = (size_t) m->g.head_dim, HKV = (size_t) m->g.n_head_kv, cb = HD * sizeof(__half);
+#ifndef __HIP_PLATFORM_AMD__
+        if(kv_arena) {
+            // Sparse mapped prefixes are separate regions. A pitched 2D
+            // envelope includes unmapped gaps between heads; use validated
+            // contiguous row ranges, with the exact existing host layout.
+            for(size_t j=0;j<att_li.size();++j) for(int kv=0;kv<2;++kv) {
+                auto* device=reinterpret_cast<uint8_t*>((kv?vc:kc)[(size_t)att_li[j]]);
+                bool valid=strata::q36::kv::for_each_copy_row((size_t)ctx,cb,HKV,kPage,
+                    kv_arena->committed_tokens(),(size_t)a,(size_t)b,
+                    [&](size_t pg,size_t device_offset,size_t host_offset,size_t bytes) {
+                        auto* host=pages[pg]+(j*2+(size_t)kv)*HKV*kPage*cb+host_offset;
+                        if(to_host) CK(cudaMemcpyAsync(host,device+device_offset,bytes,cudaMemcpyDeviceToHost,st));
+                        else CK(cudaMemcpyAsync(device+device_offset,host,bytes,cudaMemcpyHostToDevice,st));
+                    });
+                if(!valid) { std::fprintf(stderr,"strata-q36: invalid sparse KV copy plan\n"); std::abort(); }
+            }
+            return;
+        }
+#endif
         for (int64_t c = a; c < b;) {
             const int64_t pg = c / kPage, o = c - pg * kPage, e = std::min<int64_t>(b, (pg + 1) * kPage);
             uint8_t* page = pages[(size_t) pg];
@@ -2312,6 +2505,7 @@ struct Engine {
     void process(const int32_t* toks, int64_t n, F on_chunk, const float* const* img = nullptr,
                  const std::vector<Cut>* cuts = nullptr) {
         prefill_aborted = false;
+        if (!ensure_kv((size_t) (pos + n))) { std::fprintf(stderr, "strata-q36: unreserved KV operation\n"); std::abort(); }
         const int N = (int) m->g.n_embd;
         if (n == 1 && (img == nullptr || img[0] == nullptr) && (cuts == nullptr || cuts->empty())) {
             CK(cudaStreamSynchronize(st));   // the pinned staging is free again
@@ -2331,7 +2525,7 @@ struct Engine {
         const int64_t start = pos;
         // Hybrid inference also mutates routing scores, the CPU pool and a prefetch stream.
         // Until those are transactional too, keep its existing whole-chunk cancellation.
-        const bool transaction = cancel && prefill_rollback && !m->hybrid;
+        const bool transaction = cancel && rollback_data() && !m->hybrid;
         size_t ci = 0;
         while (cuts && ci < cuts->size() && (*cuts)[ci].pos <= start) ++ci;
         for (int64_t i = 0; i < n;) {
@@ -2410,11 +2604,12 @@ struct Engine {
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
                   const std::function<int(int, const std::vector<int32_t>&, int32_t*)>* judge = nullptr,
                   const std::function<int(int)>* draft_pick = nullptr) {
+        if (!ensure_kv((size_t) (pos + D + 1))) { std::fprintf(stderr, "strata-q36: unreserved KV verify\n"); std::abort(); }
         const int N = (int) m->g.n_embd;
         // MTP attention only changes KV rows (uncommitted rows >=pos are ignored). Hybrid
         // routing/CPU work and a future recurrent MTP block would need their own rollback.
         // Serve warmup must capture the same segmented graphs before READY, before cancel is attached.
-        const bool interruptible = (cancel || (warming && prefill_rollback)) && !m->hybrid && m->mtp.attn;
+        const bool interruptible = (cancel || (warming && rollback_data())) && !m->hybrid && m->mtp.attn;
         auto stopped = [&](const char* phase = "draft") {
             if (!interruptible || !cancel || !cancel->load()) return false;
             CK(cudaStreamSynchronize(st));   // include all queued draft/verify work before reporting DONE
@@ -2475,7 +2670,9 @@ struct Engine {
         CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
         rows_deferred = true;
-        if (interruptible) {
+        if (batch_dispatch) {
+            if (!batch_dispatch(T, pos, T, true, nullptr)) { rows_deferred = false; return -1; }
+        } else if (interruptible) {
             auto& parts = gv_parts[T];
             const size_t np = (m->layers.size() + kVerifyLayersPerGraph - 1) / kVerifyLayersPerGraph;
             if (parts.empty()) parts.resize(np, nullptr);
@@ -2514,6 +2711,9 @@ struct Engine {
     /// state, the cache position and the hybrid counters are as after load.
     bool warming = false;
     void warmup() {
+        if(dynamic_attention && !resize_attention(std::min<size_t>((size_t)ctx,(size_t)tmax+kGemmT+2+2*kVerify))) {
+            std::fprintf(stderr,"strata-q36: warmup attention workspace failed\n"); std::abort();
+        }
         const auto t0 = Clock::now();
         warming = true;
         const int32_t filler = 198;   // a newline: any token works
@@ -2789,26 +2989,38 @@ struct ImageCache {
         int64_t n = 0, nx = 0, ny = 0;
         uint64_t used = 0;
     };
+    std::recursive_mutex mutex;
+    bool parallel=false;  // batch1 retains the established image eviction order
+    std::map<uint64_t, size_t> pinned;
+    struct Pins {
+        ImageCache& cache; std::vector<uint64_t> keys;
+        explicit Pins(ImageCache& c): cache(c) {}
+        void add(uint64_t key) { if(!cache.parallel) return; std::lock_guard<std::recursive_mutex> lock(cache.mutex); if (std::find(keys.begin(),keys.end(),key)==keys.end()) { keys.push_back(key); ++cache.pinned[key]; } }
+        ~Pins() { std::lock_guard<std::recursive_mutex> lock(cache.mutex); for(auto key:keys) if (--cache.pinned[key]==0) cache.pinned.erase(key); }
+    };
     std::map<uint64_t, Entry> m;
     size_t bytes = 0, budget = (size_t) 2048 << 20;
     uint64_t clock = 0;
     int64_t width = 0;
     Entry* find(uint64_t key) {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
         auto it = m.find(key);
         if (it == m.end()) return nullptr;
         it->second.used = ++clock;
         return &it->second;
     }
     Entry* put(uint64_t key, const float* rows, int64_t n, int64_t nx, int64_t ny, const std::vector<uint64_t>& keep) {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
         if (Entry* e = find(key)) {
             if (e->n == n && e->nx == nx && e->ny == ny) return e;
+            if (parallel && pinned[key] > 1) return nullptr;
             drop(key);
         }
         const size_t b = (size_t) n * (size_t) width * 4;
         while (bytes + b > budget && !m.empty()) {   // the least recently used that this request does not hold
             auto v = m.end();
             for (auto it = m.begin(); it != m.end(); ++it)
-                if (std::find(keep.begin(), keep.end(), it->first) == keep.end() && (v == m.end() || it->second.used < v->second.used))
+                if (!pinned.count(it->first) && std::find(keep.begin(), keep.end(), it->first) == keep.end() && (v == m.end() || it->second.used < v->second.used))
                     v = it;
             if (v == m.end()) break;
             drop(v->first);
@@ -2824,6 +3036,7 @@ struct ImageCache {
         return &(m[key] = e);
     }
     void drop(uint64_t key) {
+        std::lock_guard<std::recursive_mutex> lock(mutex);
         auto it = m.find(key);
         if (it == m.end()) return;
         bytes -= (size_t) it->second.n * (size_t) width * 4;
@@ -2933,6 +3146,25 @@ std::string read_embeddings(const std::string& path, int64_t N, std::vector<std:
     return ve;
 }
 
+// A per-worker protocol channel keeps the original single-request state machine
+// intact. In batch mode a router owns stdin/stdout and adapts its slot lines.
+struct Q36Channel {
+    std::function<bool(std::string&)> read;
+    std::function<void(const std::string&)> write;
+};
+thread_local Q36Channel* q36_channel = nullptr;
+int q36_printf(const char* format, ...) {
+    va_list args; va_start(args, format);
+    if (!q36_channel) { int n = std::vprintf(format, args); va_end(args); return n; }
+    va_list copy; va_copy(copy, args);
+    int n = std::vsnprintf(nullptr, 0, format, copy); va_end(copy);
+    std::vector<char> out((size_t) std::max(0, n) + 1);
+    if (n >= 0) std::vsnprintf(out.data(), out.size(), format, args);
+    va_end(args);
+    if (n >= 0) q36_channel->write(std::string(out.data(), (size_t) n));
+    return n;
+}
+void q36_flush() { if (!q36_channel) std::fflush(stdout); }
 // ------------------------------------------------------------------------------------------------ serve
 // The engine protocol (serve/server.py): READY <ctx> stop; GEN / GENI requests; HAVE <key,...> -> HAVE <n:nx:ny | 0,...>
 // (which pictures the engine holds, so the server encodes only the others); STOP.  The held conversation is reused at
@@ -2943,16 +3175,16 @@ std::string read_embeddings(const std::string& path, int64_t N, std::vector<std:
 int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, const std::string& model_path) {
     Q36Vocabulary vocabulary(model_path);
 #ifdef STRATA_Q36_GRAMMAR
-    std::printf("INFO grammar=1\n");
+    q36_printf("INFO grammar=1\n");
 #endif
     const auto& g = E.m->g;
     const int64_t N = g.n_embd;
     E.alloc_snaps();
     E.alloc_pages(park_bytes);
-    std::printf("INFO engine=q36 img_refs=1 snapshots=%d snapshot_every=%d snapshot_mib=%.0f image_cache_mib=%zu n_embd=%lld park_pages=%zu\n",
-                E.max_snaps, snap_every, E.snap_bytes() / 1048576.0, icache.budget >> 20, (long long) N, E.n_pages);
-    std::printf("READY %d stop\n", E.ctx);
-    std::fflush(stdout);
+    q36_printf("INFO engine=q36 img_refs=1 snapshots=%d snapshot_every=%d snapshot_mib=%.0f image_cache_mib=%zu n_embd=%lld park_pages=%zu\n",
+                E.max_snaps, snap_every, E.snap_bytes() / 1048576.0, icache.budget >> 20, (long long) N, E.host_page_count());
+    q36_printf("READY %d stop\n", E.ctx);
+    q36_flush();
     std::mutex mu;
     std::condition_variable cv;
     std::deque<std::string> lines;
@@ -2960,9 +3192,10 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
     std::atomic<bool> stop{false};
     E.cancel = &stop;
     const bool phase_trace = std::getenv("STRATA_Q36_PHASE_TRACE") != nullptr;
-    std::thread reader([&] {
+    Q36Channel* channel = q36_channel;
+    std::thread reader([&, channel] {
         std::string l;
-        while (std::getline(std::cin, l)) {
+        while (channel ? channel->read(l) : static_cast<bool>(std::getline(std::cin, l))) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
             if (l == "STOP") {
                 if (!stop.exchange(true))
@@ -2985,21 +3218,17 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         eof = true;
         cv.notify_one();
     });
-    reader.detach();
+    struct ReaderJoin { std::thread& reader; ~ReaderJoin() { if (reader.joinable()) reader.join(); } } reader_join{reader};
     // ---- conversations: the active one (live, its cells in the cache) and the parked ones (their cells only in host
     // pages).  Pages are shared between conversations for a common start (reference counts; a page written while
     // shared is copied first).
-    struct Conv {
-        std::vector<int32_t> tok;
-        std::vector<uint64_t> val;
-        std::vector<uint8_t*> pages;
-        std::vector<Engine::Snap*> states;   // references into the fixed, shared state pool
-        int64_t mirrored = 0;   // cells [0, mirrored) are in the pages
-        uint64_t used = 0;
-    };
-    std::vector<Conv> parked;
+    using Conv = strata::q36::cache::Conversation;
+    std::vector<Conv> local_parked;
+    auto& parked=E.cache_hub?E.cache_hub->parked:local_parked;
+    strata::q36::cache::Hub::RecordLease active_record;
     std::vector<Engine::Snap*> act_states;
-    auto release_states = [](std::vector<Engine::Snap*>& states) {
+    auto release_states = [&](std::vector<Engine::Snap*>& states) {
+        if(E.cache_hub) { E.cache_hub->release_states(states); return; }
         for (Engine::Snap* sn : states) { assert(sn->refs > 0); --sn->refs; }
         states.clear();
     };
@@ -3012,8 +3241,10 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
     // smaller user-selected pools still evict whole LRU prefixes rather than corrupt state.
     // Leave at least half of a tiny ring unowned for ordinary replacement. A one-entry
     // ring has no owner quota: it is still usable as the original best-effort cache.
-    const size_t state_limit = std::min<size_t>(12, E.snaps.size() / 2);
+    const size_t state_limit = std::min<size_t>(12, E.snapshot_pool().size() / 2);
     auto retain_state = [&](std::vector<Engine::Snap*>& states, Engine::Snap& sn) {
+        auto lock=E.host_lock();
+        if(sn.writing) return;
         if (state_limit == 0 || std::find(states.begin(), states.end(), &sn) != states.end()) return;
         states.push_back(&sn);
         ++sn.refs;
@@ -3049,29 +3280,34 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             states.erase(worst);
         }
     };
-    std::map<uint8_t*, int> page_refs;
+    std::map<uint8_t*, int> local_page_refs;
+    auto& page_refs=E.cache_hub?E.cache_hub->page_refs:local_page_refs;
     std::vector<uint8_t*> act_pages;
     int64_t act_mirrored = 0;
-    uint64_t conv_clock = 0;
+    uint64_t local_conv_clock = 0;
+    auto& conv_clock=E.cache_hub?E.cache_hub->conv_clock:local_conv_clock;
     const size_t max_parked = 16;
     const bool cache_trace = std::getenv("STRATA_Q36_CACHE_TRACE") != nullptr;
     auto trace_states = [&](const char* owner, int index, size_t cells, const std::vector<Engine::Snap*>& states) {
         if (!cache_trace) return;
-        std::fprintf(stderr, "strata-q36: cache owner=%s index=%d cells=%zu states=", owner, index, cells);
-        for (const Engine::Snap* sn : states)
-            std::fprintf(stderr, "%lld/%d/%zu,", (long long) sn->pos, sn->prio, sn->refs);
-        std::fprintf(stderr, "\n");
+        auto lock=E.host_lock();
+        std::string detail;
+        for(const Engine::Snap* sn:states) detail+=std::to_string(sn->pos)+"/"+std::to_string(sn->prio)+"/"+std::to_string(sn->refs)+",";
+        if(lock.owns_lock()) lock.unlock();
+        std::fprintf(stderr,"strata-q36: cache owner=%s index=%d cells=%zu states=%s\n",owner,index,cells,detail.c_str());
     };
     long long switches = 0, cells_brought = 0;
     auto unref = [&](std::vector<uint8_t*>& pages) {
+        if(E.cache_hub) { E.cache_hub->release_pages(pages); return; }
         for (uint8_t* pg : pages)
             if (--page_refs[pg] == 0) {
                 page_refs.erase(pg);
-                E.free_pages.push_back(pg);
+                E.page_pool().push_back(pg);
             }
         pages.clear();
     };
     auto drop_lru_parked = [&]() {
+        if(E.cache_hub) return E.cache_hub->evict_lru();
         if (parked.empty()) return false;
         size_t v = 0;
         for (size_t i = 1; i < parked.size(); ++i)
@@ -3091,14 +3327,19 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             release();
         }
     } snapshot_callbacks{E, [&] {
+        if(E.cache_hub) { CK(cudaStreamSynchronize(E.st)); if(E.cst) CK(cudaStreamSynchronize(E.cst)); }
+        auto lock=E.host_lock();
         release_states(act_states);
-        for (Conv& c : parked) release_states(c.states);
+        if(E.cache_hub) { unref(act_pages); active_record.reset(); }
+        else for (Conv& c : parked) release_states(c.states);
     }};
     auto take_page = [&]() -> uint8_t* {
-        while (E.free_pages.empty())
+        auto lock=E.host_lock();
+        while (E.page_pool().empty())
             if (!drop_lru_parked()) return nullptr;
-        uint8_t* pg = E.free_pages.back();
-        E.free_pages.pop_back();
+        if(E.cache_hub) return E.cache_hub->take_page();
+        uint8_t* pg = E.page_pool().back();
+        E.page_pool().pop_back();
         page_refs[pg] = 1;
         return pg;
     };
@@ -3108,7 +3349,38 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
     bool live_cancelled = false;    // engine-thread state: a new GEN resets stop, but must not erase the old outcome
     // the active conversation's cells [act_mirrored, pos) into its pages (a shared page copied before it is written)
     auto mirror_active = [&]() {
-        if (E.n_pages == 0) return;
+        if(E.cache_hub) {
+            if(E.host_page_count()==0) return;
+            const int64_t want=E.pos;
+            for(int64_t pg=act_mirrored/Engine::kPage;pg<(int64_t)act_pages.size() && pg*Engine::kPage<want;++pg) {
+                uint8_t* source=act_pages[(size_t)pg]; bool shared=false;
+                { auto lock=E.host_lock(); shared=page_refs.at(source)>1; }
+                if(!shared) continue;
+                uint8_t* own=nullptr;
+                for(;;) {
+                    own=E.cache_hub->cow_page(source,[](uint8_t* dst,const uint8_t* src,size_t bytes) {
+                        std::memcpy(dst,src,bytes); return true;
+                    });
+                    if(own || !drop_lru_parked()) break;
+                }
+                if(!own) return;
+                { auto lock=E.host_lock();
+                  act_pages[(size_t)pg]=own;
+                  std::vector<uint8_t*> previous{source}; E.cache_hub->release_pages(previous);
+                }
+            }
+            while((int64_t)act_pages.size()*Engine::kPage<want) {
+                uint8_t* page=take_page(); if(!page) break; act_pages.push_back(page);
+            }
+            const int64_t end=std::min<int64_t>(want,(int64_t)act_pages.size()*Engine::kPage);
+            if(end>act_mirrored) {
+                E.kv_copy(act_pages,act_mirrored,end,true);
+                CK(cudaStreamSynchronize(E.st));
+                act_mirrored=end;
+            }
+            return;
+        }
+        if (E.host_page_count() == 0) return;
         const int64_t upto_want = E.pos;
         for (int64_t pg = act_mirrored / Engine::kPage; pg < (int64_t) act_pages.size() && pg * Engine::kPage < upto_want; ++pg)
             if (page_refs[act_pages[(size_t) pg]] > 1) {   // shared with a parked conversation: this one's own copy
@@ -3118,7 +3390,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                 if (!own) return;
                 if (page_refs[act_pages[(size_t) pg]] == 1) {
                     page_refs.erase(own);
-                    E.free_pages.push_back(own);
+                    E.page_pool().push_back(own);
                     continue;
                 }
                 std::memcpy(own, act_pages[(size_t) pg], E.page_bytes());
@@ -3148,7 +3420,8 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
     auto park_active = [&](bool share) {
         if (phase_trace) std::fprintf(stderr, "strata-q36: park start at %.3f cells=%zu cancelled=%d share=%d\n",
                      wall_ms(), live_v.size(), (int) live_cancelled, (int) share);
-        if (live_v.empty() || E.n_pages == 0) return;
+        if (live_v.empty() || E.host_page_count() == 0) return;
+        auto park_lock=E.host_lock();
         Engine::Snap* checkpoint = nullptr;
         std::vector<Engine::Snap*> checkpoint_states;
         if (live_cancelled) {
@@ -3203,6 +3476,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                          wall_ms(), mode, kept, live_v.size() - kept);
             if (phase_trace) std::fprintf(stderr, "strata-q36: park snapshot end at %.3f mode=%s skipped=1\n", wall_ms(), mode);
         } else {
+            if(park_lock.owns_lock()) park_lock.unlock();
             mirror_active();
             if (phase_trace) std::fprintf(stderr, "strata-q36: park mirror end at %.3f mode=%s mirrored=%lld\n",
                          wall_ms(), mode, (long long) act_mirrored);
@@ -3211,6 +3485,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                 return;
             }
             E.save_snap(prefix_hash(live_v, live_v.size()), 2);
+            if(E.cache_hub) { CK(cudaStreamSynchronize(E.st)); park_lock.lock(); }
             c.tok = live;
             c.val = live_v;
             c.pages = act_pages;
@@ -3224,13 +3499,22 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                 act_states.clear(); act_pages.clear(); act_mirrored = 0;
             }
         }
-        c.used = ++conv_clock;
+        if(E.cache_hub) {
+            const size_t needed=((size_t)c.mirrored+Engine::kPage-1)/Engine::kPage;
+            if(c.pages.size()>needed) {
+                std::vector<uint8_t*> tails(c.pages.begin()+needed,c.pages.end());
+                unref(tails);
+                c.pages.resize(needed);
+            }
+        }
+        c.origin_slot=E.batch_slot;
+        if(!E.cache_hub) c.used = ++conv_clock;
         // A longer retained prefix contains every KV cell of its exact ancestors.
         // Transfer their useful anchors, then drop those redundant records. Divergent
         // branches remain separate, even when they share the same explicit breakpoint.
         for (size_t i = 0; i < parked.size();) {
             Conv& old = parked[i];
-            if (old.val.size() <= c.val.size() && std::equal(old.val.begin(), old.val.end(), c.val.begin())) {
+            if ((!E.cache_hub || old.leases==0) && old.val.size() <= c.val.size() && std::equal(old.val.begin(), old.val.end(), c.val.begin())) {
                 for (Engine::Snap* sn : old.states) retain_state(c.states, *sn);
                 unref(old.pages);
                 release_states(old.states);
@@ -3249,17 +3533,23 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             }
             c.states.push_back(checkpoint); ++checkpoint->refs;
         }
-        parked.push_back(std::move(c));
-        while (parked.size() > max_parked) drop_lru_parked();
-        if (!checkpoint_only) {
+        if(E.cache_hub) E.cache_hub->publish(std::move(c));
+        else parked.push_back(std::move(c));
+        while (parked.size() > max_parked) if(!drop_lru_parked()) break;
+        const auto published_mirrored=parked.empty()?0:parked.back().mirrored;
+        const auto published_cells=parked.empty()?0:parked.back().val.size();
+        const auto published_index=(int)parked.size()-1;
+        const auto published_states=parked.empty()?std::vector<Engine::Snap*>{}:parked.back().states;
+        if(park_lock.owns_lock()) park_lock.unlock();
+        if (!checkpoint_only && !E.cache_hub) {
             CK(cudaStreamSynchronize(E.st));   // observe the old end-snapshot completion before new KV restore
             if (phase_trace) std::fprintf(stderr, "strata-q36: park snapshot end at %.3f mode=%s observed=1\n", wall_ms(), mode);
         }
         // The checkpoint-only branch enqueues no GPU work. Cancel DONE already drained
         // the old stream; neither E.pos nor live tokens were changed by parking.
         std::fprintf(stderr, "strata-q36: parked at %.3f cells=%zu mode=%s retained=%lld\n",
-                     wall_ms(), live_v.size(), mode, (long long) parked.back().mirrored);
-        trace_states("parked-new", (int) parked.size() - 1, parked.back().val.size(), parked.back().states);
+                     wall_ms(), live_v.size(), mode, (long long) published_mirrored);
+        trace_states("parked-new", published_index, published_cells, published_states);
     };
     std::vector<float> lg;
     std::vector<int32_t> table;      // [ctx][3] the rotary positions of the request's cells (and the cells after them)
@@ -3298,7 +3588,8 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         }
         const double phase_dequeue = phase_trace ? wall_ms() : 0;
         if (line.empty()) continue;
-        if (line.rfind("HAVE", 0) == 0) {   // HAVE <hex key>,... -> HAVE n:nx:ny or 0 per key, in order
+        if (line.rfind("HAVE", 0) == 0) {
+            std::lock_guard<std::recursive_mutex> cache_lock(icache.mutex);   // HAVE <hex key>,... -> HAVE n:nx:ny or 0 per key, in order
             std::string out = "HAVE";
             const std::string rest = line.size() > 5 ? line.substr(5) : "";
             bool first = true;
@@ -3312,17 +3603,18 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                                std::to_string((long long) e->ny)
                          : std::string("0");
             }
-            std::printf("%s\n", out.c_str());
-            std::fflush(stdout);
+            q36_printf("%s\n", out.c_str());
+            q36_flush();
             continue;
         }
         const bool geni = line.rfind("GENI ", 0) == 0;
         if (!geni && line.rfind("GEN ", 0) != 0) {
-            std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...> or GENI <max_new> [key=value ...] "
+            q36_printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...> or GENI <max_new> [key=value ...] "
                         "<file> <id,id,...>\n");
-            std::fflush(stdout);
+            q36_flush();
             continue;
         }
+        if (E.batch_begin) E.batch_begin();
         char* p = nullptr;
         const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &p, 10);
         Sampling smp;
@@ -3379,9 +3671,11 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             emb_path.assign(st0, (size_t) (p - st0));
         }
         const std::vector<int32_t> ids = parse_ids(p);
+        if(E.batch_parsed) E.batch_parsed(max_new,ids.size());
         auto fail = [&](const std::string& why) {
-            std::printf("ERR %s\n", why.c_str());
-            std::fflush(stdout);
+            q36_printf("ERR %s\n", why.c_str());
+            q36_flush();
+            if (E.batch_idle) E.batch_idle();
         };
         if (grammar_bad) { fail("grammar: invalid grammar path or grammar_after token id"); continue; }
         Q36Grammar grammar;
@@ -3396,6 +3690,15 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         bool bad = false;
         for (int32_t t : ids) bad |= t < 0 || t >= (int32_t) g.n_vocab;
         if (bad) { fail("a token id is outside the vocabulary"); continue; }
+        if (E.batch_admit && !E.batch_admit(std::min<size_t>(E.ctx, ids.size() + (size_t) max_new + E.mtp_d + 1))) {
+            if (stop.load()) {
+                q36_printf("DONE 0 %zu 0 0 cancel 0 0 0\n", ids.size());
+                E.batch_idle();
+            } else fail("BGEN: request exceeds physical KV budget");
+            continue;
+        }
+        ImageCache::Pins image_pins(icache);
+        for (auto key : img_keys) image_pins.add(key);
         const double phase_parse = phase_trace ? wall_ms() : 0;
         const int64_t n = (int64_t) ids.size();
         // ---- the pictures: the file's records (SVE1 rows, SVR1 a key the engine holds), each to its run of pads
@@ -3421,6 +3724,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                     ve = "a picture by reference (SVR1) needs its key in img_keys";
                     break;
                 }
+                image_pins.add(key);
                 keep.push_back(key);
                 const float* rows = nullptr;
                 if (has) {
@@ -3445,10 +3749,11 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         std::vector<uint64_t> ph((size_t) n + 1);   // ph[i]: the hash of cells [0, i)
         ph[0] = kFnvSeed;
         for (int64_t i = 0; i < n; ++i) ph[(size_t) i + 1] = fnv_mix(ph[(size_t) i], cell[(size_t) i]);
+        auto selection_lock=E.host_lock();
         // Refresh personal breakpoints even when reuse selects a deeper periodic state.
         // A cache-control marker newly added to a held state can promote it without recompute.
-        for (Engine::Snap& sn : E.snaps)
-            if (sn.pos > 0 && sn.pos < n && sn.hash == ph[(size_t) sn.pos]) {
+        for (Engine::Snap& sn : E.snapshot_pool())
+            if (!sn.writing && sn.pos > 0 && sn.pos < n && sn.hash == ph[(size_t) sn.pos]) {
                 const bool explicit_now = std::find(snap_at.begin(), snap_at.end(), sn.pos) != snap_at.end();
                 if (explicit_now || sn.prio >= 3) E.touch_snap(sn, explicit_now ? 3 : sn.prio);
             }
@@ -3461,8 +3766,8 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         };
         auto best_snap = [&](int64_t limit) {
             Engine::Snap* f = nullptr;
-            for (Engine::Snap& sn : E.snaps)
-                if (sn.pos > 0 && sn.pos <= limit && sn.pos < n && sn.hash == ph[(size_t) sn.pos] &&
+            for (Engine::Snap& sn : E.snapshot_pool())
+                if (!sn.writing && sn.pos > 0 && sn.pos <= limit && sn.pos < n && sn.hash == ph[(size_t) sn.pos] &&
                     (f == nullptr || sn.pos > f->pos))
                     f = &sn;
             return f;
@@ -3501,7 +3806,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             }
         }
         const double phase_match = phase_trace ? wall_ms() : 0;
-        if (cache_trace) {
+        if (cache_trace && !E.cache_hub) {
             std::fprintf(stderr, "strata-q36: cache match cells=%lld reuse=%lld src=%d selected_lcp=%zu max_lcp=%zu max_held=%zu\n",
                          (long long) n, (long long) reuse, src, L, max_lcp, max_lcp_held);
             trace_states("active", -1, live_v.size(), act_states);
@@ -3516,7 +3821,10 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                     last = pic_of[(size_t) c];
                     need += (need.empty() ? "" : ",") + std::to_string(last + 1);
                 }
-            if (!need.empty()) { fail("NEED_IMAGES " + need + " (the engine does not hold these pictures: send their rows)"); continue; }
+            if (!need.empty()) {
+                if(selection_lock.owns_lock()) selection_lock.unlock();
+                fail("NEED_IMAGES " + need + " (the engine does not hold these pictures: send their rows)"); continue;
+            }
         }
         // One diagnostic line per accepted GEN, immediately before parking (or
         // restoration if no park is needed). No token contents or paths are logged.
@@ -3526,8 +3834,36 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                              phase_loop, phase_dequeue, phase_parse, phase_cells, phase_match, wall_ms(),
                              (int) will_park, (long long) n);
         };
-        E.pinned_snap = from;
         int64_t brought = 0;
+        strata::q36::cache::Hub::SnapPin selected_pin;
+        uint64_t restored_record_id=0;
+        int restored_origin_slot=-1;
+        if(E.cache_hub) {
+            if(!live.empty() || !act_pages.empty() || !act_states.empty()) {
+                std::fprintf(stderr,"strata-q36: shared admission inherited an unfinished active lease\n"); std::abort();
+            }
+            if(src>=0) {
+                auto checkout=E.cache_hub->checkout((size_t)src);
+                if(!checkout || !from) std::abort();
+                selected_pin=strata::q36::cache::Hub::SnapPin(*E.cache_hub,*from);
+                restored_record_id=checkout.lease.id();
+                Conv copy=checkout.release_conv();
+                restored_origin_slot=copy.origin_slot;
+                active_record=std::move(checkout.lease);
+                act_states=std::move(copy.states); live=std::move(copy.tok); live_v=std::move(copy.val);
+                act_pages=std::move(copy.pages); act_mirrored=copy.mirrored;
+                brought=reuse; ++switches; cells_brought+=brought;
+            } else if(from || reuse) std::abort();
+            selection_lock.unlock();
+            if(src>=0) E.kv_copy(act_pages,0,reuse,false);
+            if(from) E.restore_snap(*from); else E.reset();
+            selected_pin.reset();
+            if(src>=0 && std::getenv("STRATA_Q36_BATCH_TRACE")) {
+                auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+                std::fprintf(stderr,"Q36_BATCH_EVENT {\"event\":\"cache_restore\",\"monotonic_ns\":%lld,\"slot_id\":%d,\"request_epoch\":%llu,\"record_id\":%llu,\"origin_slot\":%d,\"cached_cells\":%lld}\n",(long long)ns,E.batch_slot,E.batch_epoch,(unsigned long long)restored_record_id,restored_origin_slot,(long long)reuse);
+            }
+        } else {
+        E.pinned_snap = from;
         if (src >= 0) {
             // another conversation: the active one parked (whole), the chosen one's cells beyond the common start of
             // the two brought from its pages, its state from the snapshot
@@ -3537,7 +3873,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                 while (k < live_v.size() && k < c.val.size() && live_v[k] == c.val[k]) ++k;
                 return k;
             }();
-            from->used = ++E.snap_clock;   // (the parked one's end snapshot must not take the slot it is restored from)
+            from->used = ++E.snapshot_clock();   // (the parked one's end snapshot must not take the slot it is restored from)
             Conv c = std::move(parked[(size_t) src]);
             parked.erase(parked.begin() + src);
             trace_phase(true);
@@ -3555,7 +3891,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             ++switches;
             cells_brought += brought;
         } else if ((int64_t) held_n - reuse >= 4096) {
-            if (from) from->used = ++E.snap_clock;
+            if (from) from->used = ++E.snapshot_clock();
             trace_phase(true);
             park_active(true);   // a long conversation the request leaves early: kept for its caller's next turn
         } else {
@@ -3566,6 +3902,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         } else if (from != nullptr) {
             E.restore_snap(*from);
         }
+        }
         E.pinned_snap = nullptr;
         live_cancelled = false;   // the previous outcome was used by park_active; this request now owns the state
         live.resize((size_t) reuse);
@@ -3574,6 +3911,8 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         // Release anchors outside the new prefix. The hashes describe the complete
         // incoming prompt: matching anchors ahead of reuse remain valid while we redo
         // that unchanged part. An abort prunes them to the committed position below.
+        {
+        auto metadata_lock=E.host_lock();
         for (auto it = act_states.begin(); it != act_states.end();) {
             Engine::Snap* sn = *it;
             if (sn->pos <= 0 || sn->pos > n || sn->hash != ph[(size_t) sn->pos]) {
@@ -3582,8 +3921,9 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         }
         // Admit useful states already in the shared pool (including a newly marked
         // held prefix), not only states created during this particular request.
-        for (Engine::Snap& sn : E.snaps)
-            if (sn.pos > 0 && sn.pos <= n && sn.hash == ph[(size_t) sn.pos]) retain_state(act_states, sn);
+        for (Engine::Snap& sn : E.snapshot_pool())
+            if (!sn.writing && sn.pos > 0 && sn.pos <= n && sn.hash == ph[(size_t) sn.pos]) retain_state(act_states, sn);
+        }
         if (E.m->has_mrope)
             CK(cudaMemcpyAsync(E.mrope + (size_t) reuse * 3, table.data() + (size_t) reuse * 3,
                                ((size_t) E.ctx - (size_t) reuse) * 3 * sizeof(int32_t), cudaMemcpyHostToDevice, E.st));
@@ -3629,17 +3969,17 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         }
         const auto t0 = Clock::now();
         int64_t fresh = n - reuse;
-        std::printf("RESUME %lld\n", (long long) reuse);
-        std::fflush(stdout);
+        q36_printf("RESUME %lld\n", (long long) reuse);
+        q36_flush();
         std::fprintf(stderr, "strata-q36: prompt from cell %lld of %lld at %.3f\n", (long long) reuse, (long long) n, wall_ms());
         E.process(ids.data() + reuse, fresh, [&](int64_t done) {
             // Each callback publishes only a fully committed chunk. Incremental host mirroring
             // prevents a later cancellation/switch from inheriting an entire prompt's KV copy.
             // mirror_active uses E.pos, not live: the vectors are appended once below process().
             mirror_active();
-            std::printf("PP %lld %lld %.0f %.1f\n", (long long) (reuse + done), (long long) n, ms_since(t0),
+            q36_printf("PP %lld %lld %.0f %.1f\n", (long long) (reuse + done), (long long) n, ms_since(t0),
                         (double) done / std::max(1e-9, ms_since(t0) / 1000.0));
-            std::fflush(stdout);
+            q36_flush();
         }, geni ? rowp.data() + reuse : nullptr, &cuts);
         live_prefill_end = E.pos;   // committed full/partial prompt, before decoding any answer rows
         const bool cut_short = E.pos < n;   // STOP while the prompt was read: what it read stays held
@@ -3651,10 +3991,12 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             // would enqueue another 63 MiB copy after rollback; park_active saves it only if needed.
             if (E.pos > 0 && !E.prefill_aborted) E.save_snap(ph[(size_t) E.pos], 2);
         }
+        { auto metadata_lock=E.host_lock();
         for (auto it = act_states.begin(); it != act_states.end();) {
             if ((*it)->pos > E.pos) {
                 assert((*it)->refs > 0); --(*it)->refs; it = act_states.erase(it);
             } else ++it;
+        }
         }
         const double prompt_ms = ms_since(t0);
         std::mt19937_64 rng(smp.seed);
@@ -3786,8 +4128,8 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         while (!done) {
             if (stop.load()) { finish = "cancel"; break; }
             auto emit = [&](int t) {   // false: the answer ends here
-                std::printf("T %d\n", t);
-                std::fflush(stdout);
+                q36_printf("T %d\n", t);
+                q36_flush();
                 ++produced;
                 hist.push_back(t);
                 grammar.accept(t);
@@ -3835,10 +4177,10 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         const double decode_ms = ms_since(d0);
         if (constrained) std::fprintf(stderr, "strata-q36: grammar target rows: fast=%lld full=%lld\n", grammar_fast, grammar_full);
         const double cancel_done_before = trace_cancel ? wall_ms() : 0;
-        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %lld 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
+        q36_printf("DONE %lld %zu %.1f %.1f %s %lld %lld %lld 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
                     decode_ms, finish, accepted, offered, (long long) reuse, (long long) fresh);
         const double cancel_printf_after = trace_cancel ? wall_ms() : 0;
-        std::fflush(stdout);
+        q36_flush();
         const double cancel_flush_after = trace_cancel ? wall_ms() : 0;
         const double cancel_log_before = trace_cancel ? wall_ms() : 0;
         if (std::strcmp(finish, "cancel") == 0) std::fprintf(stderr, "strata-q36: cancelled at %.3f\n", wall_ms());
@@ -3851,21 +4193,36 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         // Cancelled live state stays on the device. A switch prefers its existing owned
         // checkpoint; the fallback can still copy, so measure park completion separately.
         if (!live_cancelled) mirror_active();
+        size_t parked_count=0, free_page_count=0;
+        { auto metadata_lock=E.host_lock(); parked_count=parked.size(); free_page_count=E.page_pool().size(); }
         std::fprintf(stderr, "strata-q36: request %lld cells: reused %lld (%s%s), read %lld in %.1f ms, %zu pictures, %zu "
                      "snapshots taken; %lld tokens in %.1f ms (%s); conversations: %zu parked, %zu of %zu pages free\n",
                      (long long) n, (long long) reuse, reuse == 0 ? "fresh" : from ? "snapshot" : "held state",
                      src >= 0 ? (", another conversation: " + std::to_string((long long) brought) + " cells brought back").c_str() : "",
-                     (long long) fresh, prompt_ms, pics.size(), cuts.size(), produced, decode_ms, finish, parked.size(),
-                     E.free_pages.size(), E.n_pages);
+                     (long long) fresh, prompt_ms, pics.size(), cuts.size(), produced, decode_ms, finish, parked_count,
+                     free_page_count, E.host_page_count());
+        if (E.batch_idle) {
+            park_active(false);
+            {
+                auto metadata_lock=E.host_lock();
+                unref(act_pages); release_states(act_states);
+                active_record.reset(); act_mirrored=0;
+                live.clear(); live_v.clear();
+            }
+            E.reset();
+            E.batch_idle();
+        }
     }
 }
+
+#include "q36_parallel.hpp"
 
 }  // namespace
 
 int strata::qwen35::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, embeddings;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_at = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
-    int bench_reps = 3;
+    int bench_reps = 3, batch = 1, batch_kv_mib = 6144, batch_prefill_chunk = 0;
     double expert_vram = -1.0;
     bool warm = true;
     int expert_slots = 0;
@@ -3885,6 +4242,9 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--gpu") (void) next();   // applied by strata before the switch (CUDA/HIP_VISIBLE_DEVICES)
         else if (a == "--greedy") {}            // --tokens decodes greedily here anyway
         else if (a == "--serve") serve_mode = true;
+        else if (a == "--batch") batch = std::atoi(next().c_str());
+        else if (a == "--batch-kv-mib") batch_kv_mib = std::atoi(next().c_str());
+        else if (a == "--batch-prefill-chunk") batch_prefill_chunk = std::atoi(next().c_str());
         else if (a == "--max-context" || a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--chunk" || a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 0 : std::atoi(v.c_str()); }
         else if (a == "--tokens") tokens = next();
@@ -3949,8 +4309,38 @@ int strata::qwen35::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-q36: %s\n", e.what());
         return 1;
     }
+    if (batch < 1 || batch > 4 || batch_kv_mib < 1 || batch_prefill_chunk < 0 ||
+        (batch_prefill_chunk > 0 && (batch_prefill_chunk < Engine::kVerify || batch_prefill_chunk > 2048)) ||
+        (batch > 1 && !serve_mode)) {
+        std::fprintf(stderr, "strata-q36: --batch must be 1..4 and needs --serve; --batch-kv-mib must be positive; --batch-prefill-chunk must be 0(auto) or 8..2048\n"); return 2;
+    }
+#ifndef __HIP_PLATFORM_AMD__
+    std::unique_ptr<strata::q36::kv::Budget> batch_budget;
+    std::unique_ptr<strata::q36::kv::CudaDriver> batch_driver;
+    if (batch > 1) {
+        int device = 0; CK(cudaGetDevice(&device));
+        batch_budget = std::make_unique<strata::q36::kv::Budget>((size_t) batch_kv_mib << 20);
+        batch_driver = std::make_unique<strata::q36::kv::CudaDriver>(device);
+    }
+#else
+    if (batch > 1) { std::fprintf(stderr, "strata-q36: native batch VMM currently requires CUDA\n"); return 2; }
+#endif
+    if(batch>1 && !m.packed.empty()) {
+        CK(cudaDeviceSynchronize()); size_t returned=0;
+        for(const auto& packed:m.packed) {
+            K::native_q8_0_packed_unregister(std::get<0>(packed));
+            returned+=std::get<2>(packed); CK(cudaFree(std::get<1>(packed)));
+        }
+        m.packed.clear();
+        std::fprintf(stderr,"strata-q36: batch physical KV budget uses native Q8_0 layout; packed copies returned %.0fMiB (MTP unchanged)\n",returned/1048576.0);
+    }
     Engine E;
-    E.use_graph = graph;
+    E.batch_coordinator=batch>1;
+    if(batch>1) E.shared_prefill=std::make_shared<Q36SharedPrefill>();
+#ifndef __HIP_PLATFORM_AMD__
+    E.kv_budget = batch_budget.get(); E.kv_driver = batch_driver.get();
+#endif
+    E.use_graph = batch > 1 ? false : graph;
     if (chunk == 0) {
         // auto: 512 with every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
@@ -3970,12 +4360,13 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr, "strata-q36: chunk rule: free %.2f GiB (with %.2f packed), main experts %.2f GiB\n",
                          fr / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0);
     }
+    if (batch > 1 && chunk > 128) chunk = 128;
     // Full-context PP followed by TG needs a small cache tail for the requested generated tokens.
     if (bench_at < 0 || bench_tg < 0 || bench_reps < 1 || (int64_t) bench_at + bench_pp > ctx || (int64_t) ctx + bench_tg > INT32_MAX) {
         std::fprintf(stderr, "strata-q36: benchmark prompt exceeds --max-context\n"); return 2;
     }
-    E.init(m, ctx + ((bench_pp > 0 || bench_tg > 0) ? bench_tg : 0), chunk);
-    if (serve_mode) E.alloc_prefill_rollback();   // include the rollback reservation in expert placement
+    E.init(m, ctx + ((bench_pp > 0 || bench_tg > 0) ? bench_tg : 0), batch > 1 ? 32 : chunk);
+    if (serve_mode && batch == 1) E.alloc_prefill_rollback();   // include the rollback reservation in expert placement
     if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
@@ -3993,11 +4384,18 @@ int strata::qwen35::run(int argc, char** argv) {
     E.reset();
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     E.max_snaps = std::max(0, snapshots);
-    if (warm) E.warmup();
+    if (warm && batch == 1) E.warmup();
     if (serve_mode) {
         ImageCache icache;
+        icache.parallel = batch>1;
         icache.width = m.g.n_embd;
         icache.budget = (size_t) std::max(64, image_cache_mib) << 20;
+#ifndef __HIP_PLATFORM_AMD__
+        if (batch > 1) return serve_parallel(E, icache, model, batch, snap_every,
+            batch_prefill_chunk > 0 ? batch_prefill_chunk : (batch == 2 ? 256 : 64),
+            ((size_t) std::max(0, park_mib) << 20),
+            std::max(0, snapshots), *batch_budget, *batch_driver, warm);
+#endif
         return serve(E, icache, snap_every, (size_t) std::max(0, park_mib) << 20, model);
     }
     if (bench_pp > 0 || bench_tg > 0) {

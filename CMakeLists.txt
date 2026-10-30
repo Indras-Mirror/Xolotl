@@ -257,6 +257,45 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
+  find_package(Threads REQUIRED)
+  foreach(q36_cpu_test IN ITEMS test_q36_cache_hub test_q36_cache_hub_concurrency test_q36_kv_vmm)
+    add_executable(${q36_cpu_test} tests/qwen35/${q36_cpu_test}.cpp)
+    target_link_libraries(${q36_cpu_test} PRIVATE Threads::Threads)
+    # These portable tests use assert(), including Release configurations.
+    if(MSVC)
+      target_compile_options(${q36_cpu_test} PRIVATE /UNDEBUG)
+    else()
+      target_compile_options(${q36_cpu_test} PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME ${q36_cpu_test} COMMAND ${q36_cpu_test})
+  endforeach()
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME q36_batch_isolation_offline
+      COMMAND ${Python3_EXECUTABLE} -m unittest discover
+              -s ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen35 -p test_batch_isolation.py)
+    add_executable(q36_adapter_protocol_mock tests/qwen35/q36_adapter_protocol_mock.cpp)
+    target_link_libraries(q36_adapter_protocol_mock PRIVATE Threads::Threads)
+    add_test(NAME test_q36_adapter_protocol
+      COMMAND ${CMAKE_COMMAND} -E env Q36_ADAPTER_MOCK_BIN=$<TARGET_FILE:q36_adapter_protocol_mock>
+              ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen35/test_q36_adapter_protocol.py)
+    set(q36_helpers_header ${CMAKE_CURRENT_BINARY_DIR}/q36_batch_helpers_extracted.hpp)
+    add_custom_command(OUTPUT ${q36_helpers_header}
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/qwen35/test_q36_batch_helpers.py
+              --generate-header ${q36_helpers_header}
+      DEPENDS tests/qwen35/test_q36_batch_helpers.py src/qwen35/q36_batch_forward.hpp
+      VERBATIM)
+    add_executable(q36_batch_helpers_mock tests/qwen35/q36_batch_helpers_mock.cpp ${q36_helpers_header})
+    target_include_directories(q36_batch_helpers_mock PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    add_test(NAME test_q36_batch_helpers COMMAND q36_batch_helpers_mock)
+    foreach(q36_mock IN ITEMS q36_adapter_protocol_mock q36_batch_helpers_mock)
+      if(MSVC)
+        target_compile_options(${q36_mock} PRIVATE /UNDEBUG)
+      else()
+        target_compile_options(${q36_mock} PRIVATE -UNDEBUG)
+      endif()
+    endforeach()
+  endif()
   add_executable(logit_bias_test src/core/logit_bias_test.cpp)
   target_include_directories(logit_bias_test PRIVATE include)
   add_test(NAME logit_bias_test COMMAND logit_bias_test)
@@ -662,6 +701,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_qwen35 STATIC src/qwen35/q36_engine.cu src/qwen35/q36_flash.cu)
   target_include_directories(strata_qwen35 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata_qwen35 PRIVATE strata_prefill strata_kernels strata_warnings ${_strata_gpu_runtime_target})
+  if(TARGET CUDA::cuda_driver)
+    target_link_libraries(strata_qwen35 PRIVATE CUDA::cuda_driver)
+  endif()
   if(STRATA_NATIVE_EXPERTS)
     # the hybrid mode (experts that do not all fit in VRAM): the CPU expert pool on ggml-cpu's arithmetic
     target_link_libraries(strata_qwen35 PRIVATE strata_kernels_cpu)
