@@ -14,6 +14,11 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 > DeepSeek-V4.1 engine (faster now), plus GLM-5.3-Flash and the Qwen3.8 models, in one tree. Old links and clones
 > redirect here; nothing DeepSeek-V4.1 was removed.
 
+> **Qwen 4, day one (prep, 30 Oct).** Qwen 4 isn't out yet, but we've been getting ready so Xolotl can run it as
+> close to release day as possible. If Qwen 4 Flash keeps Qwen3.8-Flash-Next's architecture, the engine already
+> runs it; the 27B looks dense, so it's going into `strata-dense` with the hyper-connections and QSA attention added.
+> What's known so far and the plan: [docs/QWEN4.md](docs/QWEN4.md).
+
 > **DeepSeek-V4.1 V4 is up (25 Oct)** on [Hugging Face](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)
 > (`v4/`, same size as V3). It's the best build so far: on held-out text it agrees with the full-precision model 86.9%
 > of the time on the top-1 token vs V3's 82.9% (KL 0.306 vs 0.405, through the real engine), and its perplexity is
