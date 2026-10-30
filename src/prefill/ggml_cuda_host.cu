@@ -140,6 +140,17 @@ struct CachingPool : ggml_cuda_pool {
 };
 }  // namespace
 
+// The pool hook of ggml 6050b467: ggml_backend_cuda_context::pool() calls this form.  Without it strata, strata-dense
+// and strata-q36 (which link strata_mmq but not ggml-cuda) fail with "undefined reference to
+// ggml_backend_cuda_context::new_pool_for_device(ggml_backend_cuda_context&, int, int)".  Like everything else in this
+// file it is only used when ggml-cuda is not linked: an engine that links both takes ggml-cuda's definition and the
+// linker never pulls this archive member.
+std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(ggml_backend_cuda_context &, int, int) {
+    return std::unique_ptr<ggml_cuda_pool>(new CachingPool());
+}
+
+// The pre-upgrade form, still declared by tools/xolotl/ggml/xolotl-ggml.patch (the declaration stays, so a tree that
+// already carries the patch keeps applying and building); nothing calls it now.
 std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int, int) {
     return std::unique_ptr<ggml_cuda_pool>(new CachingPool());
 }
