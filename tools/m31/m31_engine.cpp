@@ -14,6 +14,9 @@
 #include "gpu/prefill_hidden.hpp"
 #include "prefill/short/policy.hpp"
 #include "prefill/short/shortprefill_cuda_executor.hpp"
+#ifdef M31_ENGINE_CUDA
+#include "gpu/device_context.hpp"
+#endif
 
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
@@ -26,6 +29,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <chrono>
 #include <cmath>
@@ -33,7 +37,11 @@
 #include <cstdlib>
 #include <map>
 #include <stdexcept>
+#include <thread>
 #include <utility>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #ifdef M31_SHARED_OVERLAP_NVTX
 #include "nvtx3/nvToolsExt.h"
 #endif
@@ -68,7 +76,8 @@ struct Weights {
         return it == tensors.end() ? nullptr : it->second;
     }
     void load(const GgufModel & model, ggml_backend_t backend, bool dense_gpu,
-              const Geometry * geometry = nullptr, double arena_gib = 0, const Config & config = Config{}) {
+              const Geometry * geometry = nullptr, double arena_gib = 0, const Config & config = Config{},
+              bool upload = true) {
         if (!dense_gpu && arena_gib > 0) {
             require(geometry != nullptr, "arena needs validated geometry");
             arena = std::make_unique<ExpertArena>();
@@ -155,7 +164,7 @@ struct Weights {
                     static_cast<uint8_t *>(part.bundle->data) + part.offset) == GGML_STATUS_SUCCESS,
                     "cannot bind packed projection rows");
             if (concatenate) std::fprintf(stderr, "M31 unchanged projection bundles: groups=%zu aliased_weights=%zu (decode only)\n", bundles.size(), parts.size());
-            for (size_t sh = 0; sh < model.size(); ++sh)
+            if (upload) for (size_t sh = 0; sh < model.size(); ++sh)
                 for (const auto & ti : model.shard(sh).tensors()) {
                     auto it = tensors.find(ti.name);
                     if (it != tensors.end())
@@ -352,6 +361,35 @@ ggml_tensor * grouped_fa(Graph & b, ggml_tensor * q, ggml_tensor * k, ggml_tenso
     return ggml_reshape_2d(b.c, out, g.head_dim * g.heads, n);
 }
 
+// Byte copy of a complete backend buffer through a borrowed I8 view, so the
+// dense device weights can leave and re-enter VRAM without any reinterpretation.
+bool copy_buffer(ggml_backend_buffer_t buffer, void * host, bool to_device) {
+    const size_t bytes = ggml_backend_buffer_get_size(buffer);
+#ifdef M31_ENGINE_CUDA
+    PinnedHostRange pin(host, bytes); // released before any context reset
+    const bool pinned = pin.pinned();
+#else
+    const bool pinned = false;
+#endif
+    ggml_context * context = ggml_init({ggml_tensor_overhead() + 1024, nullptr, true});
+    require(context != nullptr, "buffer copy metadata allocation failed");
+    struct Free { ggml_context * c; ~Free() { ggml_free(c); } } release{context};
+    auto * view = ggml_new_tensor_1d(context, GGML_TYPE_I8, int64_t(bytes));
+    require(ggml_backend_tensor_alloc(buffer, view, ggml_backend_buffer_get_base(buffer)) == GGML_STATUS_SUCCESS,
+            "cannot bind a whole-buffer copy view");
+    if (to_device) ggml_backend_tensor_set(view, host, 0, bytes);
+    else ggml_backend_tensor_get(view, host, 0, bytes);
+    return pinned;
+}
+// Fault in a new host range on several threads before it is page-locked.
+void prefault(uint8_t * data, size_t bytes, unsigned threads) {
+    const size_t step = (bytes + threads - 1) / threads;
+    std::vector<std::thread> workers;
+    for (unsigned t = 0; t < threads && size_t(t) * step < bytes; ++t)
+        workers.emplace_back([=] { std::memset(data + size_t(t) * step, 0, std::min(step, bytes - size_t(t) * step)); });
+    for (auto & worker : workers) worker.join();
+}
+
 } // namespace
 
 struct Engine::Impl {
@@ -447,6 +485,115 @@ struct Engine::Impl {
         return (host_reads.input.capacity() + host_reads.residual.capacity() + host_reads.shared.capacity() +
                 host_reads.weights.capacity() + host_reads.moe.capacity()) * sizeof(float) +
                host_reads.ids.capacity() * sizeof(int32_t);
+    }
+
+    // Deep-sleep host state; see Engine::sleep.
+    struct Slumber {
+        bool active = false;
+        int64_t position = 0;
+        std::vector<uint8_t> kv;
+        std::unique_ptr<GpuExperts::Residency> experts;
+        uint64_t free_after_resident = 0;
+        Engine::SleepStats stats;
+    } slumber;
+    // Byte copy of the dense device buffers, made at the first sleep. The
+    // weights are immutable, so later sleeps reuse it without a D2H copy.
+    struct HostBlob { std::unique_ptr<uint8_t[]> data; size_t bytes = 0; };
+    std::vector<HostBlob> dense_host;
+    bool dense_host_matches() const {
+        if (dense_host.size() != device.buffers.size()) return false;
+        for (size_t i = 0; i < dense_host.size(); ++i)
+            if (!dense_host[i].data || dense_host[i].bytes != ggml_backend_buffer_get_size(device.buffers[i])) return false;
+        return true;
+    }
+    // After a wake the arena registers on its own threads; expert uploads use
+    // the pinned staging ring until a forward attaches the finished registration.
+    bool registration_pending = false;
+    Clock::time_point woke_at{};
+    // Device work in progress (forward/logits) and when it last ended. The
+    // background registration only proceeds after 250 ms without it.
+    std::atomic<int> active{0};
+    std::atomic<int64_t> active_end_ns{0};
+    struct Activity {
+        Impl * p;
+        explicit Activity(Impl * owner) : p(owner) { p->active.fetch_add(1); }
+        ~Activity() {
+            p->active_end_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
+            p->active.fetch_sub(1);
+        }
+    };
+    bool idle() const {
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+        return active.load() == 0 && now - active_end_ns.load() >= 250000000;
+    }
+    void attach_registration() noexcept {
+        if (!registration_pending || !host.arena || !host.arena->registration_settled()) return;
+        registration_pending = false;
+        try {
+            host.arena->finish_registration();
+            if (gpu_experts) gpu_experts->attach_registration(host.arena->registration());
+            std::fprintf(stderr, "M31 wake: arena registration attached %.3f s after wake\n", elapsed(woke_at));
+        } catch (const std::exception & e) {
+            host.arena->release_registration();
+            std::fprintf(stderr, "M31 wake: arena registration failed (%s); expert uploads stay on the staging ring\n", e.what());
+        }
+    }
+
+    void allocate_state() {
+        state = ggml_init({16 * 1024 * 1024, nullptr, true});
+        require(state != nullptr, "cache metadata allocation failed");
+        cache.clear();
+        for (int64_t l = 0; l < g.layers; ++l) {
+            Cache kv;
+            kv.k = ggml_new_tensor_3d(state, GGML_TYPE_F16, g.head_dim, g.kv_heads, capacity);
+            kv.v = ggml_new_tensor_3d(state, GGML_TYPE_F16, g.head_dim, g.kv_heads, capacity);
+            kv.index = ggml_new_tensor_2d(state, GGML_TYPE_F16, g.index_dim, capacity);
+            cache.push_back(kv);
+        }
+        state_buffer = ggml_backend_alloc_ctx_tensors_from_buft(state, ggml_backend_get_default_buffer_type(backend));
+        require(state_buffer != nullptr, "cannot allocate KV/index caches");
+        ggml_backend_buffer_clear(state_buffer, 0); // padded rows must contain finite values
+    }
+    // Valid rows [0, position) of every K/V/index tensor, in checkpoint order.
+    void copy_kv_rows(std::vector<uint8_t> & bytes, int64_t position, bool to_device) {
+        size_t offset = 0;
+        for (const auto & kv : cache)
+            for (auto * tensor : {kv.k, kv.v, kv.index}) {
+                require(tensor && tensor->type == GGML_TYPE_F16 && ggml_is_contiguous(tensor),
+                        "KV copy requires contiguous F16 cache tensors");
+                const size_t count = (tensor == kv.index ? tensor->nb[1] : tensor->nb[2]) * size_t(position);
+                require(count <= bytes.size() - offset, "KV copy layout mismatch");
+                if (to_device) ggml_backend_tensor_set(tensor, bytes.data() + offset, 0, count);
+                else ggml_backend_tensor_get(tensor, bytes.data() + offset, 0, count);
+                offset += count;
+            }
+        require(offset == bytes.size(), "KV copy byte count mismatch");
+    }
+    // Frees every device allocation and the arena registration. Host state,
+    // CPU graphs/pools and the RAM arena are unchanged.
+    void release_device() noexcept {
+        drain_shared();
+        try { clear_dense_decode_cache(true); } catch (...) {}
+        gpu_experts.reset();
+        short_cpu_executor.reset();
+        prefill_hidden.reset();
+        attention_inputs.reset();
+        dense_workspace.reset();
+        if (backend) ggml_backend_synchronize(backend);
+        for (auto b : device.buffers) ggml_backend_buffer_free(b);
+        device.buffers.clear();
+        if (device.ctx) { ggml_free(device.ctx); device.ctx = nullptr; }
+        device.tensors.clear();
+        if (state_buffer) { ggml_backend_buffer_free(state_buffer); state_buffer = nullptr; }
+        if (state) { ggml_free(state); state = nullptr; }
+        cache.clear();
+        if (host.arena) host.arena->release_registration();
+        registration_pending = false;
+        dense = nullptr;
+        decode_chain_active = prefill_chain_active = short_hybrid_active = false;
+        backend = nullptr;
+        cfg.backend = nullptr;
+        ready = false;
     }
 
     ~Impl() {
@@ -1250,19 +1397,8 @@ bool Engine::init(const std::string & path, const Config & requested, std::strin
         p_->host.load(*p_->model, p_->cpu, false, &p_->g, cfg.arena_gib, cfg);
         if (ggml_backend_is_cpu(p_->backend)) p_->dense = &p_->host;
         else { p_->device.load(*p_->model, p_->backend, true, &p_->g); p_->dense = &p_->device; }
-        p_->state = ggml_init({16 * 1024 * 1024, nullptr, true});
-        require(p_->state != nullptr, "cache metadata allocation failed");
+        p_->allocate_state();
         const auto & g = p_->g;
-        for (int64_t l = 0; l < g.layers; ++l) {
-            Impl::Cache kv;
-            kv.k = ggml_new_tensor_3d(p_->state, GGML_TYPE_F16, g.head_dim, g.kv_heads, p_->capacity);
-            kv.v = ggml_new_tensor_3d(p_->state, GGML_TYPE_F16, g.head_dim, g.kv_heads, p_->capacity);
-            kv.index = ggml_new_tensor_2d(p_->state, GGML_TYPE_F16, g.index_dim, p_->capacity);
-            p_->cache.push_back(kv);
-        }
-        p_->state_buffer = ggml_backend_alloc_ctx_tensors_from_buft(p_->state, ggml_backend_get_default_buffer_type(p_->backend));
-        require(p_->state_buffer != nullptr, "cannot allocate KV/index caches");
-        ggml_backend_buffer_clear(p_->state_buffer, 0); // padded rows must contain finite values
         if (cuda_requested && cfg.gpu_experts_gib == 0) {
             cfg.gpu_experts_gib = double(GpuExperts::automatic_budget_bytes(*p_->model, p_->g, p_->backend)) / 1073741824.0;
             p_->cfg = cfg;
@@ -1483,7 +1619,182 @@ bool Engine::restore_prefix(const PrefixCheckpointPtr & checkpoint, std::string 
     }
 }
 
+bool Engine::asleep() const { return p_->slumber.active; }
+
+bool Engine::sleep(SleepStats & out, std::string & error) {
+    auto & s = p_->slumber;
+    if (s.active) { out = s.stats; return true; }
+    const auto started = Impl::Clock::now();
+    try {
+        require(p_->ready && p_->model, "sleep requires an initialized engine");
+        bool cuda = false;
+#ifdef M31_ENGINE_CUDA
+        cuda = p_->backend && ggml_backend_is_cuda(p_->backend);
+#endif
+        require(cuda, "sleep requires the CUDA backend");
+    } catch (const std::exception & e) { error = e.what(); return false; }
+    s = Impl::Slumber{};
+    std::string failure;
+    // A background registration still running after a wake competes with
+    // every CUDA call below for the driver; stop it first (it rolls back).
+    if (p_->registration_pending && p_->host.arena) {
+        p_->host.arena->release_registration();
+        p_->registration_pending = false;
+    }
+    try {
+        if (p_->poisoned) reset();
+        p_->drain_shared();
+        p_->clear_dense_decode_cache(true);
+        ggml_backend_synchronize(p_->backend);
+        s.position = p_->pos;
+        if (p_->pos > 0) {
+            s.kv.resize(size_t(p_->g.kv_bytes(p_->pos)));
+            p_->copy_kv_rows(s.kv, p_->pos, false);
+        }
+        if (p_->gpu_experts) s.experts = std::make_unique<GpuExperts::Residency>(p_->gpu_experts->residency());
+        s.stats.kv_seconds = Impl::elapsed(started);
+        const auto dense_started = Impl::Clock::now();
+        if (!p_->dense_host_matches()) {
+            p_->dense_host.clear();
+            for (auto buffer : p_->device.buffers) {
+                Impl::HostBlob blob;
+                blob.bytes = ggml_backend_buffer_get_size(buffer);
+                blob.data.reset(new uint8_t[blob.bytes]);
+                prefault(blob.data.get(), blob.bytes, 8);
+                s.stats.dense_pinned = copy_buffer(buffer, blob.data.get(), false);
+                p_->dense_host.push_back(std::move(blob));
+            }
+            s.stats.dense_copied = true;
+        }
+        s.stats.dense_seconds = Impl::elapsed(dense_started);
+    } catch (const std::exception & e) {
+        // The device is released regardless. Without a complete host copy the
+        // conversation restarts at zero and the dense weights come from the GGUF.
+        failure = e.what();
+        s.kv.clear(); s.position = 0; p_->dense_host.clear(); s.experts.reset();
+    }
+    s.free_after_resident = p_->prefill_free_after_resident;
+    s.stats.kv_tokens = s.position;
+    s.stats.kv_bytes = s.kv.size();
+    for (const auto & blob : p_->dense_host) s.stats.dense_bytes += blob.bytes;
+    s.stats.cached_experts = s.experts ? s.experts->keys.size() : 0;
+    p_->release_device();
+#if defined(__GLIBC__)
+    // The freed graph metadata, scratch descriptors and driver bookkeeping
+    // sit in the main heap; give the free pages back while asleep.
+    malloc_trim(0);
+#endif
+    p_->pos = s.position; p_->last_n = 0; p_->hidden.clear(); p_->poisoned = false;
+    s.active = true;
+    s.stats.seconds = Impl::elapsed(started);
+    out = s.stats;
+    if (!failure.empty()) { error = "sleep released the device but lost the conversation: " + failure; return false; }
+    return true;
+}
+
+bool Engine::wake(ggml_backend_t backend, WakeStats & out, std::string & error) {
+    auto & s = p_->slumber;
+    if (!s.active) {
+        if (p_->ready) { out = {}; return true; }
+        error = "M31: wake requires an initialized engine";
+        return false;
+    }
+    const auto started = Impl::Clock::now();
+    out = {};
+    try {
+        bool cuda = false;
+#ifdef M31_ENGINE_CUDA
+        cuda = backend && ggml_backend_is_cuda(backend);
+#endif
+        require(cuda, "wake requires a CUDA backend");
+        auto & cfg = p_->cfg;
+        p_->backend = backend;
+        cfg.backend = backend;
+        // Same allocation order as init: workspace object, dense, KV, expert
+        // pool, prefill helpers. Registration of the resident arena runs on its
+        // own threads while dense and KV rows are uploaded.
+        if (cfg.reuse_allocations) p_->dense_workspace = std::make_unique<Workspace>(backend);
+        auto phase = Impl::Clock::now();
+        if (p_->dense_host.empty()) p_->device.load(*p_->model, backend, true, &p_->g);
+        else {
+            p_->device.load(*p_->model, backend, true, &p_->g, 0, Config{}, false);
+            require(p_->dense_host_matches(), "dense device layout changed during sleep");
+            for (size_t i = 0; i < p_->dense_host.size(); ++i)
+                out.dense_pinned = copy_buffer(p_->device.buffers[i], p_->dense_host[i].data.get(), true);
+        }
+        p_->dense = &p_->device;
+        out.dense_seconds = Impl::elapsed(phase);
+        phase = Impl::Clock::now();
+        p_->allocate_state();
+        if (s.position > 0) p_->copy_kv_rows(s.kv, s.position, true);
+        ggml_backend_synchronize(backend);
+        out.kv_seconds = Impl::elapsed(phase);
+        out.kv_tokens = s.position;
+        phase = Impl::Clock::now();
+        if (cfg.gpu_experts_gib > 0) {
+            require(p_->host.arena != nullptr, "GPU expert cache requires an arena");
+            // The arena is registered after this seed; until then the cache
+            // uploads through its pinned staging ring (the same bytes).
+            Config experts_cfg = cfg;
+            experts_cfg.register_arena = false;
+            p_->gpu_experts = std::make_unique<GpuExperts>();
+            p_->gpu_experts->init(*p_->model, p_->g, *p_->host.arena, backend, cfg.gpu_experts_gib, cfg.max_chunk, false, experts_cfg);
+            if (s.experts) {
+                out.expert_bytes = p_->gpu_experts->restore_residency(*s.experts);
+                out.cached_experts = s.experts->keys.size();
+            }
+        }
+        out.experts_seconds = Impl::elapsed(phase);
+        if (p_->gpu_prefill_chain) {
+            require(p_->gpu_experts && p_->gpu_experts->native_gpu_math(), "GPU prefill chain lost its device expert executor");
+            p_->prefill_hidden = std::make_unique<GpuPrefillHidden>();
+        }
+        if (p_->gpu_prefill_chain && p_->cpu_pool) {
+            p_->short_cpu_executor = std::make_unique<ShortPrefillCudaExecutor>(
+                p_->cpu, p_->cpu_pool, unsigned(cfg.threads), true);
+            const size_t rows = size_t(std::min<int64_t>({1024, cfg.max_chunk, cfg.context}));
+            if (rows >= 32) p_->short_cpu_executor->prepare_gpu_quant(rows,
+                size_t(p_->g.embd), size_t(p_->g.used), size_t(p_->g.expert_ff));
+        }
+        if (p_->adaptive_prefill) {
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(backend), &free_bytes, &total_bytes);
+            require(free_bytes > 0, "device did not report free VRAM for adaptive prefill");
+            // The init snapshot keeps the prefill plans of the same history
+            // identical; less free VRAM after waking only makes them smaller.
+            p_->prefill_free_after_resident = std::min<uint64_t>(s.free_after_resident, free_bytes);
+            if (free_bytes < s.free_after_resident) std::fprintf(stderr,
+                "M31 wake: %llu fewer free VRAM bytes than at load; prefill plans are bounded by the smaller value\n",
+                (unsigned long long)(s.free_after_resident - free_bytes));
+        }
+        if (p_->host.arena && cfg.register_arena) {
+            Impl * owner = p_.get();
+            p_->host.arena->register_resident(backend, cfg, [owner] { return owner->idle(); });
+            p_->registration_pending = true;
+            out.registration_background = true;
+        }
+        p_->woke_at = started;
+        p_->pos = s.position; p_->last_n = 0; p_->hidden.clear(); p_->poisoned = false;
+        p_->decode_chain_active = p_->prefill_chain_active = p_->short_hybrid_active = false;
+        p_->ready = true;
+        s = Impl::Slumber{};
+        out.seconds = Impl::elapsed(started);
+        return true;
+    } catch (const std::exception & e) {
+        p_->release_device();
+        error = e.what();
+        return false;
+    }
+}
+
 void Engine::reset() {
+    if (p_->slumber.active) {
+        // Asleep: only the host copy of the conversation exists.
+        p_->slumber.kv.clear(); p_->slumber.kv.shrink_to_fit();
+        p_->slumber.position = 0; p_->slumber.stats.kv_tokens = 0; p_->slumber.stats.kv_bytes = 0;
+        p_->pos = 0; p_->last_n = 0; p_->hidden.clear(); p_->poisoned = false;
+        return;
+    }
     p_->clear_dense_decode_cache(true);
     // A failed pass can leave incomplete or non-finite future rows. Causal
     // -infinity masks cannot neutralize NaNs before MSA block selection.
@@ -1534,6 +1845,8 @@ bool Engine::forward_mixed(const int32_t * tokens, const int32_t * visual_rows,
         // Validation above has not touched KV, hidden, graph state or streams.
         // A caller can re-plan a rejected pass without resetting valid state.
         require(!p_->cfg.cancelled || !p_->cfg.cancelled(), "cancelled");
+        Impl::Activity activity(p_.get());
+        p_->attach_registration();
         p_->poisoned = true;
         p_->decode_chain_active = p_->gpu_decode_chain && n == 1;
         p_->prefill_chain_active = p_->gpu_prefill_chain && n > 1 && n >= p_->cfg.gpu_experts_min_tokens;
@@ -1643,6 +1956,7 @@ bool Engine::logits(int row, int count, std::vector<float> & out, std::string & 
     try {
         const auto head_started = p_->cfg.profile ? Impl::Clock::now() : Impl::Clock::time_point{};
         require(p_->ready && !p_->poisoned && row >= 0 && count > 0 && row <= p_->last_n && count <= p_->last_n - row, "invalid logits rows/state");
+        Impl::Activity activity(p_.get());
         started = true;
         Impl::HeadGraph temporary;
         const bool stable_decode = p_->cfg.dense_decode_cache && count == 1 && p_->last_n == 1 && !p_->cfg.tap;

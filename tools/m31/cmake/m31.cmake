@@ -38,6 +38,7 @@ target_compile_features(m31_engine PUBLIC cxx_std_20)
 target_link_libraries(m31_engine PUBLIC ggml ggml-cpu ggml-base Threads::Threads)
 if(STRATA_ENABLE_CUDA AND TARGET ggml-cuda AND NOT STRATA_HIP_GFX906)
   target_sources(m31_engine PRIVATE "${_m31_dir}/gpu/registered_arena.cu"
+    "${_m31_dir}/gpu/device_context.cu"
     "${_m31_dir}/prefill/short/shortprefill_gpu_quant.cu")
   set_source_files_properties("${_m31_dir}/prefill/short/shortprefill_gpu_quant.cu"
     PROPERTIES COMPILE_OPTIONS "--use_fast_math")

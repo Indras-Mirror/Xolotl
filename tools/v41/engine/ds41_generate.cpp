@@ -14,6 +14,8 @@
 // --serve speaks Strata's engine line protocol (~/AI/Strata/serve/server.py StrataEngine, as glm_generate):
 //   in:  GEN <max_new> [temperature=.. top_p=.. top_k=.. min_p=.. seed=..] <ids csv> | STOP | QUIT
 //        GENI <max_new> [k=v ..] <image embeddings file> <ids csv>   (GEN with vision; see --image-token)
+//        CHECKPOINT_PAUSE -> CHECKPOINT_PAUSED (idle CUDA graph clock, before driver checkpoint)
+//        CHECKPOINT_RESUME -> CHECKPOINT_RESUMED paused_us=N graph_execs=N (after restore/unlock)
 //   out: READY <ctx> stop, RESUME <reused>, PP <read> <total> <ms> <tok/s>, T <id>, DONE ..., ERR <text>
 // --batch-slots N (or Strata's --batch N, which serve/server.py passes for "parallel": N): N conversations decode
 // together, one row each per batch window (Strata's slot protocol, serve/server.py generate_batched; INFO batch_slots=N):
@@ -1633,7 +1635,25 @@ int main(int argc, char ** argv) {
             resid_all += pipe.tier(st).resident();
             arena_all += pipe.tier(st).arena_experts();
         }
+#ifdef STRATA_ENABLE_CUDA
+        // An explicitly checkpointed idle interval must not age the CUDA graph
+        // eviction clock. Preserve executables and all model/KV/expert-cache state.
+        // DSpark shares a dense backend; each backend's clock is adjusted once.
+        std::vector<ggml_backend_t> checkpoint_backends;
+        auto checkpoint_backend = [&](ggml_backend_t backend) {
+            if (ggml_backend_is_cuda(backend) &&
+                std::find(checkpoint_backends.begin(), checkpoint_backends.end(), backend) == checkpoint_backends.end())
+                checkpoint_backends.push_back(backend);
+        };
+        for (const auto & stage : pipe.stages) checkpoint_backend(stage.backend);
+        if (pipe.head) checkpoint_backend(pipe.head->backend);
+        bool checkpoint_clock_paused = false;
+        int64_t checkpoint_pause_started_us = 0;
+#endif
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld", ctxv, (long long) resid_all, (long long) arena_all);
+#ifdef STRATA_ENABLE_CUDA
+        if (!checkpoint_backends.empty()) std::printf(" checkpoint_clock=1");
+#endif
         if (pool_on) std::printf(" conversation_cache_mib=%d conversation_cache_slots=%d", a.conv_mib, a.conv_slots);
         if (NS > 0) std::printf(" batch_slots=%d slot_cache=1", NS);   // serve/server.py: the slot protocol (generate_batched)
         std::printf("\n");
@@ -2010,6 +2030,52 @@ int main(int argc, char ** argv) {
             }
             if (line == "QUIT") break;
             if (line == "STOP" || line.empty()) continue;
+            if (line == "CHECKPOINT_PAUSE" || line == "CHECKPOINT_RESUME") {
+                // The server drains requests before PAUSE and sends RESUME after
+                // driver restore/unlock (also after a recoverable checkpoint failure).
+                // Neither command is a prompt: leave vision and every slot unchanged.
+                if (any_active()) {
+                    std::printf("ERR %s: batch slots are active\n", line.c_str());
+                } else {
+#ifdef STRATA_ENABLE_CUDA
+                    if (checkpoint_backends.empty()) {
+                        std::printf("ERR %s: no CUDA backend\n", line.c_str());
+                    } else if (line == "CHECKPOINT_PAUSE") {
+                        if (!checkpoint_clock_paused) {
+                            checkpoint_pause_started_us = ggml_time_us();
+                            checkpoint_clock_paused = true;
+                        }
+                        std::printf("CHECKPOINT_PAUSED\n");
+                    } else {
+                        int64_t paused_us = 0, graph_execs = 0;
+                        if (checkpoint_clock_paused) {
+                            paused_us = std::max<int64_t>(0, ggml_time_us() - checkpoint_pause_started_us);
+                            for (ggml_backend_t backend : checkpoint_backends)
+                                graph_execs += ggml_backend_cuda_graph_cache_shift_age(backend, paused_us);
+                            checkpoint_clock_paused = false;
+                            checkpoint_pause_started_us = 0;
+                        }
+                        std::fprintf(stderr, "serve: checkpoint clock resumed: paused_us=%lld graph_execs=%lld; "
+                                             "model, KV and expert-cache state retained\n",
+                                     (long long) paused_us, (long long) graph_execs);
+                        std::printf("CHECKPOINT_RESUMED paused_us=%lld graph_execs=%lld\n",
+                                    (long long) paused_us, (long long) graph_execs);
+                    }
+#else
+                    std::printf("ERR %s: CUDA checkpoint is unsupported in this build\n", line.c_str());
+#endif
+                }
+                std::fflush(stdout);
+                continue;
+            }
+#ifdef STRATA_ENABLE_CUDA
+            if (checkpoint_clock_paused) {
+                // No new graph may be created or used during the measured pause.
+                std::printf("ERR checkpoint clock is paused; CHECKPOINT_RESUME is required\n");
+                std::fflush(stdout);
+                continue;
+            }
+#endif
             // the slot lines: BSTOP ends a slot at its next window; BYIELD for a read that has ended meanwhile; BGEN
             // <slot> <max_new> .. reads the prompt into <slot> as a GEN 1, then the slot decodes on (BADM)
             int admit = -1;

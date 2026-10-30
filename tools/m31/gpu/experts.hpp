@@ -96,6 +96,24 @@ public:
     void release_prefill_workspace();
     const Stats & stats() const;
     void reset_stats(); // Keeps warm cache entries; counters restart at current residency.
+    // Exact cache state for a deep sleep: which expert occupies which slot, its
+    // recency, the free-slot order and the counters. No weight bytes are copied;
+    // the RAM arena is their source when the cache is seeded again.
+    struct Residency {
+        std::vector<uint64_t> keys, slots, last_used;
+        std::vector<size_t> free_slots;
+        uint64_t clock = 0;
+        Stats stat;
+    };
+    Residency residency(); // completes a pending speculative upload first
+    // Switch later uploads to direct DMA from a now complete arena registration
+    // (a cache initialized without one uses the pinned staging ring). Call
+    // between forwards; the uploaded bytes are the same on either path.
+    void attach_registration(const GpuRegisteredArena * registration);
+    // After init() with the same budget: uploads every recorded expert from the
+    // arena into its recorded slot, so later routing sees the same residency.
+    // Returns the uploaded bytes.
+    uint64_t restore_residency(const Residency & residency);
 private:
     struct Impl;
     std::unique_ptr<Impl> p_;

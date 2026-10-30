@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from serve import server as S
 
 
-class Protocol(unittest.TestCase):
+class Engine(unittest.TestCase):
     def setUp(self):
         self.p = subprocess.Popen([EXE], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -59,6 +59,8 @@ class Protocol(unittest.TestCase):
         self.send(command)
         return self.until("DONE")
 
+
+class Protocol(Engine):
     def test_zero_tokens_and_rejection_recovery(self):
         lines = self.request("GEN 0 1,2")
         self.assertFalse(any(line.startswith("T ") for line in lines))
@@ -204,10 +206,57 @@ class Protocol(unittest.TestCase):
         self.assertEqual(explicit[-1].split()[1], "1")
         self.assertEqual(explicit[-1].split()[5], "stop")
 
+    def test_sleep_wake_keeps_conversation(self):
+        ids = [1] * 600
+        self.request("GEN 1 " + ",".join(map(str, ids)))
+        self.send("SLEEP")
+        slept = self.until("SLEPT")[-1].split()
+        self.assertIn("kv_tokens=600", slept)
+        self.assertIn("conversation=1", slept)
+        self.send("SLEEP")                     # idempotent while asleep
+        self.assertIn("kv_tokens=600", self.until("SLEPT")[-1].split())
+        self.send("WAKE")
+        woke = self.until("READY")
+        self.assertTrue(woke[0].startswith("INFO woke=1"), woke)
+        self.assertEqual(woke[-1], "READY 4096 stop")
+        self.send("WAKE")                      # already awake: READY only
+        self.assertEqual(self.until("READY"), ["READY 4096 stop"])
+        warm = self.request("GEN 1 " + ",".join(map(str, ids + [2])))
+        self.assertIn("RESUME 512", warm)
+
+    def test_request_wakes_a_sleeping_engine(self):
+        ids = [1] * 600
+        self.request("GEN 1 " + ",".join(map(str, ids)))
+        self.send("SLEEP")
+        self.until("SLEPT")
+        lines = self.request("GEN 1 " + ",".join(map(str, ids + [2])))
+        self.assertTrue(lines[0].startswith("INFO woke=1"), lines)
+        self.assertIn("RESUME 512", lines)
+        self.assertIn("T 3", lines)
+
     def test_batch_completion_and_mask(self):
         lines = self.request("BGEN 3 2 allowed_ids=2,4 logit_bias=4:10 1,2")
         self.assertEqual([line for line in lines if line.startswith("T ")], ["T 4", "T 4"])
         self.assertEqual(self.until("BADM")[-1], "BADM 3 0")
+
+
+class FailedWake(Engine):
+    def setUp(self):
+        import os
+        os.environ["M31_PROTOCOL_FIXTURE_WAKE_FAILURES"] = "1"
+        try:
+            super().setUp()
+        finally:
+            del os.environ["M31_PROTOCOL_FIXTURE_WAKE_FAILURES"]
+
+    def test_failed_wake_stays_asleep_then_recovers(self):
+        self.send("SLEEP")
+        self.until("SLEPT")
+        self.send("GEN 1 1,2")
+        self.assertIn("still asleep", self.until("ERR")[-1])
+        lines = self.request("GEN 1 1,2")
+        self.assertTrue(lines[0].startswith("INFO woke=1"), lines)
+        self.assertIn("T 3", lines)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,13 @@ public:
         size_t chunk_bytes=size_t(1)<<30;
         unsigned threads=4;
         bool asynchronous=false;
+        // Register a piece only after filled() has reported every source byte
+        // it covers. The kernel then pins already resident pages, while the
+        // page faults and zeroing stay on the threads that fill the arena.
+        bool deferred=false;
+        // Polled before each piece when set; false postpones it (for example
+        // while a request runs, so registration does not hold up its copies).
+        std::function<bool()> may_register;
         // Runs on a registration worker. The source must be ready before this
         // callback reads it. DMA users drain their streams before destruction.
         std::function<void(const Piece &)> on_registered;
@@ -48,7 +55,16 @@ public:
         return source>=begin && source-begin<=bytes_ && bytes<=bytes_-(source-begin);
     }
     void finish(); // joins workers, publishes all pieces or throws after rollback
+    // Deferred mode: the logical source range [offset, offset+bytes) is final.
+    // Thread-safe; each source byte must be reported exactly once.
+    void filled(size_t offset,size_t bytes) noexcept;
+    // Stops pending registrations (for example after a failed fill). finish()
+    // then rolls back and throws; the destructor rolls back silently.
+    void abort() noexcept;
     bool ready() const noexcept {return ready_;}
+    // Every piece is registered, or registration failed: finish() will not wait.
+    // Safe to poll from the owner while asynchronous workers run.
+    bool settled() const noexcept;
     // Maximum logical source prefix contained in one physical registration.
     // A DMA spanning adjacent registered pieces must split at this boundary.
     size_t contiguous_bytes(const void * data,size_t requested) const noexcept {

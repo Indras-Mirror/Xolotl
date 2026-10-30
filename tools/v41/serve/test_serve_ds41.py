@@ -213,6 +213,10 @@ def t_image_prompt(svc):
         check("vision: source order and sampling room preserved", seen == ["first", "second"] and not thinking and maximum == 20)
         check("vision: combined records keep prompt order", Path(svc.embeddings.path).read_bytes() == b"firstsecond")
         svc.drop_embeddings()
+        ends = []                                   # the request log's picture ends (the server's 3rd argument)
+        expanded = svc.expand_image_tokens(before, encoded, ends)
+        check("vision: picture ends for the request log", expanded == ids and len(ends) == 2 and ends[-1] <= len(ids)
+              and expanded[ends[0] - 1] == image_id and expanded[ends[1] - 1] == image_id)
         try:
             svc.expand_image_tokens(before, encoded[:1])
             check("vision: rejects image-count mismatch", False)

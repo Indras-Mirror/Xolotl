@@ -69,6 +69,38 @@ public:
     };
     // Cumulative counters; requesting them performs no allocation or model work.
     PrefillStats prefill_stats() const;
+    // Deep sleep releases every device allocation of this engine: dense
+    // weights, the expert cache, KV/index rows, graph scratch and the arena's
+    // registration. Host RAM keeps the arena, a byte copy of the dense device
+    // buffers, the valid KV/index rows and the expert-cache residency. After
+    // sleep() the borrowed backend is unused; the caller may free it and
+    // release the device context. wake() takes a new backend for the same
+    // device and restores the exact pre-sleep state, so the next forward
+    // continues the conversation without reading it again. A failed sleep
+    // still releases the device but may drop the conversation (position 0).
+    // A failed wake releases what it allocated and stays asleep.
+    // The first sleep copies the dense buffers to host RAM; the copy is kept
+    // (the weights are immutable), so later sleeps only copy the KV rows.
+    // wake() returns once dense weights, KV rows and the expert cache are on
+    // the device; the arena then registers on a background thread, only while
+    // no forward/logits ran for 250 ms, and a later forward switches expert
+    // uploads from the staging ring to direct DMA.
+    struct SleepStats {
+        double seconds = 0, kv_seconds = 0, dense_seconds = 0;
+        int64_t kv_tokens = 0;
+        size_t kv_bytes = 0, dense_bytes = 0, cached_experts = 0;
+        bool dense_copied = false, dense_pinned = false;
+    };
+    struct WakeStats {
+        double seconds = 0, dense_seconds = 0, kv_seconds = 0, experts_seconds = 0;
+        int64_t kv_tokens = 0;
+        size_t cached_experts = 0;
+        uint64_t expert_bytes = 0;
+        bool dense_pinned = false, registration_background = false;
+    };
+    bool sleep(SleepStats & stats, std::string & error);
+    bool wake(ggml_backend_t backend, WakeStats & stats, std::string & error);
+    bool asleep() const;
     // Cap every backend at the MSA int32 limit. CUDA also applies a
     // conservative scratch-memory plan to the remaining prompt chunk.
     // In vision-enabled CUDA builds, cap by live VRAM to account for the helper.

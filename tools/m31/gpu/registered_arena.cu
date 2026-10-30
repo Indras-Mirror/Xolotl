@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,14 +41,47 @@ struct GpuRegisteredArena::Impl {
     Options options;
     std::vector<Item> items;
     std::vector<std::thread> workers;
-    std::atomic<size_t> next{0};
-    std::atomic<bool> failed{false};
+    std::atomic<size_t> next{0}, completed{0};
+    std::atomic<bool> failed{false}, halted{false};
     std::mutex error_mutex;
     std::exception_ptr error;
     Clock::time_point start;
+    // Deferred mode: source bytes still missing per piece, and filled pieces
+    // waiting for a registration worker.
+    std::unique_ptr<std::atomic<size_t>[]> missing;
+    std::mutex queue_mutex;
+    std::condition_variable queue_changed;
+    std::deque<size_t> ready;
+    size_t queued=0;
+    bool stopping=false;
     void remember_error()noexcept{
         failed.store(true,std::memory_order_release);
-        std::lock_guard<std::mutex> lock(error_mutex);if(!error)error=std::current_exception();
+        {std::lock_guard<std::mutex> lock(error_mutex);if(!error)error=std::current_exception();}
+        stop();
+    }
+    void stop()noexcept{
+        halted.store(true,std::memory_order_release);
+        {std::lock_guard<std::mutex> lock(queue_mutex);stopping=true;}
+        queue_changed.notify_all();
+    }
+    // Next piece to register, or items.size() when no further piece will come.
+    size_t take()noexcept{
+        if(!options.deferred){
+            if(halted.load(std::memory_order_acquire))return items.size();
+            const size_t index=next.fetch_add(1);return index<items.size()?index:items.size();
+        }
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        queue_changed.wait(lock,[&]{return !ready.empty()||stopping||queued==items.size();});
+        if(ready.empty()||failed.load(std::memory_order_acquire))return items.size();
+        const size_t index=ready.front();ready.pop_front();
+        return index;
+    }
+    void publish(size_t index)noexcept{
+        bool last;
+        {std::lock_guard<std::mutex> lock(queue_mutex);ready.push_back(index);last=++queued==items.size();}
+        // The final publication also satisfies take()'s end-of-input predicate.
+        // Wake every idle worker so finish() can join them after the queue drains.
+        if(last)queue_changed.notify_all();else queue_changed.notify_one();
     }
     void join()noexcept{for(auto &t:workers)if(t.joinable())t.join();}
     void rollback()noexcept{
@@ -56,7 +91,7 @@ struct GpuRegisteredArena::Impl {
             if(status==cudaSuccess)item.registered=false;
         }
     }
-    ~Impl(){join();rollback();}
+    ~Impl(){stop();join();rollback();}
 };
 GpuRegisteredArena::GpuRegisteredArena(ggml_backend_t b,const void *p,size_t n)
     :GpuRegisteredArena(b,p,n,Options{}){}
@@ -104,6 +139,10 @@ GpuRegisteredArena::GpuRegisteredArena(ggml_backend_t backend,const void *data,s
     }
     stat_.bytes=bytes;stat_.registered_bytes=size_t(last-first);stat_.pieces=impl_->items.size();
     stat_.threads=unsigned(std::min<size_t>(impl_->options.threads,impl_->items.size()));
+    if(impl_->options.deferred){
+        impl_->missing.reset(new std::atomic<size_t>[impl_->items.size()]);
+        for(size_t i=0;i<impl_->items.size();++i)impl_->missing[i].store(impl_->items[i].piece.source_bytes,std::memory_order_relaxed);
+    }
     int ro=0;ck(cudaDeviceGetAttribute(&ro,cudaDevAttrHostRegisterReadOnlySupported,impl_->device));
     impl_->start=Clock::now();
     try{
@@ -111,7 +150,9 @@ GpuRegisteredArena::GpuRegisteredArena(ggml_backend_t backend,const void *data,s
             try{
                 ck(cudaSetDevice(impl_->device));
                 while(!impl_->failed.load(std::memory_order_acquire)){
-                    const size_t index=impl_->next.fetch_add(1);if(index>=impl_->items.size())break;
+                    while(impl_->options.may_register&&!impl_->halted.load(std::memory_order_acquire)&&!impl_->options.may_register())
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    const size_t index=impl_->take();if(index>=impl_->items.size())break;
                     auto &item=impl_->items[index];const auto begin=Clock::now();
                     unsigned flags=cudaHostRegisterPortable|(ro?cudaHostRegisterReadOnly:0);
                     auto status=cudaHostRegister(item.piece.registered_ptr,item.piece.registered_bytes,flags);
@@ -121,14 +162,39 @@ GpuRegisteredArena::GpuRegisteredArena(ggml_backend_t backend,const void *data,s
                     item.seconds=std::chrono::duration<double>(Clock::now()-begin).count();
                     item.end_seconds=std::chrono::duration<double>(Clock::now()-impl_->start).count();
                     if(impl_->options.on_registered)impl_->options.on_registered(item.piece);
+                    impl_->completed.fetch_add(1,std::memory_order_acq_rel);
                 }
             }catch(...){impl_->remember_error();}
         });
-    }catch(...){impl_->failed.store(true);impl_->join();impl_->rollback();throw;}
+    }catch(...){impl_->failed.store(true);impl_->stop();impl_->join();impl_->rollback();throw;}
     if(!impl_->options.asynchronous)finish();
 }
+void GpuRegisteredArena::filled(size_t offset,size_t bytes)noexcept{
+    if(!impl_->options.deferred||!bytes)return;
+    // Pieces partition [aligned_base, last) in chunk_bytes steps; source
+    // offsets are relative to the logical base.
+    const size_t shift=size_t(reinterpret_cast<uintptr_t>(base_)-aligned_base_);
+    size_t at=offset;
+    const size_t end=offset+bytes;
+    while(at<end){
+        const size_t index=(at+shift)/chunk_bytes_;
+        if(index>=impl_->items.size())break;
+        const auto &piece=impl_->items[index].piece;
+        const size_t piece_end=piece.source_offset+piece.source_bytes;
+        const size_t part=std::min(end,piece_end)-at;
+        if(impl_->missing[index].fetch_sub(part,std::memory_order_acq_rel)==part)impl_->publish(index);
+        at+=part;
+    }
+}
+bool GpuRegisteredArena::settled()const noexcept{
+    return ready_||impl_->failed.load(std::memory_order_acquire)||impl_->completed.load(std::memory_order_acquire)==impl_->items.size();
+}
+void GpuRegisteredArena::abort()noexcept{impl_->failed.store(true,std::memory_order_release);impl_->stop();}
 void GpuRegisteredArena::finish(){
     if(ready_)return;
+    // A deferred piece that was never completely filled cannot be published.
+    if(impl_->options.deferred){std::lock_guard<std::mutex> lock(impl_->queue_mutex);if(impl_->queued!=impl_->items.size())impl_->failed.store(true);}
+    if(impl_->failed.load())impl_->stop();
     const auto begin=Clock::now();impl_->join();stat_.finish_wait_seconds+=std::chrono::duration<double>(Clock::now()-begin).count();
     if(impl_->failed.load()){
         impl_->rollback();if(impl_->error)std::rethrow_exception(impl_->error);
@@ -144,5 +210,5 @@ void GpuRegisteredArena::finish(){
     ready_=true;
     std::fprintf(stderr,"M31 registered arena: bytes=%zu registered_bytes=%zu pieces=%zu threads=%u seconds=%.6f sum_seconds=%.6f finish_wait_seconds=%.6f hardware_read_only=%d immutable direct H2D\n",stat_.bytes,stat_.registered_bytes,stat_.pieces,stat_.threads,stat_.register_seconds,stat_.register_sum_seconds,stat_.finish_wait_seconds,int(stat_.hardware_read_only));
 }
-GpuRegisteredArena::~GpuRegisteredArena(){if(impl_)impl_->join();}
+GpuRegisteredArena::~GpuRegisteredArena(){if(impl_){impl_->stop();impl_->join();}}
 } // namespace strata::m31

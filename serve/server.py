@@ -62,6 +62,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import deep_sleep  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -817,6 +818,8 @@ class StrataEngine:
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+    deep_sleep = "off"                   # POST /sleep: auto | native | checkpoint | off (serve/deep_sleep.py)
+    sleeping, sleep_via = False, None    # asleep, and how ("native" | "checkpoint")
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
@@ -855,6 +858,8 @@ class StrataEngine:
         self.reused = 0                  # RESUME: prompt tokens not read again (a client takes them out of the work)
         self.silent_note = None
         self.last_err = None
+        self.sleeping, self.sleep_via = False, None   # POST /sleep: a (re)started process is awake
+        self.checkpoint_paused, self.sleep_pids = False, []  # no checkpoint state crosses a process restart
         try:                            # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
@@ -1097,6 +1102,27 @@ class StrataEngine:
         """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
         self.close()
         self.unloaded = True
+
+    def can_sleep(self) -> bool:
+        """POST /sleep: the engine sleeps natively (INFO sleep=1) or the CUDA driver can checkpoint it."""
+        return deep_sleep.method(self) is not None
+
+    def sleep(self) -> dict:
+        """Deep sleep between requests (the caller holds the turn): all VRAM and the GPU context go back, the model
+        and the conversation stay in RAM.  ValueError: it stays awake; EngineDied: it ended."""
+        try:
+            return deep_sleep.sleep(self)
+        except deep_sleep.EngineGone as e:
+            raise EngineDied(str(e)) from None
+
+    def wake(self) -> dict:
+        """The GPU back after sleep(); {} when awake.  GpuBusy: it stays asleep (the GPU is not free)."""
+        try:
+            return deep_sleep.wake(self)
+        except deep_sleep.WakeRefused as e:
+            raise GpuBusy(f"the model could not wake: {e}", retry_after=15) from None
+        except deep_sleep.EngineGone as e:
+            raise EngineDied(str(e)) from None
 
     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
 
@@ -1580,6 +1606,12 @@ class StrataEngine:
             return
         holding, born = True, self.gen                  # (the engine it now has the control lines of)
         btrace("ctl acquired")
+        if self.sleeping:            # POST /sleep took the lines while this one waited for them (Service.sleep)
+            try:
+                self.wake()
+            except BaseException:
+                self.ctl.release()
+                raise
         slot, gen0, reserved = None, None, None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
@@ -1939,6 +1971,8 @@ class StrataEngine:
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        if self.sleeping:                                # the Service wakes it first; a direct caller gets the same
+            self.wake()
         bias_api.validate_request(sampling or {}, self, None)
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
@@ -2217,6 +2251,7 @@ class StrataEngine:
         a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
         if self.proc is None:
             return
+        deep_sleep.end(self)                             # a checkpointed engine cannot free its memory itself
         try:
             if self.proc.poll() is None:
                 try:
@@ -3288,6 +3323,11 @@ class Service:
                 waiting = False
                 if not self.loaded():
                     return error(503, "the model is not loaded")
+                if self._asleep():                          # the engine reads or writes its KV: awake
+                    try:
+                        self.ensure_loaded()
+                    except GpuBusy as e:
+                        return error(503, str(e))
                 with self.status_lock:
                     self.status.update(busy=True, phase="saving the session" if action == "save"
                                        else "restoring a session", started=time.time(), first_token=None,
@@ -3407,11 +3447,14 @@ class Service:
         v = self.vision
         if not getattr(v, "elastic", False) or not (self.vision_held or v.alive()):
             return "nothing"
-        if not force and time.time() - self.last_image_at < v.elastic_idle_s:
+        if (not force and time.time() - self.last_image_at < v.elastic_idle_s) or self._asleep():
             return "busy"
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
+            # Sleep may have completed between the check above and taking the FIFO.
+            if self._asleep():
+                return "busy"
             v.unload()
             if self.vision_held and hasattr(self.engine, "vram") and self.loaded():
                 out = self.engine.vram(self._engine_reserve())
@@ -3457,11 +3500,19 @@ class Service:
         except Exception:
             return None
 
+    def _asleep(self) -> bool:
+        """The engine process runs but has given the GPU back (POST /sleep); the next load wakes it."""
+        return bool(getattr(self.engine, "sleeping", False)) and self.loaded()
+
     def ensure_loaded(self):
-        """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
-        the free-VRAM check.  The caller holds self.fifo."""
-        if self.loaded() and not self._vision_down():
+        """Start the engine if it is not running (unloaded, or it died - issue #27), or wake it from a deep sleep,
+        after the before_load hook and the free-VRAM check.  The caller holds self.fifo."""
+        if self.loaded() and not self._vision_down() and not self._asleep():
             return
+        if not self.loaded():
+            # A dead engine cannot wake its checkpointed helper. End that helper
+            # before restarting so image requests never reuse a frozen process.
+            self._thaw_vision(kill=True)
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
@@ -3519,6 +3570,9 @@ class Service:
             except Exception as e:
                 raise EngineDied(f"the vision encoder failed to start: {e}") from e
             vision_started = True
+        if self._asleep():
+            self._wake_engine()
+            return
         if self.loaded():
             return
         if getattr(self.engine, "unloaded", False):
@@ -3560,10 +3614,10 @@ class Service:
             self.fifo.release()
             raise ModelBusy("a request is still running; try again when it has finished")
         try:
-            if not self.loaded():
+            if not self.loaded() or self._asleep():
                 self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
-                return {"status": "not loaded", "reserve_mib": reserve_mib,
-                        "note": "applied when the model loads"}
+                return {"status": "asleep" if self.loaded() else "not loaded", "reserve_mib": reserve_mib,
+                        "note": "applied when the model wakes" if self.loaded() else "applied when the model loads"}
             # an elastic encoder that runs keeps its VRAM on top of the asked reserve
             out = self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
             self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
@@ -3586,7 +3640,7 @@ class Service:
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
-        if self.loaded() and not self._vision_down():
+        if self.loaded() and not self._vision_down() and not self._asleep():
             return
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
@@ -3636,12 +3690,14 @@ class Service:
             return "busy"
         try:
             if not self.engine.alive():
+                self._thaw_vision(kill=True)
                 return "not loaded"
             with self.status_lock:
                 if self.status.get("busy") or self.status.get("queued"):
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
+            self._thaw_vision(kill=True)                # a checkpointed helper cannot quit by itself
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
@@ -3651,6 +3707,128 @@ class Service:
             return "unloaded"
         finally:
             self.fifo.release()
+
+    def sleep_waiting(self, wait_s: float) -> dict:
+        """sleep(), waiting up to wait_s for a running or queued request instead of answering "busy" (as
+        unload_waiting)."""
+        deadline = time.monotonic() + max(0.0, wait_s)
+        while True:
+            r = self.sleep()
+            if r.get("status") != "busy" or time.monotonic() >= deadline:
+                return r
+            time.sleep(0.25)
+
+    def sleep(self) -> dict:
+        """POST /sleep, between requests: the engine frees all of its VRAM and its GPU context but keeps the model (and
+        the conversation) in RAM, natively or by the CUDA driver's checkpoint (serve/deep_sleep.py); the vision helper
+        stops first.  The next request or POST /wake brings it back in seconds.
+        -> {"status": "asleep" | "not loaded" | "busy" | "unsupported", and the engine's figures}."""
+        can = getattr(self.engine, "can_sleep", None)
+        if not hasattr(self.engine, "sleep") or (can is not None and self.loaded() and not can()):
+            return {"status": "unsupported"}
+        if not self.fifo.acquire(blocking=False):
+            return {"status": "busy"}
+        # parallel requests do not hold the fifo: the control lines (a prompt being admitted) are taken too
+        ctl = getattr(self.engine, "ctl", None) if getattr(self.engine, "batch", 0) else None
+        if ctl is not None and not ctl.acquire(blocking=False):
+            self.fifo.release()
+            return {"status": "busy"}
+        try:
+            if not self.engine.alive():
+                return {"status": "not loaded"}
+            if self._asleep():
+                return {"status": "asleep", **(getattr(self.engine, "info", {}).get("asleep") or {})}
+            with self.status_lock:
+                if self.status.get("busy") or self.status.get("queued") or self.live_reqs or \
+                        any(getattr(self.engine, "slot_busy", ()) or ()):
+                    return {"status": "busy"}
+            vision = self._sleep_vision()
+            try:
+                figures = self.engine.sleep()
+            except BaseException:
+                self._thaw_vision()
+                raise
+            free = self.free_vram_mib()
+            print(f"[strata] model asleep ({figures.get('method', 'native')}, {figures.get('seconds', '?')} s"
+                  f"{f', the vision helper {vision}' if vision else ''}): the GPU is free"
+                  f"{f' ({free} MiB)' if free is not None else ''}, the model stays in RAM; the next request wakes it",
+                  flush=True)
+            return {"status": "asleep", **figures, **({"vision": vision} if vision else {}),
+                    **({"vram_free_mib": free} if free is not None else {})}
+        finally:
+            if ctl is not None:
+                ctl.release()
+            self.fifo.release()
+
+    def _sleep_vision(self) -> str | None:
+        """Before a sleep, a running vision helper is checkpointed by the CUDA driver (its VRAM goes; the wake brings it
+        back as it was, so the card's VRAM is what the engine saw before) -> "checkpointed"; where the driver cannot,
+        it stops as at an idle stop, and an expert cache that made room for it takes that VRAM back -> "stopped"; it
+        then starts again with the next picture (a resident one with the wake).  None: no helper ran."""
+        v = self.vision
+        if v is None or not hasattr(v, "unload") or not (v.alive() if hasattr(v, "alive") else False):
+            return None
+        pid = deep_sleep.helper_pid(v)
+        try:
+            self.vision_frozen = deep_sleep.freeze(pid) if pid else None
+        except deep_sleep.CheckpointError as e:
+            print(f"[strata] sleep: the vision helper could not be checkpointed ({e}); stopping it", flush=True)
+            self.vision_frozen = None
+        if self.vision_frozen:
+            return "checkpointed"
+        v.unload()
+        regrow = self.vision_held or (getattr(v, "lazy_vision", False) and
+                                      bool((getattr(self.engine, "info", {}) or {}).get("vram_elastic", False)))
+        if regrow and hasattr(self.engine, "vram"):
+            try:
+                self.engine.vram(self._engine_reserve() if self.vision_held else self.vram_reserve)
+            except (ValueError, EngineDied) as e:
+                print(f"[strata] sleep: the expert cache did not take the encoder's VRAM back ({e})", flush=True)
+        self.vision_held = False
+        return "stopped"
+
+    def _thaw_vision(self, kill: bool = False):
+        """The checkpointed vision helper back (after the engine's wake, or a failed sleep); kill: it is ended instead
+        (an unload).  One that cannot be restored is ended too, and starts again when needed."""
+        pids, self.vision_frozen = getattr(self, "vision_frozen", None), None
+        if not pids:
+            return
+        if not kill:
+            try:
+                deep_sleep.thaw(pids)
+                return
+            except deep_sleep.CheckpointError as e:
+                print(f"[strata] wake: the vision helper could not be restored ({e}); it starts again when needed",
+                      flush=True)
+        deep_sleep._kill_processes(pids)
+        self.vision.unload()
+        self.vision_held = False
+
+    def _wake_engine(self):
+        """ensure_loaded's wake (the hook, the VRAM check and a resident encoder done): the engine takes its GPU back;
+        a VRAM reserve asked while it slept applies now, as after a restart."""
+        print("[strata] waking the model (it was asleep) ...", flush=True)
+        try:
+            figures = self.engine.wake()
+        except EngineDied:
+            self._thaw_vision(kill=True)
+            raise
+        # GpuBusy leaves both engine and helper checkpointed for a later retry.
+        self._thaw_vision()
+        print(f"[strata] the model is awake ({figures.get('wake_seconds', '?')} s)", flush=True)
+        if self.vram_reserve_asked and self.vram_reserve is not None and hasattr(self.engine, "vram"):
+            try:
+                self.engine.vram(self.vram_reserve)
+            except (ValueError, EngineDied) as e:
+                print(f"[strata] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
+
+    def wake(self) -> dict:
+        """POST /wake: wake a sleeping engine now (a request would also wake it), with the before_load hook and the
+        free-VRAM check of a load.  -> {"status": "awake" | "not asleep", ...}; raises GpuBusy as load() does."""
+        if not self._asleep():
+            return {"status": "not asleep"}
+        self.load()
+        return {"status": "awake", **(getattr(self.engine, "info", {}).get("wake") or {})}
 
     def start_lazy_vision(self, reserve_mib: int, idle_s: float):
         """local (Indra's Mirror): a "lazy" image encoder on an elastic expert cache.  Before the encoder starts (its
@@ -3686,12 +3864,12 @@ class Service:
         def loop():
             while True:
                 time.sleep(max(1.0, min(15.0, idle_s / 4)))
-                if not v.alive() or time.time() - v.last_used < idle_s:
+                if not v.alive() or time.time() - v.last_used < idle_s or self._asleep():
                     continue
                 if not self.fifo.acquire(timeout=1.0):  # a request is running: the next turn
                     continue
                 try:
-                    if not v.alive() or time.time() - v.last_used < idle_s:
+                    if not v.alive() or time.time() - v.last_used < idle_s or self._asleep():
                         continue
                     v.unload()
                     out = self.engine.vram(self.vram_reserve) if elastic() and self.loaded() else {}
@@ -3970,7 +4148,7 @@ class Service:
         images = self.vision is not None
         return {
             "service": "strata", "model": self.model,
-            "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
+            "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"), "asleep": self._asleep(),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
@@ -4037,6 +4215,8 @@ class Service:
                 if cancel.is_set():
                     raise ClientGone()
         try:
+            if self._asleep():          # the encoder never runs beside a sleeping engine: it wakes first (its VRAM)
+                self.ensure_loaded()
             yield
         finally:
             self.fifo.release()
@@ -4441,7 +4621,7 @@ class Service:
                     try:
                         if not par:
                             self.ensure_loaded()
-                        elif not (self.loaded() and not self._vision_down()):
+                        elif not (self.loaded() and not self._vision_down() and not self._asleep()):
                             with self.fifo:
                                 self.ensure_loaded()
                     except BaseException:
@@ -5654,7 +5834,7 @@ def make_handler(svc: Service):
                                  "display_name": getattr(svc, "display_name", None),
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
-                                 "loaded": svc.loaded(), "service": "strata"})
+                                 "loaded": svc.loaded(), "asleep": svc._asleep(), "service": "strata"})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
@@ -5761,10 +5941,11 @@ def make_handler(svc: Service):
             if path == "/config":
                 self._config_post()
                 return
-            if path in ("/unload", "/load") and not self._control_body():
+            if path in ("/unload", "/load", "/sleep", "/wake") and not self._control_body():
                 return
             # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
-            if path in ("/unload", "/load") and not self._own_page("the model can be loaded or unloaded"):
+            if path in ("/unload", "/load", "/sleep", "/wake") and \
+                    not self._own_page("the model can be loaded, unloaded, put to sleep or woken"):
                 return
             # the same for the slot files: else any site could overwrite a saved conversation or replace the live one
             if path.startswith("/slots/") and not self._own_page("conversations can be saved or restored"):
@@ -5778,6 +5959,26 @@ def make_handler(svc: Service):
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 self._json(409 if r == "busy" else 200, {"status": r})
+                return
+            if path == "/sleep":                             # free the GPU, keep the model in RAM (between requests)
+                try:
+                    wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
+                                         svc.UNLOAD_WAIT_S)
+                    r = svc.sleep_waiting(wait_s) if wait_s else svc.sleep()
+                except (EngineDied, ValueError) as e:
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    return
+                self._json({"busy": 409, "unsupported": 501}.get(r.get("status"), 200), r)
+                return
+            if path == "/wake":                              # take the GPU back now, e.g. ahead of a request
+                try:
+                    self._json(200, svc.wake())
+                except GpuBusy as e:
+                    ra = getattr(e, "retry_after", None)
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}},
+                               headers={"Retry-After": int(ra)} if ra else None)
+                except (EngineDied, ValueError) as e:
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
                 try:
@@ -5962,7 +6163,7 @@ def make_handler(svc: Service):
                      "model_alias": svc.model, "chat_template": svc.template.source,
                      "chat_template_caps": svc.template.caps,
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
-                     "is_sleeping": not svc.loaded()}
+                     "is_sleeping": not svc.loaded() or svc._asleep()}
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path
             version = getattr(svc.engine, "info", {}).get("version")
@@ -7166,6 +7367,7 @@ def main() -> int:
         exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
         try:
             silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
+            sleep_mode = deep_sleep.mode_from_config(cfg)   # POST /sleep (docs/DEEP_SLEEP.md)
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         try:
@@ -7183,6 +7385,7 @@ def main() -> int:
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
+        engine.deep_sleep = sleep_mode
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups else None

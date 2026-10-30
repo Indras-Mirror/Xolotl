@@ -256,6 +256,14 @@ struct GpuExperts::Impl {
         }
         const size_t slot=reserve_slot(protected_keys,true);
         foreground_writes.push_back(slot);
+        enqueue_expert(layer, expert, slot);
+        ++stat.misses;
+        entries.emplace(id, Entry{slot, ++clock});
+        stat.occupied_slots = entries.size();
+        return slot;
+    }
+    // Queues one complete expert slot from the arena into the open upload batch.
+    void enqueue_expert(int layer, int expert, size_t slot) {
         const auto & source = layers[size_t(layer)];
         const auto upload_start = profile ? Clock::now() : Clock::time_point{};
         if (uploads) {
@@ -285,10 +293,6 @@ struct GpuExperts::Impl {
 #endif
         stat.upload_bytes += compact_transfer ?
             std::accumulate(source.allocation_bytes.begin(), source.allocation_bytes.end(), size_t(0)) : stat.slot_stride;
-        ++stat.misses;
-        entries.emplace(id, Entry{slot, ++clock});
-        stat.occupied_slots = entries.size();
-        return slot;
     }
     void publish_foreground() {
         // finish() has established copy-complete dependencies on the compute
@@ -718,6 +722,72 @@ void GpuExperts::release_prefill_workspace() {
     p_->allocator=ggml_gallocr_new(p_->buffer_type);
     if(!p_->allocator){p_->ready=false;throw std::runtime_error("M31 GPU experts: allocator recreation failed");}
     p_->stat.scratch_bytes=0;
+}
+GpuExperts::Residency GpuExperts::residency() {
+    check(p_->ready && p_->active_read_keys.empty(), "cannot snapshot an active expert cache");
+    p_->finish_prefetch();
+    Residency result;
+    for (const auto & [id, entry] : p_->entries) {
+        result.keys.push_back(id);
+        result.slots.push_back(entry.slot);
+        result.last_used.push_back(entry.last_used);
+    }
+    result.free_slots = p_->free_slots;
+    result.clock = p_->clock;
+    result.stat = p_->stat;
+    return result;
+}
+void GpuExperts::attach_registration(const GpuRegisteredArena * registration) {
+#ifdef M31_REGISTERED_ARENA_CUDA
+    check(p_->ready && p_->pending_prefetch.empty() && p_->active_read_keys.empty() && p_->foreground_writes.empty(),
+          "registration can only be attached between forwards");
+    check(registration && registration->ready(), "registration is not complete");
+    if (p_->background && p_->background->active()) p_->finish_prefetch();
+    p_->owned_registered_arena.reset();
+    p_->registered_arena = registration;
+#else
+    (void) registration;
+    check(false, "registered direct H2D is unavailable in this build");
+#endif
+}
+uint64_t GpuExperts::restore_residency(const Residency & r) {
+    check(p_->ready && p_->entries.empty() && p_->pending_prefetch.empty() && p_->active_read_keys.empty(),
+          "residency restore requires a freshly initialized cache");
+    check(r.stat.slot_count == p_->stat.slot_count && r.stat.slot_stride == p_->stat.slot_stride,
+          "residency restore requires the same slot geometry");
+    check(r.keys.size() == r.slots.size() && r.keys.size() == r.last_used.size() &&
+          r.keys.size() + r.free_slots.size() <= p_->stat.slot_count, "inconsistent residency snapshot");
+    const uint64_t uploaded_before = p_->stat.upload_bytes;
+    if (!r.keys.empty()) {
+        p_->uploads->begin_batch();
+        try {
+            for (size_t i = 0; i < r.keys.size(); ++i) {
+                const int layer = int(r.keys[i] / uint64_t(p_->g.experts)), expert = int(r.keys[i] % uint64_t(p_->g.experts));
+                check(p_->g.routed(layer) && r.slots[i] < p_->stat.slot_count, "invalid residency entry");
+                p_->leases.reserve_write(size_t(r.slots[i]));
+                p_->enqueue_expert(layer, expert, size_t(r.slots[i]));
+            }
+            p_->uploads->finish();
+            p_->uploads->synchronize();
+        } catch (...) {
+            p_->recover_uploads();
+            throw;
+        }
+        for (size_t i = 0; i < r.keys.size(); ++i) {
+            p_->leases.publish_write(size_t(r.slots[i]));
+            p_->entries.emplace(r.keys[i], Impl::Entry{size_t(r.slots[i]), r.last_used[i]});
+        }
+    }
+    const uint64_t uploaded = p_->stat.upload_bytes - uploaded_before;
+    p_->free_slots = r.free_slots;
+    p_->clock = r.clock;
+    // Counters continue from the sleep; the seeding uploads are not cache misses.
+    const auto fresh = p_->stat;
+    p_->stat = r.stat;
+    p_->stat.scratch_bytes = fresh.scratch_bytes;
+    p_->stat.pinned_staging = fresh.pinned_staging;
+    p_->stat.occupied_slots = p_->entries.size();
+    return uploaded;
 }
 void GpuExperts::reset_stats() {
     // A caller may reset between arbitrary layer forwards. Complete speculative

@@ -32,6 +32,9 @@ struct Config {
     uint64_t register_limit_bytes = 0;
     uint64_t register_chunk_bytes = uint64_t(1) << 30;
     unsigned register_threads = 4;
+    // Threads that copy the GGUF expert tensors into the RAM arena. With
+    // registration, each filled piece is registered behind the fill.
+    unsigned arena_fill_threads = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
     unsigned gpu_pack_threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
     unsigned upload_depth = 8;
     unsigned upload_streams = 1;

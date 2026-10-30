@@ -589,6 +589,21 @@ the OS file cache, so loading again takes seconds while that RAM is not needed e
 16 GB with Q2_0 in the low-RAM mode: unloading takes ~0.3 s, and a request to an unloaded model answered after
 4.6 s (text) or 14.7 s (a picture, image encoder on the CPU).
 
+With `"deep_sleep": "auto"` in the server config (off by default), `POST /sleep`
+(same rules and `?wait=` as `/unload`) is a deep sleep ([DEEP_SLEEP.md](DEEP_SLEEP.md)): the engine
+process stays, frees all of its VRAM and its GPU context, and keeps the model and the current conversation in RAM -
+natively for an engine that offers it (MiniMax-M3.1 on CUDA, see [MINIMAX_M31.md](MINIMAX_M31.md#deep-sleep)), else
+by the CUDA driver's process checkpoint. The vision helper is checkpointed (or stopped) first. `POST /wake` (or the next request, after the
+`before_load` hook and the `min_free_vram_mib` check) restores the process and its conversation state.
+Prompt reuse still follows the engine's cache-matching policy. `/health` and `/v1/status` report `"asleep"`; `/props` sets `is_sleeping`.
+`409` while a request is running, `501` for an engine that cannot sleep (or `"deep_sleep": "off"`).
+
+Controlled Linux/CUDA tests retained DeepSeek-V4.1 graph captures across checkpoint and matched serial vision
+responses and logit dumps. A separate growing text conversation retained positive prefix hits before and after sleep.
+Driver restore took about 21 s; it is not the native M3.1 wake path. The first M3.1 prefill after wake was about 4%
+slower in controlled runs, while the second prefill was unchanged. See [DEEP_SLEEP.md](DEEP_SLEEP.md) for settings,
+measured scope, reproduction commands and limitations. HIP/SYCL checkpoint support is not claimed.
+
 **Giving part of the VRAM back while it keeps serving (#533, opt-in, one NVIDIA GPU; every request and answer:
 [VRAM_ELASTIC.md](VRAM_ELASTIC.md)).** With `"vram_elastic": true`
 in the config (the engine flag `--vram-elastic`), the expert cache is allocated in 512 MiB segments
@@ -959,7 +974,7 @@ print(r.choices[0].message.content)
   (`chrome-extension://`, `moz-extension://`, `app://`: no web site can send those), and only with a JSON body; any
   other page, and `Origin: null`, gets **403**. Clients that send no `Origin` (curl, the OpenAI and Anthropic SDKs,
   other servers) are not affected. With
-  an API key, the key decides. `POST /unload` and `POST /load` take `Content-Type: application/json` from Strata's
+  an API key, the key decides. `POST /unload`, `/load`, `/sleep` and `/wake` take `Content-Type: application/json` from Strata's
   own page (or no `Origin`), like `/settings`. `POST /slots/0?action=save|restore` keeps the Host and API-key checks
   and also takes only JSON from no `Origin`, Strata's own page or a trusted origin - also when an API key is set.
 

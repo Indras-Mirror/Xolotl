@@ -193,6 +193,7 @@ void validate_config(const Config & c, bool initializing_cuda) {
     require(!c.register_arena || ((c.backend || initializing_cuda) && c.register_limit_bytes > 0),
         "arena registration requires an explicit pin budget and GPU backend");
     require(c.register_threads >= 1 && c.register_threads <= 64, "registration threads must be 1..64");
+    require(c.arena_fill_threads >= 1 && c.arena_fill_threads <= 256, "arena fill threads must be 1..256");
     require(c.register_chunk_bytes >= 4096 && c.register_chunk_bytes <= (uint64_t(16) << 30), "invalid registration chunk budget");
 #ifndef M31_REGISTERED_ARENA_CUDA
     require(!c.register_arena, "arena registration is unavailable in this build");
