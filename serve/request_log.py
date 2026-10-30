@@ -174,7 +174,7 @@ def entry(record: dict, stats: dict, detail: bool = False) -> dict:
             out["decode_tok_s"] = round(made / (stats["decode_ms"] / 1000), 1)
     if stats.get("images"):
         out["images"] = stats["images"]
-        for key in ("images_encoded", "images_from_encoder_cache"):
+        for key in ("images_encoded", "images_from_encoder_cache", "images_by_reference"):
             if stats.get(key) is not None:
                 out[key] = stats[key]
         ends, reused = stats.get("image_ends"), stats.get("first_reused")

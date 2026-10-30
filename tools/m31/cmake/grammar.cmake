@@ -1,7 +1,7 @@
 # Native tokenization and GBNF support from the SAME source tree as ggml.
-# Included only by the opt-in M31 slice. This adds no backend, vendor patches,
+# Shared by M31 and q36. This adds no vendor patches,
 # process-wide compiler flags, external downloads, or llama.cpp server.
-if(NOT STRATA_M31)
+if(NOT STRATA_M31 AND NOT STRATA_Q36_GRAMMAR)
   return()
 endif()
 
@@ -67,6 +67,30 @@ function(m31_add_grammar)
   configure_file("${_src}/src/llama-version.h.in" "${_generated}/llama-version.h" @ONLY)
   target_include_directories(m31_llama PRIVATE "${_src}/src" "${_generated}"
     PUBLIC "${_src}/include")
+
+  if(STRATA_Q36_GRAMMAR)
+    # q36 already supplies the ggml CUDA host symbols used by its MMQ kernels.
+    # Vocab-only llama needs no GPU backend: use the same core sources with a
+    # CPU-only registry so it never pulls in a second copy of those symbols.
+    add_library(q36_vocab_ggml STATIC "${_src}/ggml/src/ggml-backend-reg.cpp"
+      "${_src}/ggml/src/ggml-backend-dl.cpp")
+    target_include_directories(q36_vocab_ggml PRIVATE "${_src}/ggml/src")
+    target_compile_definitions(q36_vocab_ggml PRIVATE GGML_USE_CPU)
+    target_link_libraries(q36_vocab_ggml PUBLIC ggml-base ggml-cpu ${CMAKE_DL_LIBS})
+    target_compile_features(q36_vocab_ggml PRIVATE cxx_std_17)
+    set(_q36_core ${_core})
+    list(REMOVE_ITEM _q36_core "${_src}/src/llama-sampler.cpp")
+    set(_q36_sampler "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../../src/qwen35/q36_grammar_state.cpp")
+    set_source_files_properties("${_q36_sampler}" PROPERTIES
+      SKIP_UNITY_BUILD_INCLUSION ON
+      COMPILE_DEFINITIONS "STRATA_Q36_LLAMA_SAMPLER_SOURCE=\"${_src}/src/llama-sampler.cpp\"")
+    add_library(q36_llama STATIC ${_q36_core} ${_models} "${_q36_sampler}")
+    set_target_properties(q36_llama PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 16)
+    target_compile_features(q36_llama PUBLIC cxx_std_17)
+    target_include_directories(q36_llama PRIVATE "${_src}/src" "${_generated}"
+      PUBLIC "${_src}/include")
+    target_link_libraries(q36_llama PUBLIC q36_vocab_ggml)
+  endif()
 
   set(LLAMA_BUILD_NUMBER 0)
   set(BUILD_COMPILER "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")

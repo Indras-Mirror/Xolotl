@@ -262,8 +262,10 @@ class Tokenizer:
 
     PIECE_CACHE_MAX = 200_000    # pre-tokenizer pieces remembered (an agent resends its whole history every turn)
 
-    def _encode_plain(self, text: str) -> list[int]:
+    def _encode_plain(self, text: str, marks=None, base: int = 0, out_marks=None) -> list[int]:
         out: list[int] = []
+        if marks:   # the marks' token positions: a mark inside a piece goes to the piece's start (a token frontier)
+            return self._encode_plain_marked(text, marks, base, out_marks)
         # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
         # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
         cache = self._piece_ids
@@ -284,6 +286,51 @@ class Tokenizer:
                     cache[piece] = got
             out.extend(got)
         return out
+
+    def _encode_plain_marked(self, text: str, marks, base: int, out_marks) -> list[int]:
+        out: list[int] = []
+        a = 0
+        for piece in self._pre_split(text):
+            b = a + len(piece)
+            for k, c in marks:
+                if base + a <= c < base + b and k not in out_marks:
+                    out_marks[k] = (len(out), base + a)   # (tokens before, in this call), resolved by the caller
+            out.extend(self._encode_plain(piece))
+            a = b
+        return out
+
+    def encode_marked(self, text: str, marks: list[int], parse_special: bool = False, plain=()) -> tuple[list[int], list[int]]:
+        """encode(), and for each character offset in `marks` the number of tokens before it - the offset taken back to
+        the start of its pre-tokenizer piece (or special token) when it falls inside one, so that every position is a
+        frontier of the encoding itself (pieces never merge across)."""
+        pat = self._special_re if parse_special else self._always_re
+        pending = sorted((c, k) for k, c in enumerate(marks))
+        got: dict[int, int] = {}
+        out: list[int] = []
+        def plain_part(t, start):
+            local: dict[int, tuple[int, int]] = {}
+            inside = [(k, c) for c, k in pending if start <= c < start + len(t)]
+            ids = self._encode_plain_marked(t, inside, start, local) if inside else self._encode_plain(t)
+            for k, (n, _) in local.items():
+                got.setdefault(k, len(out) + n)
+            out.extend(ids)
+        pos = 0
+        matches = [] if pat is None else list(pat.finditer(text))
+        for m in matches:
+            start = m.start()
+            if plain and any(a <= start < b for a, b in plain):
+                continue
+            if start > pos:
+                plain_part(text[pos:start], pos)
+            for c, k in pending:
+                if start <= c < m.end():
+                    got.setdefault(k, len(out))
+            out.append(self.special_tokens[m.group(0)])
+            pos = m.end()
+        if pos < len(text):
+            plain_part(text[pos:], pos)
+        n = len(out)
+        return out, [got.get(k, n) for k in range(len(marks))]
 
     def _encode_matching(self, text: str, pat, plain=()) -> list[int]:
         """Encode `text`, emitting any literal `pat` matches as single tokens and BPE-ing the rest.

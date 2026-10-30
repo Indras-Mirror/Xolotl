@@ -118,16 +118,51 @@ class ChatTemplate:
 TEXT_PARTS = ("text", "input_text", None)
 
 
-def _text_of(content) -> str:
+def _text_of(content, cache_marker=None) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
         return content
-    return "".join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") in
-                   TEXT_PARTS)
+    return "".join(_with_mark(part.get("text", ""), cache_marker) if _cache_marked(part) else part.get("text", "") for part in content
+                   if isinstance(part, dict) and part.get("type") in TEXT_PARTS)
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
+
+# Snapshot markers are private frontend metadata, never a reserved client-text character.
+# The fresh suffix is checked against all request strings before any marker is inserted.
+CACHE_MARK = "\U000F0D00"
+CACHE_MARK_KEY = "_strata_cache_marker"
+
+
+def _request_cache_marker(req):
+    def marked(value):
+        if isinstance(value, dict):
+            return _cache_marked(value) or any(marked(v) for v in value.values())
+        return isinstance(value, list) and any(marked(v) for v in value)
+    if not marked(req):
+        return None
+    source = json.dumps(req, ensure_ascii=False)
+    while True:
+        marker = CACHE_MARK + uuid.uuid4().hex
+        if marker not in source:
+            return marker
+
+
+def _with_mark(text: str, cache_marker=None) -> str:
+    """Insert a private snapshot point before whitespace that the template may trim."""
+    if cache_marker is None:
+        return text
+    k = len(text.rstrip())
+    return text[:k] + cache_marker + text[k:]
+
+
+def _cache_marked(part) -> bool:
+    if not isinstance(part, dict):
+        return False
+    cc, bp = part.get("cache_control"), part.get("prompt_cache_breakpoint")
+    return (isinstance(cc, dict) and cc.get("type") == "ephemeral") or \
+        (isinstance(bp, dict) and bp.get("mode") == "explicit")
 
 # Thinking levels.  The model's template knows low, medium and xhigh (its default; "high" means xhigh), and
 # enable_thinking=false for none.  Clients spell these many ways; everything maps onto those four.
@@ -177,19 +212,28 @@ def _image_source(part: dict) -> str:
     return url or ""
 
 
-def _parts_of(content):
+def _parts_of(content, cache_marker=None):
     """Message content for the template: a string when there is no image (unchanged behaviour), otherwise the
     template's list form - text items and image items, in order - whose image items carry their source."""
     if not _has_image(content):
-        return _text_of(content)
+        return _text_of(content, cache_marker)
     items = []
     for part in content:
         if not isinstance(part, dict):
             continue
         if part.get("type") in IMAGE_PARTS:
-            items.append({"type": "image", "source": _image_source(part)})
+            item = {"type": "image", "source": _image_source(part)}
+            # vLLM's multimodal uuid (on an OpenAI content part): the picture's id; with "image_url": null the client
+            # sends only the id of a picture it sent before (the server keeps the id -> picture map)
+            uid = part.get("uuid")
+            if isinstance(uid, str) and uid:
+                item["uuid"] = uid
+            items.append(item)
+            if cache_marker and _cache_marked(part):
+                items.append({"type": "text", "text": cache_marker})
         elif part.get("type") in TEXT_PARTS and "text" in part:
-            items.append({"type": "text", "text": part.get("text", "")})
+            t = part.get("text", "")
+            items.append({"type": "text", "text": _with_mark(t, cache_marker) if _cache_marked(part) else t})
     return items
 
 
@@ -223,6 +267,12 @@ def _check_parts(content, path: str, kinds):
             LOGGER.debug("%s[%d].type: content part of type %r is not read by this server; left out of the prompt",
                          path, j, kind)
     return out
+
+
+def image_ids_of(messages: list[dict]) -> list[str | None]:
+    """The pictures' client ids (vLLM's "uuid" on a content part), None where a picture has none - images_of's order."""
+    return [item.get("uuid") for m in messages if isinstance(m.get("content"), list)
+            for item in m["content"] if item.get("type") == "image"]
 
 
 def images_of(messages: list[dict]) -> list[str]:
@@ -520,6 +570,7 @@ def tool_arguments(raw) -> dict:
 
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
+    cache_marker = _request_cache_marker(req)
     messages = []
     for i, m in enumerate(_object_list(req.get("messages"), "messages")):
         role = m.get("role")
@@ -529,7 +580,12 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
         images = role in ("user", "tool", "assistant")
         content = _check_parts(m.get("content"), f"messages[{i}].content",
                                TEXT_PARTS + IMAGE_PARTS if images else TEXT_PARTS)
-        out = {"role": role, "content": _parts_of(content) if images else _text_of(content)}
+        out = {"role": role, "content": _parts_of(content, cache_marker) if images else _text_of(content, cache_marker)}
+        if _cache_marked(m):   # a message's own mark: after its content
+            if isinstance(out["content"], str):
+                out["content"] = _with_mark(out["content"], cache_marker)
+            elif isinstance(out["content"], list):
+                out["content"] = out["content"] + [{"type": "text", "text": cache_marker}]
         if m.get("reasoning_content"):
             out["reasoning_content"] = m["reasoning_content"]
         if m.get("tool_calls"):
@@ -555,6 +611,14 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+    # Qwen3.6's template flag (vLLM passes chat_template_kwargs to the template as they are): with it every history
+    # assistant turn keeps its thinking block - an empty one too, as its generation prompt wrote it - so the history
+    # renders as the tokens the engine already holds and a conversation's next turn only extends them
+    pt = (req.get("chat_template_kwargs") or {}).get("preserve_thinking")
+    if isinstance(pt, bool):
+        kwargs["preserve_thinking"] = pt
+    if cache_marker:
+        kwargs[CACHE_MARK_KEY] = cache_marker
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
@@ -591,11 +655,12 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
     without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
     renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
+    cache_marker = _request_cache_marker(req)
     messages = []
     system = req.get("system")
     if system:
         messages.append({"role": "system",
-                         "content": pin_billing_stamp(_text_of(_check_parts(system, "system", TEXT_PARTS)))})
+                         "content": pin_billing_stamp(_text_of(_check_parts(system, "system", TEXT_PARTS), cache_marker))})
     for i, m in enumerate(_object_list(req.get("messages"), "messages")):
         content = _check_parts(m.get("content"), f"messages[{i}].content", ANTHROPIC_BLOCKS)
         if isinstance(content, str):
@@ -603,13 +668,13 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             continue
         if m.get("role") == "user" and _has_image(content) and not any(
                 isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
-            messages.append({"role": "user", "content": _parts_of(content)})
+            messages.append({"role": "user", "content": _parts_of(content, cache_marker)})
             continue
         text, reasoning, calls, parts = [], [], [], []
         for j, block in enumerate(content or []):
             kind = block.get("type")
             if kind == "text":
-                text.append(block.get("text", ""))
+                text.append(_with_mark(block.get("text", ""), cache_marker) if _cache_marked(block) else block.get("text", ""))
                 parts.append(block)
             elif kind in IMAGE_PARTS:
                 parts.append(block)
@@ -621,10 +686,10 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
                 # path's tool messages already do; a text-only result is one string, as before.
                 messages.append({"role": "tool", "content": _parts_of(_check_parts(
-                    block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS))})
+                    block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS), cache_marker)})
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
-            out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
+            out = {"role": m["role"], "content": _parts_of(parts, cache_marker) if _has_image(parts) else "".join(text)}
             if reasoning:
                 out["reasoning_content"] = "".join(reasoning)
             if calls:
@@ -651,6 +716,8 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
+    if cache_marker:
+        kwargs[CACHE_MARK_KEY] = cache_marker
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
