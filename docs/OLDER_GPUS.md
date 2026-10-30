@@ -1,5 +1,7 @@
 # Older GPUs (experimental)
 
+> **To check (2026-10-31): row-interleaved CPU expert kernels.** Older boxes often run the AVX1 CPU tier, which has the most per-row overhead: check it for a row-interleaved 1-token kernel. See [CPU_EXPERT_TILING.md](CPU_EXPERT_TILING.md).
+
 Strata's supported cards are NVIDIA RTX 20 / 30 / 40 / 50 and the AMD cards in [AMD_HIP.md](AMD_HIP.md). The cards
 below run through **opt-in, experimental** paths that community members wrote and measured on their own machines. The
 maintainers have none of these cards: each path is compile-checked and unit-tested here, and the ready-made engines

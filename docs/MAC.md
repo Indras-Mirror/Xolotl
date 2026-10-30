@@ -1,5 +1,7 @@
 # Strata on a Mac (Apple Silicon, Metal)
 
+> **To check (2026-10-31): row-interleaved CPU expert kernels.** On Apple Silicon the CPU expert tier is all ggml NEON per-token dots (our own kernels are x86-only), which is the case where a 4-row interleaved kernel was 1.5x on ARM. Worth checking first here. See [CPU_EXPERT_TILING.md](CPU_EXPERT_TILING.md).
+
 Strata runs on Apple Silicon Macs through its own engine on Metal. This is the same engine as on a PC. The NVIDIA
 kernels are replaced by Metal ones (`metal/`), and the host code and the server are the PC's. `./setup.sh` sets it up the way
 `START-HERE.bat` does on Windows. There is no ready-made Mac engine: setup builds it from source on your Mac

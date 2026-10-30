@@ -1,5 +1,7 @@
 # Strata - the details
 
+> **To check (2026-10-31): row-interleaved CPU expert kernels.** Every engine's CPU expert tier still runs its 1-token calls row by row; see the per-engine checklist. See [CPU_EXPERT_TILING.md](CPU_EXPERT_TILING.md).
+
 The technical side of Strata: every measured number, the API, images, all settings and how the engine works.
 New here? Start with the [README](../README.md); installing step by step is in [INSTALL.md](INSTALL.md), the models in
 [MODELS.md](MODELS.md), common problems in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).

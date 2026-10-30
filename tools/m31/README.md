@@ -1,5 +1,7 @@
 # MiniMax-M3.1-Flash
 
+> **To check (2026-10-31): row-interleaved CPU expert kernels.** Check the hybrid CPU experts for a row-interleaved 1-token kernel. See [CPU_EXPERT_TILING.md](../../docs/CPU_EXPERT_TILING.md).
+
 Opt-in MiniMax engine and shim to the common Strata HTTP server, with a separate
 image/video opt-in, developed in [issue #62](https://github.com/Indras-Mirror/Xolotl/issues/62).
 See [build, run, measured results and reproduction commands](../../docs/MINIMAX_M31.md).

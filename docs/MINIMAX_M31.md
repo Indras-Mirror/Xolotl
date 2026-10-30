@@ -1,5 +1,7 @@
 # MiniMax-M3.1-Flash
 
+> **To check (2026-10-31): row-interleaved CPU expert kernels.** Check the hybrid CPU experts (IQ3_S, IQ3_XXS, IQ4_XS, Q8_0) for a row-interleaved 1-token kernel, IQ4_XS and Q8_0 first. See [CPU_EXPERT_TILING.md](CPU_EXPERT_TILING.md).
+
 This page documents the opt-in MiniMax-M3.1 engine in `tools/m31` and its shim
 to Strata's common HTTP server, developed in [issue #62](https://github.com/Indras-Mirror/Xolotl/issues/62).
 Feature-specific build options, numerical contracts and measured results are described below.

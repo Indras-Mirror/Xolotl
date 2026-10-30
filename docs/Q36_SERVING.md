@@ -1,5 +1,7 @@
 # Qwen3.6 serving, vision and reusable conversations
 
+> **To check (2026-10-31): row-interleaved CPU expert kernels.** Check the hybrid CPU experts (UD-Q4_K_XL: Q4_K/Q5_K/Q6_K) for a row-interleaved 1-token kernel. See [CPU_EXPERT_TILING.md](CPU_EXPERT_TILING.md).
+
 The qwen35moe engine supports text and image input, sampled MTP, constrained
 output and continuation of a conversation whose final message changes. It
 retains the longest unchanged prefix. Attention KV is truncated at that prefix;

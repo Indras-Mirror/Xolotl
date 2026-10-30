@@ -1,5 +1,7 @@
 # Intel Arc (experimental)
 
+> **To check (2026-10-31): row-interleaved CPU expert kernels.** Same CPU expert code on this build: check the 1-token path for a row-interleaved kernel. See [CPU_EXPERT_TILING.md](CPU_EXPERT_TILING.md).
+
 Strata 0.1.39 includes an **experimental Intel Arc engine**: Strata's own engine ported to SYCL (Intel oneAPI).
 maxfridbe wrote it in [#423](https://github.com/Niko1221/Strata/pull/423), with fixes from the people testing it.
 The code is in `sycl/`, and the port's own notes, measurements and maintenance procedure are in

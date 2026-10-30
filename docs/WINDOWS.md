@@ -1,5 +1,7 @@
 # DeepSeek-V4.1-Flash on Windows (native, no WSL)
 
+> **To check (2026-10-31): row-interleaved CPU expert kernels.** Same CPU expert code as Linux: check the 1-token path for a row-interleaved kernel on this build too. See [CPU_EXPERT_TILING.md](CPU_EXPERT_TILING.md).
+
 The DeepSeek-V4.1 engine (`tools/v41/engine`) builds and serves natively on Windows 11 with MSVC + CUDA.
 
 Tested on one machine:

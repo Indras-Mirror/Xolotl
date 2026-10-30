@@ -1,5 +1,7 @@
 # Strata-GLM findings
 
+> **To check (2026-10-31): row-interleaved CPU expert kernels.** Check the CPU experts (Q4_K, Q5_K, Q2_K, IQ3_XXS) for a row-interleaved 1-token kernel; kq256 is opt-in and multi-token only. See [CPU_EXPERT_TILING.md](../CPU_EXPERT_TILING.md).
+
 ## s1 (2026-10-08): why GLM-5.3-Flash, what to run, what fits
 
 **Choice (Mal, 2026-10-08):** order is now GLM-5.3-Flash -> (DS4 in its own session) -> MiMo later. MiMo is kept for

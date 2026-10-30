@@ -1,5 +1,7 @@
 # AMD Radeon: the HIP backend (gfx1100, gfx1101, gfx1200, gfx1201, gfx1030)
 
+> **To check (2026-10-31): row-interleaved CPU expert kernels.** Same CPU expert code on this build: check the 1-token path for a row-interleaved kernel. See [CPU_EXPERT_TILING.md](CPU_EXPERT_TILING.md).
+
 Strata runs on AMD Radeon cards through its HIP backend, the same engine as on NVIDIA compiled for AMD. This page
 covers the build on Linux (on Windows a ready-made engine, see [Windows](#windows)) for the RX 7900 XT / XTX (RDNA3, gfx1100) and the
 RX 9070 / 9070 XT / Radeon AI PRO R9700 (RDNA4, gfx1201; see [RDNA4](#rdna4-gfx1201)). The RX 7800 XT / 7700 XT

@@ -1,5 +1,7 @@
 # Strix Halo (Ryzen AI Max, gfx1151): build from source on Linux
 
+> **To check (2026-10-31): row-interleaved CPU expert kernels.** With unified memory this box has bandwidth to spare, so the CPU experts are likely compute-bound: check them for a row-interleaved 1-token kernel. See [CPU_EXPERT_TILING.md](CPU_EXPERT_TILING.md).
+
 Strata runs on the Ryzen AI Max "Strix Halo" APUs (Radeon 8060S / 8050S, RDNA3.5, `gfx1151`, one pool of LPDDR5X shared by the
 CPU and the GPU) through the same HIP backend as the Radeon cards in [AMD_HIP.md](AMD_HIP.md). **Status: experimental.**
 Everything here was built and measured on one machine, the maintainers' Strix Halo box (Ryzen AI Max+ 395, 128 GB,

@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next (xol-qfn): what actually makes it fast
 
+> **To check (2026-10-31): row-interleaved CPU expert kernels.** Check the CPU experts (PTQ1_0, Q2_0) for a row-interleaved 1-token kernel next to rows3, which groups tokens but not rows. See [CPU_EXPERT_TILING.md](CPU_EXPERT_TILING.md).
+
 Measured 2026-10-29 on Linux, RTX 4090 24 GB, Ryzen 7 5700X, 90 GB DDR4-3200, model on a
 3.5 GB/s NVMe. Model: the abliterated XQ mixed-tier build, **78.83 GiB**, arch `qwen4exp`.
 

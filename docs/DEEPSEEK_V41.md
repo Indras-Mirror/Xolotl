@@ -13,6 +13,8 @@ DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221
 > The earlier **DeepSeek-V4-Flash (0731)** engine is still here and documented in the second half of this README.
 > (This repo was called `Strata-DS4`; old links redirect.)
 
+> **To check (2026-10-31): row-interleaved CPU expert kernels.** The CPU expert tier is where V4.1's decode comes from when experts spill off the card, and its 1-token path is still ggml's per-row dot. Check each expert class (PTQ1_0, Q2_K/Q2_0, Q4_0/Q6_K/Q8_0) for a row-interleaved kernel. See [CPU_EXPERT_TILING.md](CPU_EXPERT_TILING.md).
+
 ## Latest (2026-10-15)
 
 - **Coding quality vs speed, measured on real tasks** (21 HumanEval + 10 tool calls, greedy; `~/AI/v41-dev/taskeval`):
