@@ -337,6 +337,7 @@ void bench(cudaStream_t s, std::mt19937& rng) {
 }  // namespace
 
 int main(int argc, char** argv) {
+
     const bool do_bench = argc > 1 && std::string(argv[1]) == "--bench";
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
@@ -349,6 +350,8 @@ int main(int argc, char** argv) {
         for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS; IQ4_XS: n_ff % 256
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);
+    check(22, 21, 512, 768, s, rng);   // IQ2_S / IQ3_S down: whole 256-block rows
+    check(18, 21, 512, 768, s, rng);   // IQ3_XXS / IQ3_S down
     if (do_bench) bench(s, rng);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);

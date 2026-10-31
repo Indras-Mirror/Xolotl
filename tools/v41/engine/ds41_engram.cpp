@@ -84,6 +84,8 @@ float fp8_e4m3(uint8_t b) {
 
 // IQ4_NL (ggml block_iq4_nl: fp16 d + 16 bytes of 4-bit indices into kvalues_iq4nl; 32 weights a block)
 constexpr int kIq4nl = 20;
+constexpr int kQ5K = 13;
+constexpr int64_t kQ5KBlock = 176;
 constexpr int64_t kIq4nlBlock = 18;
 const int8_t kIq4nlValues[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
 
@@ -213,6 +215,30 @@ Ds41Engram::~Ds41Engram() {
 }
 
 void Ds41Engram::deq_row(const uint8_t * w, const uint8_t * s, float * o) const {
+    if (qtype_ == kQ5K) {
+        // ggml block_q5_K (MIT): d,dmin + 12 packed scale/min bytes + 32 high bits + 128 low bits.
+        // Decode one 256-value row without a ggml dependency (the standalone Engram tools also use this reader).
+        for (int64_t b = 0; b < dim_ / 256; ++b) {
+            const uint8_t * blk = w + b * kQ5KBlock;
+            uint16_t dh, mh;
+            std::memcpy(&dh, blk, 2); std::memcpy(&mh, blk + 2, 2);
+            const float d = fp16_to_f32(dh), dmin = fp16_to_f32(mh);
+            const uint8_t * scales = blk + 4, * high = blk + 16, * low = blk + 48;
+            for (int group = 0; group < 8; ++group) {
+                const uint8_t sc = group < 4 ? scales[group] & 63 :
+                    (scales[group + 4] & 15) | ((scales[group - 4] >> 6) << 4);
+                const uint8_t mn = group < 4 ? scales[group + 4] & 63 :
+                    (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4);
+                const float ds = d * sc, ms = dmin * mn;
+                for (int j = 0; j < 32; ++j) {
+                    const uint8_t ql = low[(group / 2) * 32 + j];
+                    const int q = ((group & 1) ? ql >> 4 : ql & 15) + ((high[j] >> group) & 1) * 16;
+                    o[b * 256 + group * 32 + j] = ds * q - ms;
+                }
+            }
+        }
+        return;
+    }
     if (qtype_ == kIq4nl) {
         for (int64_t b = 0; b < dim_ / 32; ++b) {
             const uint8_t * blk = w + b * kIq4nlBlock;
@@ -235,40 +261,57 @@ void Ds41Engram::deq_row(const uint8_t * w, const uint8_t * s, float * o) const 
 
 // The tables from a GGUF (blk.<layer>.engram_embd.weight, [dim, rows], IQ4_NL): one fd, no scale span.
 bool Ds41Engram::open_gguf(const std::string & path, std::string & err) {
-    std::vector<std::pair<uint64_t, uint32_t>> loc;   // (absolute offset, type) per Engram slot
+    std::vector<uint64_t> loc;   // absolute byte offset per Engram layer
+    uint32_t format = 0;
     try {
         GgufFile f(path);
+        const TensorInfo * combined = f.find("per_layer_token_embd.weight");
+        uint64_t base_row = 0, total_rows = 0;
+        for (int64_t r : g_->engram_rows) {
+            if (r <= 0 || total_rows > UINT64_MAX - (uint64_t) r) { err = "engram: invalid table row counts"; return false; }
+            total_rows += (uint64_t) r;
+        }
         for (size_t e = 0; e < g_->engram_layers.size(); ++e) {
             const std::string name = "blk." + std::to_string(g_->engram_layers[e]) + ".engram_embd.weight";
-            const TensorInfo * t = f.find(name);
+            const TensorInfo * t = combined ? combined : f.find(name);
             if (!t) { err = "engram: " + name + " not in " + path; return false; }
-            const int64_t rows = g_->engram_rows[e];
-            if (t->shape.size() != 2 || (int64_t) t->shape[0] != dim_ || (int64_t) t->shape[1] != rows) {
-                err = "engram: " + name + " is not [" + std::to_string(dim_) + ", " + std::to_string(rows) + "] (the backbone's geometry)";
-                return false;
+            const uint64_t rows = combined ? total_rows : (uint64_t) g_->engram_rows[e];
+            if (t->shape.size() != 2 || t->shape[0] != (uint64_t) dim_ || t->shape[1] != rows) {
+                err = "engram: " + t->name + " shape differs from the backbone's geometry"; return false;
             }
-            if (t->type != (uint32_t) kIq4nl) { err = "engram: " + name + " is " + t->type_name() + ", only IQ4_NL GGUF tables are read"; return false; }
-            loc.emplace_back(f.data_start() + t->offset, t->type);
+            if ((t->type != (uint32_t) kIq4nl && t->type != (uint32_t) kQ5K) ||
+                dim_ <= 0 || dim_ % (t->type == (uint32_t) kQ5K ? 256 : 32) != 0) {
+                err = "engram: " + t->name + " requires whole IQ4_NL or Q5_K rows"; return false;
+            }
+            if (e && format != t->type) { err = "engram: mixed table formats are unsupported"; return false; }
+            format = t->type;
+            const uint64_t row_bytes = (uint64_t) dim_ / (format == (uint32_t) kQ5K ? 256 : 32) *
+                (format == (uint32_t) kQ5K ? kQ5KBlock : kIq4nlBlock);
+            const uint64_t payload = tensor_payload_bytes(*t);
+            if (payload == 0 || t->offset > UINT64_MAX - f.data_start() ||
+                f.data_start() + t->offset > f.file_size() || payload > f.file_size() - f.data_start() - t->offset) {
+                err = "engram: " + t->name + " is truncated/out of bounds"; return false;
+            }
+            // Modern PLE offsets are validated as contiguous layer-major buckets by ds41_read_geometry.
+            // Local per-layer hash ids then address an exact subview of the combined quantized tensor.
+            loc.push_back(f.data_start() + t->offset + (combined ? base_row * row_bytes : 0));
+            base_row += (uint64_t) g_->engram_rows[e];
         }
     } catch (const std::exception & ex) {
-        err = std::string("engram: ") + path + ": " + ex.what();
-        return false;
+        err = std::string("engram: ") + path + ": " + ex.what(); return false;
     }
-    qtype_ = kIq4nl;
-    wrow_ = dim_ / 32 * kIq4nlBlock;
+    qtype_ = (int) format;
+    wrow_ = qtype_ == kQ5K ? dim_ / 256 * kQ5KBlock : dim_ / 32 * kIq4nlBlock;
     srow_ = 0;
     for (size_t e = 0; e < loc.size(); ++e) {
         const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
         if (fd < 0) { err = "engram: cannot open " + path; return false; }
         ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
-        Table t;
-        t.fd_w = fd;
-        t.off_w = loc[e].first;
-        t.rm_w = raw_map(path, fd);
-        t.rows = g_->engram_rows[e];
+        Table t; t.fd_w = fd; t.off_w = loc[e]; t.rm_w = raw_map(path, fd); t.rows = g_->engram_rows[e];
         tables_.push_back(t);
     }
-    std::fprintf(stderr, "engram: %zu tables from %s (IQ4_NL, %lld bytes a row)\n", tables_.size(), path.c_str(), (long long) wrow_);
+    std::fprintf(stderr, "engram: %zu tables from %s (%s, %lld bytes a row)\n", tables_.size(), path.c_str(),
+                 qtype_ == kQ5K ? "Q5_K" : "IQ4_NL", (long long) wrow_);
     return true;
 }
 
