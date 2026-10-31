@@ -17,7 +17,18 @@ MAX="$1"; NEED="$2"; shift 3
 FLOOR="${MEMGUARD_FLOOR_GIB:-4}"
 LOCK="${DS4_LOCK:-$HOME/.quetza-data/conductor/ds4-gpu.lock}"
 
-avail_gib() { awk '/^MemAvailable:/{printf "%d", $2/1048576}' /proc/meminfo; }
+avail_gib() {
+    # STRATA_ZFS_ARC=1: + the reclaimable OpenZFS ARC, as the ds41 engine counts it (ds41_sys.hpp mem_available_bytes)
+    if [ "${STRATA_ZFS_ARC:-0}" = 1 ] && [ -r /proc/spl/kstat/zfs/arcstats ]; then
+        awk 'FNR == NR { if ($1 == "MemAvailable:") m = $2 * 1024; next }
+             $1 == "size" { s = $3 } $1 == "c_min" { c = $3 }
+             $1 ~ /_evictable_/ && $1 !~ /ghost/ && $1 !~ /^anon_/ { e += $3 }
+             END { r = s - c; if (r < 0) r = 0; if (e < r) r = e; printf "%d", (m + r) / 1073741824 }' \
+            /proc/meminfo /proc/spl/kstat/zfs/arcstats
+    else
+        awk '/^MemAvailable:/{printf "%d", $2/1048576}' /proc/meminfo
+    fi
+}
 
 if [ "${MEMGUARD_ALLOW_COMFY:-0}" != 1 ] && { pgrep -f '[C]omfyUI.*main.py|[c]omfyui/main.py' >/dev/null || ss -ltn 2>/dev/null | grep -q ':8188 '; }; then
     echo "memguard: refusing - ComfyUI is running (it takes system RAM too; that combination froze the box)" >&2

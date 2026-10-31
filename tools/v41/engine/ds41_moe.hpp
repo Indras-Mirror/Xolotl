@@ -305,7 +305,7 @@ struct Ds41MoeConfig {
     /// Uniform blobs (DS4): open the VRAM cache at the seed instead of at init, so prompt chunks (run_chunk) can use
     /// that VRAM first (build_arena_from_routes -> chunks -> release_chunk -> seed_from_routes).
     bool defer_cache = false;
-    double mem_floor_gib = 3.0;   ///< refuse an arena that would leave less than this much MemAvailable
+    double mem_floor_gib = 3.0;   ///< refuse an arena that would leave less than this much MemAvailable (+ ARC: STRATA_ZFS_ARC)
     double max_arena_gib = 60.0;  ///< hard ceiling on the arena, whatever `arena_gib` says
     /// VRAM budget for the expert cache in GiB, for geometries whose blob size varies per layer (MiMo): the seed
     /// takes the ranked profile's head until `slots` experts OR this many bytes, sizing each slot to its expert.

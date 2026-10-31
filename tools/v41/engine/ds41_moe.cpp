@@ -2315,8 +2315,8 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
     const int64_t gib = (int64_t) (gp.arena.bytes / 1073741824ull);
     if (avail >= 0 && gib + (int64_t) im_->cfg.mem_floor_gib > avail) {
         err = "an arena of " + std::to_string(gib) + " GiB would leave less than " +
-              std::to_string((int64_t) im_->cfg.mem_floor_gib) + " GiB free (MemAvailable " +
-              std::to_string(avail) + " GiB)";
+              std::to_string((int64_t) im_->cfg.mem_floor_gib) + " GiB free (MemAvailable" +
+              (ds41_sys::zfs_arc_credit_on() ? " + reclaimable ZFS ARC " : " ") + std::to_string(avail) + " GiB)";
         gp.arena.close();
         return false;
     }

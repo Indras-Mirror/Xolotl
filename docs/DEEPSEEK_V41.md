@@ -161,6 +161,12 @@ and check `build-ds4-gpu/test_ds41_fq --cuda` says bit for bit (it adds one op t
 --chunk 64` checks the expert tier against a dequantised F32 reference. Full engineering log, every measurement and
 the next steps: [docs/ds4/V41_RESUME_PROMPT.md](ds4/V41_RESUME_PROMPT.md).
 
+On OpenZFS the ARC is not part of MemAvailable, so the arena check can refuse (or `--arena-adapt` can shrink) an arena
+while tens of GiB sit in the ARC. `STRATA_ZFS_ARC=1` counts the ARC's evictable buffers (down to its floor `c_min`) as
+available, in the engine and in `memguard.sh`; without it, or without ZFS, nothing changes. On OpenZFS 2.2 / 2.3 set
+`zfs_arc_shrinker_limit=0` as well (2.4's default), or the ARC shrinks too slowly for a large pin. Capping
+`zfs_arc_max` (root) still works instead.
+
 Two engines on one box share the same cores: the pool pins its workers to physical cores in order (core 0 is the main
 thread, `--threads` only sets the pool size), so two independent servers land on the same cores and each drops to about
 40 tok/s. Start each under its own core half instead (`taskset -c 0-11,24-35 python3 serve/server.py ...` and
