@@ -88,6 +88,12 @@ prefill 289-297 / 395-409 tok/s at 6.1K / 16.5K; full HumanEval (164) 162/164. H
 
 ## Recently added
 
+- **Upstream llama.cpp and Unsloth DeepSeek-V4.1 GGUFs** (#82, #85 AlexeyMatskevich; #84 NektoDron): `ds41_generate`
+  reads the `deepseek41` layout upstream's converter writes (ISTA-DASLab's GSQ-RCO files since Oct 27, Unsloth's), the
+  combined Engram table straight from its GGUF shard, the upstream DSpark sidecar, and IQ3_S routed-expert downs
+  (Unsloth's UD-Q2_K_XL). Running them, measured against ISTA IQ2_XS: [docs/DEEPSEEK_V41.md](docs/DEEPSEEK_V41.md).
+- **OpenZFS ARC counted as available RAM** (#83, AlexeyMatskevich, opt-in `STRATA_ZFS_ARC=1`): on a ZFS box the
+  reclaimable ARC no longer shrinks or refuses the ds41 arena, and `zfs_arc_max` no longer has to be capped by hand.
 - **Deep sleep** for MiniMax-M3.1 and DeepSeek-V4.1 (#75, NektoDron): opt-in `"deep_sleep": "auto" | "native" |
   "checkpoint"` plus authenticated `POST /sleep` and `/wake` gives the GPU back while the loaded model and conversations
   stay in host RAM. M3.1 sleeps natively (wake ~1.4-1.9 s); DeepSeek-V4.1 uses the CUDA driver checkpoint (restore
@@ -215,7 +221,9 @@ peasantsmith, ukisai, d0xin and gcsa-abliterix.
 Contributors, with thanks: [NektoDron](https://github.com/NektoDron) (MMQ id slack, forced tool calls, the arena pipe
 and indexer WMMA opt-ins, #48-#52; checked #55; the Q3_K + GPTQ Q2_0 lite calibration and allocation tooling, #58;
 the ggml 6050b467 pool-hook link fix, #72; the control-queue wakeup fix, #79; Qwen3.6 vision, prefix cache and
-batched MTP, #76; deep sleep, #75; resident prefix reuse, #80),
+batched MTP, #76; deep sleep, #75; resident prefix reuse, #80; complete Unsloth GGUF and DSpark support, #84),
+[AlexeyMatskevich](https://github.com/AlexeyMatskevich) (the upstream deepseek41 GGUF layout, #82; OpenZFS ARC
+accounting, #83; IQ3_S expert downs for Unsloth's UD-Q2_K_XL, #85),
 [paul123637-lab](https://github.com/paul123637-lab) (the DSpark seed fixes, #54 and #56; RTX 5080 and 5060 Ti helper
 numbers), [kelheor](https://github.com/kelheor) (the vision `pread` fix, #51), [exye137](https://github.com/exye137)
 (the thread-local CUDA stream leak, #57) [penink-WH](https://github.com/penink-WH) (AC922 rig) and [cpacsm75](https://github.com/cpacsm75) (192 GB
