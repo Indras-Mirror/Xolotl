@@ -265,6 +265,15 @@ inline bool ds41_is_llamacpp_gguf(const GgufModel & model) {
     return model.meta().get("deepseek41.config") == nullptr && model.meta().get("deepseek41.embedding_length") != nullptr;
 }
 
+/// The llama.cpp convention as upstream llama.cpp merged it (b11870+; ISTA-DASLab's GGUFs since Oct 27, Unsloth's):
+/// the attention / indexer / Engram keys renamed (attention.kv_source_layers, attention.indexer.*, ple.*), the Engram
+/// hash arrays as metadata, engram_q * engram_k folded into one F32 engram_gate, attn_output_a 2-D, the vision router
+/// bias kept, and the Engram tables as one per_layer_token_embd tensor in the last shard (not read: --engram; its
+/// shard may be just the header).
+inline bool ds41_is_upstream_gguf(const GgufModel & model) {
+    return ds41_is_llamacpp_gguf(model) && model.meta().get("deepseek41.attention.kv_source_layers") != nullptr;
+}
+
 namespace detail {
 /// an I32 / I64 tensor of the file, whole (the llama.cpp convention's Engram arrays)
 inline std::string int_tensor(const GgufModel & m, const std::string & n, std::vector<int64_t> & out) {
@@ -292,6 +301,9 @@ inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geom
     const GgufFile & g = model.meta();
     std::string e;
     const std::string P = "deepseek41.";
+    const bool up = ds41_is_upstream_gguf(model);
+    // PR #30817's key -> upstream's (the values are the same; ISTA's convert_ds41_upstream.py maps one to the other)
+    auto K = [&](const char * pr, const char * upstream) { return up ? upstream : pr; };
     struct U { const char * k; int64_t * v; };
     for (const U & u : std::initializer_list<U>{
              { "embedding_length", &G.n_embd }, { "block_count", &G.n_layer }, { "attention.head_count", &G.n_head },
@@ -302,12 +314,20 @@ inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geom
              { "expert_feed_forward_length", &G.n_ff }, { "expert_shared_count", &G.n_shared },
              { "hyper_connection.count", &G.hc }, { "hyper_connection.sinkhorn_iterations", &G.hc_iters },
              { "attention.indexer.head_count", &G.idx_heads }, { "attention.indexer.key_length", &G.idx_dim },
-             { "attention.indexer.top_k", &G.idx_topk }, { "attention.candidate_source_layer_id", &G.cand_layer },
-             { "attention.candidate_topk_blocks", &G.cand_blocks }, { "attention.candidate_block_size", &G.cand_bsize },
-             { "context_length", &G.ctx_len }, { "engram_n_heads", &G.engram_heads },
-             { "engram_head_dim", &G.engram_dim }, { "engram_max_ngram_size", &G.engram_ngram },
-             { "engram_pad_token_id", &G.engram_pad }, { "engram_compressed_vocab_size", &G.engram_cvocab } })
+             { "attention.indexer.top_k", &G.idx_topk },
+             { K("attention.candidate_source_layer_id", "attention.indexer.candidate_source_layer"), &G.cand_layer },
+             { K("attention.candidate_topk_blocks", "attention.indexer.candidate_top_k_blocks"), &G.cand_blocks },
+             { K("attention.candidate_block_size", "attention.indexer.candidate_block_size"), &G.cand_bsize },
+             { "context_length", &G.ctx_len }, { K("engram_n_heads", "ple.heads_per_ngram"), &G.engram_heads },
+             { K("engram_head_dim", "embedding_length_per_layer_input"), &G.engram_dim },
+             { K("engram_max_ngram_size", "ple.ngram_size"), &G.engram_ngram },
+             { K("engram_pad_token_id", "engram.pad_token_id"), &G.engram_pad } })
         if (!(e = detail::u64(g, P + u.k, *u.v)).empty()) return e;
+    // optional upstream (llama.cpp derives it; ISTA's converted files omit it): max(token map) + 1 below
+    G.engram_cvocab = 0;
+    if (!up || g.get(P + "engram.compressed_vocab_size"))
+        if (!(e = detail::u64(g, P + K("engram_compressed_vocab_size", "engram.compressed_vocab_size"), G.engram_cvocab)).empty())
+            return e;
     struct F { const char * k; double * v; };
     for (const F & f : std::initializer_list<F>{
              { "expert_weights_scale", &G.weights_scale }, { "hyper_connection.epsilon", &G.hc_eps },
@@ -320,8 +340,13 @@ inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geom
         const MetaValue * v = g.get(P + "expert_weights_norm");
         if (!v) return "missing deepseek41.expert_weights_norm";
         G.norm_topk = v->u != 0;
-        const MetaValue * sf = g.get(P + "expert_scoring_func");
-        if (!sf || sf->s != "sqrtsoftplus") return "expert_scoring_func is not sqrtsoftplus";
+        if (up) {   // llama.cpp's LLAMA_EXPERT_GATING_FUNC_TYPE_SQRTSOFTPLUS (PR #30817's files carry both keys)
+            const MetaValue * gf = g.get(P + "expert_gating_func");
+            if (!gf || !gf->is_num() || gf->num() != 4) return "expert_gating_func is not 4 (sqrtsoftplus)";
+        } else {
+            const MetaValue * sf = g.get(P + "expert_scoring_func");
+            if (!sf || sf->s != "sqrtsoftplus") return "expert_scoring_func is not sqrtsoftplus";
+        }
         // one SwiGLU clamp for every layer (DeepSeek's swiglu_limit); a per-layer array of equal values here
         const MetaValue * sl = g.get(P + "swiglu_clamp_exp");
         if (!sl || sl->type != MetaType::ARRAY || sl->items.empty()) return "missing deepseek41.swiglu_clamp_exp";
@@ -331,18 +356,44 @@ inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geom
     }
     if (!(e = detail::arr(g, P + "attention.compress_ratios", G.ratio)).empty()) return e;
     if ((int64_t) G.ratio.size() > G.n_layer) G.ratio.resize((size_t) G.n_layer);   // (+ the 3 MTP blocks' entries)
-    if (!(e = detail::arr(g, P + "kv_source_layer_ids", G.kv_sources)).empty()) return e;
-    if (!(e = detail::arr(g, P + "index_source_layer_ids", G.index_sources)).empty()) return e;
-    if (!(e = detail::arr(g, P + "engram.layer_ids", G.engram_layers)).empty()) return e;
-    if (!(e = detail::arr(g, P + "engram.num_embeddings", G.engram_rows)).empty()) return e;
+    if (!(e = detail::arr(g, P + K("kv_source_layer_ids", "attention.kv_source_layers"), G.kv_sources)).empty()) return e;
+    if (!(e = detail::arr(g, P + K("index_source_layer_ids", "attention.indexer.source_layers"), G.index_sources)).empty())
+        return e;
+    if (!(e = detail::arr(g, P + K("engram.layer_ids", "ple.layers"), G.engram_layers)).empty()) return e;
     const TensorInfo * te = model.find("token_embd.weight");
     if (!te || te->shape.size() != 2) return "missing token_embd.weight";
     G.vocab = (int64_t) te->shape[1];
     std::vector<int64_t> tm, pr;
-    if (!(e = detail::int_tensor(model, "engram_token_map.weight", tm)).empty()) return e;
-    if (!(e = detail::int_tensor(model, "engram_primes.weight", pr)).empty()) return e;
-    if (!(e = detail::int_tensor(model, "engram_multipliers.weight", G.engram_mult)).empty()) return e;
-    if ((int64_t) tm.size() != G.vocab) return "engram_token_map size";
+    if (up) {
+        // the hash arrays are metadata (whole arrays: the token map is past the reader's sample); the per-layer table
+        // rows are the sums of that layer's bucket sizes.  ple.head_offsets (their running sum over both tables, unused:
+        // Ds41Engram derives its offsets) is checked when present, as a sign the arrays belong together
+        const std::string & path = g.path();
+        if (!(e = ds41_read_int_array(path, P + "engram.token_map", tm)).empty()) return e;
+        if (!(e = ds41_read_int_array(path, P + "ple.head_vocab_sizes", pr)).empty()) return e;
+        if (!(e = ds41_read_int_array(path, P + "ple.layer_multipliers", G.engram_mult)).empty()) return e;
+        std::vector<int64_t> off;
+        const bool has_off = g.get(P + "ple.head_offsets") != nullptr;
+        if (has_off && !(e = ds41_read_int_array(path, P + "ple.head_offsets", off)).empty()) return e;
+        const size_t nb = (size_t) ((G.engram_ngram - 1) * G.engram_heads);
+        if (nb == 0 || pr.size() != nb * G.engram_layers.size() || (has_off && off.size() != pr.size()))
+            return "ple.head_vocab_sizes / ple.head_offsets do not match the Engram shape";
+        G.engram_rows.assign(G.engram_layers.size(), 0);
+        int64_t at = 0;
+        for (size_t j = 0; j < pr.size(); ++j) {
+            if (has_off && off[j] != at) return "ple.head_offsets is not the running sum of ple.head_vocab_sizes";
+            at += pr[j];
+            G.engram_rows[j / nb] += pr[j];
+        }
+    } else {
+        if (!(e = detail::arr(g, P + "engram.num_embeddings", G.engram_rows)).empty()) return e;
+        if (!(e = detail::int_tensor(model, "engram_token_map.weight", tm)).empty()) return e;
+        if (!(e = detail::int_tensor(model, "engram_primes.weight", pr)).empty()) return e;
+        if (!(e = detail::int_tensor(model, "engram_multipliers.weight", G.engram_mult)).empty()) return e;
+    }
+    if ((int64_t) tm.size() != G.vocab) return "engram token map size";
+    if (G.engram_cvocab == 0)
+        for (int64_t v : tm) G.engram_cvocab = std::max(G.engram_cvocab, v + 1);
     G.engram_token_map.assign(tm.begin(), tm.end());
     G.engram_primes.assign(pr.begin(), pr.end());
     detail::u64(g, "tokenizer.ggml.bos_token_id", G.bos);
@@ -467,6 +518,7 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
     // choice (Q5_K / Q8_0 / BF16 / F32 - the loader converts what the graph needs), attn_output_a stored 3-D, the
     // Engram projections under llama.cpp's names, no vision router bias, and the Engram hash arrays as tensors
     const bool lc = ds41_is_llamacpp_gguf(m);
+    const bool up = ds41_is_upstream_gguf(m);   // (upstream llama.cpp: 2-D attn_output_a, engram_gate, the VL bias)
     auto add = [&](const std::string & n, std::vector<uint64_t> sh, uint32_t t) { want[n] = { std::move(sh), lc ? ANY : t }; };
     const uint64_t D = (uint64_t) G.n_embd, HC = (uint64_t) G.hc, MIX = (uint64_t) G.hc_mix();
     const uint64_t DH = (uint64_t) G.d_head, NH = (uint64_t) G.n_head, RQ = (uint64_t) G.r_q;
@@ -490,7 +542,7 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
         add(b + "attn_q_a_norm.weight", { RQ }, ty::F32);
         add(b + "attn_kv.weight", { D, DH }, ty::Q8_0);
         add(b + "attn_kv_a_norm.weight", { DH }, ty::F32);
-        if (lc) add(b + "attn_output_a.weight", { NH * DH / OG, OL, OG }, ANY);   // the same bytes, 3-D
+        if (lc && !up) add(b + "attn_output_a.weight", { NH * DH / OG, OL, OG }, ANY);   // the same bytes, 3-D
         else add(b + "attn_output_a.weight", { NH * DH / OG, OG * OL }, ty::Q8_0);
         add(b + "attn_output_b.weight", { OG * OL, D }, ty::Q8_0);
         if (G.is_kv_source(l)) {
@@ -506,14 +558,19 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
         }
         add(b + "ffn_gate_inp.weight", { D, NE }, ty::F32);
         add(b + "exp_probs_b.bias", { NE }, ty::F32);
-        if (!lc) add(b + "exp_probs_b_vl.bias", { NE }, ty::F32);   // (vision only; absent in the llama.cpp convention)
+        // (vision only: absent in PR #30817's files, optional upstream - --vision checks for it)
+        if (!lc || (up && m.find(b + "exp_probs_b_vl.bias"))) add(b + "exp_probs_b_vl.bias", { NE }, ty::F32);
         add(b + "ffn_gate_shexp.weight", { D, FF }, ty::Q8_0);
         add(b + "ffn_up_shexp.weight", { D, FF }, ty::Q8_0);
         add(b + "ffn_down_shexp.weight", { FF, D }, ty::Q8_0);
         if (G.engram_slot(l) >= 0) {   // (llama.cpp names: engram_q / engram_k / engram_wkv - ds41_canonical_name)
-            add(b + (lc ? "engram_q.weight" : "engram_q_norm.weight"), { D, HC }, ty::F32);
-            add(b + (lc ? "engram_k.weight" : "engram_k_norm.weight"), { D, HC }, ty::F32);
-            add(b + (lc ? "engram_wkv.weight" : "engram_kv.weight"),
+            if (up) {
+                add(b + "engram_gate.weight", { D, HC }, ty::F32);   // = engram_q * engram_k, what the graph multiplies
+            } else {
+                add(b + (lc ? "engram_q.weight" : "engram_q_norm.weight"), { D, HC }, ty::F32);
+                add(b + (lc ? "engram_k.weight" : "engram_k_norm.weight"), { D, HC }, ty::F32);
+            }
+            add(b + (lc && !up ? "engram_wkv.weight" : "engram_kv.weight"),
                 { (uint64_t) ((G.engram_ngram - 1) * G.engram_heads * G.engram_dim), (HC + 1) * D }, ty::F16);
         }
         // routed experts: uniform role tensors or per-type tensors + the I32 maps
@@ -564,7 +621,11 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
             }
         }
     }
-    if (lc) {   // the Engram hash arrays (read by ds41_read_geometry_llamacpp)
+    if (up) {   // both Engram tables, stacked (the rows of every layer, in ple.layers order); the dense loader skips it
+        uint64_t rows = 0;
+        for (int64_t r : G.engram_rows) rows += (uint64_t) r;
+        add("per_layer_token_embd.weight", { (uint64_t) G.engram_dim, rows }, ANY);   // (shape only: no bounds check)
+    } else if (lc) {   // the Engram hash arrays (read by ds41_read_geometry_llamacpp)
         const uint64_t NEL = (uint64_t) G.engram_layers.size(), NG = (uint64_t) G.engram_ngram;
         const uint64_t NB = (NG - 1) * (uint64_t) G.engram_heads;
         add("engram_token_map.weight", { (uint64_t) G.vocab }, ANY);
@@ -585,7 +646,7 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
         }
         if (st.second != ANY && t->type != st.second)
             return n + ": type " + std::string(ggml_type_name(t->type)) + " expected " + ggml_type_name(st.second);
-        if (!m.in_bounds(*t, s)) return n + ": out of bounds";
+        if (n != "per_layer_token_embd.weight" && !m.in_bounds(*t, s)) return n + ": out of bounds";
     }
     for (size_t s = 0; s < m.size(); ++s)
         for (const auto & t : m.shard(s).tensors())
