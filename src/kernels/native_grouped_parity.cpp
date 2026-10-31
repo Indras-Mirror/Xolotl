@@ -352,6 +352,9 @@ int main(int argc, char** argv) {
     check(21, 23, 2560, 768, s, rng);
     check(22, 21, 512, 768, s, rng);   // IQ2_S / IQ3_S down: whole 256-block rows
     check(18, 21, 512, 768, s, rng);   // IQ3_XXS / IQ3_S down
+    // IQ3_S downs (#85, the model shape): Unsloth's DeepSeek-V4.1 UD-Q2_K_XL, IQ2_S / IQ3_XXS gate+up, n_ff 2304 = 9 blocks a row
+    check(22, 21, 5120, 2304, s, rng);
+    check(18, 21, 5120, 2304, s, rng);
     if (do_bench) bench(s, rng);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);

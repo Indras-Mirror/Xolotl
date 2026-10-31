@@ -177,6 +177,43 @@ The serve config's `gpu` becomes `--gpu`, which sets `CUDA_VISIBLE_DEVICES` itse
 launcher set (the engine warns when it does). With two cards, use the config's own numbering: `CUDA_VISIBLE_DEVICES=1`
 with `"gpu": [0]` still runs on physical GPU 0; set `"gpu": [1]` (#47).
 
+### Unsloth's UD-Q2_K_XL (UD 3.1)
+
+[Unsloth's DeepSeek-V4.1-Flash-1017 GGUFs](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) are in
+upstream llama.cpp's layout, which the engine reads like ISTA-DASLab's current files. Only UD-Q2_K_XL (revision
+`8a6ec9c`) was run. Other quants of the repository were not tried: their expert types may have no kernel here (UD-IQ1_S
+puts IQ1_S on experts, which has none), and the engine says so at load.
+
+The last shard holds only the Engram tables (`per_layer_token_embd`, Q5_K, 135 GB). The engine reads the tables from
+`--engram`, but the loader opens every shard, so in place of shard 7 its header is enough:
+
+```bash
+rev=8a6ec9cf118e785a362ea94ee123c61c70553be6
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --revision $rev --include "UD-Q2_K_XL/*-0000[1-6]-of-00007.gguf" --local-dir unsloth
+f=unsloth/UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00007-of-00007.gguf
+curl -fL -r 0-1048575 -o $f "https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/resolve/$rev/UD-Q2_K_XL/${f##*/}" &&
+  head -c 4 $f | grep -q GGUF && echo "shard 7 header ok"
+```
+
+This 1 MiB file is a truncated shard (its tensor data lies past the end of the file): do not point llama.cpp or
+another GGUF reader at this folder. `-m` is the
+first shard (`...-00001-of-00007.gguf`), and `--engram` points at the FP8 tables as above (the hash constants in
+Unsloth's metadata equal ours, checked). Unlike PR #30817's files they carry `exp_probs_b_vl`; vision was not tested
+with them.
+
+Same flags, same Engram tables, RTX 4090 · 125 GB RAM · Optane 905P, 8 GiB arena (`--ctx 8192 --kv-fp4 --arena-gib 8
+--prompt-batch 4096`). Perplexity: 4096 tokens of llama.cpp's `docs/build.md` (`--ppl`). Decode: 200 greedy tokens
+after a 512-token prompt, no DSpark, one run each:
+
+| GGUF | experts | PPL | top-1 | decode |
+| --- | ---: | ---: | ---: | ---: |
+| ISTA-DASLab GSQ-RCO IQ2_XS (`653a987`) | 139 GiB | 1.960 | 84.7% | 22.3 tok/s |
+| Unsloth UD-Q2_K_XL (`8a6ec9c`) | 178 GiB | 1.796 | 86.6% | 15.8 tok/s |
+
+UD-Q2_K_XL is closer to the model on this text and slower, as its 39 GiB more expert bytes mean fewer experts in VRAM
+and RAM. One text and one run each, not a benchmark; Unsloth's own KLD for UD-Q2_K_XL is on their
+[model page](https://unsloth.ai/docs/models/deepseek-v4.1-flash).
+
 ### Serving it (OpenAI + Anthropic API, tool calls)
 
 ```bash
