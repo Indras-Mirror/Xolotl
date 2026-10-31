@@ -12,7 +12,9 @@
 // The tables can also come from a GGUF (ISTA-DASLab's DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf: blk.{1,14}.engram_embd.weight
 // IQ4_NL [256, rows], one 144-byte row per hash id): pass the .gguf file itself as an --engram entry.  The row reader is the
 // same (sorted, page-coalesced preads, row cache); a row is one span (no separate scale tensor) dequantized at read.  The
-// hash geometry still comes from the backbone GGUF; the table rows must match it.  The hot set (FP8 rows) is not used then.
+// hash geometry still comes from the backbone GGUF; the table rows must match it. Modern PLE GGUFs may instead store
+// one per_layer_token_embd.weight table, IQ4_NL or Q5_K, with all layers concatenated in validated layer order.
+// The hot set (FP8 rows) is not used for GGUF tables.
 #pragma once
 
 #include "ds41_geometry.hpp"
@@ -98,7 +100,7 @@ private:
     const Ds41Geometry * g_ = nullptr;
     std::vector<Table> tables_;
     // Row format.  qtype_ < 0: the HF FP8 tables - wrow_ = dim fp8 bytes (F8_E4M3) + srow_ = dim/32 scale bytes (F8_E8M0, in
-    // the .scale tensor).  qtype_ = 20 (IQ4_NL): a GGUF table - wrow_ = dim/32 blocks of 18 bytes, srow_ = 0 (no scale span).
+    // the .scale tensor). GGUF: qtype_ = 20 (IQ4_NL, 18 bytes per 32 values) or 13 (Q5_K, 176 per 256), srow_ = 0.
     int qtype_ = -1;
     int64_t wrow_ = 0, srow_ = 0;
     void deq_row(const uint8_t * w, const uint8_t * s, float * out) const;   ///< one raw row -> dim_ floats

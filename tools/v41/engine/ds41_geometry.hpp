@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include "ds41_sys.hpp"
@@ -225,11 +226,23 @@ inline std::string ds41_read_int_array(const std::string & path, const std::stri
 
 // ------------------------------------------------------------------ key readers (missing key == error)
 namespace detail {
+inline bool int64_value(const MetaValue & v, int64_t & out) {
+    if (!v.is_num()) return false;
+    if (v.type == MetaType::F32 || v.type == MetaType::F64) {
+        if (!std::isfinite(v.f) || std::trunc(v.f) != v.f || v.f < -0x1p63 || v.f >= 0x1p63) return false;
+        out = (int64_t) v.f;
+    } else if (v.type == MetaType::I8 || v.type == MetaType::I16 || v.type == MetaType::I32 || v.type == MetaType::I64) {
+        std::memcpy(&out, &v.u, sizeof out);
+    } else {
+        if (v.u > (uint64_t) INT64_MAX) return false;
+        out = (int64_t) v.u;
+    }
+    return true;
+}
 inline std::string u64(const GgufFile & g, const std::string & k, int64_t & out) {
     const MetaValue * v = g.get(k);
     if (!v) return "missing " + k;
-    if (!v->is_num()) return k + " is not a number";
-    out = (int64_t) v->num();
+    if (!int64_value(*v, out)) return k + " is not an int64 integer";
     return {};
 }
 inline std::string f64(const GgufFile & g, const std::string & k, double & out) {
@@ -245,7 +258,11 @@ inline std::string arr(const GgufFile & g, const std::string & k, std::vector<in
     if (v->type != MetaType::ARRAY) return k + " is not an array";
     if (v->count > v->items.size()) return k + ": longer than the reader's sample (use ds41_read_int_array)";
     out.clear();
-    for (const auto & e : v->items) out.push_back((int64_t) e.num());
+    for (const auto & e : v->items) {
+        int64_t n = 0;
+        if (!int64_value(e, n)) return k + " has a non-int64 entry";
+        out.push_back(n);
+    }
     return {};
 }
 /// `"key":<number>` out of the deepseek41.config JSON (flat search; the keys are unique in DeepSeek's config)
@@ -273,6 +290,10 @@ inline bool ds41_is_llamacpp_gguf(const GgufModel & model) {
 inline bool ds41_is_upstream_gguf(const GgufModel & model) {
     return ds41_is_llamacpp_gguf(model) && model.meta().get("deepseek41.attention.kv_source_layers") != nullptr;
 }
+
+/// Alias for callers identifying the combined PLE lookup convention.
+inline bool ds41_is_ple_gguf(const GgufModel & model) { return ds41_is_upstream_gguf(model); }
+
 
 namespace detail {
 /// an I32 / I64 tensor of the file, whole (the llama.cpp convention's Engram arrays)
@@ -375,15 +396,32 @@ inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geom
         std::vector<int64_t> off;
         const bool has_off = g.get(P + "ple.head_offsets") != nullptr;
         if (has_off && !(e = ds41_read_int_array(path, P + "ple.head_offsets", off)).empty()) return e;
+        if (G.n_layer <= 0 || G.n_layer > 4096 || G.n_embd <= 0 || G.o_groups <= 0 ||
+            G.engram_dim <= 0 || G.engram_dim > 512 || G.engram_ngram < 2 || G.engram_ngram > 8 ||
+            G.engram_heads <= 0 || G.engram_heads > 1024 / (G.engram_ngram - 1) ||
+            G.engram_layers.empty() || G.engram_layers.size() > (size_t) G.n_layer)
+            return "invalid PLE Engram shape";
         const size_t nb = (size_t) ((G.engram_ngram - 1) * G.engram_heads);
-        if (nb == 0 || pr.size() != nb * G.engram_layers.size() || (has_off && off.size() != pr.size()))
+        if (pr.size() != nb * G.engram_layers.size() || (has_off && off.size() != pr.size()))
             return "ple.head_vocab_sizes / ple.head_offsets do not match the Engram shape";
         G.engram_rows.assign(G.engram_layers.size(), 0);
-        int64_t at = 0;
+        uint64_t at = 0;
         for (size_t j = 0; j < pr.size(); ++j) {
-            if (has_off && off[j] != at) return "ple.head_offsets is not the running sum of ple.head_vocab_sizes";
-            at += pr[j];
+            if (pr[j] < 2 || (has_off && (off[j] < 0 || (uint64_t) off[j] != at)) ||
+                (uint64_t) pr[j] > INT32_MAX - at)
+                return "PLE bucket ranges must tile the combined table";
+            at += (uint64_t) pr[j];
             G.engram_rows[j / nb] += pr[j];
+        }
+        for (size_t j = 0; j < G.engram_layers.size(); ++j)
+            if (G.engram_layers[j] < 0 || G.engram_layers[j] >= G.n_layer ||
+                (j && G.engram_layers[j] <= G.engram_layers[j - 1])) return "PLE layers out of range/order";
+        const MetaValue * shared = g.get(P + "swiglu_clamp_shexp");
+        if (shared) {
+            if (shared->type != MetaType::ARRAY || shared->count != (uint64_t) G.n_layer)
+                return "PLE shared clamp array must have one value per layer";
+            for (const auto & v : shared->items)
+                if (v.num() != G.swiglu_limit) return "shared/expert SwiGLU clamps differ (one limit supported)";
         }
     } else {
         if (!(e = detail::arr(g, P + "engram.num_embeddings", G.engram_rows)).empty()) return e;
@@ -392,8 +430,20 @@ inline std::string ds41_read_geometry_llamacpp(const GgufModel & model, Ds41Geom
         if (!(e = detail::int_tensor(model, "engram_multipliers.weight", G.engram_mult)).empty()) return e;
     }
     if ((int64_t) tm.size() != G.vocab) return "engram token map size";
+    if (up) {
+        for (int64_t v : tm) if (v < 0 || v >= INT32_MAX) return "PLE compressed token id out of range";
+    }
     if (G.engram_cvocab == 0)
         for (int64_t v : tm) G.engram_cvocab = std::max(G.engram_cvocab, v + 1);
+    if (up) {
+        if (G.engram_cvocab <= 0 || G.engram_cvocab > INT32_MAX) return "invalid compressed vocabulary size";
+        for (int64_t v : tm) if (v >= G.engram_cvocab) return "PLE compressed token id out of range";
+        if (G.engram_pad < 0 || (uint64_t) G.engram_pad >= tm.size()) return "PLE pad token id out of range";
+        G.engram_pad = tm[(size_t) G.engram_pad];
+        for (int64_t v : G.engram_mult)
+            if (v < 0 || (uint64_t) v > INT64_MAX / (uint64_t) G.engram_cvocab)
+                return "PLE hash multiplier can overflow signed int64";
+    }
     G.engram_token_map.assign(tm.begin(), tm.end());
     G.engram_primes.assign(pr.begin(), pr.end());
     detail::u64(g, "tokenizer.ggml.bos_token_id", G.bos);
@@ -638,7 +688,12 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
         size_t s = 0;
         const TensorInfo * t = m.find(n, &s);
         if (!t) return "missing tensor " + n;
-        if (t->shape != st.first) {
+        const bool output_a_view = lc && n.size() >= sizeof("attn_output_a.weight") - 1 &&
+            n.compare(n.size() - (sizeof("attn_output_a.weight") - 1),
+                      sizeof("attn_output_a.weight") - 1, "attn_output_a.weight") == 0 &&
+            (t->shape == std::vector<uint64_t>({ NH * DH / OG, OL, OG }) ||
+             t->shape == std::vector<uint64_t>({ NH * DH / OG, OL * OG }));
+        if (t->shape != st.first && !output_a_view) {
             std::string a, w;
             for (auto x : t->shape) a += std::to_string(x) + " ";
             for (auto x : st.first) w += std::to_string(x) + " ";

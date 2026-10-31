@@ -2,6 +2,7 @@
 // (DSparkBlock / DSparkAttention / forward_embed / forward_head ~1021-1160, Block ~907-995, MoE / Gate ~792-905).
 #include "ds41_embd.hpp"
 #include "ds41_dspark.hpp"
+#include "ds41_dspark_gguf.hpp"
 
 #include "ds41_geometry.hpp"
 #include "ds41_ops.hpp"
@@ -100,18 +101,40 @@ size_t Ds41DSpark::weight_bytes() const { return p_->wbytes; }
 const std::string & Ds41DSpark::last_error() const { return p_->err; }
 
 bool Ds41DSpark::Impl::load(std::string & e) {
-    // every mtp.* tensor of the sidecar (bias_vl too: tiny, unused for text) + the trunk's output.weight
-    std::vector<std::pair<const GgufModel *, const TensorInfo *>> src;
-    for (size_t s = 0; s < side->size(); ++s)
-        for (const auto & ti : side->shard(s).tensors())
-            if (ti.name.rfind("mtp.", 0) == 0) src.push_back({ side.get(), &ti });
+    // Legacy mtp.* sidecars keep their existing path. A modern DFlash DSpark sidecar is validated before any
+    // backend allocation, then its source names are bound to the same graph weights without repacking the file.
+    struct Source {
+        const GgufModel * first;
+        const TensorInfo * second;
+        std::string name;
+        bool force_f32 = false;
+    };
+    std::vector<Source> src;
+    if (ds41_is_dflash_dspark(side->meta())) {
+        std::vector<TensorInfo> tensors;
+        for (size_t sh = 0; sh < side->size(); ++sh)
+            for (const auto & ti : side->shard(sh).tensors()) tensors.push_back(ti);
+        std::vector<Ds41DSparkGgufBinding> bindings;
+        e = ds41_dflash_dspark_bindings(side->meta().metadata(), tensors, g, cfg.block, cfg.n_used, cfg.noise_id, bindings);
+        if (!e.empty()) return false;
+        for (const auto & binding : bindings) {
+            size_t sh = 0;
+            const TensorInfo * ti = side->find(binding.source, &sh);
+            if (!ti || !side->in_bounds(*ti, sh)) { e = "DSpark GGUF: tensor out of bounds: " + binding.source; return false; }
+            src.push_back({side.get(), ti, binding.destination, binding.force_f32});
+        }
+    } else {
+        for (size_t sh = 0; sh < side->size(); ++sh)
+            for (const auto & ti : side->shard(sh).tensors())
+                if (ti.name.rfind("mtp.", 0) == 0) src.push_back({side.get(), &ti, ti.name, false});
+    }
     size_t si = 0;
     const TensorInfo * out = main->find("output.weight", &si);
     const TensorInfo * te = main->find("token_embd.weight");
     if (!out || !te) { e = "the trunk GGUF lacks output.weight / token_embd.weight"; return false; }
     if (!strata::v41::ds41_embd_type_ok((int) te->type)) { e = "token_embd type has no row reader"; return false; }
     embd_type = (int) te->type;
-    if (!cfg.shared_head) src.push_back({ main.get(), out });
+    if (!cfg.shared_head) src.push_back({main.get(), out, out->name, false});
     // STRATA_DSPARK_EXP_TYPE=<ggml type name> (q4_K, q3_K, q2_K, iq4_xs, ...): the routed experts
     // (mtp.*.ffn.experts.w1/w2/w3, MXFP4 in the sidecar) are requantized ON LOAD (dequantize -> quantize, CPU threads).
     // A drafter's precision only moves acceptance - every draft is verified by the trunk.
@@ -166,12 +189,13 @@ bool Ds41DSpark::Impl::load(std::string & e) {
     for (auto & s : src) {
         int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
         for (size_t d = 0; d < s.second->shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) s.second->shape[d];
-        if (const int sl = sliced(s.second->name)) ne[sl == 1 ? 2 : sl == 2 ? 1 : 0] = (int64_t) keep[(size_t) blk_of(s.second->name)].size();
-        const ggml_type ty = (xt != GGML_TYPE_COUNT && is_exp(s.second->name)) ? xt : (ggml_type) s.second->type;
+        if (const int sl = sliced(s.name)) ne[sl == 1 ? 2 : sl == 2 ? 1 : 0] = (int64_t) keep[(size_t) blk_of(s.name)].size();
+        const ggml_type ty = s.force_f32 ? GGML_TYPE_F32 :
+                             (xt != GGML_TYPE_COUNT && is_exp(s.name)) ? xt : (ggml_type) s.second->type;
         if (ty != (ggml_type) s.second->type && ne[0] % ggml_blck_size(ty)) { e = s.second->name + ": row not a multiple of the block"; return false; }
         ggml_tensor * t = ggml_new_tensor(wctx, ty, (int) s.second->shape.size(), ne);
-        ggml_set_name(t, s.second->name.c_str());
-        w[s.second->name] = t;
+        ggml_set_name(t, s.name.c_str());
+        w[s.name] = t;
     }
     wbuf = ggml_backend_alloc_ctx_tensors_from_buft(wctx, ggml_backend_get_default_buffer_type(be));
     if (!wbuf) { e = "cannot allocate the DSpark weights on the backend"; return false; }
@@ -193,7 +217,7 @@ bool Ds41DSpark::Impl::load(std::string & e) {
     bool restored = false;
     if (use_stash && stash.key == skey && stash.bytes.size() == wsize) {
         for (auto & s : src) {
-            ggml_tensor * t = w[s.second->name];
+            ggml_tensor * t = w[s.name];
             const size_t off = (size_t) ((const uint8_t *) t->data - wbase);
             ggml_backend_tensor_set(t, stash.bytes.data() + off, 0, ggml_nbytes(t));
             wbytes += ggml_nbytes(t);
@@ -232,17 +256,17 @@ bool Ds41DSpark::Impl::load(std::string & e) {
         const GgufModel & m = *s.first;
         size_t sh = 0;
         m.find(s.second->name, &sh);
-        ggml_tensor * t = w[s.second->name];
+        ggml_tensor * t = w[s.name];
         const void * data = m.shard(sh).tensor_data(*s.second);
         std::vector<uint8_t> kept;   // STRATA_DSPARK_KEEP: the kept experts' / gate rows' source bytes, in order
-        if (const int sl = sliced(s.second->name)) {
+        if (const int sl = sliced(s.name)) {
             const ggml_type st = (ggml_type) s.second->type;
             const int64_t n0 = (int64_t) s.second->shape[0];
             const size_t unit = sl == 1 ? ggml_row_size(st, n0) * (size_t) s.second->shape[1]   // one expert
                               : sl == 2 ? ggml_row_size(st, n0)                                   // one gate row
                                         : ggml_type_size(st);                                     // one bias value
             if (sl == 3 && ggml_blck_size(st) != 1) { e = s.second->name + ": quantized gate bias"; return false; }
-            const auto & k = keep[(size_t) blk_of(s.second->name)];
+            const auto & k = keep[(size_t) blk_of(s.name)];
             kept.resize(k.size() * unit);
             for (size_t i = 0; i < k.size(); ++i) std::memcpy(kept.data() + i * unit, (const uint8_t *) data + (size_t) k[i] * unit, unit);
             data = kept.data();
@@ -281,7 +305,7 @@ bool Ds41DSpark::Impl::load(std::string & e) {
         // joins the thread, so the stash is complete whenever it is read.
         std::vector<std::pair<ggml_tensor *, size_t>> ts;
         for (auto & s : src) {
-            ggml_tensor * t = w[s.second->name];
+            ggml_tensor * t = w[s.name];
             ts.emplace_back(t, (size_t) ((const uint8_t *) t->data - wbase));
         }
         stash.key.clear();

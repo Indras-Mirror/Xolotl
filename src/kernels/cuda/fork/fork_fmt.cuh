@@ -34,8 +34,5 @@ template<> struct Fmt<143> { static constexpr int qk = 128, ipb = 4, step = 1;
 // per-column kernel were already there for the MiMo down outliers, only the gate/up list did not name it, so
 // native_expert_supported refused the file ("layer 0's experts are MXFP4/MXFP4 ..., no GPU kernels for")
 // ... and DeepSeek-V4.1's native expert tier (the checkpoint's own E2M1+E8M0 bytes, lossless) - ds41_geometry.hpp
-#define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(39) X(143)
 // IQ2_XXS / IQ2_XS / IQ1_M downs (16 / 17 / 29): ISTA-DASLab's GSQ-RCO DeepSeek-V4.1 GGUFs pick them for whole
 // ffn_down_exps tensors (upstream's down list has none of the three; their Fmt<> and the gate/up list already exist)
-#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(16) X(17) X(18) X(22) X(29) X(39) X(143)
-#define STRATA_MMVQ_FMTS_FORK(X) X(10) X(143)
