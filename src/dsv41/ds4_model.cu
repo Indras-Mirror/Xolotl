@@ -2516,6 +2516,10 @@ struct Model::Impl {
             const Dev& d = devs[di];
             const double room = (double) d.free0 - (double) ((size_t) o.reserve_mib << 20);
             if (!whole || need <= 0 || need <= room) continue;
+            // (past the free memory itself the cudaMalloc of these weights cannot succeed: said here, before anything loads.
+            //  Between the free memory minus the reserve and the free memory they fit but leave less than --reserve-mib for the
+            //  caches and scratch: a warning, the load goes on)
+            const bool cannot = need > (double) d.free0;
             char msg[1024];
             std::snprintf(msg, sizeof msg,
                           "CUDA%d has %.2f GB free of %.2f GB, but the dense weights of %s%s need %.2f GB on it "
@@ -2532,8 +2536,13 @@ struct Model::Impl {
                                                   " GB of VRAM or more"
                                             : std::string("GPUs with more free VRAM"))
                               .c_str());
-            err = msg;
-            return false;
+            if (cannot) {
+                err = msg;
+                return false;
+            }
+            std::fprintf(stderr, "ds4: WARNING: CUDA%d has %.2f GB free and the dense weights of its layers need %.2f GB: they "
+                                 "fit, but leave less than the %lld MiB reserve for the caches and scratch (--reserve-mib); the "
+                                 "load goes on\n", d.id, (double) d.free0 / 1e9, need / 1e9, (long long) o.reserve_mib);
         }
         // the groups' members: copies of each layer's device state, a member's part of an expert
         for (Layer& l : L) {
