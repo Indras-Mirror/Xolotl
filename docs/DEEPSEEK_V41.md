@@ -201,10 +201,10 @@ after a 512-token prompt, no DSpark, one run each:
 
 | GGUF | experts | PPL | top-1 | decode |
 | --- | ---: | ---: | ---: | ---: |
-| ISTA-DASLab GSQ-RCO IQ2_XS (`653a987`) | 145 GiB | 1.960 | 84.7% | 22.3 tok/s |
+| ISTA-DASLab GSQ-RCO IQ2_XS (`653a987`) | 139 GiB | 1.960 | 84.7% | 22.3 tok/s |
 | Unsloth UD-Q2_K_XL (`8a6ec9c`) | 178 GiB | 1.796 | 86.6% | 15.8 tok/s |
 
-UD-Q2_K_XL is closer to the model on this text and slower, as its 33 GiB more expert bytes mean fewer experts in VRAM
+UD-Q2_K_XL is closer to the model on this text and slower, as its 39 GiB more expert bytes mean fewer experts in VRAM
 and RAM. One text and one run each, not a benchmark; Unsloth's own KLD for UD-Q2_K_XL is on their
 [model page](https://unsloth.ai/docs/models/deepseek-v4.1-flash).
 
