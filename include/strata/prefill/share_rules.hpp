@@ -12,6 +12,17 @@
 
 namespace strata::prefill::share_rules {
 
+// ---- the limit (BW-MEASURE E25, owner decision 10-31) ----
+// The DEFAULT share applies to staged chunks up to this many tokens.  0.1.41 armed it below 1,024 tokens (RTX 3060, P100, RTX 5070: -20..-35% at 512 and
+// 1,000 tokens).  A chunk of 1-3K tokens routes to nearly every expert of every layer, so with half the experts resident one pass over the rest at the link's
+// speed is its floor (RTX PRO 5000 with a 28 GB/s link and 12,437 of 24,576 experts resident: 0.97-1.04 s for any 1K-4K prompt) and the CPU share takes
+// part of that pass: prompt speed +151% at 1K, +45% at 2K (TTFT 1.07 -> 0.74 s), +99% / +32% with 8 pool workers; 4K and above unchanged, and a limit
+// of 8,192 loses 1-6% at 4K-8K.  First-token KL after a 1.1-2.8K prompt: mean 0.011, top-1 100%.  STRATA_PREFILL_CPU_SHARE_MAX=1024 restores the old limit.
+constexpr int64_t kShareLimitOld = 1024;
+constexpr int64_t kShareLimitNew = 3072;
+/// `raise`: the card class may take the new limit (a class whose A/B lost at 1-3K keeps 1,024, automatically).
+constexpr int64_t default_share_limit(bool raise = true) { return raise ? kShareLimitNew : kShareLimitOld; }
+
 /// resident_slots: the expert cache's live slots; total_pairs: layers x routed experts per layer (<= 0: unknown, arm).
 constexpr bool default_share_has_work(int64_t resident_slots, int64_t total_pairs) {
     return total_pairs <= 0 || resident_slots < total_pairs;

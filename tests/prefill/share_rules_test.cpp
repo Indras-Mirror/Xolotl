@@ -19,6 +19,12 @@ int main() {
     CHECK(default_share_has_work(100000, 0));              // total unknown: keep today's behaviour
     static_assert(!default_share_has_work(10, 10), "constexpr");
 
+    // BW-MEASURE E25: the default limit is 3,072 tokens, 1,024 for a class that keeps the old one
+    CHECK(strata::prefill::share_rules::default_share_limit() == 3072);
+    CHECK(strata::prefill::share_rules::default_share_limit(true) == strata::prefill::share_rules::kShareLimitNew);
+    CHECK(strata::prefill::share_rules::default_share_limit(false) == 1024);
+    static_assert(strata::prefill::share_rules::kShareLimitOld == 1024, "the old limit (the way back is STRATA_PREFILL_CPU_SHARE_MAX=1024)");
+
     // H11: memory verdicts
     using namespace strata::prefill::share_rules;
     const uint64_t G = 1ull << 30;
