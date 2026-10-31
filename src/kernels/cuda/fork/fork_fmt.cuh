@@ -37,5 +37,6 @@ template<> struct Fmt<143> { static constexpr int qk = 128, ipb = 4, step = 1;
 #define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(39) X(143)
 // IQ2_XXS / IQ2_XS / IQ1_M downs (16 / 17 / 29): ISTA-DASLab's GSQ-RCO DeepSeek-V4.1 GGUFs pick them for whole
 // ffn_down_exps tensors (upstream's down list has none of the three; their Fmt<> and the gate/up list already exist)
-#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(16) X(17) X(18) X(22) X(29) X(39) X(143)
+// IQ3_S downs (21): Unsloth's DeepSeek-V4.1 UD-Q2_K_XL (layers 20-29); Fmt<21> is the gate/up one
+#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(16) X(17) X(18) X(21) X(22) X(29) X(39) X(143)
 #define STRATA_MMVQ_FMTS_FORK(X) X(10) X(143)
