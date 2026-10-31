@@ -71,8 +71,8 @@ resolve_config() {
     # Model assets are not source, so the template carries placeholders. Anything not supplied on
     # the command line / env falls back to the same directory convention used on the build box,
     # and preflight reports clearly if that path does not exist.
-    [ -z "$MODEL" ] && MODEL="/media/mal/SSD NVME/qwen38-abl/Qwen3.8-Flash-Next-XQ-abl.gguf"
-    [ -z "$PACK" ]  && PACK="/media/mal/SSD NVME/qwen38-abl/pack-xq"
+    [ -z "$MODEL" ] && MODEL="/media/mal/NVME1TB/Models/xol-qfn/Qwen3.8-Flash-Next-XQ-abl.gguf"
+    [ -z "$PACK" ]  && PACK="/media/mal/NVME1TB/Models/xol-qfn/pack-xq"
     python3 - "$TEMPLATE" "$EFFECTIVE" "$REPO" "$MODEL" "$PACK" "$CTX" "$KVRES" "$PORT" "$LOG" <<'PY'
 import json, sys
 tpl, out, repo, model, pack, ctx, kvres, port, log = sys.argv[1:10]
