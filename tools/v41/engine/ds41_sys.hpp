@@ -1,7 +1,8 @@
 // tools/v41/engine/ds41_sys.hpp - the DeepSeek-V4.1 engine's file and memory calls, portable.
 //
 // Linux: thin forwards to the POSIX calls the engine always used (open/pread/pwrite/close/fstat/fsync/
-// posix_fadvise/posix_memalign/aligned_alloc/setenv, /proc/meminfo), so its behaviour there is unchanged.
+// posix_fadvise/posix_memalign/aligned_alloc/setenv, /proc/meminfo), so its behaviour there is unchanged
+// (STRATA_ZFS_ARC=1 opts in to counting the reclaimable OpenZFS ARC as available, mem_available_bytes).
 // Windows: the same contract on Win32.
 //   - Files are opened with CreateFileW + FILE_FLAG_OVERLAPPED, so positional reads from many threads run in
 //     parallel instead of serialising on one file pointer; O_DIRECT maps to FILE_FLAG_NO_BUFFERING, whose
@@ -12,6 +13,8 @@
 //   - posix_fadvise has no Win32 counterpart for an unmapped file and is a no-op.
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -165,7 +168,7 @@ inline int setenv(const char* name, const char* value, int overwrite) {
     return _putenv_s(name, value);
 }
 
-/// Physical memory the OS can hand out now (Linux: MemAvailable).
+/// Physical memory the OS can hand out now (the available physical memory).
 inline uint64_t mem_available_bytes() {
     MEMORYSTATUSEX m{};
     m.dwLength = sizeof m;
@@ -194,6 +197,41 @@ inline int posix_memalign(void** p, size_t align, size_t n) { return ::posix_mem
 inline void* aligned_alloc(size_t align, size_t n) { return std::aligned_alloc(align, n); }
 inline void aligned_free(void* p) { std::free(p); }
 inline int setenv(const char* name, const char* value, int overwrite) { return ::setenv(name, value, overwrite); }
+/// The OpenZFS ARC the kernel can take back now: its evictable buffers (the MRU / MFU / uncached lists; the ghost lists
+/// hold no data), at most down to the ARC's floor c_min.  0, with `why` set, without /proc/spl/kstat/zfs/arcstats (no
+/// ZFS module loaded, not Linux) or when its fields are not the ones OpenZFS 2.x writes.
+inline uint64_t zfs_arc_reclaimable_bytes(const char** why = nullptr) {
+    std::FILE* f = std::fopen("/proc/spl/kstat/zfs/arcstats", "r");
+    if (!f) { if (why) *why = "no /proc/spl/kstat/zfs/arcstats (ZFS module not loaded)"; return 0; }
+    char line[256], name[64];
+    unsigned type = 0;
+    unsigned long long v = 0, size = 0, c_min = 0, evictable = 0;
+    int seen = 0;
+    while (std::fgets(line, sizeof line, f)) {
+        if (std::sscanf(line, "%63s %u %llu", name, &type, &v) != 3) continue;
+        if (std::strcmp(name, "size") == 0) { size = v; seen |= 1; }
+        else if (std::strcmp(name, "c_min") == 0) { c_min = v; seen |= 2; }
+        else if (std::strstr(name, "_evictable_") && std::strstr(name, "ghost") == nullptr && std::strncmp(name, "anon_", 5) != 0) {
+            evictable += v;   // mru_ / mfu_ / uncached_ x _data / _metadata
+            seen |= 4;
+        }
+    }
+    std::fclose(f);
+    if (seen != 7) { if (why) *why = "arcstats lacks size / c_min / *_evictable_* (not an OpenZFS 2.x layout)"; return 0; }
+    if (why) *why = size <= c_min ? "the ARC is at its floor c_min" : nullptr;
+    return size <= c_min ? 0 : std::min<uint64_t>(evictable, size - c_min);
+}
+
+/// STRATA_ZFS_ARC=1 (opt-in, OpenZFS on Linux): whether mem_available_bytes() adds the reclaimable ARC.
+inline bool zfs_arc_credit_on() {
+    const char* e = std::getenv("STRATA_ZFS_ARC");
+    return e && e[0] == '1';
+}
+
+/// Physical memory the OS can hand out now: MemAvailable.  With STRATA_ZFS_ARC=1 plus the ARC's reclaimable part:
+/// MemAvailable leaves the ARC out although the kernel's shrinker takes it back under pressure, so on a ZFS box the
+/// arena check (and the chunk-prefetch budget) saw too little and the ARC had to be capped by hand (zfs_arc_max).
+/// Without the variable, or without ZFS, this is MemAvailable as before.
 inline uint64_t mem_available_bytes() {
     std::FILE* f = std::fopen("/proc/meminfo", "r");
     if (!f) return 0;
@@ -202,7 +240,23 @@ inline uint64_t mem_available_bytes() {
     while (std::fgets(line, sizeof line, f))
         if (std::sscanf(line, "MemAvailable: %llu kB", (unsigned long long*) &kb) == 1) break;
     std::fclose(f);
-    return kb * 1024;
+    const uint64_t avail = kb * 1024;
+    if (avail == 0 || !zfs_arc_credit_on()) return avail;
+    const char* why = nullptr;
+    const uint64_t arc = zfs_arc_reclaimable_bytes(&why);
+    std::fprintf(stderr, "STRATA_ZFS_ARC: MemAvailable %.1f GiB + reclaimable ZFS ARC %.1f GiB%s%s\n", avail / 1073741824.0,
+                 arc / 1073741824.0, why ? " - " : "", why ? why : "");
+    // OpenZFS 2.2 / 2.3 default zfs_arc_shrinker_limit=10000 (pages per shrinker call): the ARC then gives memory back
+    // slowly, and pinning an arena sized from it can stall in reclaim.  2.4 defaults to 0 (no limit).
+    static std::atomic<bool> warned{ false };
+    if (std::FILE* s = std::fopen("/sys/module/zfs/parameters/zfs_arc_shrinker_limit", "r")) {
+        long long lim = 0;
+        if (std::fscanf(s, "%lld", &lim) == 1 && lim > 0 && arc > 0 && !warned.exchange(true))
+            std::fprintf(stderr, "STRATA_ZFS_ARC: zfs_arc_shrinker_limit=%lld slows the ARC's shrinking; set it to 0, or cap "
+                                 "zfs_arc_max instead\n", lim);
+        std::fclose(s);
+    }
+    return avail + arc;
 }
 
 #endif
