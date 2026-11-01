@@ -318,3 +318,44 @@ and hashes without raw data, and falls back to a full restore on any mismatch.
 Its synchronous staging copies add substantial overhead; it is unsuitable for
 latency comparisons. Successful qualification requires zero mismatches, not merely
 correct output after diagnostic fallback.
+
+## Optional snapshot ownership checks
+
+`--snapshot-owner-lineage` is an opt-in native serve mode. It defaults off and
+keeps the configured context, MTP, grammar, KV and host-cache budgets. Each
+execution owner receives the same immutable setting; sleep/wake retains it.
+
+A semantic prefix identifies candidate conversations, but does not by itself
+prove that an arbitrary recurrence snapshot matches their numerical KV bytes.
+Different prefill chunk plans can produce different floating-point histories.
+In this mode:
+
+- Restore chooses an anchor only from the selected conversation's owned states.
+- Replaying from position R drops all of that child's anchors beyond R, even if
+  the replayed tokens are unchanged. Other records keep their own references.
+- Saving an anchor may deduplicate only against the current prefix's still-owned
+  anchor at the same position/hash. A foreign semantic twin requires a fresh
+  completed capture.
+- Global semantic state import and semantic ancestor coalescing are disabled.
+  Older records remain separate under the existing record/state limits and LRU
+  eviction. A checkout still inherits its actual parent's pages and state refs.
+
+The rule is about the unchanged logical range, not an entire host page: appending
+inside a partial COW page preserves anchors before the append boundary. The
+existing resident-prefix page certificates remain responsible for safe GPU-copy
+skips in native batch mode. When the single-owner path switches conversations it
+restores the selected prefix in full, because that path has no such certificate.
+
+Fresh captures or additional retained records can change copy cost and eviction
+patterns. This mode is not a demonstrated latency optimization or a promise of
+identical sampled output across arbitrary batch schedules. Qualify it using the
+same binary with the flag off/on, including changed-tail and append requests,
+shared prefixes, cancellation, memory pressure, sleep and actual numeric state
+checks with a matched prefill cut plan.
+
+`test_q36_snapshot_owner` uses the real shared Hub with deliberately different
+fake numerical payloads for identical semantic prefixes. It covers owner-only
+selection/dedup eligibility, fork/refcounts, rewind/replay, partial-page COW
+append, cancellation boundaries, writer/pin/lease lifetime and concurrent
+checkouts. These CPU tests establish metadata ownership properties; they do not
+establish model-logit equivalence or GPU latency.

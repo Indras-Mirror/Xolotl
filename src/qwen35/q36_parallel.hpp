@@ -138,6 +138,7 @@ int serve_parallel(Engine& scratch, ImageCache& images, const std::string& model
         engine.use_graph = false; engine.dynamic_attention = true;
         engine.resident_prefix_reuse=scratch.resident_prefix_reuse;
         engine.resident_prefix_verify=scratch.resident_prefix_verify;
+        engine.snapshot_owner_lineage=scratch.snapshot_owner_lineage;
         engine.shared_prefill=scratch.shared_prefill;
         engine.cache_hub=host_hub;
         engine.init(*scratch.m, scratch.ctx, prefill_chunk);
@@ -312,6 +313,7 @@ int serve_parallel(Engine& scratch, ImageCache& images, const std::string& model
     output("INFO grammar=1\n");
 #endif
     output("INFO engine=q36 img_refs=1 n_embd=" + std::to_string(scratch.m->g.n_embd) +
+           (scratch.snapshot_owner_lineage ? " snapshot_owner_lineage=1" : "") +
            " slot_cache=" + std::to_string(park_bytes>0 && snapshots>0 ? 1 : 0) +
            " host_cache_shared=1 snapshots=" + std::to_string(host_hub->snaps.size()) +
            " host_park_mib=" + std::to_string((host_hub->n_pages*host_hub->page_bytes)>>20) +

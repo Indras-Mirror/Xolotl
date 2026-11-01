@@ -39,6 +39,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include "q36_cache_hub.hpp"
+#include "q36_snapshot_owner.hpp"
 #include "q36_resident_prefix.hpp"
 #include "q36_resident_verify.hpp"
 #ifndef __HIP_PLATFORM_AMD__
@@ -1255,6 +1256,7 @@ struct Q36SharedPrefill {
 };
 struct Engine {
     bool resident_prefix_reuse=false, resident_prefix_verify=false;
+    bool snapshot_owner_lineage=false;
     strata::q36::resident::Prefix resident_prefix;
     int64_t resident_teacher_end=0, resident_ram_equal_end=0;
     std::vector<strata::q36::resident::PageStamp> resident_ram_stamps;
@@ -2255,6 +2257,7 @@ struct Engine {
     const Snap* pinned_snap = nullptr;
     std::function<bool()> evict_snapshot_owner;   // evicts one whole LRU parked prefix (KV and state refs)
     std::function<void(Snap&)> snapshot_saved;    // bounded ownership of the current prefix's useful anchors
+    std::function<Snap*(int64_t,uint64_t)> owned_snapshot; // current numeric prefix only, when opt-in ownership is enabled
     int max_snaps = 128;
     uint64_t snap_clock = 0;
     long long snaps_saved = 0, snaps_restored = 0;
@@ -2334,7 +2337,12 @@ struct Engine {
             Snap* victim=nullptr;
             {
                 auto lock=host_lock();
-                for(Snap& sn:snapshot_pool())
+                if (snapshot_owner_lineage && owned_snapshot) {
+                    if (Snap* sn = owned_snapshot(pos,hash)) {
+                        touch_snap(*sn,prio); if(snapshot_saved) snapshot_saved(*sn); return;
+                    }
+                }
+                if (!snapshot_owner_lineage) for(Snap& sn:snapshot_pool())
                     if(!sn.writing && sn.pos==pos && sn.hash==hash) {
                         touch_snap(sn,prio); if(snapshot_saved) snapshot_saved(sn); return;
                     }
@@ -2359,7 +2367,12 @@ struct Engine {
             return;
         }
         if (max_snaps <= 0) return;
-        for (Snap& sn : snapshot_pool())
+        if (snapshot_owner_lineage && owned_snapshot) {
+            if (Snap* sn = owned_snapshot(pos,hash)) {
+                touch_snap(*sn,prio); if(snapshot_saved) snapshot_saved(*sn); return;
+            }
+        }
+        if (!snapshot_owner_lineage) for (Snap& sn : snapshot_pool())
             if (sn.pos == pos && sn.hash == hash) {
                 touch_snap(sn, prio);
                 if (snapshot_saved) snapshot_saved(sn);
@@ -3251,6 +3264,7 @@ void q36_flush() { if (!q36_channel) std::fflush(stdout); }
 // `snap_every` cells near its end.
 int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, const std::string& model_path) {
     Q36Vocabulary vocabulary(model_path);
+    if (E.snapshot_owner_lineage) q36_printf("INFO snapshot_owner_lineage=1\n");
 #ifdef STRATA_Q36_GRAMMAR
     q36_printf("INFO grammar=1\n");
 #endif
@@ -3308,6 +3322,11 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         if(E.cache_hub) { E.cache_hub->release_states(states); return; }
         for (Engine::Snap* sn : states) { assert(sn->refs > 0); --sn->refs; }
         states.clear();
+    };
+    auto prune_owned = [&](int64_t retained, const std::vector<uint64_t>& hashes) {
+        auto lock=E.host_lock();
+        auto removed=strata::q36::snapshot_owner::prune(act_states,retained,hashes);
+        release_states(removed);
     };
     // At most twelve anchors per retained prefix: explicit points, recently reused
     // divergence/end states, then the newest automatic grid/message states. Without
@@ -3396,11 +3415,14 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
     };
     E.evict_snapshot_owner = drop_lru_parked;
     E.snapshot_saved = [&](Engine::Snap& sn) { retain_state(act_states, sn); };
+    if (E.snapshot_owner_lineage) E.owned_snapshot = [&](int64_t pos,uint64_t hash) {
+        return strata::q36::snapshot_owner::at(act_states,pos,hash);
+    };
     struct SnapshotCallbacks {
         Engine& e;
         std::function<void()> release;
         ~SnapshotCallbacks() {
-            e.evict_snapshot_owner = {}; e.snapshot_saved = {};
+            e.evict_snapshot_owner = {}; e.snapshot_saved = {}; e.owned_snapshot = {};
             release();
         }
     } snapshot_callbacks{E, [&] {
@@ -3602,7 +3624,9 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         // A longer retained prefix contains every KV cell of its exact ancestors.
         // Transfer their useful anchors, then drop those redundant records. Divergent
         // branches remain separate, even when they share the same explicit breakpoint.
-        for (size_t i = 0; i < parked.size();) {
+        // Semantic ancestry is not numerical ancestry after a replay. With ownership enabled,
+        // retain separate records rather than importing another record's unproven anchors.
+        if (!E.snapshot_owner_lineage) for (size_t i = 0; i < parked.size();) {
             Conv& old = parked[i];
             if ((!E.cache_hub || old.leases==0) && old.val.size() <= c.val.size() && std::equal(old.val.begin(), old.val.end(), c.val.begin())) {
                 for (Engine::Snap* sn : old.states) retain_state(c.states, *sn);
@@ -3854,7 +3878,8 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             while (k < len && k < (size_t) n && v[k] == cell[k]) ++k;
             return k;
         };
-        auto best_snap = [&](int64_t limit) {
+        auto best_snap = [&](int64_t limit,const std::vector<Engine::Snap*>& owned) {
+            if (E.snapshot_owner_lineage) return strata::q36::snapshot_owner::best(owned,limit,ph);
             Engine::Snap* f = nullptr;
             for (Engine::Snap& sn : E.snapshot_pool())
                 if (!sn.writing && sn.pos > 0 && sn.pos <= limit && sn.pos < n && sn.hash == ph[(size_t) sn.pos] &&
@@ -3874,7 +3899,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         if (L == live_v.size() && L < (size_t) n && L == (size_t) E.pos) {
             reuse = (int64_t) L;         // the request extends the held state
         } else {
-            from = best_snap((int64_t) L);
+            from = best_snap((int64_t) L,act_states);
             reuse = from ? from->pos : 0;
         }
         for (size_t i = 0; i < parked.size(); ++i) {
@@ -3886,7 +3911,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                 max_lcp_held = std::max(max_lcp_held, parked[i].val.size());
             }
             if ((int64_t) Lc <= reuse) continue;
-            Engine::Snap* f = best_snap((int64_t) Lc);
+            Engine::Snap* f = best_snap((int64_t) Lc,parked[i].states);
             if (f && f->pos > reuse) {
                 src = (int) i;
                 from = f;
@@ -3944,6 +3969,10 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                 active_record=std::move(checkout.lease);
                 act_states=std::move(copy.states); live=std::move(copy.tok); live_v=std::move(copy.val);
                 act_pages=std::move(copy.pages); act_mirrored=copy.mirrored;
+                if (E.snapshot_owner_lineage) {
+                    if (std::find(act_states.begin(),act_states.end(),from)==act_states.end()) std::abort();
+                    prune_owned(reuse,ph);
+                }
                 brought=reuse; ++switches; cells_brought+=brought;
             } else if(from || reuse) std::abort();
             selection_lock.unlock();
@@ -3997,7 +4026,9 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             live_v = std::move(c.val);
             act_pages = std::move(c.pages);
             act_mirrored = c.mirrored;
-            const int64_t lo = std::min<int64_t>((int64_t) same, reuse);
+            // Token equality does not prove equality of an older numerical PP trajectory.
+            // The shared-Hub path has PR80 page certificates; this local path has none.
+            const int64_t lo = E.snapshot_owner_lineage ? 0 : std::min<int64_t>((int64_t) same, reuse);
             if (reuse > lo) E.kv_copy(act_pages, lo, reuse, false);
             brought = reuse - lo;
             ++switches;
@@ -4009,6 +4040,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         } else {
             trace_phase(false);
         }
+        if (E.snapshot_owner_lineage) prune_owned(reuse,ph);
         if (reuse == 0) {
             E.reset();
         } else if (from != nullptr) {
@@ -4027,13 +4059,13 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         auto metadata_lock=E.host_lock();
         for (auto it = act_states.begin(); it != act_states.end();) {
             Engine::Snap* sn = *it;
-            if (sn->pos <= 0 || sn->pos > n || sn->hash != ph[(size_t) sn->pos]) {
+            if (sn->pos <= 0 || sn->pos > (E.snapshot_owner_lineage ? reuse : n) || sn->hash != ph[(size_t) sn->pos]) {
                 assert(sn->refs > 0); --sn->refs; it = act_states.erase(it);
             } else ++it;
         }
         // Admit useful states already in the shared pool (including a newly marked
         // held prefix), not only states created during this particular request.
-        for (Engine::Snap& sn : E.snapshot_pool())
+        if (!E.snapshot_owner_lineage) for (Engine::Snap& sn : E.snapshot_pool())
             if (!sn.writing && sn.pos > 0 && sn.pos <= n && sn.hash == ph[(size_t) sn.pos]) retain_state(act_states, sn);
         }
         if (E.m->has_mrope)
@@ -4351,6 +4383,7 @@ int strata::qwen35::run(int argc, char** argv) {
     int expert_slots = 0;
     int snapshots = 0, snap_every = 512, image_cache_mib = 2048, park_mib = 0;
     bool serve_mode = false, graph = true, resident_prefix_reuse = false, resident_prefix_verify = false;
+    bool snapshot_owner_lineage = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -4368,6 +4401,7 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--batch") batch = std::atoi(next().c_str());
         else if (a == "--batch-kv-mib") batch_kv_mib = std::atoi(next().c_str());
         else if (a == "--resident-prefix-reuse") resident_prefix_reuse = true;
+        else if (a == "--snapshot-owner-lineage") snapshot_owner_lineage = true;
         else if (a == "--resident-prefix-verify") resident_prefix_verify = true;
         else if (a == "--batch-prefill-chunk") batch_prefill_chunk = std::atoi(next().c_str());
         else if (a == "--max-context" || a == "--ctx") ctx = std::atoi(next().c_str());
@@ -4469,6 +4503,7 @@ int strata::qwen35::run(int argc, char** argv) {
     E.batch_coordinator=batch>1;
     E.resident_prefix_reuse=resident_prefix_reuse;
     E.resident_prefix_verify=resident_prefix_verify;
+    E.snapshot_owner_lineage=snapshot_owner_lineage;
     if(batch>1) E.shared_prefill=std::make_shared<Q36SharedPrefill>();
 #ifndef __HIP_PLATFORM_AMD__
     E.kv_budget = batch_budget.get(); E.kv_driver = batch_driver.get();
