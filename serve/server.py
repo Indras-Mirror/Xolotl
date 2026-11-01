@@ -1507,6 +1507,14 @@ class StrataEngine:
                     self.proc.stdin.flush()
             except (OSError, AttributeError):
                 pass
+            return
+        # Wake only ownerless slot admission waiters. Release wlock before
+        # acquiring slot_cv; active and stale native owners returned above.
+        cv = getattr(self, "slot_cv", None)
+        if cv is not None and cancel.is_set():
+            with cv:
+                if cancel in getattr(self, "_slot_admission_waiters", ()):
+                    cv.notify_all()
 
     def _send_owned_batch(self, text, cancel, slot, born):
         """Publish a pinned slot owner and its BGEN atomically against watcher BSTOP.
@@ -2278,9 +2286,17 @@ class StrataEngine:
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
-                                if self.pick_slot(prompt) is None:
-                                    wait_remaining = deadline - time.monotonic() if deadline is not None else 1.0
-                                    self.slot_cv.wait(timeout=min(1.0, max(0, wait_remaining)))
+                                if self.pick_slot(prompt) is None and not cancel.is_set():
+                                    # Membership and the cancel predicate share the condition lock.
+                                    # A watcher cannot notify between publication and wait's
+                                    # atomic release, so cancellation cannot lose its wakeup.
+                                    waiters = self.__dict__.setdefault("_slot_admission_waiters", set())
+                                    waiters.add(cancel)
+                                    try:
+                                        wait_remaining = deadline - time.monotonic() if deadline is not None else 1.0
+                                        self.slot_cv.wait(timeout=min(1.0, max(0, wait_remaining)))
+                                    finally:
+                                        waiters.discard(cancel)
                             if cancel.is_set():
                                 return
                             if not holding:
