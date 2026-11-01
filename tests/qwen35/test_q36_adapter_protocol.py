@@ -153,6 +153,17 @@ class Adapter(unittest.TestCase):
     def test_physical_preflight_refuses_ready(self):
         p=subprocess.run([str(MOCK_BINARY)],input='',text=True,capture_output=True,timeout=3,env={**os.environ,'MOCK_LOW_VRAM':'1'})
         self.assertNotEqual(p.returncode,0);self.assertNotIn('READY ',p.stdout)
+class SnapshotOwnerOption(unittest.TestCase):
+    def test_all_workers_inherit_opt_in(self):
+        s=Session({'MOCK_SNAPSHOT_OWNER':'1'});self.addCleanup(s.close)
+        self.assertTrue(any('snapshot_owner_lineage=1' in line for line in s.lines))
+        for slot in range(4):
+            s.send(f'BGEN {slot} 1 1')
+            s.until(lambda line:line.startswith(f'BDONE {slot} '))
+    def test_default_stays_disabled(self):
+        s=Session();self.addCleanup(s.close)
+        self.assertTrue(all('snapshot_owner_lineage' not in line for line in s.lines))
+
 class ResidentCheckpoint(unittest.TestCase):
     def test_opt_in_idle_pause_resume_and_busy_refusal(self):
         s=Session({'MOCK_RESIDENT_PREFIX':'1'});self.addCleanup(s.close)
