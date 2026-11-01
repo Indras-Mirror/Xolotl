@@ -48,6 +48,7 @@ int main() {
     check(original == expected && deep == original && assigned == original, "default copy values");
     check(address(deep) != address(original) && address(assigned) != address(original), "ordinary copies are deep by default");
     check(!original.published() && !deep.published() && !assigned.published(), "ordinary deep copies remain private");
+    check(!original.shared() && !SharedBytes{}.shared(), "diagnostic reports private and empty storage as unshared");
     auto alias = original.share();
     check(address(alias) == address(original) && alias.shared() && original.shared(), "only explicit share aliases payload");
     check(original.published() && alias.published(), "sharing permanently marks the block before publication");

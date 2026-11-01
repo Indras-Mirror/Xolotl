@@ -64,7 +64,7 @@ public:
         return SharedBytes(storage_);
     }
     // Diagnostic only; no mutation decision may depend on a relaxed refcount.
-    bool shared() const noexcept { return storage_ && !storage_.unique(); }
+    bool shared() const noexcept { return storage_ && storage_.use_count() > 1; }
     bool published() const noexcept { return storage_ && storage_->published.load(std::memory_order_acquire); }
     void swap(SharedBytes& other) noexcept { storage_.swap(other.storage_); }
     size_t size() const noexcept { return storage_ ? storage_->size() : 0; }
