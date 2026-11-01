@@ -175,6 +175,11 @@ inline uint64_t mem_available_bytes() {
     return GlobalMemoryStatusEx(&m) ? (uint64_t) m.ullAvailPhys : 0;
 }
 
+/// STRATA_ZFS_ARC=1 credits the reclaimable OpenZFS ARC on Linux only (there it reads /proc/spl/kstat/zfs/arcstats).
+/// Windows has no ZFS module to ask, so the credit is always off - the same answer the POSIX side gives when the
+/// module is not loaded.  The arena refusal in ds41_moe.cpp names this call on both platforms (#94).
+inline bool zfs_arc_credit_on() { return false; }
+
 #else  // POSIX: the calls the engine always made
 
 inline int open(const char* path, int flags, int mode = 0) { return ::open(path, flags, mode); }
