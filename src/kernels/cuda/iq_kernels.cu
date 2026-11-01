@@ -1239,6 +1239,7 @@ template<> struct Split<23> {   // IQ4_XS
         return d * sumi;
     }
 };
+#include "fork/fork_split.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 template<> inline constexpr bool kSplit<42> = true;
 template<> struct Split<42> {   // Q2_0
     struct W { int qx[4], qy[4]; float d2; };
@@ -3305,6 +3306,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 11: dq_q3_k(vx, ibs, y, tid); break;
         case 10: dq_q2_k(vx, ibs, y, tid); break;
         case 143: dq_ptq1_0(vx, ibs, y, tid); break;   // fork: PTQ1_0 ternary
+        case 19: dq_iq1_s(vx, ibs, y, tid); break;     // fork: IQ1_S (Unsloth's DeepSeek-V4.1 experts)
         case 42: dq_q2_0(vx, ibs, y, tid); break;
         case 12: dq_q4_k(vx, ibs, y, tid); break;
         case 13: dq_q5_k(vx, ibs, y, tid); break;
@@ -3362,7 +3364,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
-    if (t == 10 || t == 39 || t == 143) return true;   // fork: Q2_K, MXFP4, PTQ1_0 (11 = Q3_K is upstream's)
+    if (t == 10 || t == 39 || t == 143 || t == 19) return true;   // fork: Q2_K, MXFP4, PTQ1_0, IQ1_S (11 = Q3_K is upstream's)
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
 #ifdef STRATA_Q6K_EXPERTS
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40 || t == 144 || t == 145 || t == 146 || t == 147 || t == 148 || t == 149;
@@ -5330,6 +5332,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 10: return (size_t) (n / 256) * sizeof(block_q2_K);
         case 143: return (size_t) (n / QK_PTQ1_0) * sizeof(strata_block_ptq1_0);   // fork: PTQ1_0
+        case 19: return (size_t) (n / 256) * sizeof(block_iq1_s);                 // fork: IQ1_S
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);

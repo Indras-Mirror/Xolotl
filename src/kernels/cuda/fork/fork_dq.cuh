@@ -63,3 +63,21 @@ __device__ void dq_ptq1_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         y[i] = cvt<dst_t>(d * (float) (digit - 1));
     }
 }
+
+// IQ1_S (Unsloth's Dynamic V3.1 DeepSeek-V4.1 experts): ggml's dequantize_iq1_s - thread tid writes 8 values of
+// 32-value sub-block tid % 8; qh[ib] holds the sub-block's 3 grid-index bits per 8-group, its scale (bits 12-14)
+// and the delta sign (bit 15).
+template<typename dst_t>
+__device__ void dq_iq1_s(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_iq1_s* x = (const block_iq1_s*) vx;
+    const int64_t il = tid / 8, ib = tid % 8;
+    dst_t* y = yy + 32 * ib + 8 * il;
+    const float delta = x[ibs].qh[ib] & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+    const float d = (float) x[ibs].d * (2 * ((x[ibs].qh[ib] >> 12) & 7) + 1);
+    uint32_t grid32[2];
+    const int8_t* q = (const int8_t*) grid32;
+    grid32[0] = iq1s_grid_gpu[x[ibs].qs[4 * ib + il] | (((x[ibs].qh[ib] >> 3 * il) & 7) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * (q[j] + delta));
+}

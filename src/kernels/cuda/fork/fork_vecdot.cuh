@@ -236,3 +236,29 @@ __device__ __forceinline__ float vec_dot_ptq1_0_q8_1_quarter(const void* __restr
     for (int k = 0; k < 4; ++k) acc += __low2float(bq8_1[k].ds) * (float) (sumi[k] - sumu[k]);
     return __half2float(bq->d) * acc;
 }
+
+// IQ1_S (Unsloth's Dynamic V3.1 DeepSeek-V4.1 GGUFs: UD-IQ1_M / UD-IQ2_XXS keep whole ffn_gate/up_exps, and some
+// ffn_down_exps, in IQ1_S): llama.cpp's vec_dot_iq1_s_q8_1 (vecdotq.cuh), VDR_IQ1_S_Q8_1_MMVQ = 1, one 32-value
+// sub-block (iqs 0..7) per call.
+__device__ __forceinline__ float vec_dot_iq1_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_iq1_s* bq1 = (const block_iq1_s*) vbq + kbx;
+    const int qs_packed = get_int_b2(bq1->qs, iqs);
+    const uint8_t* qs = (const uint8_t*) &qs_packed;
+    const int qh = bq1->qh[iqs];
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int grid = iq1s_grid_gpu[qs[l0 / 2] | (((qh >> 3 * (l0 / 2)) & 0x07) << 8)];
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+        const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+    }
+    const float d1q = __half2float(bq1->d) * (((qh >> 11) & 0x0E) + 1);
+    const float delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f * IQ1S_DELTA / 0x8000);
+    const float2 ds = __half22float2(bq8_1[iqs].ds);
+    return d1q * (ds.x * sumi + ds.y * delta);
+}

@@ -16,8 +16,10 @@
 #define STRATA_D_FMTS(X) X(20) X(21) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(144) X(146) X(147) X(148) X(149)
 #endif
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
-#define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(39) X(143)
-#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(16) X(17) X(18) X(22) X(29) X(39) X(143)
+// IQ1_S (19) gate/up and down: Unsloth's Dynamic V3.1 DeepSeek-V4.1 GGUFs (UD-IQ1_M: IQ1_S gate/up on 20 of 40 layers,
+// IQ1_S down on 5; UD-IQ2_XXS: IQ1_S gate/up on 10) - Fmt<19> / Split<19> in src/kernels/cuda/fork/
+#define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(19) X(39) X(143)
+#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(16) X(17) X(18) X(19) X(22) X(29) X(39) X(143)
 #define STRATA_MMVQ_FMTS_FORK(X) X(10) X(143)
 
 namespace strata::kernels::registry {
@@ -29,7 +31,7 @@ constexpr int block_size(int type) noexcept {
         case 143: return 128;
         case 144: case 145: case 146: case 147: case 148: case 149: return 128;   // APR / Gyro-L trellis (upstream)
         case 10: case 11: case 12: case 13: case 14: case 16: case 17:
-        case 18: case 21: case 22: case 23: case 29: return 256;
+        case 18: case 19: case 21: case 22: case 23: case 29: return 256;
         default: return 0;
     }
 }
