@@ -108,7 +108,7 @@ bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
     size_t ids = 0, images = 0;
     if (!product(ids, {c.ids.size(), sizeof(int32_t)}) ||
         !product(images, {c.imgs.size(), sizeof(ConversationImageKey)})) return false;
-    for (size_t n : {ids, images, c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(), c.block_pos.size()})
+    for (size_t n : {ids, images, c.gdn.bytes(), c.ple.bytes(), c.tails.bytes(), c.dead.bytes(), c.block_pos.bytes()})
         if (!add(total, n)) return false;
     return true;
 }
@@ -219,6 +219,9 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
         !product(positions, {qsa, z.block_pos})) return fail(error, "snapshot metadata byte count overflow");
     for (size_t n : {ids, images, checkpoints, layers, tails, dead, positions, z.gdn, ss.ple_hist ? z.ple : 0})
         if (!add(bytes, n)) return fail(error, "snapshot byte count overflow");
+    const size_t headers = (z.gdn != 0) + (ss.ple_hist && z.ple != 0) +
+                           (tails != 0) + (dead != 0) + (positions != 0);
+    if (!add(bytes, headers * SharedBytes::allocation_overhead)) return fail(error, "snapshot header byte count overflow");
     for (const auto& c : view.checkpoints)
         if (!metadata_bytes(c, bytes)) return fail(error, "checkpoint byte count overflow");
     const int64_t upto = (int64_t) view.ids.size(); // view_validate bounds this by signed max_cells
@@ -260,7 +263,8 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse, size_t* reused_bytes,
                                 std::vector<ConversationCheckpoint>* /*storage: STRATA_CKPT_POOL, CUDA only*/,
-                                std::vector<ConversationCheckpoint>* /*moved: STRATA_PARK_ASYNC, CUDA only*/) {
+                                std::vector<ConversationCheckpoint>* /*moved: STRATA_PARK_ASYNC, CUDA only*/,
+                                ConversationCaptureOptions /*options: CUDA only*/) {
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
     // Build into a new object so a failure cannot publish a partial snapshot.

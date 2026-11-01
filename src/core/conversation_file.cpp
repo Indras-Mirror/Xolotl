@@ -644,6 +644,7 @@ struct Out {
     void u64(uint64_t v) { raw(&v, 8); }
     void i64(int64_t v) { raw(&v, 8); }
     template<class T> void vec(const std::vector<T>& v) { u64(v.size()); raw(v.data(), v.size() * sizeof(T)); }
+    void vec(const SharedBytes& v) { u64(v.size()); raw(v.data(), v.size()); }
     void buffer(const ConversationBuffer& b) {
         u64(b.size());
         b.visit(0, b.size(), [&](const uint8_t* p, size_t c, size_t) { raw(p, c); return ok; });
@@ -740,6 +741,12 @@ struct In {
         if (!count(n, sizeof(T), limit)) return false;
         v.resize((size_t) n);
         return raw(v.data(), (size_t) n * sizeof(T));
+    }
+    bool vec(SharedBytes& v, uint64_t limit = UINT64_MAX) {
+        uint64_t n = 0;
+        if (!count(n, 1, limit)) return false;
+        v.resize((size_t) n);
+        return raw(v.data(), (size_t) n);
     }
     bool buffer(ConversationBuffer& b, size_t part) {
         uint64_t n = 0;

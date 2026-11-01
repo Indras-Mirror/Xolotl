@@ -178,20 +178,33 @@ inline std::vector<T> copy_beating(const std::vector<T>& src) {
     return out;
 }
 
-inline ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoint& c) {
+inline SharedBytes copy_beating(const SharedBytes& src) {
+    SharedBytes out;
+    out.reserve(src.size());
+    const size_t step = (size_t) 1 << 20;
+    for (size_t at = 0; at < src.size(); at += step) {
+        out.insert(out.end(), src.begin() + (std::ptrdiff_t) at,
+                   src.begin() + (std::ptrdiff_t) std::min(src.size(), at + step));
+        if (const long us = test_slow_copy_us(); us > 0) std::this_thread::sleep_for(std::chrono::microseconds(us));
+        core::progress_beat();
+    }
+    return out;
+}
+
+inline ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoint& c, bool share_state = false) {
     ConversationCheckpoint o;
     o.ids = copy_beating(c.ids);
     o.imgs = copy_beating(c.imgs);
-    o.gdn = copy_beating(c.gdn);
+    o.gdn = share_state ? c.gdn.share() : copy_beating(c.gdn);
     o.dev_tag = c.dev_tag;   // the same bytes
-    o.ple = copy_beating(c.ple);
-    o.tails = copy_beating(c.tails);
-    o.dead = copy_beating(c.dead);
-    o.block_pos = copy_beating(c.block_pos);
+    o.ple = share_state ? c.ple.share() : copy_beating(c.ple);
+    o.tails = share_state ? c.tails.share() : copy_beating(c.tails);
+    o.dead = share_state ? c.dead.share() : copy_beating(c.dead);
+    o.block_pos = share_state ? c.block_pos.share() : copy_beating(c.block_pos);
     o.used = c.used;
     o.pinned = c.pinned;
     o.stage_parts.reserve(c.stage_parts.size());
-    for (const auto& part : c.stage_parts) o.stage_parts.push_back(copy_checkpoint_beating(part));
+    for (const auto& part : c.stage_parts) o.stage_parts.push_back(copy_checkpoint_beating(part, share_state));
     return o;
 }
 
@@ -227,17 +240,18 @@ inline void copy_checkpoint_into(ConversationCheckpoint& o, const ConversationCh
 
 /// `storage` (optional): dropped checkpoints whose vectors the copies go into, taken from its back while it lasts
 inline std::vector<ConversationCheckpoint> copy_checkpoints_beating(const std::vector<ConversationCheckpoint>& cs,
-                                                                    std::vector<ConversationCheckpoint>* storage = nullptr) {
+                                                                    std::vector<ConversationCheckpoint>* storage = nullptr,
+                                                                    bool share_state = false) {
     for (const auto& c : cs) core::conversation_checkpoint_join(c.gdn.data());
     std::vector<ConversationCheckpoint> out;
     out.reserve(cs.size());
     for (const auto& c : cs) {
-        if (storage != nullptr && !storage->empty()) {
+        if (!share_state && storage != nullptr && !storage->empty()) {
             out.push_back(std::move(storage->back()));
             storage->pop_back();
             copy_checkpoint_into(out.back(), c);
         } else {
-            out.push_back(copy_checkpoint_beating(c));
+            out.push_back(copy_checkpoint_beating(c, share_state));
         }
     }
     return out;

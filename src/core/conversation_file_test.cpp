@@ -219,6 +219,31 @@ int main() {
     }
 
     const std::vector<char> image = slurp(good);
+    {
+        SavedConversation shared = original;
+        for (size_t i = 0; i < shared.checkpoints.size(); ++i) {
+            auto& dst = shared.checkpoints[i];
+            const auto& src = original.checkpoints[i];
+            dst.gdn = src.gdn.share(); dst.ple = src.ple.share(); dst.tails = src.tails.share();
+            dst.dead = src.dead.share(); dst.block_pos = src.block_pos.share();
+        }
+        check(std::as_const(shared.checkpoints[0]).gdn.data() == original.checkpoints[0].gdn.data(),
+              "file fixture actually holds shared checkpoint state");
+        const fs::path shared_path = dir / "shared-checkpoints.bin";
+        check(session_file_write(shared_path.string(), shared, id, written, error), "write shared checkpoint payloads");
+        check(slurp(shared_path) == image, "shared payloads preserve the frozen session format byte for byte");
+        SavedConversation back;
+        size_t read = 0;
+        check(session_file_read(shared_path.string(), id, back, read, error) && same(original, back),
+              "shared checkpoint disk round trip is identical");
+        check(std::as_const(back.checkpoints[0]).gdn.data() != original.checkpoints[0].gdn.data(),
+              "parsed checkpoint bytes own independent storage");
+        const auto value = original.checkpoints[0].gdn[0];
+        shared.checkpoints[0].gdn[0] ^= 1;
+        check(original.checkpoints[0].gdn[0] == value && back.checkpoints[0].gdn[0] == value,
+              "mutating an alias after writing cannot change older readers or the parsed session");
+    }
+
     // truncation at every structural boundary and in the middle
     for (size_t cut : {size_t(0), size_t(7), size_t(63), size_t(64), size_t(65), size_t(200), image.size() / 2,
                        image.size() - 17, image.size() - 16, image.size() - 8, image.size() - 1}) {
