@@ -48,6 +48,30 @@ if(TARGET ggml-cpu)
         endif()
         target_compile_definitions(ds41_dense PRIVATE STRATA_DSV41_HC_MIX)
     endif()
+    # opt-in: the flat-bias router of one model.py Gate (sqrt(softplus), the bias select and adds; the weights' gather,
+    # sum, division and scale) as two ggml ops (GGML_OP_DSV41_ROUTE_SCORES / _WEIGHTS); top-k stays the stock argsort.
+    # Needs a ggml tree with tools/xolotl/ggml/xolotl-ggml.patch (tools/xolotl/fetch-llama.sh).  Bit-identical
+    # (test_ds41_route).
+    option(STRATA_DSV41_ROUTE_OP "DeepSeek-V4.1: fused router ops (needs tools/xolotl/ggml/xolotl-ggml.patch)" OFF)
+    if(STRATA_DSV41_ROUTE_OP)
+        file(READ ${_v41_ggml_src}/../include/ggml.h _v41_ggml_h_route)
+        if(NOT _v41_ggml_h_route MATCHES "GGML_OP_DSV41_ROUTE_SCORES")
+            message(FATAL_ERROR "STRATA_DSV41_ROUTE_OP: ${_v41_ggml_src}/.. has no GGML_OP_DSV41_ROUTE_SCORES - "
+                                "run tools/xolotl/fetch-llama.sh (xolotl-ggml.patch)")
+        endif()
+        target_compile_definitions(ds41_dense PRIVATE STRATA_DSV41_ROUTE_OP)
+    endif()
+    # opt-in: a layer graph's state writes (ggml_cpy's) batched, up to 5 per launch (GGML_OP_DSV41_COPIES).  Needs the
+    # ggml tree with tools/xolotl/ggml/xolotl-ggml.patch (tools/xolotl/fetch-llama.sh).  Byte copies.
+    option(STRATA_DSV41_COPIES_OP "DeepSeek-V4.1: batched state copies (needs tools/xolotl/ggml/xolotl-ggml.patch)" OFF)
+    if(STRATA_DSV41_COPIES_OP)
+        file(READ ${_v41_ggml_src}/../include/ggml.h _v41_ggml_h_cp)
+        if(NOT _v41_ggml_h_cp MATCHES "GGML_OP_DSV41_COPIES")
+            message(FATAL_ERROR "STRATA_DSV41_COPIES_OP: ${_v41_ggml_src}/.. has no GGML_OP_DSV41_COPIES - "
+                                "run tools/xolotl/fetch-llama.sh (xolotl-ggml.patch)")
+        endif()
+        target_compile_definitions(ds41_dense PRIVATE STRATA_DSV41_COPIES_OP)
+    endif()
 endif()
 if(TARGET ds41_dense AND TARGET strata_kernels_cpu)
     add_executable(test_ds41_dense ${_v41_dir}/test_ds41_dense.cpp)
@@ -67,6 +91,14 @@ if(TARGET ds41_dense)
     if(STRATA_DSV41_HC_MIX)
         add_executable(test_ds41_hcmix ${_v41_dir}/test_ds41_hcmix.cpp)
         target_link_libraries(test_ds41_hcmix PRIVATE ds41_dense)
+    endif()
+    if(STRATA_DSV41_ROUTE_OP)
+        add_executable(test_ds41_route ${_v41_dir}/test_ds41_route.cpp)
+        target_link_libraries(test_ds41_route PRIVATE ds41_dense)
+    endif()
+    if(STRATA_DSV41_COPIES_OP)
+        add_executable(test_ds41_copies ${_v41_dir}/test_ds41_copies.cpp)
+        target_link_libraries(test_ds41_copies PRIVATE ds41_dense)
     endif()
 endif()
 # the Engram row-read bench (CPU + disk only): it compiles the module straight in, so it builds without ggml or CUDA.

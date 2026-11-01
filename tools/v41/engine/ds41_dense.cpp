@@ -1281,18 +1281,40 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // ---- router (model.py Gate): sqrt(softplus), top-k on score + bias, weights from the raw scores
     ggml_tensor * rl = ggml_mul_mat(gc, im.BL(il, "ffn_gate_inp.weight"), fn);
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
-    ggml_tensor * sc = ggml_sqrt(gc, ggml_softplus(gc, rl));                                  // [NE, n]
+    static const float rb_margin = std::getenv("STRATA_RB_MARGIN") ? (float) std::atof(std::getenv("STRATA_RB_MARGIN")) : -1.0f;
+#if defined(STRATA_DSV41_ROUTE_OP)
+    // -DSTRATA_DSV41_ROUTE_OP=ON (the ops are in tools/xolotl/ggml/xolotl-ggml.patch): the flat-bias router
+    // below as two ops (GGML_OP_DSV41_ROUTE_SCORES / _WEIGHTS), the same steps bit for bit (test_ds41_route) - 12 fewer
+    // tiny kernels per layer with --vision, 8 without.  The smart / margin selections keep the composite.
+    // STRATA_ROUTE_COMPOSITE=1: the composite.
+    static const bool route_composite = std::getenv("STRATA_ROUTE_COMPOSITE") != nullptr;
+    const bool route_op = !route_composite && !smart_router() && rb_margin < 0.0f;
+#else
+    const bool route_op = false;
+#endif
+    ggml_tensor * sc = nullptr, * route_sel = nullptr;
+#if defined(STRATA_DSV41_ROUTE_OP)
+    if (route_op) {
+        const bool vl = im.vision && im.i_img;
+        ggml_tensor * rs = ggml_dsv41_route_scores(gc, rl, im.BL(il, "exp_probs_b.bias"),
+                                                   vl ? im.BL(il, "exp_probs_b_vl.bias") : nullptr,
+                                                   vl ? b.v1(im.i_img, n, (size_t) col0 * 4) : nullptr, im.ly[(size_t) il].rbias);
+        sc = ggml_view_2d(gc, rs, im.NE, n, rs->nb[1], 0);                                     // [NE, n]
+        route_sel = ggml_view_2d(gc, rs, im.NE, n, rs->nb[1], rs->nb[2]);
+    }
+#endif
+    if (!route_op) sc = ggml_sqrt(gc, ggml_softplus(gc, rl));                                 // [NE, n]
     // selection = score + exp_probs_b + the selection-only rbias (soft prune / cache bonus); the weights below come
     // from the unbiased scores, as model.py's Gate - all-zero rbias (the default) = the model's routing bit for bit
     // vision: image positions select with exp_probs_b_vl.bias instead (model.py Gate: torch.where(image_mask, bias_vl, bias))
     ggml_tensor * bias_sel = im.BL(il, "exp_probs_b.bias");
-    if (im.vision && im.i_img) {
+    if (!route_op && im.vision && im.i_img) {
         ggml_tensor * bt = ggml_reshape_2d(gc, im.BL(il, "exp_probs_b.bias"), im.NE, 1);
         ggml_tensor * bv = ggml_reshape_2d(gc, im.BL(il, "exp_probs_b_vl.bias"), im.NE, 1);
         ggml_tensor * m = ggml_reshape_2d(gc, b.v1(im.i_img, n, (size_t) col0 * 4), 1, n);
         bias_sel = ggml_add(gc, ggml_mul(gc, ggml_repeat(gc, ggml_sub(gc, bv, bt), sc), m), bt);
     }
-    ggml_tensor * s0 = ggml_add(gc, sc, bias_sel);                                             // the model's own selection score
+    ggml_tensor * s0 = route_op ? nullptr : ggml_add(gc, sc, bias_sel);                        // the model's own selection score
     ggml_tensor * rb = ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1);
     ggml_tensor * sel = nullptr;
     // SMART route bias (opt-in; the flat bias changes ~every choice it can: -14 pt API top-1, repetition loops):
@@ -1305,7 +1327,6 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // Both may be set.  Weights still come from the unbiased scores.  Unset = the flat bias, bit for bit as before.
     // PROTECT / POOL (and STRATA_RB_SMART=1) build them from rknob: P / M then change per request (set_route_select),
     // 0 = off, and P = M = 0 selects exactly as the flat bias.
-    static const float rb_margin = std::getenv("STRATA_RB_MARGIN") ? (float) std::atof(std::getenv("STRATA_RB_MARGIN")) : -1.0f;
     ggml_tensor * xids = nullptr;   // the exact top-NU (route meter)
     if (smart_router() || rb_margin >= 0.0f) {
         const int kt = smart_router() ? kRK : (int) im.NU + 1;
@@ -1341,12 +1362,18 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         sel = ggml_add(gc, ggml_add(gc, s0, ggml_mul(gc, ggml_repeat(gc, rb, like), unprot)), ggml_scale(gc, protect, 1e4f));
         if (pool) sel = ggml_add(gc, sel, ggml_scale_bias(gc, pool, 1e4f, -1e4f));   // outside the pool: -1e4 (pool = 1: exactly 0)
     } else {
-        sel = ggml_add(gc, s0, rb);
+        sel = route_op ? route_sel : ggml_add(gc, s0, rb);
     }
     ggml_tensor * ids = ggml_argsort_top_k(gc, sel, (int) im.NU);   // [NU, n]
-    ggml_tensor * wts = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), ids), im.NU, n);
-    if (G.norm_topk) wts = ggml_div(gc, wts, ggml_scale_bias(gc, ggml_sum_rows(gc, wts), 1.0f, 1e-20f));
-    wts = ggml_scale(gc, wts, (float) G.weights_scale);
+    ggml_tensor * wts = nullptr;
+#if defined(STRATA_DSV41_ROUTE_OP)
+    if (route_op) wts = ggml_dsv41_route_weights(gc, sc, ids, G.norm_topk, (float) G.weights_scale);
+#endif
+    if (!wts) {
+        wts = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), ids), im.NU, n);
+        if (G.norm_topk) wts = ggml_div(gc, wts, ggml_scale_bias(gc, ggml_sum_rows(gc, wts), 1.0f, 1e-20f));
+        wts = ggml_scale(gc, wts, (float) G.weights_scale);
+    }
 
     // ---- shared expert (model.py Expert, clamped SwiGLU)
     const float lim = (float) G.swiglu_limit;
@@ -1358,20 +1385,37 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     }
     ggml_tensor * se = ggml_mul_mat(gc, im.BL(il, "ffn_down_shexp.weight"), ggml_swiglu_split(gc, gt, up));
 
-    outs.push_back(ggml_cpy(gc, h, b.cols3(im.hap, D, HC, n, col0)));
-    outs.push_back(ggml_cpy(gc, f_post, b.cols2(im.post_f, HC, n, col0)));
-    outs.push_back(ggml_cpy(gc, ggml_reshape_3d(gc, f_comb, HC, HC, n), b.cols3(im.comb_f, HC, HC, n, col0)));
-    outs.push_back(ggml_cpy(gc, se, b.cols2(im.shexp, D, n, col0)));
-    outs.push_back(ggml_cpy(gc, fn, b.cols2(im.o_fn, D, n, col0)));
-    outs.push_back(ggml_cpy(gc, ids, b.cols2(im.o_ids, im.NU, n, col0)));
-    outs.push_back(ggml_cpy(gc, wts, b.cols2(im.o_wts, im.NU, n, col0)));
+    // the layer's state writes.  -DSTRATA_DSV41_COPIES_OP=ON (the op is in
+    // tools/xolotl/ggml/xolotl-ggml.patch): batched into GGML_OP_DSV41_COPIES (up to 5 per launch, the same bytes; they stay
+    // where the ggml_cpy's were, after every read of the buffers).  STRATA_COPIES_SPLIT=1: one ggml_cpy each.
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> cps;
+    cps.emplace_back(h, b.cols3(im.hap, D, HC, n, col0));
+    cps.emplace_back(f_post, b.cols2(im.post_f, HC, n, col0));
+    cps.emplace_back(ggml_reshape_3d(gc, f_comb, HC, HC, n), b.cols3(im.comb_f, HC, HC, n, col0));
+    cps.emplace_back(se, b.cols2(im.shexp, D, n, col0));
+    cps.emplace_back(fn, b.cols2(im.o_fn, D, n, col0));
+    cps.emplace_back(ids, b.cols2(im.o_ids, im.NU, n, col0));
+    cps.emplace_back(wts, b.cols2(im.o_wts, im.NU, n, col0));
     if (xids) {   // route meter: the exact top-NU and their normalized weights
         ggml_tensor * xw = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), xids), im.NU, n);
         xw = ggml_div(gc, xw, ggml_scale_bias(gc, ggml_sum_rows(gc, xw), 1.0f, 1e-20f));
-        outs.push_back(ggml_cpy(gc, xids, b.cols2(im.o_xids, im.NU, n, col0)));
-        outs.push_back(ggml_cpy(gc, xw, b.cols2(im.o_xwts, im.NU, n, col0)));
+        cps.emplace_back(xids, b.cols2(im.o_xids, im.NU, n, col0));
+        cps.emplace_back(xw, b.cols2(im.o_xwts, im.NU, n, col0));
     }
-    outs.push_back(ggml_cpy(gc, f_pre, b.cols2(im.pre_state, HC, n, col0)));   // reads of pre_state happen above
+    cps.emplace_back(f_pre, b.cols2(im.pre_state, HC, n, col0));   // reads of pre_state happen above
+#if defined(STRATA_DSV41_COPIES_OP)
+    static const bool copies_split = std::getenv("STRATA_COPIES_SPLIT") != nullptr;
+    if (!copies_split) {
+        for (size_t i = 0; i < cps.size(); i += 5) {
+            ggml_tensor * src[5], * dst[5];
+            const int k = (int) std::min<size_t>(5, cps.size() - i);
+            for (int j = 0; j < k; ++j) { src[j] = cps[i + (size_t) j].first; dst[j] = cps[i + (size_t) j].second; }
+            outs.push_back(ggml_dsv41_copies(gc, src, dst, k));
+        }
+        cps.clear();
+    }
+#endif
+    for (const auto & cp : cps) outs.push_back(ggml_cpy(gc, cp.first, cp.second));
     for (ggml_tensor * t : outs) ggml_build_forward_expand(gf, t);
     for (ggml_tensor * t : late) ggml_build_forward_expand(gf, t);
     return gf;

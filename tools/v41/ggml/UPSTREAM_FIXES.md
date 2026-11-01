@@ -71,3 +71,24 @@ runs without a CUDA graph. GLM's fresh ~30K / ~44K prompts died in `cudaGraphIns
 graph was captured after the engine had handed the chunk its VRAM). `tools/glm/serve/glm-engine.sh` sets 64.
 Measured (verify/s6/glm-oom, bias-0.25 config): BASE OOM at 30K and 44K; graphs off everywhere OK but decode
 20.4 -> 16.9 tok/s; this patch OK at 6K / 30K / 44K (prefill 292 / 368 / 376 tok/s), decode 19.5-21.7 tok/s.
+
+## Router ops and batched copies (2026-10-31) - in tools/xolotl/ggml/xolotl-ggml.patch
+- `GGML_OP_DSV41_ROUTE_SCORES` / `GGML_OP_DSV41_ROUTE_WEIGHTS`: the flat-bias router of one model.py Gate
+  (`ds41_dense.cpp` build_attn) in two ops - sqrt(softplus), the vision bias select sub/repeat/mul/add, the
+  exp_probs_b and route-bias adds; then the gather of the k picks, sum_rows, scale_bias, div, scale. Top-k stays the
+  stock argsort, so the expert choice is the stock kernel's. 12 fewer kernels per layer with `--vision`. Engine side
+  opt-in: `-DSTRATA_DSV41_ROUTE_OP=ON`; `STRATA_ROUTE_COMPOSITE=1` runs the composite in the same binary; the smart /
+  margin route selections (`STRATA_RB_*`) keep the composite.
+- `GGML_OP_DSV41_COPIES`: up to 5 same-type 4-byte `ggml_cpy`'s (F32 / I32, any strides) in one launch. build_attn's
+  end-of-layer state writes (hap, post_f, comb_f, shexp, o_fn, o_ids, o_wts, pre_state; + the route meter's two) go out
+  as 2 launches instead of 8, where the ggml_cpy's were. Opt-in: `-DSTRATA_DSV41_COPIES_OP=ON`;
+  `STRATA_COPIES_SPLIT=1` runs one ggml_cpy each.
+- CPU and CUDA. Verified: `test_ds41_route` (+ `--cuda`) bit for bit with the composite (scores, selection, ids,
+  weights; 256 experts, k 6, 1-4096 tokens, text / image / mixed, norm on and off); `test_ds41_copies` (+ `--cuda`)
+  byte for byte with ggml_cpy.
+- Measured (RTX 5090 + RTX 4080 helper, Unsloth UD-IQ1_M with #86's IQ1_S kernels, `--ctx 262144`, 2 x 8
+  back-to-back DSpark requests, same binary, both ops vs `STRATA_ROUTE_COMPOSITE=1 STRATA_COPIES_SPLIT=1`): 57.50 ->
+  55.91 s total (+2.8%), dense 15.52 -> 15.20 ms per pass. The outputs were not token for token the same in this run
+  (7 of 16 requests ended at other lengths; the same run-to-run variation shows with no change at all); the 9 requests
+  of equal length took 33.14 -> 31.67 s. On the earlier tree each op alone gave the same tokens in all 16 requests:
+  router +1.4%, copies +1.2%. Not built for HIP or SYCL.

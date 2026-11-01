@@ -26,19 +26,22 @@ index 1cd81ee..7e98030 100644
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
  
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index d62a631..643e733 100644
+index d62a631..540fa71 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -586,6 +586,8 @@ extern "C" {
+@@ -586,6 +586,11 @@ extern "C" {
          GGML_OP_DSV4_HC_PRE,
          GGML_OP_DSV4_HC_POST,
          GGML_OP_TOP_K_MASK,
 +        GGML_OP_DSV41_FAKE_QUANT,
 +        GGML_OP_DSV41_HC_MIXES,
++        GGML_OP_DSV41_ROUTE_SCORES,
++        GGML_OP_DSV41_ROUTE_WEIGHTS,
++        GGML_OP_DSV41_COPIES,
  
          GGML_OP_UNARY,
  
-@@ -2683,7 +2685,8 @@ extern "C" {
+@@ -2683,7 +2688,8 @@ extern "C" {
      // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
      // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
      // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
@@ -48,7 +51,7 @@ index d62a631..643e733 100644
      // res:     [n_kv,       n_batch,    1,       ne3 ]
      //
      // broadcast:
-@@ -2765,6 +2768,29 @@ extern "C" {
+@@ -2765,6 +2771,62 @@ extern "C" {
              struct ggml_tensor  * blocks,
              struct ggml_tensor  * extra);
  
@@ -75,29 +78,65 @@ index d62a631..643e733 100644
 +            struct ggml_tensor  * base,
 +            float                 eps);
 +
++    // Strata-DS4: the router of one model.py Gate (tools/v41/engine/ds41_dense.cpp build_attn) in two ops - the same
++    // values as the stock-op composite (softplus, sqrt, the vision bias select sub/repeat/mul/add, two adds; get_rows,
++    // sum_rows, ggml_scale_bias, div, ggml_scale), bit for bit on CUDA and CPU.  Top-k stays the stock argsort.
++    //   logits: F32 [n_expert, n_tokens] contiguous   bias, rbias: F32 [n_expert]
++    //   bias_vl: F32 [n_expert] or NULL; img: F32 [n_tokens] (0 / 1, an image position) when bias_vl is set
++    //   result: F32 [n_expert, n_tokens, 2]: [..., 0] = sqrt(softplus(logits)) (the weights' scores),
++    //           [..., 1] = scores + (bias_vl ? (bias_vl - bias)*img + bias : bias) + rbias (the selection scores)
++    GGML_API struct ggml_tensor * ggml_dsv41_route_scores(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * logits,
++            struct ggml_tensor  * bias,
++            struct ggml_tensor  * bias_vl,
++            struct ggml_tensor  * img,
++            struct ggml_tensor  * rbias);
++
++    //   scores: F32 [n_expert, n_tokens] (rows may be strided)   ids: I32 [k, n_tokens] (rows may be strided), k <= 32
++    //   result: F32 [k, n_tokens] = w * scale, w = scores[ids] (norm: / (sum of the row's k + 1e-20))
++    GGML_API struct ggml_tensor * ggml_dsv41_route_weights(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * scores,
++            struct ggml_tensor  * ids,
++            bool                  norm,
++            float                 scale);
++
++    // Strata-DS4: up to 5 ggml_cpy's of 4-byte elements (F32 / I32) in ONE op: dsts[i] <- srcs[i] (same type, same
++    // element count, any strides; each pair walked in src order like ggml_cpy).  The result is a 1-element I32 tensor
++    // to expand - it carries no data.  Byte copies, so the destinations hold exactly what the ggml_cpy's would.
++    GGML_API struct ggml_tensor * ggml_dsv41_copies(
++            struct ggml_context * ctx,
++            struct ggml_tensor ** srcs,
++            struct ggml_tensor ** dsts,
++            int                   n);
++
      // custom operators
  
      typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index fb35be3..b3ad5d4 100644
+index fb35be3..1b05fa5 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -1047,7 +1047,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1047,7 +1047,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              case GGML_OP_DSV4_HC_COMB:
              case GGML_OP_DSV4_HC_PRE:
              case GGML_OP_DSV4_HC_POST:
 -            case GGML_OP_TOP_K_MASK: {
 +            case GGML_OP_TOP_K_MASK:
 +            case GGML_OP_DSV41_FAKE_QUANT:
-+            case GGML_OP_DSV41_HC_MIXES: {
++            case GGML_OP_DSV41_HC_MIXES:
++            case GGML_OP_DSV41_ROUTE_SCORES:
++            case GGML_OP_DSV41_ROUTE_WEIGHTS:
++            case GGML_OP_DSV41_COPIES: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
              } break;
              case GGML_OP_UNARY: {
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 53d39d2..dd38a65 100644
+index 53d39d2..f23307f 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -2114,6 +2114,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -2114,6 +2114,26 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
              {
                  ggml_compute_forward_top_k_mask(params, tensor);
              } break;
@@ -109,20 +148,35 @@ index 53d39d2..dd38a65 100644
 +            {
 +                ggml_compute_forward_dsv41_hc_mixes(params, tensor);
 +            } break;
++        case GGML_OP_DSV41_ROUTE_SCORES:
++            {
++                ggml_compute_forward_dsv41_route_scores(params, tensor);
++            } break;
++        case GGML_OP_DSV41_ROUTE_WEIGHTS:
++            {
++                ggml_compute_forward_dsv41_route_weights(params, tensor);
++            } break;
++        case GGML_OP_DSV41_COPIES:
++            {
++                ggml_compute_forward_dsv41_copies(params, tensor);
++            } break;
          case GGML_OP_MAP_CUSTOM1:
              {
                  ggml_compute_forward_map_custom1(params, tensor);
-@@ -2298,6 +2306,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2298,6 +2318,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_DSV4_HC_PRE:
          case GGML_OP_DSV4_HC_POST:
          case GGML_OP_TOP_K_MASK:
 +        case GGML_OP_DSV41_FAKE_QUANT:
 +        case GGML_OP_DSV41_HC_MIXES:
++        case GGML_OP_DSV41_ROUTE_SCORES:
++        case GGML_OP_DSV41_ROUTE_WEIGHTS:
++        case GGML_OP_DSV41_COPIES:
              {
                  n_tasks = n_threads;
              } break;
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 5735f96..2231740 100644
+index 5735f96..231f124 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -12545,7 +12545,7 @@ void ggml_compute_forward_lightning_indexer(
@@ -147,7 +201,7 @@ index 5735f96..2231740 100644
                  char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
                  if (k_to_float) {
                      k_to_float(k_row, k_row_f32, n_embd);
-@@ -12609,8 +12614,97 @@ void ggml_compute_forward_lightning_indexer(
+@@ -12609,8 +12614,196 @@ void ggml_compute_forward_lightning_indexer(
                      score += MAX(qk, 0.0f) * w_row[h];
                  }
                  // apply mask
@@ -246,16 +300,118 @@ index 5735f96..2231740 100644
 +        y[i] = post ? s * 2.0f : s + eps;
 +    }
 +}
++
++// ggml_compute_forward_dsv41_route_scores (Strata-DS4): model.py Gate's scores and selection scores, the engine's
++// stock-op composite step for step - unary-ops.cpp op_softplus, ggml_vec_sqrt_f32's sqrtf, the vision bias select
++// (sub, repeat, mul, add: one plain op each, volatile so GNU mode cannot contract the product into the add), then the
++// two adds.
++void ggml_compute_forward_dsv41_route_scores(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * logits  = dst->src[0];
++    const ggml_tensor * bias    = dst->src[1];
++    const ggml_tensor * rbias   = dst->src[2];
++    const ggml_tensor * bias_vl = dst->src[3];
++    const ggml_tensor * img     = dst->src[4];
++    const int64_t ne = logits->ne[0];
++    const int64_t nt = dst->ne[1];
++    const float * x  = (const float *) logits->data;
++    const float * bt = (const float *) bias->data;
++    const float * rb = (const float *) rbias->data;
++    const float * bv = bias_vl ? (const float *) bias_vl->data : nullptr;
++    const float * m  = img ? (const float *) img->data : nullptr;
++    float * y = (float *) dst->data;
++    const int64_t n  = ne*nt;
++    const int64_t i0 = n * params->ith / params->nth;
++    const int64_t i1 = n * (params->ith + 1) / params->nth;
++    for (int64_t i = i0; i < i1; ++i) {
++        const int64_t e = i % ne;
++        const int64_t t = i / ne;
++        const float v  = x[i];
++        const float sp = (v > 20.0f) ? v : log1pf(expf(v));
++        const float s  = sqrtf(sp);
++        float b = bt[e];
++        if (bv) {
++            const float d = bv[e] - bt[e];
++            const volatile float dm = d * m[t];
++            b = dm + bt[e];
++        }
++        const float s0 = s + b;
++        y[i]     = s;
++        y[n + i] = s0 + rb[e];
++    }
++}
++
++// ggml_compute_forward_dsv41_route_weights (Strata-DS4): get_rows of the k selected scores, then (norm) the row sum as
++// ggml_vec_sum_f32 takes it (a double accumulator, in order), ggml_scale_bias(1, 1e-20), the division, ggml_scale.
++void ggml_compute_forward_dsv41_route_weights(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * scores = dst->src[0];
++    const ggml_tensor * ids    = dst->src[1];
++    const int64_t k  = dst->ne[0];
++    const int64_t nt = dst->ne[1];
++    const bool  norm  = ggml_get_op_params_i32(dst, 0) != 0;
++    const float scale = ggml_get_op_params_f32(dst, 1);
++    const int64_t t0 = nt * params->ith / params->nth;
++    const int64_t t1 = nt * (params->ith + 1) / params->nth;
++    for (int64_t t = t0; t < t1; ++t) {
++        const float * sc = (const float *) ((const char *) scores->data + t*scores->nb[1]);
++        float * w = (float *) dst->data + t*k;
++        for (int64_t j = 0; j < k; ++j) {
++            w[j] = sc[((const int32_t *) ((const char *) ids->data + t*ids->nb[1]))[j]];
++        }
++        if (norm) {
++            ggml_float sum = 0.0;
++            for (int64_t j = 0; j < k; ++j) {
++                sum += (ggml_float) w[j];
++            }
++            const volatile float s = (float) sum;
++            const float d = s*1.0f + 1e-20f;
++            for (int64_t j = 0; j < k; ++j) {
++                w[j] = w[j] / d;
++            }
++        }
++        for (int64_t j = 0; j < k; ++j) {
++            w[j] *= scale;
++        }
++    }
++}
++
++// ggml_compute_forward_dsv41_copies (Strata-DS4): up to 5 same-type 4-byte copies, element i of each pair's src (in
++// its own index order) to element i of its dst (in the dst's), as ggml_cpy does
++void ggml_compute_forward_dsv41_copies(const ggml_compute_params * params, ggml_tensor * dst) {
++    const int n = ggml_get_op_params_i32(dst, 0);
++    for (int p = 0; p < n; ++p) {
++        const ggml_tensor * s = dst->src[2*p + 0];
++        const ggml_tensor * d = dst->src[2*p + 1];
++        const int64_t ne = ggml_nelements(s);
++        const int64_t i0 = ne * params->ith / params->nth;
++        const int64_t i1 = ne * (params->ith + 1) / params->nth;
++        for (int64_t i = i0; i < i1; ++i) {
++            int64_t r = i;
++            const int64_t s0 = r % s->ne[0]; r /= s->ne[0];
++            const int64_t s1 = r % s->ne[1]; r /= s->ne[1];
++            const int64_t s2 = r % s->ne[2]; r /= s->ne[2];
++            r = i;
++            const int64_t d0 = r % d->ne[0]; r /= d->ne[0];
++            const int64_t d1 = r % d->ne[1]; r /= d->ne[1];
++            const int64_t d2 = r % d->ne[2]; r /= d->ne[2];
++            const char * ps = (const char *) s->data + s0*s->nb[0] + s1*s->nb[1] + s2*s->nb[2] + (i / (s->ne[0]*s->ne[1]*s->ne[2]))*s->nb[3];
++            char * pd = (char *) d->data + d0*d->nb[0] + d1*d->nb[1] + d2*d->nb[2] + (i / (d->ne[0]*d->ne[1]*d->ne[2]))*d->nb[3];
++            memcpy(pd, ps, 4);
++        }
++    }
++}
 diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
-index 00a2ea7..b409817 100644
+index 00a2ea7..1e28823 100644
 --- a/ggml/src/ggml-cpu/ops.h
 +++ b/ggml/src/ggml-cpu/ops.h
-@@ -109,6 +109,8 @@ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params
+@@ -109,6 +109,11 @@ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params
  void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_top_k_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_dsv41_fake_quant(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_dsv41_hc_mixes(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsv41_route_scores(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsv41_route_weights(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsv41_copies(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -576,10 +732,10 @@ index 651524b..57c5b8a 100644
  static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
  
 diff --git a/ggml/src/ggml-cuda/dsv4-hc.cu b/ggml/src/ggml-cuda/dsv4-hc.cu
-index 2d0b3cf..d6d436a 100644
+index 2d0b3cf..26005e2 100644
 --- a/ggml/src/ggml-cuda/dsv4-hc.cu
 +++ b/ggml/src/ggml-cuda/dsv4-hc.cu
-@@ -331,3 +331,130 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+@@ -331,3 +331,265 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
              nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
              gate_in, gate_out);
  }
@@ -710,16 +866,154 @@ index 2d0b3cf..d6d436a 100644
 +                                                   (const float *) base->data, (float *) dst->data, hc, nt, eps);
 +    CUDA_CHECK(cudaGetLastError());
 +}
++
++
++// ---- Strata-DS4: GGML_OP_DSV41_ROUTE_SCORES / _WEIGHTS - model.py Gate in two kernels.  The engine's stock-op
++// composite step for step under the same -use_fast_math flags, so bit-identical: unary.cu op_softplus / op_sqrt, the
++// binbcast ops as single .rn ops (__fadd_rn / __fsub_rn / __fmul_rn, never contracted), get_rows' copy, sum_rows'
++// reduce_rows_f32 (lane j of warp 0 holds value j, every other lane and warp 0, then the xor-shuffle tree: adding the
++// zeros is exact, so one warp's tree is the same sum), scale_f32's `scale * x + bias` and binbcast's op_div `a / b`.
++static __global__ void dsv41_route_scores_f32(
++        const float * __restrict__ x, const float * __restrict__ bt, const float * __restrict__ rb,
++        const float * __restrict__ bv, const float * __restrict__ m, float * __restrict__ dst,
++        const int64_t ne, const int64_t nt) {
++    const int64_t n = ne*nt;
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n) {
++        return;
++    }
++    const int64_t e = i % ne;
++    const int64_t t = i / ne;
++    const float v  = x[i];
++    const float sp = (v > 20.0f) ? v : log1pf(expf(v));
++    const float s  = sqrtf(sp);
++    float b = bt[e];
++    if (bv) {
++        b = __fadd_rn(__fmul_rn(__fsub_rn(bv[e], bt[e]), m[t]), bt[e]);
++    }
++    dst[i]     = s;
++    dst[n + i] = __fadd_rn(__fadd_rn(s, b), rb[e]);
++}
++
++void ggml_cuda_op_dsv41_route_scores(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * logits  = dst->src[0];
++    const ggml_tensor * bias_vl = dst->src[3];
++    const ggml_tensor * img     = dst->src[4];
++    const int64_t ne = logits->ne[0];
++    const int64_t nt = dst->ne[1];
++    const int64_t blocks = (ne*nt + 255) / 256;
++    dsv41_route_scores_f32<<<blocks, 256, 0, ctx.stream()>>>(
++        (const float *) logits->data, (const float *) dst->src[1]->data, (const float *) dst->src[2]->data,
++        bias_vl ? (const float *) bias_vl->data : nullptr, img ? (const float *) img->data : nullptr,
++        (float *) dst->data, ne, nt);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// one warp per token, lane j < k = the token's j-th pick
++static __global__ void dsv41_route_weights_f32(
++        const char * __restrict__ scores, const int64_t nb1, const char * __restrict__ ids, const int64_t inb1,
++        float * __restrict__ dst,
++        const int k, const int64_t nt, const int norm, const float scale, const float one, const float tiny,
++        const float zero) {
++    const int64_t t = (int64_t) blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
++    const int lane = threadIdx.x % WARP_SIZE;
++    if (t >= nt) {
++        return;
++    }
++    const float * sc = (const float *) (scores + t*nb1);
++    float w = lane < k ? sc[((const int32_t *) (ids + t*inb1))[lane]] : 0.0f;
++    if (norm) {
++        const float s = warp_reduce_sum(w);
++        const float d = one * s + tiny;
++        w = w / d;
++    }
++    if (lane < k) {
++        dst[t*k + lane] = scale * w + zero;
++    }
++}
++
++void ggml_cuda_op_dsv41_route_weights(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * scores = dst->src[0];
++    const ggml_tensor * ids    = dst->src[1];
++    const int     k  = (int) dst->ne[0];
++    const int64_t nt = dst->ne[1];
++    const int   norm  = ggml_get_op_params_i32(dst, 0);
++    const float scale = ggml_get_op_params_f32(dst, 1);
++    const int warps = 4;
++    const int64_t blocks = (nt + warps - 1) / warps;
++    // 1, 1e-20 and 0 as kernel arguments: ggml_scale_bias / ggml_scale pass theirs at run time, so the compiler must not
++    // fold `1 * s + 1e-20` or `scale * w + 0` into a different instruction than scale_f32's
++    dsv41_route_weights_f32<<<blocks, warps * WARP_SIZE, 0, ctx.stream()>>>(
++        (const char *) scores->data, (int64_t) scores->nb[1], (const char *) ids->data, (int64_t) ids->nb[1], (float *) dst->data, k, nt,
++        norm, scale, 1.0f, 1e-20f, 0.0f);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// ---- Strata-DS4: GGML_OP_DSV41_COPIES - up to 5 same-type 4-byte copies in one launch (blockIdx.y = the pair)
++struct dsv41_copy_pair {
++    const char * s;
++    char *       d;
++    int64_t      n;
++    int64_t      sne[4], snb[4], dne[4], dnb[4];
++};
++struct dsv41_copy_args {
++    dsv41_copy_pair p[5];
++};
++
++static __global__ void dsv41_copies_k(const dsv41_copy_args a) {
++    const dsv41_copy_pair & q = a.p[blockIdx.y];
++    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < q.n; i += (int64_t) gridDim.x * blockDim.x) {
++        int64_t r = i, so = 0, dof = 0;
++#pragma unroll
++        for (int k = 0; k < 3; ++k) {
++            so += (r % q.sne[k]) * q.snb[k];
++            r /= q.sne[k];
++        }
++        so += r * q.snb[3];
++        r = i;
++#pragma unroll
++        for (int k = 0; k < 3; ++k) {
++            dof += (r % q.dne[k]) * q.dnb[k];
++            r /= q.dne[k];
++        }
++        dof += r * q.dnb[3];
++        *(uint32_t *) (q.d + dof) = *(const uint32_t *) (q.s + so);
++    }
++}
++
++void ggml_cuda_op_dsv41_copies(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const int n = ggml_get_op_params_i32(dst, 0);
++    dsv41_copy_args a = {};
++    int64_t nmax = 0;
++    for (int p = 0; p < n; ++p) {
++        const ggml_tensor * s = dst->src[2*p + 0];
++        const ggml_tensor * d = dst->src[2*p + 1];
++        a.p[p].s = (const char *) s->data;
++        a.p[p].d = (char *) d->data;
++        a.p[p].n = ggml_nelements(s);
++        for (int k = 0; k < 4; ++k) {
++            a.p[p].sne[k] = s->ne[k]; a.p[p].snb[k] = (int64_t) s->nb[k];
++            a.p[p].dne[k] = d->ne[k]; a.p[p].dnb[k] = (int64_t) d->nb[k];
++        }
++        nmax = std::max(nmax, a.p[p].n);
++    }
++    const int64_t blocks = std::min<int64_t>((nmax + 255) / 256, 65535);
++    dsv41_copies_k<<<dim3((unsigned) blocks, (unsigned) n), 256, 0, ctx.stream()>>>(a);
++    CUDA_CHECK(cudaGetLastError());
++}
 diff --git a/ggml/src/ggml-cuda/dsv4-hc.cuh b/ggml/src/ggml-cuda/dsv4-hc.cuh
-index 1885e76..7e298f4 100644
+index 1885e76..79bd30c 100644
 --- a/ggml/src/ggml-cuda/dsv4-hc.cuh
 +++ b/ggml/src/ggml-cuda/dsv4-hc.cuh
-@@ -6,3 +6,5 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -6,3 +6,8 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
  // gate_scale_in/gate_scale_out: the SCALE nodes of a fused SCALE -> SIGMOID -> SCALE chain feeding src[2]
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
          const ggml_tensor * gate_scale_in = nullptr, const ggml_tensor * gate_scale_out = nullptr);
 +void ggml_cuda_op_dsv41_fake_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +void ggml_cuda_op_dsv41_hc_mixes(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_dsv41_route_scores(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_dsv41_route_weights(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_dsv41_copies(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
 index 41d9483..4cb6ea0 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
@@ -778,10 +1072,10 @@ index d97e8fd..bd0348c 100644
              GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
      }
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index aff687a..1f8f6ba 100644
+index aff687a..a3b4d97 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2605,6 +2605,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2605,6 +2605,21 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_DSV4_HC_POST:
              ggml_cuda_op_dsv4_hc_post(ctx, dst);
              break;
@@ -791,10 +1085,19 @@ index aff687a..1f8f6ba 100644
 +        case GGML_OP_DSV41_HC_MIXES:
 +            ggml_cuda_op_dsv41_hc_mixes(ctx, dst);
 +            break;
++        case GGML_OP_DSV41_ROUTE_SCORES:
++            ggml_cuda_op_dsv41_route_scores(ctx, dst);
++            break;
++        case GGML_OP_DSV41_ROUTE_WEIGHTS:
++            ggml_cuda_op_dsv41_route_weights(ctx, dst);
++            break;
++        case GGML_OP_DSV41_COPIES:
++            ggml_cuda_op_dsv41_copies(ctx, dst);
++            break;
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -2782,6 +2788,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -2782,6 +2797,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
      bool use_cuda_graph = true;
      // Loop over nodes in GGML graph to obtain info needed for CUDA graph
  
@@ -807,7 +1110,7 @@ index aff687a..1f8f6ba 100644
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
  
-@@ -2789,6 +2801,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -2789,6 +2810,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
              continue;
          }
  
@@ -820,7 +1123,7 @@ index aff687a..1f8f6ba 100644
          // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
          if (node->op == GGML_OP_MUL_MAT_ID) {
              const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -5395,6 +5413,52 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
+@@ -5395,6 +5422,52 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
  }
  
@@ -873,7 +1176,7 @@ index aff687a..1f8f6ba 100644
  int ggml_backend_cuda_get_device_count() {
      return ggml_cuda_info().device_count;
  }
-@@ -5815,6 +5879,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5815,6 +5888,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          return true;
                      case GGML_TYPE_IQ4_NL:
                      case GGML_TYPE_MXFP4:
@@ -881,7 +1184,7 @@ index aff687a..1f8f6ba 100644
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
                          return op->src[0]->ne[0] % QK_K == 0;
-@@ -5830,7 +5895,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5830,7 +5904,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                             (
                                 (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                 op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
@@ -891,12 +1194,16 @@ index aff687a..1f8f6ba 100644
                                 op->src[0]->type == GGML_TYPE_F32
                             ) || (
                                 op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
-@@ -6109,6 +6175,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6109,6 +6184,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
 +        case GGML_OP_DSV41_FAKE_QUANT:
 +            return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && op->type == GGML_TYPE_F32;
++        case GGML_OP_DSV41_ROUTE_SCORES:
++        case GGML_OP_DSV41_ROUTE_WEIGHTS:
++        case GGML_OP_DSV41_COPIES:
++            return true;   // ggml_dsv41_route_* assert the types and layouts the kernels take
 +        case GGML_OP_DSV41_HC_MIXES:
 +            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
 +                op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && op->type == GGML_TYPE_F32;
@@ -1367,46 +1674,52 @@ index 33936ac..cb6ff36 100644
                  }
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index ed8554b..0483745 100644
+index ed8554b..20363c5 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -1093,6 +1093,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1093,6 +1093,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "DSV4_HC_PRE",
      "DSV4_HC_POST",
      "TOP_K_MASK",
 +    "DSV41_FAKE_QUANT",
 +    "DSV41_HC_MIXES",
++    "DSV41_ROUTE_SCORES",
++    "DSV41_ROUTE_WEIGHTS",
++    "DSV41_COPIES",
  
      "UNARY",
  
-@@ -1110,7 +1112,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1110,7 +1115,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "GLU",
  };
  
 -static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
-+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1209,6 +1211,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1209,6 +1214,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "dsv4_hc_pre(x, weights)",
      "dsv4_hc_post(x, residual, post, comb)",
      "top_k_mask(mask, top_k, score, blocks, extra)",
 +    "dsv41_fake_quant(x)",
 +    "dsv41_hc_mixes(mixes, scale, base)",
++    "dsv41_route_scores(logits, bias, bias_vl, img, rbias)",
++    "dsv41_route_weights(scores, ids)",
++    "dsv41_copies(src..., dst...)",
  
      "unary(x)",
  
-@@ -1226,7 +1230,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1226,7 +1236,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "glu(x)",
  };
  
 -static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
-+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -5498,6 +5502,9 @@ struct ggml_tensor * ggml_argsort_top_k(
+@@ -5498,6 +5508,9 @@ struct ggml_tensor * ggml_argsort_top_k(
      GGML_ASSERT(a->ne[0] >= k);
  
      struct ggml_tensor * result = ggml_argsort(ctx, a, GGML_SORT_ORDER_DESC);
@@ -1416,7 +1729,7 @@ index ed8554b..0483745 100644
  
      result = ggml_view_4d(ctx, result,
                  k, result->ne[1], result->ne[2], result->ne[3],
-@@ -6482,9 +6489,9 @@ struct ggml_tensor * ggml_lightning_indexer(
+@@ -6482,9 +6495,9 @@ struct ggml_tensor * ggml_lightning_indexer(
  
      GGML_ASSERT(       q->type == GGML_TYPE_F32);
      GGML_ASSERT( weights->type == GGML_TYPE_F32);
@@ -1428,7 +1741,7 @@ index ed8554b..0483745 100644
      GGML_ASSERT(      q->ne[1] == weights->ne[0]);
      GGML_ASSERT(      k->ne[1] == 1);
      GGML_ASSERT(   mask->ne[1] == q->ne[2]);
-@@ -6598,6 +6605,42 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
+@@ -6598,6 +6611,105 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
      return result;
  }
  
@@ -1465,6 +1778,69 @@ index ed8554b..0483745 100644
 +    result->src[0] = mixes;
 +    result->src[1] = scale;
 +    result->src[2] = base;
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv41_route_scores(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * logits,
++        struct ggml_tensor  * bias,
++        struct ggml_tensor  * bias_vl,
++        struct ggml_tensor  * img,
++        struct ggml_tensor  * rbias) {
++    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits));
++    const int64_t ne = logits->ne[0];
++    const int64_t nt = logits->ne[1] * logits->ne[2] * logits->ne[3];
++    GGML_ASSERT(bias->type  == GGML_TYPE_F32 && ggml_is_contiguous(bias)  && ggml_nelements(bias)  == ne);
++    GGML_ASSERT(rbias->type == GGML_TYPE_F32 && ggml_is_contiguous(rbias) && ggml_nelements(rbias) == ne);
++    GGML_ASSERT((bias_vl == NULL) == (img == NULL));
++    if (bias_vl) {
++        GGML_ASSERT(bias_vl->type == GGML_TYPE_F32 && ggml_is_contiguous(bias_vl) && ggml_nelements(bias_vl) == ne);
++        GGML_ASSERT(img->type == GGML_TYPE_F32 && ggml_is_contiguous(img) && ggml_nelements(img) == nt);
++    }
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne, nt, 2);
++    result->op     = GGML_OP_DSV41_ROUTE_SCORES;
++    result->src[0] = logits;
++    result->src[1] = bias;
++    result->src[2] = rbias;
++    result->src[3] = bias_vl;
++    result->src[4] = img;
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv41_route_weights(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * scores,
++        struct ggml_tensor  * ids,
++        bool                  norm,
++        float                 scale) {
++    GGML_ASSERT(scores->type == GGML_TYPE_F32 && scores->nb[0] == sizeof(float) && ggml_is_matrix(scores));
++    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && ggml_is_matrix(ids));   // ggml_argsort_top_k's view
++    GGML_ASSERT(ids->ne[1] == scores->ne[1] && ids->ne[0] <= 32);
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ids->ne[0], ids->ne[1]);
++    ggml_set_op_params_i32(result, 0, norm ? 1 : 0);
++    ggml_set_op_params_f32(result, 1, scale);
++    result->op     = GGML_OP_DSV41_ROUTE_WEIGHTS;
++    result->src[0] = scores;
++    result->src[1] = ids;
++    return result;
++}
++
++struct ggml_tensor * ggml_dsv41_copies(
++        struct ggml_context * ctx,
++        struct ggml_tensor ** srcs,
++        struct ggml_tensor ** dsts,
++        int                   n) {
++    GGML_ASSERT(n >= 1 && 2*n <= GGML_MAX_SRC);
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
++    for (int i = 0; i < n; ++i) {
++        GGML_ASSERT(srcs[i]->type == dsts[i]->type && ggml_type_size(srcs[i]->type) == 4 && ggml_blck_size(srcs[i]->type) == 1);
++        GGML_ASSERT(ggml_nelements(srcs[i]) == ggml_nelements(dsts[i]));
++        result->src[2*i + 0] = srcs[i];
++        result->src[2*i + 1] = dsts[i];
++    }
++    ggml_set_op_params_i32(result, 0, n);
++    result->op = GGML_OP_DSV41_COPIES;
 +    return result;
 +}
 +
