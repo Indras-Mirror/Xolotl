@@ -1057,6 +1057,11 @@ def parse_stage_in_flight_sample(line: str) -> dict | None:
     return {"elapsed_us": elapsed_us, "in_flight_us": in_flight_us}
 
 
+class _BatchCancelToken:
+    __slots__ = ("epoch",)
+    def __init__(self, epoch=0): self.epoch = epoch
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -1152,15 +1157,30 @@ class StrataEngine:
                   "STRATA_ENGINE_NICE=0 turns it off)", flush=True)
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
         spawned_at = time.monotonic()
+        self.cancel_owner_lock = getattr(self, "cancel_owner_lock", threading.RLock())
+        self._batch_cancel_epoch = 0
+        self._cancel_pipe_write = None
+        self._batch_cancel_enabled = (env or os.environ).get("STRATA_BATCH_CANCEL_PIPE") == "1"
+        cancel_read = None
+        cancel_spawn = {}
+        if os.name != "nt" and self._batch_cancel_enabled:
+            cancel_read, self._cancel_pipe_write = os.pipe()
+            os.set_blocking(self._cancel_pipe_write, False)
+            env = {**(env or os.environ), "STRATA_CANCEL_FD": str(cancel_read)}
+            cancel_spawn["pass_fds"] = (cancel_read,)
         try:
             self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
-                              **pin)
-        except OSError:                                  # nothing started: the narrator stops, the log handle goes back
+                              **cancel_spawn, **pin)
+        except BaseException:                                  # nothing started: the narrator stops, the log handle goes back
             loading.set()
+            self._close_cancel_pipe()
             if log:
                 self.log.close()
             raise
+        finally:
+            if cancel_read is not None:
+                os.close(cancel_read)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
@@ -1189,6 +1209,7 @@ class StrataEngine:
                 break
         loading.set()
         if self.max_context <= 0:
+            self._close_cancel_pipe()
             if timed_out:                               # still loading, or hung: end it, so the turn is not held for good
                 try:
                     self.proc.kill()
@@ -1290,7 +1311,12 @@ class StrataEngine:
             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
             self.ctl_epoch = 0                          # how often the control lines were taken
             self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
-        self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
+        if self._batch_cancel_enabled:
+            with self.cancel_owner_lock:
+                self.gen = self.__dict__.get("gen", 0) + 1
+                self._slot_cancel_owners, self._slot_cancel_tokens = {}, {}
+        else:
+            self.gen = self.__dict__.get("gen", 0) + 1
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
@@ -1479,7 +1505,41 @@ class StrataEngine:
 
     _running_cancel = None
 
-    def stop_if_running(self, cancel) -> None:
+    def _close_cancel_pipe(self):
+        lock = getattr(self, "cancel_owner_lock", None)
+        with lock or contextlib.nullcontext():
+            fd = getattr(self, "_cancel_pipe_write", None)
+            self._cancel_pipe_write = None
+            if fd is not None:
+                try: os.close(fd)
+                except OSError: pass
+
+    def _bstop_command(self, slot, owner=None):
+        epoch = getattr(owner[3], "epoch", 0) if owner is not None else 0
+        return f"BSTOP {slot} {epoch}" if epoch else f"BSTOP {slot}"
+
+    def _try_cancel_pipe(self, cancel, owner):
+        # Caller holds only the short owner lock, never the large stdin writer lock.
+        slot, born, proc, token = owner
+        fd = getattr(self, "_cancel_pipe_write", None)
+        if (not getattr(token,"epoch",0) or fd is None or
+                str((self.info or {}).get("batch_cancel_fd",0)) != "1"):
+            return False
+        message = (self._bstop_command(slot,owner)+"\n").encode("ascii")
+        assert len(message) <= 128  # atomic pipe write, far below PIPE_BUF
+        try:
+            while True:
+                try: written = os.write(fd,message); break
+                except InterruptedError: continue
+            if written != len(message):
+                self._close_cancel_pipe()  # never leave a partial frame for a later owner's message
+                return False
+        except (OSError, ValueError) as exc:  # closed/full/nonblocking channel: explicit epoch-tagged stdin fallback
+            if not isinstance(exc, BlockingIOError): self._close_cancel_pipe()
+            return False
+        return True
+
+    def _stop_if_running_legacy(self, cancel) -> None:
         """The client of the request the engine is running (its `cancel`) hung up: STOP now, from the watcher's thread -
         not at the request thread's next engine line (a token, or a prompt chunk 0.1-0.3 s later).  The request thread
         still drains to DONE as before."""
@@ -1516,7 +1576,44 @@ class StrataEngine:
                 if cancel in getattr(self, "_slot_admission_waiters", ()):
                     cv.notify_all()
 
-    def _send_owned_batch(self, text, cancel, slot, born):
+    def stop_if_running(self, cancel) -> None:
+        if not getattr(self, "_batch_cancel_enabled", False):
+            return self._stop_if_running_legacy(cancel)
+        lock = getattr(self,"cancel_owner_lock",None)
+        with lock or contextlib.nullcontext():
+            owner = getattr(self,"_slot_cancel_owners",{}).get(cancel)
+            if owner is not None:
+                slot,born,proc,token=owner
+                current=getattr(self,"_slot_cancel_tokens",{}).get(slot)
+                if (current is token and self.gen==born and self.proc is proc and self.can_stop and self.alive()):
+                    if self._try_cancel_pipe(cancel,owner): return
+                else: return
+        # Queued/lazy requests have no native owner. Never wait behind another
+        # request's large stdin write, and no writer lock exists before READY.
+        if owner is None and (self._running_cancel is not cancel or not self.can_stop or not self.alive()):
+            return
+        write_lock = getattr(self,"wlock",None)
+        if write_lock is None: return
+        # Fallback retains the old stdin serialization, but carries the exact epoch.
+        with write_lock:
+            with lock or contextlib.nullcontext():
+                owner=getattr(self,"_slot_cancel_owners",{}).get(cancel)
+                if owner is not None:
+                    slot,born,proc,token=owner
+                    if (getattr(self,"_slot_cancel_tokens",{}).get(slot) is token and
+                            self.gen==born and self.proc is proc and self.can_stop and self.alive()):
+                        try:
+                            proc.stdin.write(self._bstop_command(slot,owner)+"\n");proc.stdin.flush()
+                        except (OSError,AttributeError): pass
+                    return
+            if self._running_cancel is cancel and self.can_stop and self.alive():
+                try:
+                    self.proc.stdin.write("STOP\n");self.proc.stdin.flush()
+                except (OSError,AttributeError): pass
+
+
+
+    def _send_owned_batch_legacy(self, text, cancel, slot, born):
         """Publish a pinned slot owner and its BGEN atomically against watcher BSTOP.
 
         Q36's per-worker input accepts BSTOP during admission as well as decode.
@@ -1547,7 +1644,64 @@ class StrataEngine:
                 raise EngineDied("the engine stopped before this request was sent") from None
             return owner
 
-    def _forget_batch_owner(self, cancel, owner):
+    def _send_owned_batch(self, text, cancel, slot, born):
+        if not getattr(self, "_batch_cancel_enabled", False):
+            return self._send_owned_batch_legacy(text, cancel, slot, born)
+        """Publish a pinned slot owner and its BGEN atomically against watcher BSTOP.
+
+        Q36's per-worker input accepts BSTOP during admission as well as decode.
+        Other batch engines retain their existing admission cancellation protocol.
+        """
+        with self.wlock:
+            if cancel.is_set():
+                return None
+            if self.gen != born or not self.alive():
+                raise EngineDied("the engine changed before this request was sent")
+            epoch = 0
+            if self._batch_cancel_enabled and str((self.info or {}).get("batch_cancel_epoch",0)) == "1":
+                self._batch_cancel_epoch = getattr(self,"_batch_cancel_epoch",0) + 1
+                if self._batch_cancel_epoch >= 2**63: raise EngineDied("cancel epoch exhausted; restart the engine")
+                epoch = self._batch_cancel_epoch
+                parts=text.split(" ",3)
+                if len(parts)!=4: raise EngineDied("bad batch command for cancellation epoch")
+                text=" ".join(parts[:3])+f" cancel_epoch={epoch} "+parts[3]
+            owner = (slot, born, self.proc, _BatchCancelToken(epoch))
+            if str((self.info or {}).get("batch_pinned", 0)) == "1" or epoch:
+                if not hasattr(self, "_slot_cancel_owners"):
+                    self._slot_cancel_owners, self._slot_cancel_tokens = {}, {}
+                with getattr(self,"cancel_owner_lock",None) or contextlib.nullcontext():
+                    if self.gen != born or self.proc is not owner[2]:
+                        raise EngineDied("the engine changed during batch publication")
+                    if cancel.is_set(): return None
+                    self._slot_cancel_owners[cancel] = owner
+                    self._slot_cancel_tokens[slot] = owner[3]
+            try:
+                self.proc.stdin.write(text + "\n")
+                self.proc.stdin.flush()
+            except (OSError, AttributeError):
+                # The caller has not received owner yet, so undo publication here.
+                with getattr(self,"cancel_owner_lock",None) or contextlib.nullcontext():
+                    owners = getattr(self, "_slot_cancel_owners", {})
+                    tokens = getattr(self, "_slot_cancel_tokens", {})
+                    if owners.get(cancel) is owner: owners.pop(cancel, None)
+                    if tokens.get(slot) is owner[3]: tokens.pop(slot, None)
+                raise EngineDied("the engine stopped before this request was sent") from None
+            return owner
+
+    def _bind_active_batch_owner(self, cancel, owner):
+        if not getattr(self, "_batch_cancel_enabled", False): return
+        if owner is None: raise EngineDied("active batch slot has no admission owner")
+        slot,born,proc,token=owner
+        lock=getattr(self,"cancel_owner_lock",None)
+        with lock or contextlib.nullcontext():
+            if self.gen!=born or self.proc is not proc or not self.alive():
+                raise EngineDied("the engine changed before batch activation")
+            if not hasattr(self,"_slot_cancel_owners"):
+                self._slot_cancel_owners,self._slot_cancel_tokens={},{}
+            self._slot_cancel_owners[cancel]=owner;self._slot_cancel_tokens[slot]=token
+        if cancel.is_set(): self.stop_if_running(cancel)
+
+    def _forget_batch_owner_legacy(self, cancel, owner):
         if owner is None:
             return
         with self.wlock:
@@ -1557,6 +1711,15 @@ class StrataEngine:
                 owners.pop(cancel, None)
             if tokens.get(owner[0]) is owner[3]:
                 tokens.pop(owner[0], None)
+
+    def _forget_batch_owner(self, cancel, owner):
+        if not getattr(self, "_batch_cancel_enabled", False):
+            return self._forget_batch_owner_legacy(cancel, owner)
+        if owner is None: return
+        with getattr(self,"cancel_owner_lock",None) or contextlib.nullcontext():
+            owners=getattr(self,"_slot_cancel_owners",{});tokens=getattr(self,"_slot_cancel_tokens",{})
+            if owners.get(cancel) is owner: owners.pop(cancel,None)
+            if tokens.get(owner[0]) is owner[3]: tokens.pop(owner[0],None)
 
     HAVE_ADMISSION_WAIT_S = 300.0   # queued behind a legal long prefill, not a silent native HAVE reply
 
@@ -1940,14 +2103,14 @@ class StrataEngine:
                 return line
         return None
 
-    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None):
+    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None, cancel_owner=None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
         if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
             return
         try:
-            self._send(f"BSTOP {slot}")
+            self._send(self._bstop_command(slot,cancel_owner))
         except EngineDied:
             pass
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
@@ -2419,6 +2582,8 @@ class StrataEngine:
                         continue
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     phase = "slot" if cont else "none"
+                    if cont and str((self.info or {}).get("batch_pinned", 0)) != "1":
+                        self._bind_active_batch_owner(cancel, cancel_owner)
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
@@ -2440,7 +2605,7 @@ class StrataEngine:
                         line = self.slot_q[slot].get(timeout=10.0)
                     except queue.Empty:
                         if cancel.is_set() and not stop_sent:
-                            self._send(f"BSTOP {slot}")
+                            self._send(self._bstop_command(slot,cancel_owner))
                             stop_sent = True
                         yield None
                         continue
@@ -2453,15 +2618,18 @@ class StrataEngine:
                         live["generated"] = len(out)
                         if cancel.is_set():
                             if not stop_sent:
-                                self._send(f"BSTOP {slot}")
+                                self._send(self._bstop_command(slot,cancel_owner))
                                 stop_sent = True
                             continue
                         yield t
                         if not going_solo and not stop_sent and self._may_go_solo(int(max_new) - len(out), solo_again,
                                                                                   embeddings):
-                            self._send(f"BSTOP {slot}")         # alone now: on with the drafts (below)
+                            self._send(self._bstop_command(slot,cancel_owner))         # alone now: on with the drafts (below)
                             going_solo = True
                     elif line.startswith("BDONE "):
+                        if getattr(self, "_batch_cancel_enabled", False):
+                            self._forget_batch_owner(cancel, cancel_owner)
+                            cancel_owner = None
                         phase = "none"
                         slot_completed = True
                         f = line.split()
@@ -2544,7 +2712,7 @@ class StrataEngine:
                 elif phase == "slot":
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)    # freed at its BDONE
+                    self._release_slot_when_done(slot, stream, cancel_owner)    # freed at its BDONE
                     self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
                     with self.slot_cv:
@@ -2998,6 +3166,7 @@ class StrataEngine:
         a while; ENGINE_QUIT_WAIT_S), then terminate (ENGINE_TERM_WAIT_S), then kill (ENGINE_KILL_WAIT_S).  Raises
         EngineStuck when it still runs after all three."""
         if self.proc is None:
+            self._close_cancel_pipe()
             return
         deep_sleep.end(self)                             # a checkpointed engine cannot free its memory itself
         try:
@@ -3022,6 +3191,7 @@ class StrataEngine:
             pass
         finally:
             if self.proc.poll() is not None:
+                self._close_cancel_pipe()
                 if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
                     self.pump.join(timeout=2)
                 try:
@@ -4685,14 +4855,25 @@ class Service:
             self.admission_reserved -= 1
             self.admission_changed.notify_all()
 
-    def note_client_disconnect(self, cancel: threading.Event) -> None:
+    def note_client_disconnect(self, cancel: threading.Event, signalled=False) -> None:
         """Cancel once; count only work that was still queued or active when the client left."""
+        if not getattr(self.engine, "_batch_cancel_enabled", False):
+            with self.status_lock:
+                if not cancel.is_set():
+                    request_id = getattr(cancel, "_strata_request_id", None)
+                    active = request_id in self.terminal_requests
+                    cancel.set()
+                    if active:
+                        self.client_disconnect_cancels += 1
+            return
         with self.status_lock:
-            if not cancel.is_set():
+            if signalled or not cancel.is_set():
                 request_id = getattr(cancel, "_strata_request_id", None)
                 active = request_id in self.terminal_requests
                 cancel.set()
-                if active:
+                counted=getattr(cancel,"_strata_disconnect_counted",False)
+                cancel._strata_disconnect_counted=True
+                if active and not counted:
                     self.client_disconnect_cancels += 1
 
     @contextlib.contextmanager
@@ -7765,11 +7946,21 @@ def make_handler(svc: Service):
                     except (OSError, ValueError):            # the socket was closed here: the request has ended
                         return
                     if gone and not done.is_set():
-                        self._note(outcome="disconnected")
-                        svc.note_client_disconnect(cancel)
+                        if not getattr(svc.engine, "_batch_cancel_enabled", False):
+                            self._note(outcome="disconnected")
+                            svc.note_client_disconnect(cancel)
+                            stopper = getattr(svc.engine, "stop_if_running", None)
+                            if stopper is not None:
+                                stopper(cancel)
+                            return
+                        newly_signalled = not cancel.is_set()
+                        cancel.set()  # critical signal precedes status/monitor accounting locks
                         stopper = getattr(svc.engine, "stop_if_running", None)
-                        if stopper is not None:
-                            stopper(cancel)
+                        try:
+                            if stopper is not None: stopper(cancel)
+                        finally:
+                            self._note(outcome="disconnected")
+                            svc.note_client_disconnect(cancel, signalled=newly_signalled)
                         return
                     done.wait(WATCH_CLIENT_S)                # bytes to read (not a hang-up): look again later
 

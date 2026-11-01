@@ -97,6 +97,11 @@
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/program/branch_boundary.hpp"
+#include "strata/program/batch_cancel.hpp"
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <climits>
+#endif
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -10328,6 +10333,7 @@ int main(int argc, char** argv) {
         // shares that prefix mounts through it instead of reading it again.
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
+        std::function<bool(std::string&)> poll_batch_cancellations;
         bool live_ok = false;
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
@@ -10947,6 +10953,9 @@ int main(int argc, char** argv) {
         // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
         static const bool split_mtp_batch = strata::program::draft_kv::split_env_on(std::getenv("STRATA_SPLIT_MTP_BATCH"));
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+            // Single-GPU prompt callbacks run on the scheduler thread. Previous slot
+            // commits are settled before a prompt run; never touch BSlot from a stage worker.
+            if (!multi_gpu && poll_batch_cancellations && !poll_batch_cancellations(e)) return false;
             // KVA: a chunk the late layers did not compute has no real final rows: its draft cells are neither built
             // nor read (the floor rises before the cells are built, so they are skipped)
             if (use_mtp && mtp.cell_floor_enabled() && sp.kva_floor() > mtp.cell_floor()) mtp.set_cell_floor(sp.kva_floor());
@@ -12024,6 +12033,41 @@ int main(int argc, char** argv) {
         // 0.1.44: the reader is detached and may sit in read(2) past QUIT (the server writes more, or closes stdin, while
         // main returns and the process exits), so what it touches is shared with it, never main's locals: a line or
         // EOF after QUIT used to lock a destroyed mutex (undefined behaviour; an abort on macOS).
+        const bool batch_cancel_enabled = [] {
+            const char* v = std::getenv("STRATA_BATCH_CANCEL_PIPE");
+            return v && std::strcmp(v, "1") == 0;
+        }();
+        const auto cancel_mailbox = std::make_shared<strata::program::BatchCancelMailbox>((size_t) std::max(o.batch, 0));
+        std::atomic<int> cancel_admission_slot{-1};
+        std::atomic<uint64_t> cancel_admission_epoch{0};
+        int cancel_fd = -1;
+#if !defined(_WIN32)
+        if (const char* v = batch_cancel_enabled ? std::getenv("STRATA_CANCEL_FD") : nullptr) {
+            char* end = nullptr; const long fd = std::strtol(v, &end, 10);
+            if (end != v && *end == '\0' && fd > 2 && fd <= INT_MAX && fcntl((int) fd, F_GETFD) >= 0)
+                cancel_fd = (int) fd;
+        }
+#endif
+#if !defined(_WIN32)
+        if (cancel_fd >= 0) std::thread([mail=cancel_mailbox,fd=cancel_fd] {
+            std::string pending; char bytes[256];
+            for (;;) {
+                const ssize_t n=::read(fd,bytes,sizeof bytes);
+                if(n<0 && errno==EINTR) continue;
+                if(n<=0) break;
+                pending.append(bytes,(size_t)n);
+                for(size_t at; (at=pending.find('\n'))!=std::string::npos;) {
+                    const std::string cmd=pending.substr(0,at);pending.erase(0,at+1);
+                    strata::program::BatchStop stop;
+                    if(strata::program::parse_batch_stop(cmd,stop)) {
+                        mail->request(stop.slot,stop.epoch);
+                    }
+                }
+                if(pending.size()>128) pending.clear(); // bounded malformed input, no BSlot access
+            }
+            ::close(fd);
+        }).detach();
+#endif
         struct StdinShared {
             std::atomic<bool> stop_req{false};
             std::mutex mu;
@@ -12037,7 +12081,7 @@ int main(int argc, char** argv) {
         std::condition_variable& in_cv = in_shared->cv;
         std::deque<std::string>& in_lines = in_shared->lines;
         bool& in_eof = in_shared->eof;
-        std::thread([st = in_shared] {
+        std::thread([st = in_shared,mail=cancel_mailbox,batch_cancel_enabled] {
             strata::platform::name_this_thread("strata-stdin");
             strata::aux_cpus::pin_current_thread();
             // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
@@ -12071,6 +12115,12 @@ int main(int argc, char** argv) {
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { st->stop_req.store(true); continue; }
+                strata::program::BatchStop stop;
+                if (batch_cancel_enabled && strata::program::parse_batch_stop(l,stop)) {
+                    mail->request(stop.slot,stop.epoch);continue;
+                }
+                // A malformed tagged stop must never degrade to an unguarded legacy stop.
+                if(batch_cancel_enabled && l.rfind("BSTOP ",0)==0 && l.find(' ',6)!=std::string::npos) continue;
                 std::lock_guard<std::mutex> lk(st->mu);
                 st->lines.push_back(l);
                 st->cv.notify_one();
@@ -12087,7 +12137,10 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
-        sp.should_stop = [&] { return stop_req.load(); };
+        auto request_cancelled = [&] {
+            return stop_req.load() || (batch_cancel_enabled && cancel_mailbox->cancelled(cancel_admission_slot.load(),cancel_admission_epoch.load()));
+        };
+        sp.should_stop = request_cancelled;
         // 149-prefetch STRATA_RAM_ADAPT2: the prompt's routing seeds the RAM policy with a limited weight
         // (STRATA_RAM_ADAPT_PROMPT_W, default 0.25: an expert every prompt token routes to counts like ~5 decode routings),
         // fading by 5% a decode window; the decode's own counts and the GPU tier are untouched
@@ -12206,13 +12259,14 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
-            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+            std::printf("INFO %slogit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
                         "tail_role_token=%lld vram_elastic=%d "
                         "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
+                        batch_cancel_enabled ? (cancel_fd >= 0 ? "batch_cancel_epoch=1 batch_cancel_fd=1 " : "batch_cancel_epoch=1 batch_cancel_fd=0 ") : "",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -12447,6 +12501,7 @@ int main(int argc, char** argv) {
         };
         // ---- --batch: the slots of the batch windows
         struct BSlot {
+            uint64_t cancel_epoch = 0;
             bool active = false, stop = false;
             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
             std::array<int32_t, strata::kernels::kVerifyNarrowT> draft{}; ///< the slot's next MTP proposal
@@ -12508,6 +12563,7 @@ int main(int argc, char** argv) {
         };
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         long long admit_max_new = 0;
+        uint64_t admit_cancel_epoch = 0;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
         auto try_next_line = [&](std::string& out) -> bool {
             std::lock_guard<std::mutex> lk(in_mu);
@@ -12556,32 +12612,56 @@ int main(int argc, char** argv) {
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
         };
-        auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+        auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e,
+                                const std::function<bool()>& should_cancel = {}, bool* was_cancelled = nullptr) -> bool {
+            if (was_cancelled) *was_cancelled = false;
+            // Only called at completed copy/sync boundaries. A normal cancellation
+            // is distinct from a GPU error, and never publishes a partial target.
+            auto cancel_boundary = [&]() {
+                if (!should_cancel || !should_cancel()) return false;
+                if (was_cancelled) *was_cancelled = true;
+                return true;
+            };
             const int64_t upto = (int64_t) ids.size();
+            if (cancel_boundary()) return false;
             if (slot_copy_direct) {
                 if (!direct_slot_copy(true, b, ids, e)) return false;
+                if (cancel_boundary()) return false; // direct path's existing final sync completed
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
                 strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
+                if (cancel_boundary()) return false;
                 strata::core::ConversationCheckpoint ck;
+                // An async checkpoint's host payload must outlive its writer even
+                // on a short-circuit return (a VRAM restore can bypass the host join).
+                struct CheckpointScratch {
+                    strata::core::ConversationCheckpoint& c; bool join;
+                    ~CheckpointScratch() { if (join && c.gdn.data() != nullptr) strata::core::conversation_checkpoint_join(c.gdn.data()); }
+                } scratch{ck, bool(should_cancel)};
                 ck.ids = ids;
                 if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
                     !strata::core::conversation_checkpoint_restore(ck, to, g, e))
                     return false;
+                if (cancel_boundary()) return false;
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                    if (cancel_boundary()) return false;
                     strata::core::ConversationKv img;
                     if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
                         return false;
                     if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
+                    if (cancel_boundary()) return false;
                     if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
+                    if (cancel_boundary()) return false;
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
+                if (cancel_boundary()) return false;
             }
             if (batch_mtp) {
+                if (cancel_boundary()) return false;
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters' K/V
                 // are on the drafter's device (the last stage's GPU with a layer split): the copy's ring refill is a
                 // kernel launch there.
@@ -12593,6 +12673,7 @@ int main(int argc, char** argv) {
                                                            draft_geometry, upto, false, e) ||
                     cudaDeviceSynchronize() != cudaSuccess)
                     return false;
+                if (cancel_boundary()) return false;
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
             }
             return true;
@@ -12709,9 +12790,37 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking slot %d\n", b);
             }
         };
+        if (batch_cancel_enabled) poll_batch_cancellations = [&](std::string& e) -> bool {
+            bool finish = false;
+            for (size_t b=0;b<bs.size();++b) {
+                auto& sl=bs[b];
+                if(sl.active && cancel_mailbox->cancelled((int)b,sl.cancel_epoch)) {
+                    sl.stop=true;
+                }
+                finish = finish || (sl.active && sl.stop);
+            }
+            // A pipelined/layer-split slot can still have rows in flight. Its existing
+            // drain/finish path observes stop; only single-GPU scheduler boundaries retire early.
+            if (!finish || !stages.empty()) return true;
+            if (!ver.wait_commit(e)) return false; // existing commit event, no new global/device fence
+            for (size_t b=0;b<bs.size();++b) {
+                auto& sl=bs[b]; if(!sl.active || !sl.stop) continue;
+                const double ms=std::chrono::duration<double,std::milli>(Clock::now()-sl.t0).count();
+                sl.active=false; sl.cached=o.prompt_cache>0 && !sl.img && !sl.tainted;
+                cancel_mailbox->retire((int)b,sl.cancel_epoch);
+                std::printf("BDONE %zu %lld cancel %.1f\n",b,(long long)sl.produced,ms);
+            }
+            std::fflush(stdout);
+            return true;
+        };
+        // This callback is never installed on a stage worker. Slot commits were
+        // settled before the main prompt run, and the hook runs after its existing
+        // router sync; it changes no prompt/session/checkpoint/VRAM allocation.
+        if (!multi_gpu && cancel_fd >= 0) sp.on_host_sync = poll_batch_cancellations;
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
         auto batch_step = [&]() -> bool {
+            if (poll_batch_cancellations && !poll_batch_cancellations(err)) return false;
             int S = 0;
             int rows[strata::kernels::kVerifyMaxT] = {};
             int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
@@ -12829,6 +12938,7 @@ int main(int argc, char** argv) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                     std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
                     sl.active = false;
+                    cancel_mailbox->retire((int) (&sl-bs.data()),sl.cancel_epoch);
                     sl.cached = false;
                     sl.checks.clear();
                     nan_flush = true;
@@ -12846,6 +12956,7 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
+                        cancel_mailbox->retire((int) (&sl-bs.data()),sl.cancel_epoch);
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
                         break;
                     }
@@ -13072,6 +13183,7 @@ int main(int argc, char** argv) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                     std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
                     sl.active = false;
+                    cancel_mailbox->retire((int) (&sl-bs.data()),sl.cancel_epoch);
                     sl.cached = false;
                     sl.draft_ready = false;
                     sl.checks.clear();
@@ -13093,6 +13205,7 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", blk.b, (long long) sl.produced, fin, ms);
                         sl.active = false;
+                        cancel_mailbox->retire((int) (&sl-bs.data()),sl.cancel_epoch);
                         sl.draft_ready = false;
                         // a cache again (#857), as on the pipelined path without drafts: final once its commits have run
                         // (pmtp_settle, before anything reads the slot's sessions)
@@ -13219,6 +13332,7 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld nonfinite %.1f\n", gi * GS + t, (long long) sl.produced, ms);
                         sl.active = false;
+                        cancel_mailbox->retire((int) (&sl-bs.data()),sl.cancel_epoch);
                         sl.cached = false;
                         sl.checks.clear();
                         nan_flush = true;
@@ -13237,6 +13351,7 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
                         sl.active = false;
+                        cancel_mailbox->retire((int) (&sl-bs.data()),sl.cancel_epoch);
                         // a pipelined slot is a cache again (#857: a request left alone in its slot goes back to the solo path with its
                         // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
                         // row writes this slot clears the flag (below, where the group starts), so a stale state is never reused
@@ -13413,6 +13528,7 @@ int main(int argc, char** argv) {
             return pmtp_settle();
         };
         for (;;) {
+            if (poll_batch_cancellations && !poll_batch_cancellations(err)) return 1;
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
@@ -13468,6 +13584,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             admit_slot = -1;
+            admit_cancel_epoch=0;cancel_admission_slot.store(-1);cancel_admission_epoch.store(0);
             if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
                 const bool bimg = line.rfind("BGENI ", 0) == 0;
                 char* e1 = nullptr;
@@ -13480,6 +13597,9 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 admit_slot = (int) b;
+                admit_cancel_epoch=batch_cancel_enabled ? strata::program::batch_cancel_epoch(line) : 0;
+                cancel_mailbox->begin(admit_slot,admit_cancel_epoch);
+                cancel_admission_epoch.store(admit_cancel_epoch);cancel_admission_slot.store(admit_slot);
                 admit_max_new = mn;
                 adm_drain_ms = line_drain_ms;
                 line = std::string(bimg ? "GENI 1" : "GEN 1") + e2;
@@ -14784,7 +14904,7 @@ int main(int argc, char** argv) {
                     return false;
                 };
                 while (f1 < N) {
-                    if (stop_req.load()) return fail("cancelled");
+                    if (request_cancelled()) { return fail("cancelled"); }
                     // stage 0: up to two windows queued; window K+2 (K's parity) only once stage 1 has finished window
                     // K, whose hand-off K+2 overwrites
                     while (l0 < N && l0 < f0 + 2 && l0 < f1 + 2) {
@@ -14857,7 +14977,7 @@ int main(int argc, char** argv) {
                 std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
                 pp_exact = true;   // between windows the session is exactly at `a`
                 for (int64_t q = a; q < b;) {
-                    if (stop_req.load()) { e = "cancelled"; return false; }
+                    if (request_cancelled()) { e = "cancelled"; return false; }
                     pp_exact = false;   // until this window and the drafter's rows are in
                     const int T = (int) std::min<int64_t>(S, b - q);
                     for (int t = 0; t < T; ++t) {
@@ -15775,7 +15895,7 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                 }
                 if (!sp_ok) {
-                    if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
+                    if (yielded_at < 0 && (batch_fatal || !request_cancelled())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
                         // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
@@ -16455,8 +16575,8 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     if (nf) finish = "nonfinite";
                     else if (eos) finish = "stop";
-                    else if (stop_req.load()) finish = "cancel";
-                    const bool last = nf || eos || produced_n >= max_new || stop_req.load();
+                    else if (request_cancelled()) { finish = "cancel"; }
+                    const bool last = nf || eos || produced_n >= max_new || request_cancelled();
                     // Cover both verifier windows and the drafter's lookahead, as the serial loop covers its window.
                     // Do not promote B across a growth boundary: even a correct guess must be drained and rolled back.
                     const int64_t next_cells = std::min<int64_t>(o.max_context,
@@ -17013,7 +17133,7 @@ int main(int argc, char** argv) {
                     policy.observe_chain(T_mtp, chain_n, a, cm,
                                          std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (eos) { finish = "stop"; break; }
-                if (stop_req.load()) { finish = "cancel"; break; }
+                if (request_cancelled()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
             }
@@ -17244,13 +17364,28 @@ int main(int argc, char** argv) {
                         (long long) (sp.chain_experts_streamed() - streamed0));
             std::fflush(stdout);
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
-                bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
+                bool cont = !cancelled && (!batch_cancel_enabled || !request_cancelled()) && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
                 if (cont) park_slot(admit_slot);   // the conversation the slot holds, before this one overwrites it
-                if (cont && !copy_to_slot(admit_slot, live, err)) {
-                    std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
+                if (cont && batch_cancel_enabled && request_cancelled()) cont = false;
+                bool copy_cancelled = false;
+                if (cont && !copy_to_slot(admit_slot, live, err, batch_cancel_enabled ? std::function<bool()>(request_cancelled) : std::function<bool()>(), &copy_cancelled)) {
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
+                    if (copy_cancelled) {
+                        bs[(size_t) admit_slot].tainted = true; // old ids/checkpoints cannot describe a partial target
+                        err.clear();                          // ordinary cancellation is not an engine error
+                    } else {
+                        std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
+                    }
+                    cont = false;
+                }
+                if (cont && batch_cancel_enabled && request_cancelled()) {
+                    // The completed copy overwrote the old idle slot. Its previous
+                    // ids/checkpoints no longer describe those sessions: make every
+                    // old cached/active-checkpoint reuse path ineligible.
+                    bs[(size_t) admit_slot].cached = false;
+                    bs[(size_t) admit_slot].tainted = true;
                     cont = false;
                 }
                 const auto tc1 = Clock::now();
@@ -17260,6 +17395,7 @@ int main(int argc, char** argv) {
                     if (ckpt_pool.on())
                         for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
                     sl = BSlot{};
+                    sl.cancel_epoch=admit_cancel_epoch;
                     const auto tc2 = Clock::now();   // (the slot's old checkpoints freed)
                     sl.active = true;
                     sl.x = x;
@@ -17344,6 +17480,8 @@ int main(int argc, char** argv) {
                 }
                 adm_drain_ms = 0.0;
                 std::fflush(stdout);
+                if(!cont) cancel_mailbox->retire(admit_slot,admit_cancel_epoch);
+                cancel_admission_slot.store(-1);cancel_admission_epoch.store(0);
                 admit_slot = -1;
             }
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
