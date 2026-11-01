@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import bisect
 import json
+import os
 import pathlib
 import sys
 import threading
+from collections import OrderedDict
 
 import regex
 
@@ -122,9 +124,85 @@ def _sequence_findall(patterns, text: str) -> list[str]:
     return pieces
 
 
+class _PlainSegmentCache:
+    """Bounded, tokenizer-local memoization AFTER special-token splitting.
+
+    An exact plain string is the complete input to the existing BPE routine.
+    Never infer a reusable token prefix from a character prefix: a newly appended
+    character can change pre-tokenizer and BPE boundaries. Values are immutable;
+    callers get their own output list, and concurrent encodes may safely evict
+    or compute the same entry. The lock covers metadata only, never tokenization.
+    """
+    MIN_CHARS = 256
+    MAX_ENTRIES = 64
+
+    def __init__(self, budget: int):
+        if budget < 0:
+            raise ValueError("tokenizer segment cache budget must be nonnegative")
+        self.budget = budget
+        self.entries = OrderedDict()
+        self.bytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.lock = threading.Lock()
+
+    def get(self, text, mark_offsets=None):
+        if not self.budget or len(text) < self.MIN_CHARS or (mark_offsets is not None and len(mark_offsets) > 16):
+            return None
+        key = text if mark_offsets is None else (text, tuple(mark_offsets))
+        with self.lock:
+            item = self.entries.get(key)
+            if item is None:
+                self.misses += 1
+                return None
+            self.hits += 1
+            self.entries.move_to_end(key)
+            return item[0] if mark_offsets is None else (item[0], item[2])
+
+    def put(self, text, ids, mark_offsets=None, mark_frontiers=None):
+        if not self.budget or len(text) < self.MIN_CHARS or (mark_offsets is not None and len(mark_offsets) > 16):
+            return
+        offsets = None if mark_offsets is None else tuple(mark_offsets)
+        frontiers = None if mark_frontiers is None else tuple(mark_frontiers)
+        key = text if offsets is None else (text, offsets)
+        value = tuple(ids)
+        # Conservative retained-entry accounting: charge each integer even when
+        # it is shared with vocab/piece caches, plus room for the LRU nodes/table.
+        # The small fixed cache object/lock are outside this payload budget.
+        # IDs index a Python vocabulary list, so charging a full platform-sized
+        # integer per ID also bounds their payload without walking a long miss
+        # for sys.getsizeof on every token.
+        charge = sys.getsizeof(text) + sys.getsizeof(value) + len(value) * sys.getsizeof(sys.maxsize) + 256
+        if offsets is not None:
+            # Mark offsets are relative to this segment, not a caller's absolute
+            # prompt position or its mark IDs. Preserve the exact pre-tokenizer
+            # frontiers found on the miss; no approximate offset-to-token mapping.
+            charge += sys.getsizeof(key) + sys.getsizeof(offsets) + sum(map(sys.getsizeof, offsets))
+            charge += sys.getsizeof(frontiers) + sum(
+                sys.getsizeof(point) + (sum(map(sys.getsizeof, point)) if point is not None else 0)
+                for point in frontiers)
+        if charge > self.budget:
+            return
+        with self.lock:
+            previous = self.entries.pop(key, None)
+            if previous is not None:
+                self.bytes -= previous[1]
+            while self.entries and (self.bytes + charge > self.budget or len(self.entries) >= self.MAX_ENTRIES):
+                _, old = self.entries.popitem(last=False)
+                self.bytes -= old[1]
+            self.entries[key] = (value, charge, frontiers)
+            self.bytes += charge
+
+    def stats(self):
+        with self.lock:
+            return {"budget_bytes": self.budget, "charged_bytes": self.bytes,
+                    "entries": len(self.entries), "hits": self.hits, "misses": self.misses}
+
+
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
-                 pre: str = "qwen35", special_ids: dict[str, int] | None = None):
+                 pre: str = "qwen35", special_ids: dict[str, int] | None = None,
+                 *, segment_cache_bytes: int | None = None):
         self.tokens = tokens
         self.pre = pre
         self.token_types = token_types
@@ -182,6 +260,19 @@ class Tokenizer:
         self._bytes_cache: dict[int, bytes] = {}
         # How far a special-token match can look ahead of where it starts (PromptEncoder's margin).
         self.max_special_len = max((len(t) for t in self.special_tokens), default=1)
+
+        if segment_cache_bytes is None:
+            try:
+                segment_cache_bytes = int(os.environ.get("STRATA_TOKENIZER_SEGMENT_CACHE_MIB", "0")) * 1024 * 1024
+            except ValueError as exc:
+                raise ValueError("STRATA_TOKENIZER_SEGMENT_CACHE_MIB must be a nonnegative integer") from exc
+        self._segment_ids = _PlainSegmentCache(segment_cache_bytes)
+        self._segment_trace = os.environ.get("STRATA_TOKENIZER_SEGMENT_CACHE_TRACE") == "1"
+
+    def _trace_segment_cache(self):
+        if self._segment_trace:
+            sys.stderr.write("STRATA_TOKENIZER_SEGMENT_CACHE " +
+                             json.dumps(self._segment_ids.stats(), separators=(",", ":")) + "\n")
 
     @staticmethod
     def _alt(literals: list[str]):
@@ -302,9 +393,20 @@ class Tokenizer:
     PIECE_CACHE_MAX = 200_000    # pre-tokenizer pieces remembered (an agent resends its whole history every turn)
 
     def _encode_plain(self, text: str, marks=None, base: int = 0, out_marks=None) -> list[int]:
-        out: list[int] = []
         if marks:   # the marks' token positions: a mark inside a piece goes to the piece's start (a token frontier)
             return self._encode_plain_marked(text, marks, base, out_marks)
+        if not self._segment_ids.budget or len(text) < self._segment_ids.MIN_CHARS:
+            return self._encode_plain_uncached(text)
+        memo = self._segment_ids.get(text)
+        if memo is not None:
+            return list(memo)
+        out = self._encode_plain_uncached(text)
+        self._segment_ids.put(text, out)
+        return out
+
+    def _encode_plain_uncached(self, text: str) -> list[int]:
+        """The existing BPE/piece-cache path, also used for ineligible segments."""
+        out: list[int] = []
         # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
         # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
         cache = self._piece_ids
@@ -326,16 +428,49 @@ class Tokenizer:
             out.extend(got)
         return out
 
-    def _encode_plain_marked(self, text: str, marks, base: int, out_marks) -> list[int]:
+    def _encode_plain_marked_uncached(self, text: str, marks, base: int, out_marks) -> list[int]:
+        # Keep the legacy piece-first algorithm for OFF/short/many-mark input.
+        # No offset tuple, frontier array or per-piece segment-cache calls.
         out: list[int] = []
         a = 0
         for piece in self._pre_split(text):
             b = a + len(piece)
             for k, c in marks:
                 if base + a <= c < base + b and k not in out_marks:
-                    out_marks[k] = (len(out), base + a)   # (tokens before, in this call), resolved by the caller
-            out.extend(self._encode_plain(piece))
+                    out_marks[k] = (len(out), base + a)
+            out.extend(self._encode_plain_uncached(piece))
             a = b
+        return out
+
+    def _encode_plain_marked(self, text: str, marks, base: int, out_marks) -> list[int]:
+        if (not self._segment_ids.budget or len(text) < self._segment_ids.MIN_CHARS or
+                not isinstance(marks, (list, tuple)) or len(marks) > 16):
+            return self._encode_plain_marked_uncached(text, marks, base, out_marks)
+        offsets = tuple(c - base for _, c in marks)
+        memo = self._segment_ids.get(text, offsets)
+        if memo is not None:
+            ids, frontiers = memo
+            # The reference walks pieces before marks. With duplicated caller
+            # IDs, the earliest piece wins even if input offsets are unsorted.
+            ordered = sorted((point[1], i, point) for i, point in enumerate(frontiers) if point is not None)
+            for _, i, point in ordered:
+                k = marks[i][0]
+                if k not in out_marks:
+                    out_marks[k] = (point[0], base + point[1])
+            return list(ids)
+        out: list[int] = []
+        frontiers = [None] * len(marks)
+        a = 0
+        for piece in self._pre_split(text):
+            b = a + len(piece)
+            for i, ((k, _), c) in enumerate(zip(marks, offsets)):
+                if a <= c < b:
+                    frontiers[i] = (len(out), a)
+                    if k not in out_marks:
+                        out_marks[k] = (len(out), base + a)
+            out.extend(self._encode_plain_uncached(piece))
+            a = b
+        self._segment_ids.put(text, out, offsets, frontiers)
         return out
 
     def encode_at_offsets(self, text: str, marks: list[int], parse_special: bool = False, plain=()) -> tuple[list[int], list[int]]:
@@ -370,6 +505,7 @@ class Tokenizer:
         if pos < len(text):
             plain_part(text[pos:], pos)
         n = len(out)
+        self._trace_segment_cache()
         return out, [got.get(k, n) for k in range(len(marks))]
 
     def _encode_matching(self, text: str, pat, plain=(), marks=None) -> list[int]:
@@ -424,12 +560,16 @@ class Tokenizer:
         `plain`: (start, end) spans of `text` that are ordinary text even where they spell a literal - a
         `</think>` quoted in a message (#537) - and are tokenized with the text around them.
         """
-        return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain)
+        ids = self._encode_matching(text, self._special_re if parse_special else self._always_re, plain)
+        self._trace_segment_cache()
+        return ids
 
     def encode_marked(self, text: str, parse_special: bool = False, plain=()) -> tuple[list[int], list[tuple[int, int]]]:
         """encode() and its resume points: (end offset in `text`, ids so far) after every special-token match."""
         marks: list[tuple[int, int]] = []
-        return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain, marks), marks
+        ids = self._encode_matching(text, self._special_re if parse_special else self._always_re, plain, marks)
+        self._trace_segment_cache()
+        return ids, marks
 
     def token_bytes(self, i: int) -> bytes:
         """The raw bytes of one token (a multi-byte character can be split across tokens)."""
