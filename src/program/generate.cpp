@@ -96,6 +96,7 @@
 #include "strata/program/prefill_plan.hpp"
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
+#include "strata/program/branch_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -830,6 +831,7 @@ struct Options {
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     bool conversation_share_checkpoints = false; // immutable completed host payloads; default off
+    bool prompt_cache_branch = false; // learn a replaced suffix boundary; off by default
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
     bool prompt_cache_spread = false;   ///< --prompt-cache-spread: keep checkpoints spread back from the end, not the latest
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
@@ -1005,6 +1007,7 @@ void usage() {
                  "  --trim-stage-weights an explicit --layer-split: each GPU loads only its own layers' dense weights\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --conversation-share-checkpoints --serve, single GPU: share completed host checkpoints (default off)\n"
+                 "  --prompt-cache-branch --serve, single GPU: learn suffix-edit checkpoint boundaries (default off)\n"
                  "  --prompt-cache-tail  --serve, single GPU: one extra checkpoint near the prompt's end, at an existing\n"
                  "                       chunk boundary (default off; requires --prompt-cache and --prompt-cache-every > 0)\n"
                  "  --prompt-cache-spread  --serve: keep the checkpoints spread back from the conversation's end (dense\n"
@@ -3210,6 +3213,7 @@ int main(int argc, char** argv) {
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--conversation-share-checkpoints") o.conversation_share_checkpoints = true;
+        else if (a == "--prompt-cache-branch") o.prompt_cache_branch = true;
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
@@ -14207,6 +14211,30 @@ int main(int argc, char** argv) {
                 }
             }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            // Learn where this prompt diverged before parking/rewinding changes
+            // the outgoing metadata. This is only a future read boundary: all
+            // existing snapshot and positional-KV validation still runs below.
+            int64_t branch_common = 0;
+            if (o.prompt_cache_branch && !multi_gpu && o.prompt_cache > 0 && req_ckpt) {
+                const int64_t floor = std::max({resume, slot_tokens, parked.tokens});
+                auto consider_branch = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& images) {
+                    if ((int64_t) pre.size() > std::max(floor, branch_common))
+                        branch_common = std::max(branch_common,
+                            strata::core::conversation_common_prefix(pre, images, ids, req_imgs));
+                };
+                if (want_cvec == cvec_cached) {
+                    if (live_ok) consider_branch(live, live_imgs);
+                    for (const ConvCheckpoint& c : checks) consider_branch(c.ids, c.imgs);
+                }
+                for (const BSlot& sl : bs) {
+                    if (sl.active || !sl.cached || sl.cvec != want_cvec) continue;
+                    // Image requests never migrate from an idle batch slot.
+                    if (req_imgs.empty()) consider_branch(sl.ids, {});
+                    for (const ConvCheckpoint& c : sl.checks) consider_branch(c.ids, c.imgs);
+                }
+                branch_common = std::max(branch_common, conversations.common_prefix(ids, req_imgs, want_cvec, floor));
+            }
+
             std::optional<strata::core::SavedConversation> incoming;
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
@@ -15644,6 +15672,16 @@ int main(int argc, char** argv) {
             // Only add a snapshot; the existing token and image checks still decide reuse.
             const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
                 ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
+            const int64_t branch_at = o.prompt_cache_branch && !multi_gpu && o.prompt_cache > 0 && req_ckpt &&
+                    reread_to < 0
+                ? strata::program::branch_checkpoint_boundary(branch_common, resume, n) : -1;
+            static const bool branch_trace = [] {
+                const char* e = std::getenv("STRATA_CACHE_BRANCH_TRACE");
+                return e != nullptr && std::atoi(e) != 0;
+            }();
+            if (o.prompt_cache_branch && branch_trace)
+                std::fprintf(stderr, "STRATA_CACHE_BRANCH {\"event\":\"plan\",\"common\":%lld,\"resume\":%lld,\"target\":%lld}\n",
+                             (long long) branch_common, (long long) resume, (long long) branch_at);
             // pin=N (opt-in): one more place the prompt is read to and checkpointed.  One pinned prefix at a time: a
             // new pin replaces the old; it needs room for the root, the pin and a rotating checkpoint
             int64_t pin_at = -1;
@@ -15668,10 +15706,9 @@ int main(int argc, char** argv) {
                                  "%lld)\n", (long long) req_pin, (long long) read_from);
             }
             std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
-            if (pin_at >= 0) {
-                cuts.push_back(pin_at);
-                std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
-            }
+            if (branch_at >= 0) cuts.push_back(branch_at);
+            if (pin_at >= 0) cuts.push_back(pin_at);
+            if (branch_at >= 0 || pin_at >= 0) std::sort(cuts.begin(), cuts.end());
             int64_t at = read_from;
             // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
             // max_t with the last prompt token) to the first window, which starts at merge_at (-1: the first window
@@ -15681,7 +15718,7 @@ int main(int argc, char** argv) {
             int64_t merge_at = -1;
             auto merge_from = [&](int64_t a0, int64_t to) -> int64_t {
                 if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
-                if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
+                if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at || to == branch_at) return -1;
                 if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
                 if (std::getenv("STRATA_LOGPOS") != nullptr) return -1;
                 if (host_res.empty() || !pending.empty() ||
@@ -15754,8 +15791,11 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
-                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
+                const bool needs_checkpoint = to == turn_at || to == root_at || to == message_at ||
+                                              to == pin_at || to == branch_at;
+                const bool checkpoint_saved = !needs_checkpoint || checkpoint_at(to, nullptr,
+                    to == message_at && to != turn_at && to != root_at && to != pin_at && to != branch_at);
+                if (!checkpoint_saved) {   // preserve the normal recoverable checkpoint failure path
                     if (!ckpt_why.empty() || !checkpoint_failure_is_survivable()) {   // #3350: only an unwell GPU ends the request
                         std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                         return 1;
@@ -15768,6 +15808,8 @@ int main(int argc, char** argv) {
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
+                if (branch_trace && to == branch_at && checkpoint_saved)
+                    std::fprintf(stderr, "STRATA_CACHE_BRANCH {\"event\":\"saved\",\"position\":%lld}\n", (long long) to);
             }
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());

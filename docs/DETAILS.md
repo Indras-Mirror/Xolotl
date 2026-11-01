@@ -788,6 +788,7 @@ system prompt with a billing header that changes on every request; the server pi
 | `--prompt-cache N` | Number of checkpoints (`0` = off, which also disables parking). |
 | `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID` | Checkpoint interval, the system-prompt checkpoint (`0` = none) and the turn token. The interval is not a piece-size setting: [what it does](PROMPT_CACHE_TAIL.md#prompt-cache-every-does-not-set-the-size-of-the-pieces-a-prompt-is-read-in). |
 | `--conversation-share-checkpoints` (opt-in) | Share completed immutable host checkpoint payloads while parking; single GPU, off by default. Live state and K/V still copy. |
+| `--prompt-cache-branch` (opt-in) | Learn one suffix-edit checkpoint after reading to the divergence; single GPU, off by default. |
 | `--prompt-cache-spread` (opt-in) | The checkpoint that leaves is the one whose removal leaves the smallest gap, so the kept points thin out geometrically back from the end. An agent that rewrites its history a few thousand tokens back then resumes near the edit instead of at the system prompt. Same RAM. |
 | `"strata_checkpoint": false` (per request) | A one-shot request that no later request continues saves no checkpoints and keeps no session. |
 | `"strata_prefix": {"messages": 1}` (per request, opt-in) | One long document, many questions. Marks where the document ends: `{"messages": 1}`, `{"message": 0, "chars": 210000}` or `{"tokens": 12345}`. The checkpoint at the boundary is pinned, so 20 questions cost one read of the document. One pinned prefix at a time per engine; needs `--prompt-cache 3` or more; a malformed field is a 400. See [RESEARCH_RUNS.md](RESEARCH_RUNS.md). |
@@ -806,6 +807,20 @@ immutable even after every other alias is released; reference counts never grant
 charges the full payload capacity per alias, including its storage header, conservatively rather than discounting
 shared allocations. The newly captured live state and all positional K/V still use the normal copy path.
 Session file bytes and restore rules are unchanged. The option is off by default and does not enable token-based K/V-copy skipping.
+**Replaced suffixes inside a message (opt-in).** `--prompt-cache-branch` on a single GPU learns where a request
+diverged from a cached conversation, including edits inside the last user message. On the first edit the engine
+still restores an existing checkpoint and reads the intervening tokens. When that read reaches the common-prefix
+boundary, it saves a new complete running-state checkpoint there. A later edit at the same boundary can reuse it
+through the normal token/image checks, without replaying the unchanged gap from a coarse periodic checkpoint.
+Only one learned point is added per request, within the existing `--prompt-cache` count and conversation-cache
+budget; it does not create a dense checkpoint grid over the context. A shared prefix below 8,192 tokens or less
+than 64 tokens beyond an existing reusable checkpoint is left alone. A changed picture clamps the common prefix
+to that picture's first cell, even when its pad token IDs match. This does not reuse a recurrent state merely
+because tokens match: the new state is captured only after actually reading to that position, and its positional
+K/V is maintained by the existing cache rules. The option is off by default, is not applied to layer-split runs,
+and `strata_checkpoint: false` disables it for that request. It adds a prompt-read boundary, so floating-point
+rounding can differ from an unsplit read. `STRATA_CACHE_BRANCH_TRACE=1` logs the planned and saved token positions
+to stderr as `STRATA_CACHE_BRANCH` JSON records, without prompt content.
 
 The RAM figure the floor is checked against is the smallest of `MemAvailable`, the room under each cgroup limit visible to
 the engine (v2 `memory.max` and `memory.high`, v1 `memory.limit_in_bytes`, less clean inactive file cache) and the
