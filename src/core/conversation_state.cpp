@@ -104,7 +104,7 @@ bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
     size_t ids = 0, images = 0;
     if (!product(ids, {c.ids.size(), sizeof(int32_t)}) ||
         !product(images, {c.imgs.size(), sizeof(ConversationImageKey)})) return false;
-    for (size_t n : {ids, images, c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(), c.block_pos.size()})
+    for (size_t n : {ids, images, c.gdn.bytes(), c.ple.bytes(), c.tails.bytes(), c.dead.bytes(), c.block_pos.bytes()})
         if (!add(total, n)) return false;
     return true;
 }
@@ -475,6 +475,9 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
         !product(positions, {qsa, z.block_pos})) return fail(error, "snapshot metadata byte count overflow");
     for (size_t n : {ids, images, checkpoints, layers, tails, dead, positions, z.gdn, ss.ple_hist ? z.ple : 0})
         if (!add(bytes, n)) return fail(error, "snapshot byte count overflow");
+    const size_t headers = (z.gdn != 0) + (ss.ple_hist && z.ple != 0) +
+                           (tails != 0) + (dead != 0) + (positions != 0);
+    if (!add(bytes, headers * SharedBytes::allocation_overhead)) return fail(error, "snapshot header byte count overflow");
     for (const auto& c : view.checkpoints)
         if (!metadata_bytes(c, bytes)) return fail(error, "checkpoint byte count overflow");
     const int64_t upto = (int64_t) view.ids.size(); // view_validate bounds this by signed max_cells
@@ -519,7 +522,8 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse, size_t* reused_bytes,
                                 std::vector<ConversationCheckpoint>* storage,
-                                std::vector<ConversationCheckpoint>* moved) {
+                                std::vector<ConversationCheckpoint>* moved,
+                                ConversationCaptureOptions options) {
     static const bool ptr = std::getenv("STRATA_PARK_TRACE") != nullptr;
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
@@ -541,7 +545,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     }
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     const auto p1 = now();
-    captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints, storage);
+    captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints, storage, options.share_checkpoints);
     if (moved != nullptr)
         for (auto& c : *moved) {
             conversation_checkpoint_join(c.gdn.data());

@@ -787,6 +787,7 @@ system prompt with a billing header that changes on every request; the server pi
 | --- | --- |
 | `--prompt-cache N` | Number of checkpoints (`0` = off, which also disables parking). |
 | `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID` | Checkpoint interval, the system-prompt checkpoint (`0` = none) and the turn token. The interval is not a piece-size setting: [what it does](PROMPT_CACHE_TAIL.md#prompt-cache-every-does-not-set-the-size-of-the-pieces-a-prompt-is-read-in). |
+| `--conversation-share-checkpoints` (opt-in) | Share completed immutable host checkpoint payloads while parking; single GPU, off by default. Live state and K/V still copy. |
 | `--prompt-cache-spread` (opt-in) | The checkpoint that leaves is the one whose removal leaves the smallest gap, so the kept points thin out geometrically back from the end. An agent that rewrites its history a few thousand tokens back then resumes near the edit instead of at the system prompt. Same RAM. |
 | `"strata_checkpoint": false` (per request) | A one-shot request that no later request continues saves no checkpoints and keeps no session. |
 | `"strata_prefix": {"messages": 1}` (per request, opt-in) | One long document, many questions. Marks where the document ends: `{"messages": 1}`, `{"message": 0, "chars": 210000}` or `{"tokens": 12345}`. The checkpoint at the boundary is pinned, so 20 questions cost one read of the document. One pinned prefix at a time per engine; needs `--prompt-cache 3` or more; a malformed field is a 400. See [RESEARCH_RUNS.md](RESEARCH_RUNS.md). |
@@ -795,6 +796,16 @@ system prompt with a billing header that changes on every request; the server pi
 | `--conversation-cache-park-gain N` (opt-in) | Park a conversation again only after it advanced N tokens past the copy it would replace. |
 | `--conversation-cache-min-free-mib N` | RAM floor, default 2560. Parking and session files are skipped when less than the snapshot plus the floor is available. |
 | `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB`) | Total RAM this engine's container may use, for when a container cannot see its own limit. Config `args`: `"--memory-limit-mib", "102400"`. `0` = none. |
+
+**Sharing completed checkpoint state (opt-in).** `--conversation-share-checkpoints` on a single GPU shares the
+already completed host payloads of recurrent/indexer checkpoints when parking a conversation, instead of copying
+the same immutable checkpoint chain for every branch. Token/image metadata, use stamps and pins remain independent.
+Ordinary checkpoint copies still copy their bytes; only this explicit capture option shares storage. A mutable
+access detaches before writing, so keeping a branch never changes an older checkpoint. A published payload remains
+immutable even after every other alias is released; reference counts never grant permission to write it. The cache budget
+charges the full payload capacity per alias, including its storage header, conservatively rather than discounting
+shared allocations. The newly captured live state and all positional K/V still use the normal copy path.
+Session file bytes and restore rules are unchanged. The option is off by default and does not enable token-based K/V-copy skipping.
 
 The RAM figure the floor is checked against is the smallest of `MemAvailable`, the room under each cgroup limit visible to
 the engine (v2 `memory.max` and `memory.high`, v1 `memory.limit_in_bytes`, less clean inactive file cache) and the

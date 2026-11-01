@@ -119,6 +119,8 @@ struct ConversationView {
     const std::vector<ConversationCheckpoint>& checkpoints;
     bool cvec;
 };
+struct ConversationCaptureOptions { bool share_checkpoints = false; };
+
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& session,
                                  const ModelGeometry& g, const QsaState& draft, size_t& bytes, std::string& error);
 bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const ConversationView& view,
@@ -175,7 +177,8 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
                                 std::vector<ConversationCheckpoint>* storage = nullptr,
-                                std::vector<ConversationCheckpoint>* moved = nullptr);
+                                std::vector<ConversationCheckpoint>* moved = nullptr,
+                                ConversationCaptureOptions options = {});
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,

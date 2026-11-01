@@ -177,6 +177,11 @@ option(STRATA_DENSE "Build strata-dense, the Qwen3.8-27B dense GGUF engine (CUDA
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()
+  find_package(Threads REQUIRED)
+  add_executable(shared_bytes_test src/core/shared_bytes_test.cpp)
+  target_include_directories(shared_bytes_test PRIVATE include)
+  target_link_libraries(shared_bytes_test PRIVATE Threads::Threads)
+  add_test(NAME shared_bytes_test COMMAND shared_bytes_test)
   add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   add_test(NAME conversation_cache_test COMMAND conversation_cache_test)

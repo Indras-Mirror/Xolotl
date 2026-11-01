@@ -215,6 +215,37 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation full,incremental;
     check(conversation_snapshot_save(full,view,ss,g,draft.st,error), "full capture through host transfer backend");
     const size_t full_copies = copied_bytes;
+    check(std::as_const(full.checkpoints[0]).gdn.data() != std::as_const(image.checkpoints[0]).gdn.data() &&
+          full.checkpoints[0].gdn == image.checkpoints[0].gdn,
+          "default capture still deep-copies completed checkpoint bytes");
+    SavedConversation shared_checkpoints;
+    copied_bytes = 0;
+    const ConversationCaptureOptions share_options{true};
+    check(conversation_snapshot_save(shared_checkpoints,view,ss,g,&draft.st,error,{},nullptr,nullptr,nullptr,share_options),
+          "explicit sharing captures an otherwise complete image");
+    check(copied_bytes == full_copies && shared_checkpoints.live.gdn == full.live.gdn,
+          "sharing checkpoints skips no live-state or positional-KV transfers");
+    const auto& shared_chain = std::as_const(shared_checkpoints.checkpoints);
+    const auto& source_chain = std::as_const(image.checkpoints);
+    check(shared_chain.size() == source_chain.size() &&
+          shared_chain[0].gdn.data() == source_chain[0].gdn.data() &&
+          shared_chain[0].ple.data() == source_chain[0].ple.data() &&
+          shared_chain[0].tails.data() == source_chain[0].tails.data() &&
+          shared_chain[0].dead.data() == source_chain[0].dead.data() &&
+          shared_chain[0].block_pos.data() == source_chain[0].block_pos.data(),
+          "all five completed checkpoint payloads explicitly share immutable storage");
+    check(shared_checkpoints.bytes() == full.bytes(), "shared buffers are charged fully within the same budget");
+    const auto before_byte = source_chain[0].gdn[0];
+    shared_checkpoints.checkpoints[0].gdn[0] ^= 1;
+    check(source_chain[0].gdn[0] == before_byte && shared_chain[0].gdn.data() != source_chain[0].gdn.data(),
+          "a later writer detaches before changing an older parked checkpoint");
+    for (size_t i = 0; i < full.kv.size(); ++i)
+        check(shared_checkpoints.kv[i].k == full.kv[i].k && shared_checkpoints.kv[i].v == full.kv[i].v &&
+              shared_checkpoints.kv[i].k_scale == full.kv[i].k_scale &&
+              shared_checkpoints.kv[i].v_scale == full.kv[i].v_scale &&
+              shared_checkpoints.kv[i].pooled == full.kv[i].pooled,
+              "checkpoint-only sharing leaves all five KV planes byte-identical");
+
     ConversationKvReuse reuse{full.kv,9,9};
     size_t peak = 0, reused = 0;
     check(conversation_snapshot_capture_bytes(reuse,view,ss,g,draft.st,peak,error), "incremental capture admission without transfers");
