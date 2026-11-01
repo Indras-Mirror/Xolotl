@@ -205,6 +205,9 @@ public:
 
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
+    /// Optional single-GPU scheduler callback after an existing router stream sync.
+    /// It must not mutate this prompt/session or launch GPU work. Unset by default.
+    std::function<bool(std::string& err)> on_host_sync;
     /// The first stage only, checked before every chunk but the first: true ends the run there as if the prompt
     /// ended there.  `run` returns true once every stage has read the tokens before that chunk, and `stopped_at()`
     /// says how many of the run's tokens that is (-1 when the run read them all).  A read beside the batch slots
