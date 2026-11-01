@@ -78,9 +78,10 @@ strata::core::SavedConversation Ds41ConversationServe::pack(const Ds41ConvImage 
 bool Ds41ConversationServe::unpack(const strata::core::SavedConversation & saved, Ds41ConvImage & out) const {
     out.ids = saved.live.ids;
     out.checkpoints = saved.checkpoints;
-    out.stage0 = saved.live.gdn;
+    out.stage0.assign(saved.live.gdn.begin(), saved.live.gdn.end());   // SharedBytes since #89: copy the bytes out
     out.later_stages.clear();
-    for (const auto & part : saved.stage_images) out.later_stages.push_back(part.live.gdn);
+    for (const auto & part : saved.stage_images)
+        out.later_stages.emplace_back(part.live.gdn.begin(), part.live.gdn.end());
     return true;
 }
 
