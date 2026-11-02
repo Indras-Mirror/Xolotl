@@ -49,6 +49,43 @@ flash-attention rounding, KL 1.3e-3 - a quarter of what llama.cpp itself shows b
   `--peer-vram http://127.0.0.1:8099/v1/vram` asks another Xolotl server (e.g. the big model) to keep room free before
   an unpark and tells it the VRAM is back after a park.
 
+## Beside a big model: QFN + LFM3 with Quetza's voice pipeline
+
+A 2B omni model is most useful as the ears and voice of a larger one. `scripts/xol-qfn-voice.sh` runs both on one card
+and opens QuetzaCodetl with voice mode pointed at LFM3:
+
+```bash
+scripts/xol-qfn-voice.sh              # QFN (chat) + LFM3 (ears, voice), then the CLI
+scripts/xol-qfn-voice.sh --serve-only # start/attach both and exit
+```
+
+The one non-obvious step is VRAM. QFN's elastic expert cache takes all free VRAM at start (23.4 / 24.5 GB), and LFM3's
+encoder then fails to load (`cudaMalloc failed: out of memory`, reproduced 2026-11-02). The script POSTs
+`{"reserve_mib": 4608}` to QFN's `/v1/vram` first; QFN gives 4.4 GB back, and LFM3 loads in ~6 s (3.2 GB resident),
+leaving ~1.7 GB headroom. `XOLQFN_VOICE_RESERVE_MIB` changes the amount.
+
+Measured with both up (RTX 4090): ASR, TTS (24 kHz pcm) and `/v1/decide` all answer concurrently, and QFN keeps its
+speed - a 96-token answer took 0.75 s while LFM3 streamed 3.5 s of speech. Turn-taking stays on the chat model:
+`/v1/decide` is a route on that server, so it does not move with the ears.
+
+QuetzaCodetl chooses the backends (`/voice-backend`, or `QUETZA_VOICE_BACKEND=lfm3`); the launcher sets that variable
+and `QUETZA_LFM3_URL` / `QUETZA_LFM3_SERVER` / `QUETZA_LFM3_VOICE`, and `/voice-auto` starts the pipeline.
+
+## Voice: how LFM3 speaks, and what a voice LoRA would change
+
+LFM3 has no speaker conditioning. `male` / `female` is a **text instruction** in the TTS prompt
+(`Perform TTS in American English using a male voice.`); the reference pipeline warns and ignores a speaker reference
+file. Speech is generated as codec codes, not as a waveform from a speaker embedding:
+
+1. the 2B LM emits 12 codes per 80 ms frame (12.5 Hz) autoregressively;
+2. a depthformer in the mmproj fills the 12 codebooks (MaskGIT, 4 + 4 + 4);
+3. the LiquidCodec decoder turns the codes into 24 kHz audio.
+
+The pieces for a voice LoRA are in the BF16 checkpoint (`LFM3-Omni-2B/audio_tokenizer`, a `LiquidCodecEncoder` with
+`encode()`): encode a target speaker's audio to codes, pair with transcripts, LoRA the LM with the codec and depthformer
+frozen, merge into BF16 and requantise. That produces **one baked-in voice**, not cloning - arbitrary-speaker cloning
+needs conditioning the architecture does not expose.
+
 ## Build and run
 
 ```bash

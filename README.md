@@ -82,6 +82,10 @@ tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speec
   audio and video in; text and speech out) in its own engine behind the usual server - ~300 tok/s decode, 26-33K tok/s
   prefill, `/v1/audio/speech` and `/v1/audio/transcriptions` from the model itself, and park/unpark in ~50 ms so it can
   sit beside a big model as its ears, eyes and voice. Logits match llama.cpp's (KL 1.3e-7 on an exact-layout run).
+- **LFM3 as the ears and voice of a bigger model** (`scripts/xol-qfn-voice.sh`): QFN 45 GB and LFM3-Omni on one 4090,
+  then QuetzaCodetl in voice mode. QFN's elastic expert cache has to hand ~4.5 GB back (`POST /v1/vram`) or LFM3's
+  encoder cannot load; after that both are resident at 22.8 GB, and LFM3 transcribes and speaks while QFN keeps its
+  speed - 0.75 s for a 96-token answer while 3.5 s of speech streamed.
 - **Nine community pull requests** (#86-#95): IQ1_S routed experts for Unsloth's DeepSeek-V4.1 UD-IQ1_M (#86) and
   opt-in fused router ops and batched state copies in the DeepSeek-V4.1 engine (#87, Xiaomi2008); opt-in request-owned
   batch cancellation (#95), learned checkpoints for edited prompt suffixes (#90), shared immutable checkpoint payloads
