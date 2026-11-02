@@ -112,6 +112,22 @@ class PersistentVisionIdentity(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             BoundVision(self.root, config).persistence_namespace()
 
+    def test_split_snapshot_symlink_inventory_uses_configured_shard_names(self):
+        snapshot = self.root / 'snapshot'; snapshot.mkdir()
+        blobs = self.root / 'blobs'; blobs.mkdir()
+        one = blobs / 'opaque-a'; two = blobs / 'opaque-b'
+        one.write_bytes(b'first'); two.write_bytes(b'second')
+        first = snapshot / 'vision-00001-of-00002.gguf'
+        first.symlink_to(one)
+        (snapshot / 'vision-00002-of-00002.gguf').symlink_to(two)
+        config = dict(self.config, model=str(first))
+        before = BoundVision(self.root, config).persistence_namespace()
+        two.write_bytes(b'edited')
+        self.assertNotEqual(before, BoundVision(self.root, config).persistence_namespace())
+        two.unlink()
+        with self.assertRaises(FileNotFoundError):
+            BoundVision(self.root, config).persistence_namespace()
+
     def test_cache_log_paths_and_unselected_config_do_not_change_actual_pipeline(self):
         one = BoundVision(self.root, self.config)
         two = BoundVision(self.root, self.config)

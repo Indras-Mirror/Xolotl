@@ -3486,16 +3486,17 @@ class Vision:
             path = shutil.which(args[i], path=(env or os.environ).get("PATH")) if i == 0 else args[i]
             if not path:
                 raise ValueError("persistent image identity requires a resolved reader")
-            resolved = Path(path).resolve(strict=True)
-            files.add(str(resolved))
-            # llama.cpp may open all GGUF shards from one configured shard path.
-            split = re.fullmatch(r"(.*-)\d{5}-of-(\d{5})(\.gguf)", resolved.name)
+            original = Path(path)
+            files.add(str(original.resolve(strict=True)))
+            # Keep the configured spelling: HF snapshot shards can be symlinks
+            # to opaque blob names, while the loader finds siblings by shard name.
+            split = re.fullmatch(r"(.*-)\d{5}-of-(\d{5})(\.gguf)", original.name)
             if i != 0 and split:
                 count = int(split[2])
                 if not 1 <= count <= 4096:
                     raise ValueError("persistent image reader split inventory is not bounded")
                 for part in range(1, count + 1):
-                    files.add(str((resolved.parent / f"{split[1]}{part:05d}-of-{count:05d}{split[3]}").resolve(strict=True)))
+                    files.add(str((original.parent / f"{split[1]}{part:05d}-of-{count:05d}{split[3]}").resolve(strict=True)))
         # Persistent native storage is Linux-only. Refuse unbound image reuse
         # when the actual loaded implementation cannot be inspected.
         proc = Path("/proc") / str(self.proc.pid)
