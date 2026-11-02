@@ -86,6 +86,11 @@ tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speec
   then QuetzaCodetl in voice mode. QFN's elastic expert cache has to hand ~4.5 GB back (`POST /v1/vram`) or LFM3's
   encoder cannot load; after that both are resident at 22.8 GB, and LFM3 transcribes and speaks while QFN keeps its
   speed - 0.75 s for a 96-token answer while 3.5 s of speech streamed.
+- **More community fixes** (#96, #101, #102, NektoDron): MiniMax M3.1 serving works with the current frontend again
+  (#96), Qwen picture numbering (`chat_template_kwargs: {"add_vision_id": true}`) reaches the template (#101), and new
+  Qwen3.6 setups keep the official 64-token image minimum (#102). Layer split no longer aborts on the first request at
+  boundaries other than 20 (#98, diagnosed by ghino18, confirmed by tragicwinds), and a request beyond the batch slots
+  waits for one again instead of a 503 (#100, reported by tragicwinds).
 - **Nine community pull requests** (#86-#95): IQ1_S routed experts for Unsloth's DeepSeek-V4.1 UD-IQ1_M (#86) and
   opt-in fused router ops and batched state copies in the DeepSeek-V4.1 engine (#87, Xiaomi2008); opt-in request-owned
   batch cancellation (#95), learned checkpoints for edited prompt suffixes (#90), shared immutable checkpoint payloads
