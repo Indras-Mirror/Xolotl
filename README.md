@@ -86,8 +86,9 @@ tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speec
   then QuetzaCodetl in voice mode. QFN's elastic expert cache has to hand ~4.5 GB back (`POST /v1/vram`) or LFM3's
   encoder cannot load; after that both are resident at 22.8 GB, and LFM3 transcribes and speaks while QFN keeps its
   speed - 0.75 s for a 96-token answer while 3.5 s of speech streamed.
-- **More community fixes** (#96, #101, #102, NektoDron): MiniMax M3.1 serving works with the current frontend again
-  (#96), Qwen picture numbering (`chat_template_kwargs: {"add_vision_id": true}`) reaches the template (#101), and new
+- **More community fixes** (#96, #101, #102, #104, NektoDron): MiniMax M3.1 serving works with the current frontend again
+  (#96), Qwen picture numbering (`chat_template_kwargs: {"add_vision_id": true}`) reaches the template (#101) and can be
+  a server default (`"add_vision_id": true` in the run config, #104), and new
   Qwen3.6 setups keep the official 64-token image minimum (#102). Layer split no longer aborts on the first request at
   boundaries other than 20 (#98, diagnosed by ghino18, confirmed by tragicwinds), and a request beyond the batch slots
   waits for one again instead of a 503 (#100, reported by tragicwinds).

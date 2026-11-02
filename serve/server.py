@@ -4868,6 +4868,7 @@ class Service:
         # the config's "preserve_thinking" (true / false): the template flag's default for requests that do not set it
         # in chat_template_kwargs; None leaves the template's own default
         self.preserve_thinking = None
+        self.add_vision_id = None                       # opt-in template default; each request's boolean flag wins
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
@@ -6057,6 +6058,8 @@ class Service:
         kwargs = {k: v for k, v in kwargs.items() if k != CACHE_MARK_KEY}
         if self.preserve_thinking is not None and "preserve_thinking" not in kwargs:
             kwargs = {**kwargs, "preserve_thinking": self.preserve_thinking}   # the config's default for the flag
+        if self.add_vision_id is not None and "add_vision_id" not in kwargs:
+            kwargs = {**kwargs, "add_vision_id": self.add_vision_id}
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -10921,6 +10924,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.repeat_stop_tokens = rs
     if isinstance(cfg.get("preserve_thinking"), bool):
         svc.preserve_thinking = cfg["preserve_thinking"]
+    if isinstance(cfg.get("add_vision_id"), bool):
+        svc.add_vision_id = cfg["add_vision_id"]
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         svc.reasoning_budget_configured = True
