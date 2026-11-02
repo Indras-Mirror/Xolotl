@@ -101,6 +101,20 @@ turns going through the prompt batch, and the VRAM cache reloading with this con
 prompt. Pull the latest Xolotl (25 Oct or newer) and use
 `--rank v4/rank-1017-v4.bin --tier-batch-pcie 0.25`.
 
+**Coding speed depends on the kind of coding (2 Nov).** A user on a 3090 Ti + 128 GB asked why they see ~35 tok/s
+while coding when our tables say ~24. Same machine, same served settings (V4, Q6_K dense, arena 80 GiB, DSpark depth 4
+with prompt-lookup drafts), an 8K code prompt, 256 tokens out:
+
+| context | writing new code | repeating the code with comments added |
+|---|---|---|
+| 524K (as served) | 23.6 tok/s | **35.3 tok/s** |
+| 131K | 24.2 tok/s | 34.4 tok/s |
+| 131K + `STRATA_PRESTAGE_GIB=1.5` | 24.6 tok/s | 33.6 tok/s |
+
+Context size and prestaging barely move it. What moves it is the work: when the answer repeats or edits code that is
+already in the conversation (refactors, adding comments, patching a file), the prompt-lookup drafts get accepted far
+more often and decode goes up by about half. Writing new code from scratch stays around 24 tok/s. One probe per cell.
+
 ## Measuring it yourself
 
 ```bash
