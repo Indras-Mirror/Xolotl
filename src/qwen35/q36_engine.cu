@@ -40,6 +40,9 @@
 #include <cuda_runtime.h>
 #include "q36_cache_hub.hpp"
 #include "q36_snapshot_owner.hpp"
+#include "q36_persistent_payload.hpp"
+#include "strata/core/persistent_prefix.hpp"
+#include <sstream>
 #include "q36_resident_prefix.hpp"
 #include "q36_resident_verify.hpp"
 #ifndef __HIP_PLATFORM_AMD__
@@ -3099,7 +3102,7 @@ struct ImageCache {
         it->second.used = ++clock;
         return &it->second;
     }
-    Entry* put(uint64_t key, const float* rows, int64_t n, int64_t nx, int64_t ny, const std::vector<uint64_t>& keep) {
+    Entry* put(uint64_t key, const void* rows, int64_t n, int64_t nx, int64_t ny, const std::vector<uint64_t>& keep) {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         if (Entry* e = find(key)) {
             if (e->n == n && e->nx == nx && e->ny == ny) return e;
@@ -3122,8 +3125,14 @@ struct ImageCache {
         }
         std::memcpy(e.rows, rows, b);
         e.n = n; e.nx = nx; e.ny = ny; e.used = ++clock;
-        bytes += b;
-        return &(m[key] = e);
+        try {
+            auto inserted=m.emplace(key,e);
+            bytes += b;
+            return &inserted.first->second;
+        } catch (...) {
+            cudaFreeHost(e.rows);
+            throw;
+        }
     }
     void drop(uint64_t key) {
         std::lock_guard<std::recursive_mutex> lock(mutex);
@@ -3272,6 +3281,83 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
     const int64_t N = g.n_embd;
     E.alloc_snaps();
     E.alloc_pages(park_bytes);
+    // One bounded I/O queue per process, shared by native batching workers.
+    static auto prefix_store=std::make_shared<strata::core::prefix::Store>(strata::core::prefix::Config::from_env());
+    std::string prefix_identity;
+    if(prefix_store->enabled()) {
+        std::ostringstream options; options.precision(17);
+        options << "q36-checkpoint-v1:" << E.ctx << ':' << E.tmax << ':' << E.mtp_d << ':'
+                << E.use_graph << ':' << E.use_flash << ':' << E.use_mmq << ':' << E.main_hybrid << ':'
+                << E.hybrid_t << ':' << E.m->has_mtp << ':' << E.m->top_k << ':' << E.m->n_rot << ':'
+                << E.m->eps << ':' << E.m->rope_base << ':' << E.snap_bytes() << ':' << E.page_bytes();
+        for(const auto& layer:E.m->layers) options << ':' << layer.n_slots;
+        for(const char* name:{"STRATA_Q36_FA","STRATA_Q36_NO_MMQ","STRATA_Q36_BLAS_F32", "STRATA_Q36_MROPE_OFF",
+                             "STRATA_Q36_STREAM_ALL","STRATA_Q36_FIXED_SLOTS","STRATA_MMQ_KQ","STRATA_DENSE_F32",
+                             "STRATA_HIP_PROMPT_F16","STRATA_DEQUANT_SIDE","STRATA_BF16_TC","STRATA_RDNA2_SGEMM",
+                             "STRATA_WMMA_GEMM","STRATA_WMMA_BF16","STRATA_PF_GEMM","STRATA_PF_SWITCH_MIN_T",
+                             "STRATA_DENSE_MMQ","STRATA_PF_PAD","STRATA_HIPBLASLT_TUNING","STRATA_HIPBLASLT_TABLE","STRATA_ROCBLAS_TUNING",
+                             "CUBLAS_WORKSPACE_CONFIG","NVIDIA_TF32_OVERRIDE"})
+            options << ':' << name << '=' << (std::getenv(name)?std::getenv(name):"");
+        int device=0, runtime=0, driver=0; cudaDeviceProp properties{};
+        CK(cudaGetDevice(&device)); CK(cudaGetDeviceProperties(&properties,device));
+        CK(cudaRuntimeGetVersion(&runtime)); CK(cudaDriverGetVersion(&driver));
+        options << ':' << properties.name << ':' << properties.major << ':' << properties.minor << ':' << runtime << ':' << driver;
+        std::vector<std::string> inputs;
+        for(size_t i=0;i<E.m->file->size();++i)inputs.push_back(E.m->file->shard(i).path());
+        for(const char* name:{"STRATA_HIPBLASLT_TUNING","STRATA_ROCBLAS_TUNING"})
+            if(const char* path=std::getenv(name))if(*path)inputs.emplace_back(path);
+        prefix_identity=strata::core::prefix::model_identity("q36",options.str(),std::move(inputs));
+    }
+    auto image_namespace = [&](uint64_t key) { return prefix_identity+"/image/"+std::to_string(key); };
+    auto restore_image = [&](uint64_t key, const std::function<bool()>& cancelled) {
+        try {
+        if(prefix_identity.empty() || icache.find(key) || (cancelled && cancelled()))return;
+        auto record=prefix_store->find(image_namespace(key),{0},1,cancelled);
+        if(!record || (cancelled && cancelled()))return;
+        strata::q36::persistent::Reader r{record->payload};uint64_t magic,n,nx,ny,width;
+        if(!r.u64(magic)||magic!=0x31494d363351ULL||!r.u64(n)||!r.u64(nx)||!r.u64(ny)||!r.u64(width)||
+           width!=uint64_t(icache.width)||!width||!n||!nx||!ny||nx>UINT64_MAX/ny||nx*ny!=n ||
+           width>SIZE_MAX/sizeof(float)||n>icache.budget/(width*sizeof(float)) ||
+           n*width*sizeof(float)!=record->payload.size()-r.at)return;
+        if(cancelled && cancelled())return;
+        std::lock_guard<std::recursive_mutex> image_lock(icache.mutex);
+        if(icache.find(key))return;
+        size_t retained=0;
+        for(const auto& entry:icache.m)if(icache.pinned.count(entry.first)) {
+            const size_t bytes=size_t(entry.second.n)*size_t(icache.width)*sizeof(float);
+            if(bytes>icache.budget-retained)return;
+            retained+=bytes;
+        }
+        // Persistence must not oversubscribe the caller's image RAM budget
+        // when other native owners have pinned every eviction candidate.
+        if(size_t(n*width*sizeof(float))>icache.budget-retained)return;
+        icache.put(key,record->payload.data()+r.at,int64_t(n),int64_t(nx),int64_t(ny),{key});
+        } catch(const std::bad_alloc&) {
+            std::fprintf(stderr,"strata-q36: persistent image restore: allocation failed; cache miss\n");
+        } catch(const std::length_error&) {
+            std::fprintf(stderr,"strata-q36: persistent image restore: invalid size; cache miss\n");
+        }
+    };
+    auto persist_images = [&](const std::vector<Pic>& pics) {
+        try {
+        if(prefix_identity.empty())return;
+        for(const auto& pic:pics) {
+            if(!pic.rows || pic.n<=0)continue;
+            size_t bytes=0;
+            if(icache.width<=0 || uint64_t(icache.width)>SIZE_MAX/sizeof(float) ||
+               !strata::q36::persistent::size_bytes(40,size_t(pic.n),size_t(icache.width)*sizeof(float),bytes))continue;
+            auto reservation=prefix_store->reserve(bytes);if(!reservation)continue;
+            strata::q36::persistent::Writer w;w.bytes.reserve(bytes);
+            w.u64(0x31494d363351ULL);w.u64(uint64_t(pic.n));w.u64(uint64_t(pic.nx));w.u64(uint64_t(pic.ny));w.u64(uint64_t(icache.width));
+            w.raw(pic.rows,bytes-40);
+            prefix_store->enqueue_reserved(image_namespace(pic.key),{0},std::move(w.bytes),std::move(reservation));
+        }
+        } catch(const std::bad_alloc&) {
+            std::fprintf(stderr,"strata-q36: persistent image save: allocation failed; cache miss\n");
+        } catch(const std::length_error&) {
+            std::fprintf(stderr,"strata-q36: persistent image save: invalid size; cache miss\n");
+        }
+    };
     q36_printf("INFO engine=q36 img_refs=1 snapshots=%d snapshot_every=%d snapshot_mib=%.0f image_cache_mib=%zu n_embd=%lld park_pages=%zu\n",
                 E.max_snaps, snap_every, E.snap_bytes() / 1048576.0, icache.budget >> 20, (long long) N, E.host_page_count());
     q36_printf("READY %d stop\n", E.ctx);
@@ -3526,6 +3612,135 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         for (size_t i = 0; i < n; ++i) h = fnv_mix(h, v[i]);
         return h;
     };
+    auto persist_conversation = [&](const Conv& c) {
+        try {
+        if(prefix_identity.empty() || live_cancelled) return;
+        std::vector<Engine::Snap*> states=c.states;
+        std::sort(states.begin(),states.end(),[](const Engine::Snap* a,const Engine::Snap* b){return a->pos>b->pos;});
+        for(const auto* sn:states) {
+            if(sn->writing || sn->pos<=0 || sn->pos>c.mirrored || size_t(sn->pos)>c.tok.size() ||
+               size_t(sn->pos)>c.val.size() || sn->hash!=prefix_hash(c.val,size_t(sn->pos)))continue;
+            const size_t count=(size_t(sn->pos)+Engine::kPage-1)/Engine::kPage;
+            if(count>c.pages.size())continue;
+            size_t header=0, expected=0;
+            if(!strata::q36::persistent::size_bytes(56,size_t(sn->pos),8,header) ||
+               E.snap_bytes()>SIZE_MAX-header ||
+               !strata::q36::persistent::size_bytes(header+E.snap_bytes(),count,E.page_bytes(),expected))continue;
+            auto reservation=prefix_store->reserve(expected);
+            if(!reservation)continue;
+            strata::q36::persistent::Writer w;w.bytes.reserve(expected);
+            w.u64(0x315043363351ULL);w.u64(uint64_t(sn->pos));w.u64(E.page_bytes());w.u64(E.snap_bytes());
+            w.u64(sn->hash);w.u64(uint64_t(std::min(3,std::max(0,sn->prio))));w.u64(count*E.page_bytes());
+            for(size_t i=0;i<size_t(sn->pos);++i)w.u64(uint32_t(c.tok[i]));
+            w.raw(sn->host,E.snap_bytes());
+            const size_t base=w.bytes.size();w.bytes.resize(expected,0);
+            const size_t row=size_t(E.m->g.head_dim)*sizeof(__half), span=row*Engine::kPage;
+            for(size_t pg=0;pg<count;++pg) {
+                const size_t valid=std::min<size_t>(Engine::kPage,size_t(sn->pos)-pg*Engine::kPage)*row;
+                for(size_t off=0;off<E.page_bytes();off+=span)
+                    std::memcpy(w.bytes.data()+base+pg*E.page_bytes()+off,c.pages[pg]+off,valid);
+            }
+            std::vector<uint64_t> cells(c.val.begin(),c.val.begin()+sn->pos);
+            if(!prefix_store->enqueue_reserved(prefix_identity,std::move(cells),std::move(w.bytes),std::move(reservation)))break;
+        }
+        } catch(const std::bad_alloc&) {
+            std::fprintf(stderr,"strata-q36: persistent checkpoint save: allocation failed; cache miss\n");
+        } catch(const std::length_error&) {
+            std::fprintf(stderr,"strata-q36: persistent checkpoint save: invalid size; cache miss\n");
+        }
+    };
+    auto restore_persistent = [&](const std::vector<uint64_t>& cells) {
+        try {
+        if(prefix_identity.empty() || cells.size()<2 || stop.load() || !E.host_page_count() || E.snapshot_pool().empty())return;
+        size_t ram_cells=0;
+        {
+            auto lock=E.host_lock();
+            auto common=[&](const std::vector<uint64_t>& values,size_t limit) {
+                size_t n=0;while(n<limit&&n<cells.size()&&values[n]==cells[n])++n;return n;
+            };
+            const size_t active=common(live_v,live_v.size());
+            if(active==live_v.size()&&active==size_t(E.pos)&&active<cells.size())ram_cells=active;
+            auto states=[&](const std::vector<uint64_t>& values,size_t limit,const std::vector<Engine::Snap*>& owned) {
+                const size_t same=common(values,limit);
+                for(const auto* state:owned)if(!state->writing&&state->pos>0&&size_t(state->pos)<=same&&
+                    size_t(state->pos)<cells.size()&&state->hash==prefix_hash(cells,size_t(state->pos)))
+                    ram_cells=std::max(ram_cells,size_t(state->pos));
+            };
+            states(live_v,live_v.size(),act_states);
+            for(const auto& c:parked)states(c.val,size_t(c.mirrored),c.states);
+        }
+        const size_t limit=std::min(cells.size()-1,E.host_page_count()*size_t(Engine::kPage));
+        auto record=prefix_store->find(prefix_identity,cells,limit,[&]{return stop.load();},ram_cells);
+        if(!record || stop.load())return;
+        strata::q36::persistent::Checkpoint payload;
+        if(!strata::q36::persistent::decode(record->payload,record->cells,E.page_bytes(),E.snap_bytes(),size_t(E.ctx),payload,false) ||
+           payload.hash!=prefix_hash(record->cells,record->cells.size()))return;
+        for(size_t i=0;i<payload.tokens.size();++i) {
+            const int32_t token=payload.tokens[i];
+            if(token<0||token>=E.m->g.n_vocab)return;
+            if(!(record->cells[i]&kImageCell)&&record->cells[i]!=uint64_t(token))return;
+            if((record->cells[i]&kImageCell)&&token!=E.m->tok_image_pad)return;
+        }
+        const size_t needed=payload.pages_bytes/E.page_bytes();
+        if(needed>E.host_page_count())return;
+        auto lock=E.host_lock();
+        // Duplicate imports race harmlessly: the existing complete record wins.
+        for(const auto& old:parked)if(old.val==record->cells)
+            for(const auto* state:old.states)
+                if(!state->writing && state->pos==int64_t(record->cells.size()) && state->hash==payload.hash)return;
+        Engine::Snap* sn=nullptr;
+        auto capacity=[&] {
+            sn=nullptr;
+            for(auto& item:E.snapshot_pool())if(!item.refs&&!item.pins&&!item.writing&&item.host){sn=&item;break;}
+            return sn && E.page_pool().size()>=needed;
+        };
+        while(!capacity())if(stop.load() || !drop_lru_parked())return;
+        if(stop.load())return;
+        Conv imported;imported.tok=std::move(payload.tokens);imported.val=record->cells;
+        imported.mirrored=int64_t(imported.val.size());
+        imported.pages.reserve(needed);imported.states.reserve(1);
+        std::vector<strata::q36::resident::PageStamp> tickets;tickets.reserve(needed);
+        parked.reserve(parked.size()+1);
+        bool snapshot_pinned=false,snapshot_owned=false;
+        auto rollback=[&] {
+            auto cleanup_lock=E.host_lock();
+            unref(imported.pages);
+            if(snapshot_owned){--sn->refs;sn->pos=-1;}
+            if(snapshot_pinned){--sn->pins;sn->pos=-1;}
+            if(snapshot_owned||snapshot_pinned)sn->writing=false;
+        };
+        strata::q36::persistent::ScopeExit<decltype(rollback)> transaction{rollback};
+        sn->writing=true;++sn->pins;sn->pos=-1;snapshot_pinned=true;
+        for(size_t i=0;i<needed;++i) {
+            auto* page=E.cache_hub?E.cache_hub->take_page():E.page_pool().back();
+            if(!E.cache_hub){page_refs.emplace(page,1);E.page_pool().pop_back();}
+            imported.pages.push_back(page);
+        }
+        if(E.cache_hub)for(auto* page:imported.pages)tickets.push_back(E.cache_hub->begin_page_write(page));
+        if(lock.owns_lock())lock.unlock();
+        // No live device state is touched. All handles stay privately reserved
+        // until the checksum-verified bytes and cancellation check have completed.
+        for(size_t i=0;i<needed && !stop.load();++i)
+            std::memcpy(imported.pages[i],payload.page_data+i*E.page_bytes(),E.page_bytes());
+        if(!stop.load())std::memcpy(sn->host,payload.state_data,E.snap_bytes());
+        if(E.cache_hub)lock.lock();
+        if(stop.load())return;
+        if(E.cache_hub)for(const auto& ticket:tickets)if(!E.cache_hub->finish_page_write(ticket))std::abort();
+        sn->pos=imported.mirrored;sn->hash=payload.hash;sn->prio=payload.priority;
+        sn->used=++E.snapshot_clock();sn->writing=false;--sn->pins;snapshot_pinned=false;
+        ++sn->refs;snapshot_owned=true;
+        imported.states.push_back(sn);
+        if(E.cache_hub)E.cache_hub->publish(std::move(imported));
+        else {imported.used=++conv_clock;parked.push_back(std::move(imported));}
+        transaction.armed=false;
+        while(parked.size()>max_parked)if(!drop_lru_parked())break;
+        std::fprintf(stderr,"strata-q36: persistent restored=%zu bytes=%zu\n",record->cells.size(),record->payload.size());
+        } catch(const std::bad_alloc&) {
+            std::fprintf(stderr,"strata-q36: persistent restore: allocation failed; cache miss\n");
+        } catch(const std::length_error&) {
+            std::fprintf(stderr,"strata-q36: persistent restore: invalid size; cache miss\n");
+        }
+    };
     // Park the active prefix without changing its device state. A cancelled caller may
     // retain an already-owned, mirrored checkpoint instead of copying a new end state.
     // share=true retains the active handles; share=false transfers only the retained subset.
@@ -3654,10 +3869,15 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         const auto published_cells=parked.empty()?0:parked.back().val.size();
         const auto published_index=(int)parked.size()-1;
         const auto published_states=parked.empty()?std::vector<Engine::Snap*>{}:parked.back().states;
+        auto persisted_owner=!prefix_identity.empty() && !live_cancelled && E.cache_hub && !parked.empty()?E.cache_hub->checkout(parked.size()-1):strata::q36::cache::Hub::Checkout{};
         if(park_lock.owns_lock()) park_lock.unlock();
         if (!checkpoint_only && !E.cache_hub) {
             CK(cudaStreamSynchronize(E.st));   // observe the old end-snapshot completion before new KV restore
             if (phase_trace) std::fprintf(stderr, "strata-q36: park snapshot end at %.3f mode=%s observed=1\n", wall_ms(), mode);
+        }
+        if(!prefix_identity.empty() && !live_cancelled) {
+            if(persisted_owner)persist_conversation(persisted_owner.conv);
+            else if(!parked.empty())persist_conversation(parked.back());
         }
         // The checkpoint-only branch enqueues no GPU work. Cancel DONE already drained
         // the old stream; neither E.pos nor live tokens were changed by parking.
@@ -3710,7 +3930,9 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             for (const std::string& k : split(rest, ',')) {
                 if (k.empty()) continue;
                 uint64_t key = 0;
-                const ImageCache::Entry* e = parse_hex(k, key) ? icache.find(key) : nullptr;
+                const bool valid_key=parse_hex(k,key);
+                if(valid_key)restore_image(key,{});
+                const ImageCache::Entry* e = valid_key ? icache.find(key) : nullptr;
                 out += first ? " " : ",";
                 first = false;
                 out += e ? std::to_string((long long) e->n) + ":" + std::to_string((long long) e->nx) + ":" +
@@ -3845,9 +4067,12 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                     const ImageCache::Entry* e = icache.put(key, bodies[k].data(), pn, nx, ny, keep);
                     if (!e) { ve = "no host memory for a picture's rows"; break; }
                     rows = e->rows;
-                } else if (const ImageCache::Entry* e = icache.find(key)) {
-                    if (e->n != pn || e->nx != nx || e->ny != ny) { ve = "a picture's reference does not match its grid"; break; }
-                    rows = e->rows;
+                } else {
+                    restore_image(key,[&]{return stop.load();});
+                    if(const ImageCache::Entry* e=icache.find(key)) {
+                        if (e->n != pn || e->nx != nx || e->ny != ny) { ve = "a picture's reference does not match its grid"; break; }
+                        rows = e->rows;
+                    }
                 }
                 pics.push_back({pn, nx, ny, key, rows});
             }
@@ -3863,6 +4088,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         std::vector<uint64_t> ph((size_t) n + 1);   // ph[i]: the hash of cells [0, i)
         ph[0] = kFnvSeed;
         for (int64_t i = 0; i < n; ++i) ph[(size_t) i + 1] = fnv_mix(ph[(size_t) i], cell[(size_t) i]);
+        restore_persistent(cell);
         auto selection_lock=E.host_lock();
         // Refresh personal breakpoints even when reuse selects a deeper periodic state.
         // A cache-control marker newly added to a held state can promote it without recompute.
@@ -4347,7 +4573,20 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                          cancel_flush_after, cancel_log_before, cancel_log_after);
         // Cancelled live state stays on the device. A switch prefers its existing owned
         // checkpoint; the fallback can still copy, so measure park completion separately.
+        if (!live_cancelled && !prefix_identity.empty()) persist_images(pics);
         if (!live_cancelled) mirror_active();
+        if (!live_cancelled && !E.batch_idle && !prefix_identity.empty()) {
+            try {
+                // Borrow committed anchors for serialization. No new native park,
+                // GPU snapshot or ownership transfer is needed for persistence.
+                Conv completed;
+                completed.tok=live;completed.val=live_v;completed.pages=act_pages;
+                completed.states=act_states;completed.mirrored=act_mirrored;
+                persist_conversation(completed);
+            } catch(const std::bad_alloc&) {
+                std::fprintf(stderr,"strata-q36: persistent completed view: allocation failed; skip save\n");
+            }
+        }
         size_t parked_count=0, free_page_count=0;
         { auto metadata_lock=E.host_lock(); parked_count=parked.size(); free_page_count=E.page_pool().size(); }
         std::fprintf(stderr, "strata-q36: request %lld cells: reused %lld (%s%s), read %lld in %.1f ms, %zu pictures, %zu "

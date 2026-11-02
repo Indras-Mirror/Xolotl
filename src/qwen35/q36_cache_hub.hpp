@@ -131,10 +131,14 @@ public:
         std::lock_guard<std::recursive_mutex> lock(mutex);
         if (free_pages.empty()) return nullptr;
         const uint64_t cookie=track_page_versions?next_page_version():0;
-        auto* page = free_pages.back(); free_pages.pop_back();
+        auto* page = free_pages.back();
         if (!page || page_refs.count(page)) throw std::logic_error("cache free page is still owned");
+        // Keep the free-list owner until both potentially allocating metadata
+        // insertions have succeeded. A failed reservation loses no host page.
         page_refs.emplace(page, 1);
-        if(track_page_versions)page_versions[page]={cookie,0,false};
+        try { if(track_page_versions)page_versions[page]={cookie,0,false}; }
+        catch (...) { page_refs.erase(page); throw; }
+        free_pages.pop_back();
         return page;
     }
     // Copy takes place outside metadata locks. The extra source reference keeps

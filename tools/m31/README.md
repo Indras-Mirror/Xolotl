@@ -89,6 +89,38 @@ equal. `SLEEP` while asleep and `WAKE` while awake are idempotent. A failed
 wake answers `ERR` and leaves the engine asleep; `conversation=0` in `SLEPT`
 reports that the KV rows could not be kept (the next request reads its prompt).
 
+## Optional persistent prefix tier
+
+Set `STRATA_PREFIX_CACHE_DIR` to a private writable directory to enable the
+shared disk tier. `STRATA_PREFIX_CACHE_BYTES` bounds the entire directory across
+models and processes; `STRATA_PREFIX_CACHE_MIN_FREE_BYTES` reserves free space.
+`STRATA_PREFIX_CACHE_QUEUE_BYTES` bounds pending immutable snapshots and I/O
+buffers. The tier is off when the directory is unset. Incompatible, corrupt,
+incomplete or oversized snapshots are cache misses.
+
+The engine copies a committed snapshot to host memory before reporting request
+completion; only the subsequent file write runs in the background. Large
+snapshots can therefore add completion latency. The native log reports snapshot
+time separately from disk write and restore counters.
+
+M31 saves complete F16 K/V and MSA-index rows plus actual vision embedding
+identity after a successful, cache-enabled request. It restores the longest
+compatible indexed prefix at a 256-token boundary, then computes the suffix
+again to obtain fresh logits. Large snapshots use a bounded selection of such
+boundaries. Neither sampler state nor expert residency is reused. The normal
+last-live-conversation cache remains enabled. Set
+`STRATA_PREFIX_CACHE_RAM_BYTES` explicitly for an additional bounded LRU of old
+conversation snapshots; its default is zero.
+
+The snapshot must fit the queue budget as well as the disk budget. For example,
+a model needing about 135 KiB of K/V/index state per token needs over 5 GiB for
+40K tokens, so the default 2 GiB queue cannot store that snapshot. An 8–16 GiB
+queue and a separately chosen 4–16 GiB RAM tier are useful example budgets;
+choose them for the actual model and available memory. These are settings to
+try, not measured performance claims. The disk identity binds the model file
+inventory, executable and computation settings on this host; model files must
+remain immutable while the engine is running.
+
 ## Layout
 
 - `m31_engine.*`, `m31_geometry.hpp`, `m31_arena.hpp`: model graph and storage.

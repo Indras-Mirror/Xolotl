@@ -159,6 +159,18 @@ int main(int argc, char ** argv) {
         check_tail("split", split, "split_decode_rewind", head("split_decode_rewind"));
         require(engine.restore_prefix(checkpoint, error), error); pass(reused, length - reused);
         check_tail("split", split, "restore", head("restore"));
+        // An admitted persistent payload must reproduce the same checkpoint,
+        // independently of the original checkpoint object's host ownership.
+        Engine::PrefixCheckpointPtr imported;
+        require(engine.import_prefix(checkpoint->position(), checkpoint->payload(), imported, error), error);
+        require(engine.restore_prefix(imported, error), error); pass(reused, length - reused);
+        check_tail("split", split, "import_restore", head("import_restore"));
+        const auto valid_position = engine.position();
+        Engine::PrefixCheckpointPtr rejected;
+        require(!engine.import_prefix(checkpoint->position(), {}, rejected, error),
+                "truncated persistent checkpoint was accepted");
+        require(!rejected && engine.position() == valid_position,
+                "invalid persistent checkpoint changed live state");
         require(engine.release_prefill_workspace(error), error); rewind(); pass(reused, length - reused);
         check_tail("split", split, "release_rewind", head("release_rewind"));
         std::ofstream summary(out / "summary.json");

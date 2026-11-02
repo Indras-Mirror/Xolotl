@@ -22,6 +22,9 @@ public:
     Engine & operator=(const Engine &) = delete;
     bool init(const std::string & gguf, const Config & cfg, std::string & error);
     const Geometry & geometry() const;
+    // Effective backend/device identity for the opt-in persistent tier. No
+    // inference runs here; empty means persistence must remain disabled.
+    std::string prefix_runtime_identity() const;
     // Append one chunk. A preflight rejection preserves valid state. Once execution
     // starts, an error requires reset(): caches may be partially written.
     bool forward(const int32_t * tokens, int n, std::string & error);
@@ -41,6 +44,7 @@ public:
         PrefixCheckpoint & operator=(const PrefixCheckpoint &) = delete;
         size_t bytes() const { return bytes_.size(); }
         int64_t position() const { return position_; }
+        const std::vector<uint8_t> & payload() const { return bytes_; }
     private:
         friend class Engine;
         PrefixCheckpoint() = default;
@@ -51,6 +55,12 @@ public:
     using PrefixCheckpointPtr = std::shared_ptr<const PrefixCheckpoint>;
     size_t prefix_checkpoint_bytes() const;
     bool checkpoint_prefix(size_t maximum_bytes, PrefixCheckpointPtr & out, std::string & error);
+    // Admit an immutable on-disk payload only after the caller verifies its
+    // checksum and exact model/config/backend identity. This performs shape
+    // validation without changing live state; restore_prefix remains the only
+    // operation that uploads rows. Disk pointers are never engine pointers.
+    bool import_prefix(int64_t position, std::vector<uint8_t> payload,
+                       PrefixCheckpointPtr & out, std::string & error) const;
     // On success only forward() may consume the restored prefix; logits() has
     // no last chunk. The caller retains the exact last-prefix logits separately.
     // Rejected foreign/invalid checkpoints leave the current valid state alone.
