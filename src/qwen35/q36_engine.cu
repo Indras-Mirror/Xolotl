@@ -3308,10 +3308,11 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             if(const char* path=std::getenv(name))if(*path)inputs.emplace_back(path);
         prefix_identity=strata::core::prefix::model_identity("q36",options.str(),std::move(inputs));
     }
+    const bool bound_images=strata::core::prefix::bound_image_producer();
     auto image_namespace = [&](uint64_t key) { return prefix_identity+"/image/"+std::to_string(key); };
     auto restore_image = [&](uint64_t key, const std::function<bool()>& cancelled) {
         try {
-        if(prefix_identity.empty() || icache.find(key) || (cancelled && cancelled()))return;
+        if(!bound_images || prefix_identity.empty() || icache.find(key) || (cancelled && cancelled()))return;
         auto record=prefix_store->find(image_namespace(key),{0},1,cancelled);
         if(!record || (cancelled && cancelled()))return;
         strata::q36::persistent::Reader r{record->payload};uint64_t magic,n,nx,ny,width;
@@ -3332,6 +3333,8 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         // when other native owners have pinned every eviction candidate.
         if(size_t(n*width*sizeof(float))>icache.budget-retained)return;
         icache.put(key,record->payload.data()+r.at,int64_t(n),int64_t(nx),int64_t(ny),{key});
+        std::fprintf(stderr,"strata-q36: persistent image restored key=%016llx tokens=%llu\n",
+                     (unsigned long long)key,(unsigned long long)n);
         } catch(const std::bad_alloc&) {
             std::fprintf(stderr,"strata-q36: persistent image restore: allocation failed; cache miss\n");
         } catch(const std::length_error&) {
@@ -3340,7 +3343,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
     };
     auto persist_images = [&](const std::vector<Pic>& pics) {
         try {
-        if(prefix_identity.empty())return;
+        if(!bound_images || prefix_identity.empty())return;
         for(const auto& pic:pics) {
             if(!pic.rows || pic.n<=0)continue;
             size_t bytes=0;
@@ -3358,8 +3361,10 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             std::fprintf(stderr,"strata-q36: persistent image save: invalid size; cache miss\n");
         }
     };
-    q36_printf("INFO engine=q36 img_refs=1 snapshots=%d snapshot_every=%d snapshot_mib=%.0f image_cache_mib=%zu n_embd=%lld park_pages=%zu\n",
+    q36_printf("INFO engine=q36 img_refs=1 snapshots=%d snapshot_every=%d snapshot_mib=%.0f image_cache_mib=%zu n_embd=%lld park_pages=%zu",
                 E.max_snaps, snap_every, E.snap_bytes() / 1048576.0, icache.budget >> 20, (long long) N, E.host_page_count());
+    if(prefix_store->enabled())q36_printf(" persistent_images_bound=%d",int(bound_images));
+    q36_printf("\n");
     q36_printf("READY %d stop\n", E.ctx);
     q36_flush();
     std::mutex mu;
@@ -3615,6 +3620,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
     auto persist_conversation = [&](const Conv& c) {
         try {
         if(prefix_identity.empty() || live_cancelled) return;
+        if(!bound_images && std::any_of(c.val.begin(),c.val.end(),[](uint64_t value){return bool(value&kImageCell);}))return;
         std::vector<Engine::Snap*> states=c.states;
         std::sort(states.begin(),states.end(),[](const Engine::Snap* a,const Engine::Snap* b){return a->pos>b->pos;});
         for(const auto* sn:states) {
@@ -4069,6 +4075,9 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                     const ImageCache::Entry* e = icache.put(key, bodies[k].data(), pn, nx, ny, keep);
                     if (!e) { ve = "no host memory for a picture's rows"; break; }
                     rows = e->rows;
+                    if(bound_images && !prefix_identity.empty())
+                        std::fprintf(stderr,"strata-q36: persistent image supplied key=%016llx tokens=%lld\n",
+                                     (unsigned long long)key,(long long)pn);
                 } else {
                     restore_image(key,[&]{return stop.load();});
                     if(const ImageCache::Entry* e=icache.find(key)) {
@@ -4090,7 +4099,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         std::vector<uint64_t> ph((size_t) n + 1);   // ph[i]: the hash of cells [0, i)
         ph[0] = kFnvSeed;
         for (int64_t i = 0; i < n; ++i) ph[(size_t) i + 1] = fnv_mix(ph[(size_t) i], cell[(size_t) i]);
-        restore_persistent(cell);
+        if(bound_images || pics.empty())restore_persistent(cell);
         auto selection_lock=E.host_lock();
         // Refresh personal breakpoints even when reuse selects a deeper periodic state.
         // A cache-control marker newly added to a held state can promote it without recompute.

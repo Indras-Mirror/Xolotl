@@ -145,6 +145,22 @@ int main() {
     // Identity invalidates same-size writes even when mtime is restored.
     const auto model=std::string(dir)+"/model";
     {std::ofstream out(model); out << "123";}
+    // Unbound embedding producers may use text persistence, never keyed image state.
+    const char* inherited=std::getenv("STRATA_PREFIX_CACHE_VISION_ID");
+    const std::optional<std::string> saved_vision=inherited?std::optional<std::string>(inherited):std::nullopt;
+    unsetenv("STRATA_PREFIX_CACHE_VISION_ID");
+    assert(image_state_allowed(false) && !image_state_allowed(true));
+    const auto unbound=model_identity("test","settings",{model});
+    const std::string binding="frontend-vision-pipeline-v1:"+std::string(64,'a');
+    setenv("STRATA_PREFIX_CACHE_VISION_ID",binding.c_str(),1);
+    assert(image_state_allowed(false) && image_state_allowed(true));
+    const auto bound=model_identity("test","settings",{model});assert(bound!=unbound);
+    setenv("STRATA_PREFIX_CACHE_VISION_ID",("frontend-vision-pipeline-v1:"+std::string(64,'b')).c_str(),1);
+    assert(model_identity("test","settings",{model})!=bound);
+    setenv("STRATA_PREFIX_CACHE_VISION_ID","stale/unvalidated",1);
+    assert(image_state_allowed(false) && !image_state_allowed(true));
+    if(saved_vision)setenv("STRATA_PREFIX_CACHE_VISION_ID",saved_vision->c_str(),1);
+    else unsetenv("STRATA_PREFIX_CACHE_VISION_ID");
     const auto before=model_identity("test","settings",{model});
     {std::ofstream out(model); out << "456";}
     assert(before!=model_identity("test","settings",{model}));

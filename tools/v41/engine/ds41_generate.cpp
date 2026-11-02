@@ -2397,7 +2397,8 @@ int main(int argc, char ** argv) {
                 }
             };
             std::string request_prefix_identity;
-            if (!persistent_base.empty()) {
+            if (!persistent_base.empty() && core::prefix::image_state_allowed(
+                    std::any_of(rid.begin(),rid.end(),[](uint64_t value){return value!=0;}))) {
                 // Preserve exact float bits in the computation identity (decimal rounding is unsafe).
                 uint32_t rb, rbf, rbr;
                 std::memcpy(&rb, &req_rb, 4); std::memcpy(&rbf, &req_rbf, 4); std::memcpy(&rbr, &req_rbr, 4);

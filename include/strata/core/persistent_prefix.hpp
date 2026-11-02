@@ -78,6 +78,8 @@ inline std::string model_identity(const std::string& family, const std::string& 
     files.erase(std::unique(files.begin(), files.end()), files.end());
     std::ostringstream out;
     out << "prefix-host-v1:" << family.size() << ':' << family << ':' << settings.size() << ':' << settings;
+    if (const char* vision = std::getenv("STRATA_PREFIX_CACHE_VISION_ID"))
+        out << ":vision-producer:" << std::strlen(vision) << ':' << vision;
     for (const auto& file : files) {
         struct stat st{};
         if (::stat(file.c_str(), &st) || !S_ISREG(st.st_mode)) return {};
@@ -102,6 +104,14 @@ inline std::string model_identity(const std::string& family, const std::string& 
     (void)family; (void)settings; (void)files; return {};
 #endif
 }
+inline bool bound_image_producer() {
+    const char* value=std::getenv("STRATA_PREFIX_CACHE_VISION_ID");
+    const std::string prefix="frontend-vision-pipeline-v1:";
+    if(!value || std::strlen(value)!=prefix.size()+64 || std::strncmp(value,prefix.c_str(),prefix.size()))return false;
+    for(size_t i=prefix.size();value[i];++i)if(!((value[i]>='0'&&value[i]<='9')||(value[i]>='a'&&value[i]<='f')))return false;
+    return true;
+}
+inline bool image_state_allowed(bool contains_images) { return !contains_images || bound_image_producer(); }
 struct Record { std::shared_ptr<void> reservation; std::vector<uint64_t> cells; std::vector<uint8_t> payload; };
 struct FileRecord {
     std::vector<uint64_t> cells;

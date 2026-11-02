@@ -10550,7 +10550,8 @@ int main(int argc, char** argv) {
                                       const strata::core::SessionState& source,
                                       const strata::core::QsaState* draft) -> PersistentPrepared {
             PersistentPrepared prepared;
-            if (!persistent_prefix.enabled() || tokens.empty()) return prepared;
+            if (!persistent_prefix.enabled() || tokens.empty() ||
+                !strata::core::prefix::image_state_allowed(!images.empty())) return prepared;
             try {
                 std::string why;
                 if (!persistent_identity(prepared.identity, prepared.sid, why)) return {};
@@ -14511,7 +14512,7 @@ int main(int argc, char** argv) {
             // The catalogue is searched before any live state is parked or overwritten.
             // A read, identity, checksum or cancellation failure is just a cache miss.
             if (persistent_prefix.enabled() && stages.empty() && !multi_gpu && o.peer_device < 1 &&
-                o.prompt_cache > 0 && !request_cancelled()) {
+                o.prompt_cache > 0 && !request_cancelled() && strata::core::prefix::image_state_allowed(!req_imgs.empty())) {
                 struct PersistentReadCancelled {};
                 try {
                     std::string identity, why;
