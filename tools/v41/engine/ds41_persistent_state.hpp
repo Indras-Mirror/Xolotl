@@ -3,6 +3,7 @@
 #pragma once
 #include "ds41_dense.hpp"
 #include "ds41_persistent_wire.hpp"
+#include "ds41_persistent_identity.hpp"
 #include "ggml-backend.h"
 #include "strata/core/persistent_prefix.hpp"
 #include <array>
@@ -14,44 +15,6 @@
 #include <vector>
 
 namespace strata::v41 {
-
-// Conservative input identity: moving a model may miss, but changing file identity,
-// CLI arithmetic settings or environment prevents reuse of an old image.
-// As with session files, model inputs must remain immutable during a serving process.
-inline std::string ds41_persistent_identity(int argc, char ** argv,
-        const std::vector<std::string> & paths, const std::vector<std::string> & environment) {
-    namespace fs = std::filesystem;
-    std::ostringstream settings;
-    for (int i = 1; i < argc; ++i) settings << std::strlen(argv[i]) << ':' << argv[i] << ':';
-    auto env = environment; std::sort(env.begin(), env.end());
-    for (const auto & value : env) settings << value.size() << ':' << value << ':';
-    std::vector<fs::path> files;
-    std::error_code ec;
-    for (const auto & input : paths) {
-        if (input.empty()) continue;
-        const fs::path p(input);
-        if (fs::is_regular_file(p, ec) && !ec) files.push_back(p);
-        else if (fs::is_directory(p, ec) && !ec) {
-            fs::recursive_directory_iterator it(p, ec), end;
-            if (ec) return {};
-            for (; it != end; it.increment(ec)) {
-                if (ec) return {};
-                if (it->is_regular_file(ec)) files.push_back(it->path());
-                if (ec || files.size() > 65536) return {};
-            }
-        } else return {};
-    }
-    if (files.empty()) return {};
-    std::sort(files.begin(), files.end());
-    files.erase(std::unique(files.begin(), files.end()), files.end());
-    std::vector<std::string> names;
-    for (const auto & file : files) names.push_back(file.string());
-    // Settings may contain private environment values; retain only a corruption-style
-    // digest in metadata, never the original values or command line.
-    uint64_t digest = 1469598103934665603ull;
-    for (const unsigned char value : settings.str()) { digest ^= value; digest *= 1099511628211ull; }
-    return strata::core::prefix::model_identity("ds41-native-boundary-v1", std::to_string(digest), std::move(names));
-}
 
 inline std::vector<uint64_t> ds41_persistent_cells(const std::vector<int> & tokens,
                                                   const std::vector<uint64_t> & identities, size_t n) {

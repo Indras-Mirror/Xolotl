@@ -1615,10 +1615,49 @@ int main(int argc, char ** argv) {
                     environment.push_back(value);
             }
 #endif
-            persistent_base = ds41_persistent_identity(argc, argv, inputs, environment);
+            auto query_runtime = [&]() -> std::string {
+                // Identify the backend that actually owns dense state, not the
+                // requested CLI backend or a CUDA current device left by a helper.
+                const auto backend = dense.backend();
+                const auto device = backend ? ggml_backend_get_device(backend) : nullptr;
+                if (!device) return {};
+                ggml_backend_dev_props props{};
+                ggml_backend_dev_get_props(device, &props);
+                const char * name = ggml_backend_name(backend);
+                if (!name || !*name || !props.name || !*props.name || !props.description || !*props.description) return {};
+                std::ostringstream out;
+                auto field = [&](const char * value) { const std::string text = value ? value : "";
+                    out << text.size() << ':' << text << ':'; };
+                field(name); field(props.name); field(props.description); field(props.device_id);
+                out << int(props.type) << ':' << props.memory_total << ':';
+                // The expert tier may execute CPU kernels even with a CUDA dense backend.
+                out << ggml_cpu_has_avx2() << ':' << ggml_cpu_has_avx_vnni() << ':'
+                    << ggml_cpu_has_avx512() << ':' << ggml_cpu_has_avx512_vnni() << ':'
+                    << ggml_cpu_has_avx512_bf16() << ':' << ggml_cpu_has_amx_int8() << ':'
+                    << ggml_cpu_has_neon() << ':' << ggml_cpu_has_sve() << ':' << ggml_cpu_get_sve_cnt() << ':';
+                if (ggml_backend_is_cpu(backend)) { out << "cpu"; return out.str(); }
+#ifdef STRATA_ENABLE_CUDA
+                if (ggml_backend_is_cuda(backend)) {
+                    int ordinal = -1, runtime = 0, driver = 0;
+                    cudaDeviceProp properties{};
+                    if (!props.device_id || !*props.device_id ||
+                        cudaDeviceGetByPCIBusId(&ordinal, props.device_id) != cudaSuccess ||
+                        cudaGetDeviceProperties(&properties, ordinal) != cudaSuccess ||
+                        cudaRuntimeGetVersion(&runtime) != cudaSuccess || cudaDriverGetVersion(&driver) != cudaSuccess ||
+                        runtime <= 0 || driver <= 0) return {};
+                    out << "cuda:" << ordinal << ':' << properties.major << ':' << properties.minor << ':'
+                        << runtime << ':' << driver << ':';
+                    field(properties.name);
+                    return out.str();
+                }
+#endif
+                // No opaque GPU backend is accepted without its runtime descriptor.
+                return {};
+            };
+            persistent_base = ds41_persistent_identity_if_enabled(true, argc, argv, inputs, environment, query_runtime);
         }
         if (persistent_prefix.enabled() && persistent_base.empty())
-            std::fprintf(stderr, "serve: persistent prefix unavailable: requires a single-stage conversation pool and valid immutable input inventory\n");
+            std::fprintf(stderr, "serve: persistent prefix unavailable: requires a single-stage conversation pool and valid immutable input/runtime identity\n");
         struct PrefixPending {
             // Destroy host bytes before releasing their queue reservation.
             std::shared_ptr<void> reservation;
