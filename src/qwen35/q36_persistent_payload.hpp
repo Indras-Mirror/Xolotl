@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 // CPU codec for one complete restorable Q36 checkpoint. Native buffers and
 // ownership are deliberately absent from the wire format.
 #include <cstdint>
@@ -35,6 +36,21 @@ struct Writer {
         if(n>bytes.max_size()-at)throw std::length_error("Q36 checkpoint length");
         bytes.resize(at+n);
         if(n)std::memcpy(bytes.data()+at,p,n);
+    }
+    // A capture owns private bytes until enqueue. Poll between bounded copies,
+    // including padding initialization, rather than touching a model-sized tail
+    // in one resize. A false result leaves only a disposable partial capture.
+    template<class Cancel> bool capture(const void* p,size_t n,Cancel cancelled) {
+        const auto* source=static_cast<const uint8_t*>(p);
+        while(n) {
+            if(cancelled())return false;
+            const size_t chunk=std::min<size_t>(n,1<<20),at=bytes.size();
+            if(chunk>bytes.max_size()-at)throw std::length_error("Q36 checkpoint length");
+            bytes.resize(at+chunk,0);
+            if(source){std::memcpy(bytes.data()+at,source,chunk);source+=chunk;}
+            n-=chunk;
+        }
+        return !cancelled();
     }
 };
 inline bool size_bytes(size_t prefix,size_t count,size_t width,size_t& out) {

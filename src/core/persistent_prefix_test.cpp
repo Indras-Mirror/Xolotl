@@ -2,6 +2,7 @@
 #undef NDEBUG
 #endif
 #include "strata/core/persistent_prefix.hpp"
+#include "../qwen35/q36_persistent_payload.hpp"
 #include <cassert>
 #include <iostream>
 #include <sys/wait.h>
@@ -118,6 +119,43 @@ int main() {
         assert(!bounded.reserve(b.queue_bytes-1024));
     }
     // Independent model processes share the same byte quota rather than multiplying it.
+    // Cancel inside the real checksum/payload loops, without timing or slow disks.
+    // A successful lookup calibrates the deterministic callback sequence for this
+    // isolated one-entry directory; the final calls belong to 64 KiB hash chunks.
+    {
+        Config d=c; d.directory=std::string(dir)+"/cancel-read";
+        d.disk_bytes=8ull<<20; d.queue_bytes=8ull<<20;
+        Store s(d); const std::vector<uint8_t> large(3ull<<20, 17);
+        assert(s.enqueue("cancel",{1,2},large)); s.flush();
+        size_t lookup_polls=0;
+        auto file=s.find_file("cancel",{1,2},SIZE_MAX,[&]{++lookup_polls;return false;});
+        assert(file && lookup_polls>16); file.reset();
+        const auto hits=s.stats().hits.load();
+        size_t polls=0;
+        assert(!s.find_file("cancel",{1,2},SIZE_MAX,[&]{return ++polls==lookup_polls-8;}));
+        assert(polls==lookup_polls-8 && s.stats().hits==hits);
+        // find() first repeats the lookup, then polls before each 1 MiB read.
+        // Cancel before the second payload chunk, after one actual chunk read.
+        polls=0;
+        assert(!s.find("cancel",{1,2},SIZE_MAX,[&]{return ++polls==lookup_polls+2;}));
+        assert(polls==lookup_polls+2);
+        // Aborted readers release both the directory lease and payload budget.
+        auto budget=s.reserve(d.queue_bytes); assert(budget); budget.reset();
+        auto retry=s.find("cancel",{1,2}); assert(retry && retry->payload==large);
+        retry.reset();
+        // The same capture primitive used by Q36 must release admission state
+        // when cancellation discards its partially copied private bytes.
+        auto cancelled_capture=[&] {
+            auto claim=s.claim_capture("partial",{3,4}); assert(claim);
+            auto reservation=s.reserve(large.size()); assert(reservation);
+            strata::q36::persistent::Writer writer;size_t checks=0;
+            return writer.capture(large.data(),large.size(),[&]{return ++checks==2;});
+        };
+        assert(!cancelled_capture());
+        assert(s.claim_capture("partial",{3,4}));
+        budget=s.reserve(d.queue_bytes); assert(budget); budget.reset();
+        assert(!s.find("partial",{3,4}));
+    }
     std::vector<pid_t> writers;
     for(int i=0;i<4;++i) {
         child=fork(); assert(child>=0);

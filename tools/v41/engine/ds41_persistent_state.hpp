@@ -46,8 +46,14 @@ inline bool little_endian() { const uint32_t one = 1; return *(const uint8_t *) 
 // Capture only while the owning slot is bound and the prompt snapshot is final.
 // Disk workers receive these immutable bytes, never device pointers or live state.
 inline bool ds41_capture_persistent(Ds41Dense & dense, const Ds41PersistentBoundary & boundary,
-                                    std::vector<uint8_t> & out, std::string & error) {
+                                    std::vector<uint8_t> & out, std::string & error,
+                                    const std::function<bool()> & cancelled = {}) {
     using namespace ds41_persistent_detail;
+    auto stopped = [&] {
+        if (cancelled && cancelled()) { error = "persistent capture cancelled"; return true; }
+        return false;
+    };
+    if (stopped()) return false;
     static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559, "IEEE float32 required");
     if (!little_endian() || boundary.pos < 1 || dense.snapshot_pos() != boundary.pos ||
         (!boundary.replay && boundary.logits.empty()) ||
@@ -67,18 +73,21 @@ inline bool ds41_capture_persistent(Ds41Dense & dense, const Ds41PersistentBound
     u64(out, regions.size());
     append(out, boundary.logits.data(), boundary.logits.size() * sizeof(float));
     append(out, boundary.seed.data(), boundary.seed.size() * sizeof(float));
+    if (stopped()) return false;
     ggml_backend_synchronize(dense.backend());
     for (const auto & region : regions) {
+        if (stopped()) return false;
         u64(out, (uint64_t) region.t->type);
         for (unsigned d = 0; d < GGML_MAX_DIMS; ++d) {
             u64(out, (uint64_t) region.t->ne[d]); u64(out, region.t->nb[d]);
         }
         u64(out, region.off); u64(out, region.bytes);
-        const size_t offset = out.size();
-        out.resize(offset + region.bytes);
-        ggml_backend_tensor_get(region.t, out.data() + offset, region.off, region.bytes);
+        if (!persistent_wire::capture_region(out, region.bytes, stopped,
+                [&](uint8_t * target, size_t offset, size_t chunk) {
+                    ggml_backend_tensor_get(region.t, target, region.off + offset, chunk);
+                })) return false;
     }
-    return true;
+    return !stopped();
 }
 
 // All bytes, native layouts and metadata are checked before the first write.

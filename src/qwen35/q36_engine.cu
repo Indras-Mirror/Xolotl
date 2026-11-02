@@ -3388,6 +3388,8 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
     std::deque<std::string> lines;
     bool eof = false;
     std::atomic<bool> stop{false};
+    // A following GEN may reset stop while an old private capture unwinds.
+    std::atomic<uint64_t> persistent_stop_epoch{0};
     E.cancel = &stop;
     const bool phase_trace = std::getenv("STRATA_Q36_PHASE_TRACE") != nullptr;
     Q36Channel* channel = q36_channel;
@@ -3396,6 +3398,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         while (channel ? channel->read(l) : static_cast<bool>(std::getline(std::cin, l))) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
             if (l == "STOP") {
+                ++persistent_stop_epoch;
                 if (!stop.exchange(true))
                     std::fprintf(stderr, "strata-q36: STOP at %.3f\n", wall_ms());   // (the cancel latency, see DONE)
                 continue;
@@ -3635,11 +3638,14 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
     };
     auto persist_conversation = [&](const Conv& c) {
         try {
-        if(prefix_identity.empty() || live_cancelled) return;
+        const auto capture_epoch=persistent_stop_epoch.load();
+        auto cancelled=[&]{return live_cancelled || stop.load() || persistent_stop_epoch.load()!=capture_epoch;};
+        if(prefix_identity.empty() || cancelled()) return;
         if(!bound_images && std::any_of(c.val.begin(),c.val.end(),[](uint64_t value){return bool(value&kImageCell);}))return;
         std::vector<Engine::Snap*> states=c.states;
         std::sort(states.begin(),states.end(),[](const Engine::Snap* a,const Engine::Snap* b){return a->pos>b->pos;});
         for(const auto* sn:states) {
+            if(cancelled())return;
             if(sn->writing || sn->pos<=0 || sn->pos>c.mirrored || size_t(sn->pos)>c.tok.size() ||
                size_t(sn->pos)>c.val.size() || sn->hash!=prefix_hash(c.val,size_t(sn->pos)))continue;
             const size_t count=(size_t(sn->pos)+Engine::kPage-1)/Engine::kPage;
@@ -3648,23 +3654,34 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             if(!strata::q36::persistent::size_bytes(56,size_t(sn->pos),8,header) ||
                E.snap_bytes()>SIZE_MAX-header ||
                !strata::q36::persistent::size_bytes(header+E.snap_bytes(),count,E.page_bytes(),expected))continue;
-            std::vector<uint64_t> cells(c.val.begin(),c.val.begin()+sn->pos);
+            std::vector<uint64_t> cells;cells.reserve(size_t(sn->pos));
+            for(size_t i=0;i<size_t(sn->pos);++i) {
+                if((i&4095)==0 && cancelled())return;
+                cells.push_back(c.val[i]);
+            }
             auto capture=prefix_store->claim_capture(prefix_identity,cells);
             if(!capture)continue;
+            if(cancelled())return;
             auto reservation=prefix_store->reserve(expected);
             if(!reservation)continue;
+            if(cancelled())return;
             strata::q36::persistent::Writer w;w.bytes.reserve(expected);
             w.u64(0x315043363351ULL);w.u64(uint64_t(sn->pos));w.u64(E.page_bytes());w.u64(E.snap_bytes());
             w.u64(sn->hash);w.u64(uint64_t(std::min(3,std::max(0,sn->prio))));w.u64(count*E.page_bytes());
-            for(size_t i=0;i<size_t(sn->pos);++i)w.u64(uint32_t(c.tok[i]));
-            w.raw(sn->host,E.snap_bytes());
-            const size_t base=w.bytes.size();w.bytes.resize(expected,0);
+            for(size_t i=0;i<size_t(sn->pos);++i) {
+                if((i&4095)==0 && cancelled())return;
+                w.u64(uint32_t(c.tok[i]));
+            }
+            if(!w.capture(sn->host,E.snap_bytes(),cancelled))return;
             const size_t row=size_t(E.m->g.head_dim)*sizeof(__half), span=row*Engine::kPage;
             for(size_t pg=0;pg<count;++pg) {
                 const size_t valid=std::min<size_t>(Engine::kPage,size_t(sn->pos)-pg*Engine::kPage)*row;
-                for(size_t off=0;off<E.page_bytes();off+=span)
-                    std::memcpy(w.bytes.data()+base+pg*E.page_bytes()+off,c.pages[pg]+off,valid);
+                for(size_t off=0;off<E.page_bytes();off+=span) {
+                    if(!w.capture(c.pages[pg]+off,valid,cancelled) ||
+                       !w.capture(nullptr,span-valid,cancelled))return;
+                }
             }
+            if(cancelled())return;
             if(!prefix_store->enqueue_reserved(prefix_identity,std::move(cells),std::move(w.bytes),std::move(reservation),std::move(capture)))break;
         }
         } catch(const std::bad_alloc&) {

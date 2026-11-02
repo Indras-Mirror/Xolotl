@@ -1684,10 +1684,17 @@ int main(int argc, char ** argv) {
             }
             pending.clear();
         };
+        auto persistent_cancelled = [&](int slot) {
+            std::lock_guard<std::mutex> guard(qm);
+            for (const auto & command : q)
+                if (command == "STOP" || (slot >= 0 && command == "BSTOP " + std::to_string(slot))) return true;
+            return false;
+        };
         auto persistent_save = [&](const std::string & identity, const std::vector<int> & tokens,
                                    const std::vector<uint64_t> & images, int boundary,
-                                   const std::vector<float> & logits, const std::vector<float> & seed, int seed_rows) {
-            if (identity.empty() || boundary < std::max(1, park_min) || tokens.size() < (size_t) boundary) return;
+                                   const std::vector<float> & logits, const std::vector<float> & seed, int seed_rows, int slot) {
+            auto cancelled = [&] { return persistent_cancelled(slot); };
+            if (identity.empty() || boundary < std::max(1, park_min) || tokens.size() < (size_t) boundary || cancelled()) return;
             try {
                 Ds41PersistentBoundary state;
                 state.pos = boundary; state.logits = logits; state.seed_rows = seed_rows;
@@ -1701,7 +1708,7 @@ int main(int argc, char ** argv) {
                 std::vector<uint8_t> payload;
                 payload.reserve((size_t) estimate);
                 std::string error;
-                if (!ds41_capture_persistent(dense, state, payload, error)) return;
+                if (!ds41_capture_persistent(dense, state, payload, error, cancelled) || cancelled()) return;
                 const bool queued = persistent_prefix.enqueue_reserved(identity, ds41_persistent_cells(tokens, images, boundary),
                                                                         std::move(payload), std::move(reservation));
                 std::fprintf(stderr, "serve: persistent prefix save tokens=%d queued=%d\n", boundary, queued ? 1 : 0);
@@ -2005,7 +2012,7 @@ int main(int argc, char ** argv) {
                     std::strcmp(fin, "error") != 0 && bind(b)) {
                     const Conv & c = cv[(size_t) b];
                     persistent_save(c.persistent_identity, c.hist, c.live_id, c.snap_len,
-                                    c.snap_logits, c.snap_seed, c.snap_seed_n);
+                                    c.snap_logits, c.snap_seed, c.snap_seed_n, b);
                 }
             }
             cv[(size_t) b].used = now_ms();
@@ -2424,12 +2431,7 @@ int main(int argc, char ** argv) {
                         if ((exact && !match.has_logits) || (!exact && pool_offer >= (int64_t) ids.size())) pool_offer = 0;
                         offered = std::max(offered, pool_offer);
                     }
-                    auto cancelled = [&]() {
-                        std::lock_guard<std::mutex> guard(qm);
-                        for (const auto & command : q)
-                            if (command == "STOP" || (my_slot >= 0 && command == "BSTOP " + std::to_string(my_slot))) return true;
-                        return false;
-                    };
+                    auto cancelled = [&]() { return persistent_cancelled(my_slot); };
                     const double start = now_ms();
                     auto disk = persistent_prefix.find(request_prefix_identity, cells, cells.size(), cancelled, (size_t) offered * 2);
                     bool disk_replay = false;
@@ -2874,8 +2876,10 @@ int main(int argc, char ** argv) {
             int last_prefix_anchor = reused;
             if (!request_prefix_identity.empty() && (reused == 0 || live_prefix_identity == request_prefix_identity)) {
                 persistent_chunk = [&](int boundary, int last_row) {
+                    auto cancelled = [&] { return prefill_cancelled ||
+                        (my_slot >= 0 && bs[(size_t) my_slot].stop) || persistent_cancelled(my_slot); };
                     if (boundary >= total || boundary < std::max(8192, park_min) ||
-                        boundary - last_prefix_anchor < 8192 || request_prefix_pending.size() >= 64) return;
+                        boundary - last_prefix_anchor < 8192 || request_prefix_pending.size() >= 64 || cancelled()) return;
                     try {
                         uint64_t estimate = 48 + (uint64_t) nv * 4;
                         for (const auto & region : dense.state_regions(boundary)) estimate += region.bytes + 88;
@@ -2895,7 +2899,7 @@ int main(int argc, char ** argv) {
                         pending.cells = ds41_persistent_cells(ids, rid, (size_t) boundary);
                         pending.payload.reserve((size_t) estimate);
                         std::string error;
-                        if (!ds41_capture_persistent(dense, image, pending.payload, error)) return;
+                        if (!ds41_capture_persistent(dense, image, pending.payload, error, cancelled) || cancelled()) return;
                         request_prefix_pending.push_back(std::move(pending));
                         last_prefix_anchor = boundary;
                     } catch (...) { std::fprintf(stderr, "serve: persistent prefix anchor skipped (host allocation)\n"); }
@@ -3517,7 +3521,7 @@ int main(int argc, char ** argv) {
                     publish_prefixes(request_prefix_pending, std::strcmp(finish, "cancel") != 0 && std::strcmp(finish, "error") != 0);
                     save_live("turn end");
                     if (std::strcmp(finish, "cancel") != 0 && std::strcmp(finish, "error") != 0)
-                        persistent_save(live_prefix_identity, hist, live_id, snap_len, snap_logits, snap_seed, snap_seed_n);
+                        persistent_save(live_prefix_identity, hist, live_id, snap_len, snap_logits, snap_seed, snap_seed_n, my_slot);
                 }   // (a slot that decodes on goes to the pool at its BDONE)
             }
             // batch slots: every turn's boundary into the pool at once (an async copy of the new tail).  With one live
@@ -3528,14 +3532,14 @@ int main(int argc, char ** argv) {
                 publish_prefixes(request_prefix_pending, std::strcmp(finish, "cancel") != 0 && std::strcmp(finish, "error") != 0);
                 save_live("turn end");
                 if (std::strcmp(finish, "cancel") != 0 && std::strcmp(finish, "error") != 0)
-                    persistent_save(live_prefix_identity, hist, live_id, snap_len, snap_logits, snap_seed, snap_seed_n);
+                    persistent_save(live_prefix_identity, hist, live_id, snap_len, snap_logits, snap_seed, snap_seed_n, my_slot);
 #if defined(DS41_HAVE_DSPARK)
                 dsp_slot = my_slot;         // a solo request: DSpark's window is this slot's conversation now
                 dsp_epoch = batch_epoch;
 #endif
             } else if (std::strcmp(finish, "cancel") != 0 && std::strcmp(finish, "error") != 0) {
                 publish_prefixes(request_prefix_pending, true);
-                persistent_save(live_prefix_identity, hist, live_id, snap_len, snap_logits, snap_seed, snap_seed_n);
+                persistent_save(live_prefix_identity, hist, live_id, snap_len, snap_logits, snap_seed, snap_seed_n, my_slot);
             }
         }
         persistent_prefix.flush();

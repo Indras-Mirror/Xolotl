@@ -12,6 +12,19 @@ void write64(std::vector<uint8_t> & data, size_t at, uint64_t n) {
 }
 }
 int main() {
+    {
+        const std::vector<uint8_t> source((3<<20)+7,0x42);
+        std::vector<uint8_t> captured;size_t polls=0,reads=0;
+        auto read=[&](uint8_t* target,size_t offset,size_t n) {
+            ++reads;require(n<=size_t(1<<20),"capture native read bounded");
+            std::memcpy(target,source.data()+offset,n);
+        };
+        require(!capture_region(captured,source.size(),[&]{return ++polls==2;},read),"cancel between native capture reads");
+        require(reads==1 && captured.size()==size_t(1<<20),"cancel suppresses remaining native reads");
+        captured.clear();reads=0;
+        require(capture_region(captured,source.size(),[]{return false;},read) && captured==source && reads==4,
+                "chunked capture preserves every byte and final short read");
+    }
     Region first; first.type = 1; first.ne = {4, 8, 1, 1}; first.nb = {4, 16, 128, 128}; first.bytes = 16;
     Region spare = first; spare.offset = 112; spare.bytes = 16;
     const std::vector<Region> regions{first, spare};

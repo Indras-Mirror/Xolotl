@@ -7,6 +7,18 @@ static void require(bool value,const char* why) {
     if(!value){std::fprintf(stderr,"FAIL: %s\n",why);std::exit(1);}
 }
 int main() {
+    {
+        const std::vector<uint8_t> source(3<<20,0x7b);
+        p::Writer capture;size_t polls=0;
+        require(!capture.capture(source.data(),source.size(),[&]{return ++polls==2;}),"mid-capture cancellation");
+        require(capture.bytes.size()==size_t(1<<20) &&
+                std::equal(capture.bytes.begin(),capture.bytes.end(),source.begin()),"only first bounded copy completed");
+        p::Writer complete;
+        require(complete.capture(source.data(),source.size(),[]{return false;}) &&
+                complete.capture(nullptr,17,[]{return false;}),"uncancelled capture and padding");
+        require(std::equal(source.begin(),source.end(),complete.bytes.begin()) &&
+                std::all_of(complete.bytes.end()-17,complete.bytes.end(),[](uint8_t v){return v==0;}),"capture bytes and padding unchanged");
+    }
     size_t count=0;
     require(p::size_bytes(40,10,4,count)&&count==80,"checked image length");
     require(!p::size_bytes(40,SIZE_MAX,4,count),"image length overflow rejected");

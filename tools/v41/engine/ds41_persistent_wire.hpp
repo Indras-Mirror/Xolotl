@@ -1,13 +1,29 @@
 // Host-only fail-closed decoder for a DS41 prompt-boundary image.
 #pragma once
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace strata::v41::persistent_wire {
 constexpr uint64_t magic = 0x3154534950525344ull;
+// Read an immutable native region into private capture bytes. The caller owns
+// the bound slot; no disk worker receives a tensor or callback into live state.
+template<class Cancel,class Read>
+inline bool capture_region(std::vector<uint8_t>& out,size_t bytes,Cancel cancelled,Read read) {
+    for(size_t copied=0;copied<bytes;) {
+        if(cancelled())return false;
+        const size_t chunk=std::min<size_t>(1<<20,bytes-copied),offset=out.size();
+        if(chunk>out.max_size()-offset)throw std::length_error("persistent capture length");
+        out.resize(offset+chunk);
+        read(out.data()+offset,copied,chunk);
+        copied+=chunk;
+    }
+    return !cancelled();
+}
 struct Region {
     uint64_t type = 0;
     std::array<uint64_t, 4> ne{}, nb{};
