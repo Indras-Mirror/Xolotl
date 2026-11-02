@@ -166,7 +166,10 @@ public:
         if (!reservation) return;
         auto image = std::make_shared<Image>();
         std::string error;
-        if (!engine.checkpoint_prefix(size_t(std::min(config_.queue_bytes, config_.disk_bytes)), image->checkpoint, error)) return;
+        if (!engine.checkpoint_prefix(size_t(std::min(config_.queue_bytes, config_.disk_bytes)), image->checkpoint, error)) {
+            std::cerr << "m31 prefix_cache save_skipped=checkpoint_failed reason=" << error << '\n';
+            return;
+        }
         image->tokens = history;
         image->mixed.visual_rows = mixed.visual_rows;
         image->mixed.embeddings = mixed.embeddings;
@@ -182,6 +185,7 @@ public:
         for (size_t n = stride; n <= history.size(); n += stride) keys.emplace_back(all.begin(), all.begin() + n);
         const size_t last = history.size() / 256 * 256;
         if (keys.empty() || keys.back().size() != last) keys.emplace_back(all.begin(), all.begin() + last);
+        if (cancelled && cancelled()) return;
         const bool queued = store_.enqueue_file_keys_reserved(identity_, std::move(keys), image->bytes(),
             [image](const std::string & path, std::string &) { return write(path, *image); }, std::move(reservation));
         if (ram_budget_ && image->bytes() <= ram_budget_) {

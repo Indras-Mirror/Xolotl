@@ -1,4 +1,30 @@
 // Exercise the production transport/serve loop without model files or GPU work.
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <thread>
+// The real serve loop uses a slow model-free snapshot so a frontend STOP
+// deterministically arrives while save polls cancellation if final T leaks.
+namespace strata::m31 {
+struct PersistentPrefix {
+    PersistentPrefix(const std::string &, const std::string &, const std::string &) {}
+    bool enabled() const { return std::getenv("M31_PROTOCOL_FIXTURE_PERSISTENT") != nullptr; }
+    template<class E, class I, class M, class H, class HM, class C>
+    int restore(E &, const I &, const M &, H &, HM &, int current, C) { return current; }
+    template<class E, class H, class M, class C>
+    void save(E &, const H &, const M &, C cancelled) {
+        if (!enabled()) return;
+        std::cout << "SAVE_BEGIN\n" << std::flush;
+        for (int i = 0; i < 100; ++i) {
+            if (cancelled()) { std::cout << "SAVE_CANCEL\n" << std::flush; return; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        std::cout << "SAVE_COMMIT\n" << std::flush;
+    }
+};
+}
+#define M31_PROTOCOL_TEST_PERSISTENT
 #define M31_PROTOCOL_TEST_ONLY
 #include "../m31_generate.cpp"
 namespace {
@@ -9,6 +35,7 @@ struct FixtureEngine {
     bool valid_ = true, bad_logits_ = false;
     const Geometry & geometry() const { return geometry_; }
     int64_t position() const { return position_; }
+    std::string prefix_runtime_identity() const { return "fixture"; }
     int prefill_chunk(int requested, std::string &) { return std::min(64, requested); }
     bool forward(const int32_t * ids, int n, std::string &) {
         if (position_ == 0 && ids[0] == 6) bad_logits_ = true;

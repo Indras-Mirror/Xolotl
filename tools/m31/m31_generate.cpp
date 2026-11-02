@@ -326,7 +326,7 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
               << "\nREADY " << config.context << " stop\n" << std::flush;
     std::vector<int32_t> history;
     MixedInput history_mixed;
-#ifndef M31_PROTOCOL_TEST_ONLY
+#if !defined(M31_PROTOCOL_TEST_ONLY) || defined(M31_PROTOCOL_TEST_PERSISTENT)
     std::ostringstream cache_settings;
     cache_settings << "format=m31-f16-kv-index-v1 build=" << __DATE__ << ' ' << __TIME__
                    << " backend=" << cli.args.backend << " device=" << cli.device
@@ -405,7 +405,7 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
         int reused = request.cache_prompt ? protocol::reusable_prefix(history, request.ids) : 0;
         if (reused && request.vision)
             reused = reusable_visual_prefix(reused, request.ids, history_mixed, mixed, int(engine.geometry().embd));
-#ifndef M31_PROTOCOL_TEST_ONLY
+#if !defined(M31_PROTOCOL_TEST_ONLY) || defined(M31_PROTOCOL_TEST_PERSISTENT)
         if (request.cache_prompt)
             reused = persistent.restore(engine, request.ids, mixed, history, history_mixed, reused, config.cancelled);
 #endif
@@ -414,6 +414,11 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
         if (reused) { history.resize(size_t(reused)); std::cout << "RESUME " << reused << '\n' << std::flush; }
         const auto tp = Clock::now();
         int read = 0, generated = 0, last_chunk = 0;
+        int pending_completion_token = -1;
+        bool defer_completion = false;
+#if !defined(M31_PROTOCOL_TEST_ONLY) || defined(M31_PROTOCOL_TEST_PERSISTENT)
+        defer_completion = persistent.enabled() && request.cache_prompt && request.checkpoint;
+#endif
         double prompt_ms = 0, decode_ms = 0;
         Clock::time_point td;
         bool decoding = false;
@@ -477,9 +482,16 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
                 } else {
                     decode_ms = std::chrono::duration<double, std::milli>(sampled_at - td).count();
                 }
-                std::cout << "T " << token << '\n' << std::flush;
+                const bool stopped = (!request.ignore_eos && stops.count(token)) || request.stop.count(token);
+                const bool completed = stopped || generated + 1 == request.max_new;
+                // The HTTP consumer closes its generator after EOS or its token
+                // budget and sends STOP. Keep that synthetic STOP behind the
+                // optional snapshot's cancellation checks. Genuine disconnects
+                // still reach those checks through the independent STOP pipe.
+                if (defer_completion && completed) pending_completion_token = token;
+                else std::cout << "T " << token << '\n' << std::flush;
                 ++generated;
-                if ((!request.ignore_eos && stops.count(token)) || request.stop.count(token)) { finish = "stop"; break; }
+                if (stopped) { finish = "stop"; break; }
                 if (generated == request.max_new) break;
                 if (!engine.forward(&token, 1, error)) {
                     if (cancelled) break;
@@ -496,12 +508,22 @@ void serve(EngineType & engine, Config & config, const Cli & cli, Lines & lines,
             if (cancelled || !request.cache_prompt || !request.checkpoint) { engine.reset(); history.clear(); history_mixed = {}; }
             else {
                 history_mixed = std::move(mixed);
-#ifndef M31_PROTOCOL_TEST_ONLY
+#if !defined(M31_PROTOCOL_TEST_ONLY) || defined(M31_PROTOCOL_TEST_PERSISTENT)
                 // The request has completed and retained valid state. Cancelled
                 // requests never hand their snapshot to the background writer.
                 persistent.save(engine, history, history_mixed, config.cancelled);
 #endif
             }
+            // save() polls the live cancellation pipe and may observe a real
+            // disconnect while copying rows. Never expose a successful final
+            // token or retain the conversation after that cancellation.
+            if (cancelled) {
+                finish = "cancel";
+                engine.reset(); history.clear(); history_mixed = {};
+                pending_completion_token = -1;
+            }
+            if (pending_completion_token >= 0)
+                std::cout << "T " << pending_completion_token << '\n' << std::flush;
             done(generated, int(request.ids.size()), prompt_ms, decode_ms, finish, reused, read, request.slot);
         } catch (const std::exception & e) {
             engine.reset(); history.clear(); history_mixed = {};

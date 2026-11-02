@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Production line-loop regressions with a deterministic model-free engine."""
 import argparse
+import os
 import queue
 import subprocess
 import struct
@@ -17,7 +18,8 @@ from serve import server as S
 class Engine(unittest.TestCase):
     def setUp(self):
         self.p = subprocess.Popen([EXE], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, text=True, bufsize=1)
+                                  stderr=subprocess.PIPE, text=True, bufsize=1,
+                                  env={**os.environ, **getattr(self, "fixture_env", {})})
         self.lines = queue.Queue()
         def pump():
             for line in self.p.stdout:
@@ -58,6 +60,50 @@ class Engine(unittest.TestCase):
     def request(self, command):
         self.send(command)
         return self.until("DONE")
+
+
+class PersistentCompletion(Engine):
+    fixture_env = {"M31_PROTOCOL_FIXTURE_PERSISTENT": "1"}
+
+    def assert_committed_before_frontend_stop(self, command, generated, finish):
+        self.send(command)
+        lines = []
+        while True:
+            line = self.lines.get(timeout=5)
+            self.assertIsNotNone(line)
+            lines.append(line)
+            if line.startswith("T ") and len([x for x in lines if x.startswith("T ")]) == generated:
+                # Common HTTP frontend closes the native generator here.
+                self.send("STOP")
+            if line.startswith("DONE"):
+                break
+        self.assertIn("SAVE_COMMIT", lines)
+        self.assertNotIn("SAVE_CANCEL", lines)
+        last_token = max(i for i, line in enumerate(lines) if line.startswith("T "))
+        self.assertLess(lines.index("SAVE_COMMIT"), last_token)
+        self.assertEqual(lines[-1].split()[5], finish)
+
+    def test_eos_completion_is_committed_before_frontend_stop(self):
+        self.assert_committed_before_frontend_stop("GEN 5 stop=3 1,2", 1, "stop")
+
+    def test_budget_completion_keeps_last_sample_out_of_kv(self):
+        self.assert_committed_before_frontend_stop("GEN 2 1,2", 2, "length")
+        # Prompt two + first sample; the final sample was never forwarded.
+        self.send("SLEEP")
+        self.assertIn("kv_tokens=3", self.until("SLEPT")[-1])
+
+    def test_real_cancel_during_snapshot_does_not_commit_or_expose_final_token(self):
+        self.send("GEN 1 1,2")
+        before = self.until("SAVE_BEGIN")
+        self.assertFalse(any(line.startswith("T ") for line in before))
+        self.send("STOP")
+        after = self.until("DONE")
+        self.assertIn("SAVE_CANCEL", after)
+        self.assertNotIn("SAVE_COMMIT", after)
+        self.assertFalse(any(line.startswith("T ") for line in after))
+        self.assertEqual(after[-1].split()[5], "cancel")
+        self.send("SLEEP")
+        self.assertIn("kv_tokens=0", self.until("SLEPT")[-1])
 
 
 class Protocol(Engine):
