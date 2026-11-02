@@ -2159,6 +2159,8 @@ class StrataEngine:
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
         if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
+            with self.slot_cv:
+                self.slot_claims.discard(slot)
             return
         try:
             self._send(self._bstop_command(slot,cancel_owner))
@@ -2167,7 +2169,13 @@ class StrataEngine:
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
         releasing = self.slot_releasing
         histories = getattr(self, "slot_histories", None)
-        releasing.add(slot)
+        with self.slot_cv:
+            # #100: hand the slot from the request's claim to this BDONE wait in one step, before the wait can run.
+            # A reply that ended on its stop token has its BDONE queued already, so the wait frees the slot at once and
+            # the next request claims it; the caller used to drop "its" claim after this returned - the NEW owner's -
+            # and #1603's reaper then freed a slot that was decoding, so a third request got BGEN refusals and a 503.
+            releasing.add(slot)
+            self.slot_claims.discard(slot)
 
         def wait():
             end = time.monotonic() + 600.0
@@ -2763,8 +2771,7 @@ class StrataEngine:
                 elif phase == "slot":
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream, cancel_owner)    # freed at its BDONE
-                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
+                    self._release_slot_when_done(slot, stream, cancel_owner)    # freed at its BDONE (it takes the claim)
                 else:
                     with self.slot_cv:
                         if self.gen == born and slot_completed:

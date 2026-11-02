@@ -1,9 +1,13 @@
 # Deep sleep: POST /sleep and /wake
 
-> **Status: draft (merged 2026-10-31 for testing, #75).** The GPU measurements below predate the rebase onto current
-> main. On the merged tree only the model-free checks were run (39/39 deep-sleep tests, the rest of serve/ passing); the
-> DeepSeek-V4.1 checkpoint/restore and the M3.1 native wake still need a GPU run on current main before this is
-> considered done. Off by default, so normal serving is unaffected. Tracking: #74.
+> **Status: merged 2026-10-31 (#75), off by default.** DeepSeek-V4.1 checkpoint/restore was run on current main on
+> 2026-11-03 (RTX 4090 24 GB, driver 595.91.07, V41-XQ-1017-v4, `"deep_sleep": "auto"` -> `checkpoint`): a three-turn
+> conversation with `/sleep` + 30 s + `/wake` between turns against a fresh control with equal idle time. Sleep
+> 14.6 / 16.6 s (22.5 GB to host RAM, the card back to 23.3 GB free), wake 7.2 / 7.0 s, the first reply after wake
+> at control speed (10.7 vs 10.1 s, 17.8 vs 18.5 s), the same answers on the factual turns. Not shown by that run:
+> numerical equivalence (this engine is not run-to-run deterministic at temperature 0 here - turn 0 already differed
+> before any sleep), a conversation-cache hit across sleep (0 cached tokens in both arms), and the M3.1 native wake
+> (no M3.1 model on that box). Tracking: #74.
 
 A sleeping engine keeps its model and conversation state in host RAM while
 releasing its device resources. It must be put to sleep explicitly: ordinary

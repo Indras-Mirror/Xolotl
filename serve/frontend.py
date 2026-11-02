@@ -709,6 +709,11 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
         kwargs["preserve_thinking"] = pt
     if cache_marker:
         kwargs[CACHE_MARK_KEY] = cache_marker
+    # Qwen's optional picture/video ordinal labels are rendered by the template.
+    # Keep the default prompt unchanged and do not treat non-boolean strings as true.
+    vision_id = (req.get("chat_template_kwargs") or {}).get("add_vision_id")
+    if isinstance(vision_id, bool):
+        kwargs["add_vision_id"] = vision_id
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
