@@ -84,7 +84,20 @@ inline std::string model_identity(const std::string& family, const std::string& 
         out << ':' << file.size() << ':' << file << ':' << st.st_dev << ':' << st.st_ino << ':' << st.st_size
             << ':' << st.st_mtim.tv_sec << ':' << st.st_mtim.tv_nsec << ':' << st.st_ctim.tv_sec << ':' << st.st_ctim.tv_nsec;
     }
-    return out.str();
+    // Keep catalogue identity bounded even for packs containing thousands of files.
+    // The inventory is local compatibility metadata, not an authentication digest.
+    const auto inventory=out.str();
+    uint64_t a=1469598103934665603ull,b=0x9e3779b97f4a7c15ull;
+    for(unsigned char value:inventory) {
+        a=(a^value)*1099511628211ull;
+        b^=uint64_t(value)+0x9e3779b97f4a7c15ull+(b<<6)+(b>>2);
+        b=(b<<27)|(b>>37);b*=0x94d049bb133111ebull;
+    }
+    auto avalanche=[](uint64_t value) {value^=value>>30;value*=0xbf58476d1ce4e5b9ull;
+        value^=value>>27;value*=0x94d049bb133111ebull;return value^(value>>31);};
+    std::ostringstream fingerprint;
+    fingerprint << "host-inventory-v2/" << std::hex << avalanche(a) << '/' << avalanche(b);
+    return fingerprint.str();
 #else
     (void)family; (void)settings; (void)files; return {};
 #endif
