@@ -3505,9 +3505,9 @@ class Vision:
             if "/" not in line:
                 continue
             path = line[line.index("/"):]
-            if path.endswith(" (deleted)"):
-                raise ValueError("persistent image reader inventory changed; restart the reader")
             if ".so" in path:
+                if path.endswith(" (deleted)"):
+                    raise ValueError("persistent image reader inventory changed; restart the reader")
                 files.add(str(Path(path).resolve(strict=True)))
         inventory = []
         for name in sorted(files):

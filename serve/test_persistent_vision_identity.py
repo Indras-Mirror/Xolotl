@@ -148,6 +148,24 @@ class PersistentVisionIdentity(unittest.TestCase):
         two.spawn = (two.spawn[0], None, {'STRATA_PREFIX_CACHE_DIR': '/cache-b', 'STRATA_TEST_LOG': '/log-b'})
         self.assertEqual(one.persistence_namespace(), two.persistence_namespace())
 
+    def test_cuda_anonymous_deleted_scratch_is_not_a_deleted_library(self):
+        vision = BoundVision(self.root, self.config)
+        expected = vision.persistence_namespace()
+        maps_path = Path('/proc') / str(os.getpid()) / 'maps'
+        actual_maps = maps_path.read_text()
+        read_text = Path.read_text
+        def with_mapping(mapping):
+            def read(path, *args, **kwargs):
+                if path == maps_path:
+                    return actual_maps + '\n1000-2000 rw-s 00000000 00:01 1 ' + mapping + '\n'
+                return read_text(path, *args, **kwargs)
+            return read
+        with patch.object(Path, 'read_text', with_mapping('/dev/zero (deleted)')):
+            self.assertEqual(expected, vision.persistence_namespace())
+        with patch.object(Path, 'read_text', with_mapping('/usr/lib/libreader.so (deleted)')):
+            with self.assertRaisesRegex(ValueError, 'inventory changed'):
+                vision.persistence_namespace()
+
     def test_unstarted_lazy_reader_is_not_started_or_bound(self):
         lazy = SimpleNamespace(alive=lambda: False, persistent_images=False,
                                persistence_namespace=lambda: self.fail('lazy reader must stay unresolved'))
