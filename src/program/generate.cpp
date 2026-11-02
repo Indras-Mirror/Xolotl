@@ -13670,7 +13670,7 @@ int main(int argc, char** argv) {
                 !pipe_inflight()) {
                 bool pending_save = false;
                 for (auto& slot : bs) {
-                    if (!slot.active && (slot.stop || slot.tainted || (!slot.cached && !slot.persistent_pending)))
+                    if (!slot.active && (slot.tainted || (!slot.persistent_pending && (slot.stop || !slot.cached))))
                         slot.persistent_admission = {};
                     pending_save = pending_save || slot.persistent_pending;
                 }
@@ -13679,7 +13679,9 @@ int main(int argc, char** argv) {
                     auto& slot = bs[b];
                     if (!slot.persistent_pending) continue;
                     slot.persistent_pending = false;
-                    if (slot.active || slot.stop || slot.tainted) {
+                    // persistent_pending was latched at a natural native completion. A later
+                    // frontend stop cannot invalidate that already committed immutable state.
+                    if (slot.active || slot.tainted) {
                         slot.persistent_admission = {};
                         continue;
                     }
@@ -17448,8 +17450,13 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
                              (long long) pp_reached);
             }
-            if (persistent_prefix.enabled() && live_ok && !cancelled && !nf_hit && admit_slot < 0 &&
-                stages.empty() && !multi_gpu && o.peer_device < 1 && !request_cancelled())
+            // The consumer can close its stream as soon as EOS is emitted, before
+            // this scheduler publishes the completed state. Classify completion from
+            // the native outcome; a late transport cancellation cannot undo it.
+            const bool persistent_completed = !cancelled && !nf_hit &&
+                (std::strcmp(finish, "stop") == 0 || std::strcmp(finish, "length") == 0);
+            if (persistent_prefix.enabled() && live_ok && persistent_completed && admit_slot < 0 &&
+                stages.empty() && !multi_gpu && o.peer_device < 1)
                 persistent_save(live, live_imgs, checks, cvec_cached, ss, use_mtp ? &mtp.kv_state() : nullptr);
             if (nib::config().recheck && nib::any_on() && !cancelled) {
                 // STRATA_EXPERT_NIBBLE_RECHECK=1 (debug): every converted slot's hash again on its own device, against the
@@ -17615,7 +17622,10 @@ int main(int argc, char** argv) {
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && (!batch_cancel_enabled || !request_cancelled()) && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
-                const bool completed_in_main = !cont && !cancelled && !nf_hit && live_ok;
+                // GEN 1 admission reaching its own cap is not a completed BGEN
+                // request when a real cancellation prevents slot handoff.
+                const bool completed_in_main = !cont && persistent_completed && live_ok &&
+                    (std::strcmp(finish, "stop") == 0 || produced_n >= admit_max_new || p + 2 > o.max_context);
                 const auto tc0 = Clock::now();
                 if (cont) park_slot(admit_slot);   // the conversation the slot holds, before this one overwrites it
                 if (cont && batch_cancel_enabled && request_cancelled()) cont = false;
@@ -17644,7 +17654,7 @@ int main(int argc, char** argv) {
                 }
                 const auto tc1 = Clock::now();
                 if (completed_in_main && persistent_prefix.enabled() &&
-                    stages.empty() && !multi_gpu && o.peer_device < 1 && !request_cancelled())
+                    stages.empty() && !multi_gpu && o.peer_device < 1)
                     persistent_save(live, live_imgs, checks, cvec_cached, ss, use_mtp ? &mtp.kv_state() : nullptr);
                 if (cont) {
                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
