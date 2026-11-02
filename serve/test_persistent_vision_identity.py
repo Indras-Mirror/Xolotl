@@ -99,6 +99,19 @@ class PersistentVisionIdentity(unittest.TestCase):
         fallback = BoundVision(self.root, dict(self.config, exe=self.files['cpu-reader'], gpu=False))
         self.assertNotEqual(primary.persistence_namespace(), fallback.persistence_namespace())
         self.assertEqual(primary.persistence_namespace(), BoundVision(self.root, self.config).persistence_namespace())
+        selected = BoundVision(self.root, self.config)
+        cpu_config = dict(self.config, exe=self.files['cpu-reader'], gpu=False)
+        selected.fallback = (Vision.reader_args(cpu_config), None, {})
+        attempts = []
+        def start_reader():
+            attempts.append(selected.spawn[0][0])
+            if selected.spawn[0][0] == self.files['reader']:
+                raise RuntimeError('primary reader unavailable')
+            selected.proc = SimpleNamespace(pid=os.getpid())
+        selected._start_reader = start_reader
+        Vision._start(selected)
+        self.assertEqual(attempts, [self.files['reader'], self.files['cpu-reader']])
+        self.assertEqual(selected.persistence_namespace(), fallback.persistence_namespace())
 
     def test_split_reader_model_inventory_includes_other_shards(self):
         first = self.root / 'vision-00001-of-00002.gguf'
