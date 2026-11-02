@@ -34,6 +34,7 @@ import hashlib
 import hmac
 import codecs
 import ctypes
+import itertools
 import json
 import math
 import os
@@ -49,6 +50,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from http.client import HTTPException
@@ -1836,6 +1838,55 @@ class StrataEngine:
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
 
+    def speak(self, ids, max_frames: int, keys: str, cancel: threading.Event, codes: list | None = None):
+        """local (Indra's Mirror): LFM3-Omni speech out - `GENA <max_frames> [keys] ids` (xolotl-lfm3; the prompt is the
+        model's "tts" template).  Yields 16-bit little-endian PCM chunks (24 kHz mono) as the engine makes them; `codes`
+        (a list) collects each frame's 12 audio codes when keys asks for codes=1.  The caller holds the FIFO.  A
+        consumer that stops early (or `cancel`) sends STOP and reads the request to its DONE."""
+        if not self.alive():
+            raise EngineDied("the engine is unavailable; this request was not sent")
+        self._send(f"GENA {int(max_frames)}{keys} {','.join(str(int(t)) for t in ids)}")
+        done = False
+        silence = max(float(self.silence_s or 0), 120.0)
+        try:
+            while True:
+                try:
+                    line = self.lines.get(timeout=silence)
+                except queue.Empty:
+                    done = True
+                    raise self._silent(f"the engine said nothing for {silence:.0f} s while speaking") from None
+                if line is None:
+                    done = True
+                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                if line.startswith("A "):
+                    if cancel.is_set():
+                        return
+                    parts = line.split(" ", 2)
+                    yield base64.b64decode(parts[2]) if len(parts) == 3 else b""
+                elif line.startswith("C ") and codes is not None:
+                    codes.append([int(x) for x in line[2:].split(",")])
+                elif line.startswith("DONE"):
+                    done = True
+                    self._parse_done(line)
+                    return
+                elif line.startswith("ERR"):
+                    done = True
+                    raise ValueError(line[4:].strip())
+        finally:
+            if not done:                                  # stopped early: STOP, then read to DONE (bounded)
+                try:
+                    self._send("STOP")
+                except EngineDied:
+                    pass
+                deadline = time.monotonic() + silence
+                while time.monotonic() < deadline:
+                    try:
+                        line = self.lines.get(timeout=max(0.1, deadline - time.monotonic()))
+                    except queue.Empty:
+                        break
+                    if line is None or line.startswith(("DONE", "ERR")):
+                        break
+
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
@@ -3547,12 +3598,22 @@ class Vision:
             return False
 
     @staticmethod
+    def is_av(data: bytes) -> bool:
+        """Audio (WAV, MP3, FLAC, Ogg) or video (MP4/MOV, WebM/MKV, AVI) by its first bytes: only an encoder whose
+        mmproj has an audio tower or reads video (LFM3-Omni's, `"vision": {"av": true}`) is sent these."""
+        return (data[:4] == b"RIFF" and data[8:12] in (b"WAVE", b"AVI ")) or data[:3] == b"ID3" or \
+            (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0) or data[:4] in (b"fLaC", b"OggS") or \
+            data[4:8] == b"ftyp" or data[:4] == b"\x1aE\xdf\xa3"
+
+    @staticmethod
     def normalize(data: bytes) -> bytes:
         """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG.
         A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow)."""
         jpeg = data[:3] == b"\xff\xd8\xff"
         if (jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
                 data[:6] in (b"GIF87a", b"GIF89a"):
+            return data
+        if Vision.is_av(data):          # audio / video for an omni encoder (xolotl-lfm3-vision): mtmd reads it as it is
             return data
         try:
             import io
@@ -4673,11 +4734,17 @@ class Service:
                  fit_max_tokens: bool = True):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.voice_servers: dict = {}                    # local (Indra's Mirror): lazily-started ASR/TTS sidecars
+        self.speech_cfg: dict | None = None              # local: the engine speaks itself (LFM3-Omni, "speech" block)
+        self.asr_native: dict | None = None              # local: the model transcribes itself ("asr_native" block)
+        self.port = 0
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        self.hide_ids: set[int] = set()               # local: config "hide_tokens" - control tokens kept out of the reply text
+        self.thinking_model = True                    # local: config "thinking": false = a model that never thinks (LFM3-Omni):
+                                                      # its reply is content from the first token, whatever the request asks
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.structured_compact = False                 # config: no inter-token JSON whitespace
@@ -5278,6 +5345,46 @@ class Service:
             if ctl is not None:
                 ctl.release()
             self.fifo.release()
+
+    # local (Indra's Mirror): LFM3-Omni's own speech (the config's "speech" block) - the model's "tts" chat template
+    TTS_LANGS = {"ar": "Arabic", "da": "Danish", "de": "German", "el": "Greek", "en": "American English",
+                 "en-us": "American English", "en-gb": "British English", "fi": "Finnish", "fr": "French",
+                 "he": "Hebrew", "it": "Italian", "ja": "Japanese", "ko": "Korean", "nl": "Dutch", "pl": "Polish",
+                 "pt": "Portuguese", "es": "Spanish", "sv": "Swedish", "tr": "Turkish", "zh": "Chinese"}
+
+    def tts_ids(self, text: str, language: str | None = None, voice: str | None = None) -> list[int]:
+        """The prompt of LFM3-Omni's "tts" template (tokenizer.chat_template.tts): a system line naming the language
+        and voice, the text as the user turn, the assistant turn opened with <|audio_start|>.  A voice other than
+        female / male (an OpenAI name such as "alloy", a cloned-voice name) is the config's default voice."""
+        cfg = self.speech_cfg or {}
+        code = (language or cfg.get("language") or "en").lower()
+        lang = self.TTS_LANGS.get(code, language or "American English")
+        v = (voice or "").lower()
+        if v not in ("female", "male"):
+            v = str(cfg.get("voice") or "female").lower()
+        prompt = (f"<|startoftext|><|im_start|>system\nPerform TTS in {lang} using a {v} voice.<|im_end|>\n"
+                  f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think></think><|audio_start|>")
+        return self.tok.encode(prompt, parse_special=True)
+
+    def speak(self, text: str, language=None, voice=None, max_frames=None, sampling=None, cancel=None, codes=None):
+        """Yields 16-bit PCM chunks of `text` spoken by the engine (GENA), holding the FIFO for the whole utterance."""
+        if not hasattr(self.engine, "speak"):
+            raise ValueError("this engine cannot speak")
+        ids = self.tts_ids(text, language, voice)
+        cfg = self.speech_cfg or {}
+        frames = int(max_frames or cfg.get("max_frames", 1500))
+        keys = ""
+        for k in ("temperature", "top_k", "penalty_repeat", "penalty_last_n", "seed"):
+            if (sampling or {}).get(k) is not None:
+                keys += f" {k}={sampling[k]}"
+        if codes is not None:
+            keys += " codes=1"
+        cancel = cancel or threading.Event()
+        self.last_request_at = time.time()
+        with self.fifo:
+            self.ensure_loaded()
+            yield from self.engine.speak(ids, frames, keys, cancel, codes)
+        self.last_request_at = time.time()
 
     def _say_died(self, e: Exception) -> None:
         """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
@@ -6094,7 +6201,7 @@ class Service:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
-        if force and kwargs.get("enable_thinking", True) is False:
+        if force and (not self.thinking_model or kwargs.get("enable_thinking", True) is False):
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
         self.embeddings.keys = None
@@ -6231,7 +6338,7 @@ class Service:
                 req["strata_prefix"] = {"messages": lead}
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        return ids, self.thinking_model and kwargs.get("enable_thinking", True) is not False, max_new
 
     @staticmethod
     def deepseek_shared_start(messages) -> int:
@@ -6663,7 +6770,7 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
-                                piece = detok.push(t)
+                                piece = detok.push(t) if t not in self.hide_ids else ""   # local: config "hide_tokens"
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
@@ -8053,6 +8160,122 @@ def make_handler(svc: Service):
                 server.touch()
             self._raw(status, out, ctype)
 
+        def _speech_native(self):
+            """local (Indra's Mirror): POST /v1/audio/speech spoken by the engine itself (LFM3-Omni, GENA).  OpenAI body:
+            input, voice (female / male; other names = the config's voice), response_format wav (default) or pcm
+            (16-bit little-endian, 24 kHz mono, as OpenAI's), stream; also language / lang, seed, temperature,
+            max_frames.  pcm, and wav with "stream": true, are written as the frames are made."""
+            try:
+                req = json.loads(self._body() or b"{}")
+            except (ValueError, BadBody) as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": f"bad JSON body: {e}"}})
+                return
+            text = req.get("input") or req.get("prompt") or ""
+            if not isinstance(text, str) or not text.strip():
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "\"input\" must be a non-empty string"}})
+                return
+            fmt = str(req.get("response_format") or "wav").lower()
+            if fmt not in ("wav", "pcm"):
+                self._json(400, {"error": {"type": "invalid_request_error",
+                                           "message": "response_format: this server makes wav or pcm"}})
+                return
+            sampling = {k: req.get(k) for k in ("temperature", "top_k", "seed")}
+            cancel = threading.Event()
+            chunks = svc.speak(text.strip(), req.get("language") or req.get("lang"), req.get("voice"),
+                               req.get("max_frames"), sampling, cancel)
+            stream = fmt == "pcm" or bool(req.get("stream"))
+            rate = 24000
+            def wav_header(n_bytes):
+                return (b"RIFF" + struct.pack("<I", (36 + n_bytes) & 0xFFFFFFFF) + b"WAVEfmt " +
+                        struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) + b"data" + struct.pack("<I", n_bytes & 0xFFFFFFFF))
+            try:
+                if not stream:
+                    pcm = b"".join(chunks)
+                    self._raw(200, wav_header(len(pcm)) + pcm, "audio/wav")
+                    return
+                first = next(chunks, b"")                # an error before any audio is still an HTTP error
+                self.send_response(200)
+                self.send_header("Content-Type", f"audio/pcm;rate={rate};encoding=signed-int;bits=16" if fmt == "pcm" else "audio/wav")
+                self._cors()
+                self.end_headers()
+                if fmt == "wav":
+                    self.wfile.write(wav_header(0xFFFFFFFF - 36))
+                for c in itertools.chain([first], chunks):
+                    if c:
+                        self.wfile.write(c)
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                cancel.set()
+                chunks.close()
+            except ValueError as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except EngineDied as e:
+                self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+
+        def _asr_native(self):
+            """local (Indra's Mirror): POST /v1/audio/transcriptions by the model itself (LFM3-Omni: system "Perform ASR
+            in <language>.", the clip as input_audio) - a chat completion on this server.  multipart/form-data with
+            `file` (+ `language`, `prompt`, `response_format` json | text), or JSON {"file": base64, "format": "wav"}."""
+            try:
+                body = self._body()
+            except BadBody as e:
+                self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            ctype = self.headers.get("Content-Type", "")
+            fields: dict = {}
+            audio, fmt = b"", "wav"
+            if ctype.startswith("multipart/form-data"):
+                import email.parser, email.policy
+                msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+                    b"Content-Type: " + ctype.encode() + b"\r\n\r\n" + body)
+                for part in msg.iter_parts():
+                    name = part.get_param("name", header="content-disposition")
+                    data = part.get_payload(decode=True) or b""
+                    if name == "file":
+                        audio = data
+                        fn = part.get_filename() or ""
+                        fmt = fn.rsplit(".", 1)[-1].lower() if "." in fn else "wav"
+                    elif name:
+                        fields[name] = data.decode("utf-8", "replace")
+            else:
+                try:
+                    j = json.loads(body or b"{}")
+                    audio = base64.b64decode(j.get("file") or "")
+                    fmt = j.get("format") or "wav"
+                    fields = {k: str(v) for k, v in j.items() if k not in ("file", "format")}
+                except (ValueError, TypeError) as e:
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": f"bad body: {e}"}})
+                    return
+            if not audio:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "no audio (\"file\")"}})
+                return
+            cfg = svc.asr_native or {}
+            code = (fields.get("language") or cfg.get("language") or "en").lower()
+            lang = {"en": "English"}.get(code) or Service.TTS_LANGS.get(code, fields.get("language") or "English").replace("American ", "").replace("British ", "")
+            chat = {"model": svc.model, "temperature": 0, "max_tokens": int(cfg.get("max_tokens", 1024)), "stream": False,
+                    "messages": [{"role": "system", "content": f"Perform ASR in {lang}."},
+                                 {"role": "user", "content": [{"type": "input_audio", "input_audio": {
+                                     "data": base64.b64encode(audio).decode(), "format": fmt}}]}]}
+            try:
+                hdr = {"Content-Type": "application/json"}
+                if svc.api_key:
+                    hdr["Authorization"] = f"Bearer {svc.api_key}"
+                r = urllib.request.Request(f"http://127.0.0.1:{svc.port}/v1/chat/completions", data=json.dumps(chat).encode(),
+                                           headers=hdr, method="POST")
+                with urllib.request.urlopen(r, timeout=float(cfg.get("timeout_s", 300))) as resp:   # noqa: S310 - our own port
+                    out = json.loads(resp.read())
+                text = (out["choices"][0]["message"].get("content") or "").strip()
+            except urllib.error.HTTPError as e:
+                self._raw(e.code, e.read(), e.headers.get("Content-Type", "application/json"))
+                return
+            except (OSError, ValueError, KeyError, IndexError) as e:
+                self._json(502, {"error": {"type": "server_error", "message": f"transcription failed: {e}"}})
+                return
+            if (fields.get("response_format") or "json") == "text":
+                self._raw(200, text.encode(), "text/plain; charset=utf-8")
+            else:
+                self._json(200, {"text": text})
+
         def _authorized(self) -> bool:
             if not svc.api_key:
                 return True
@@ -8481,6 +8704,12 @@ def make_handler(svc: Service):
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             path = V1_V1_ALIASES.get(path, path)         # an Anthropic client given ".../v1" as its base posts /v1/v1/messages
             if path.startswith("/v1/") and self._foreign_page():
+                return
+            if path == "/v1/audio/speech" and svc.speech_cfg is not None:    # local: the engine speaks (LFM3-Omni)
+                self._speech_native()
+                return
+            if path == "/v1/audio/transcriptions" and svc.asr_native is not None:   # local: the model transcribes
+                self._asr_native()
                 return
             if path in ("/v1/audio/transcriptions", "/v1/audio/speech"):   # local: the voice sidecar
                 self._audio(path)
@@ -10400,6 +10629,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             "Thinking about it.</think>\n\nHello from the mock engine."],
             cycle=getattr(a, "script_cycle", False),
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
+    # the model's image marker: the token its chat template writes after <|vision_start|> for each picture (Qwen's
+    # <|image_pad|>; LFM3's <|image|>), expanded to one token per encoder row
+    global IMAGE_PAD
+    IMAGE_PAD = cfg.get("image_pad") or IMAGE_PAD
+    if isinstance(cfg.get("vision"), dict) and cfg["vision"].get("av"):   # audio / video parts to the same encoder
+        from serve import frontend as _fe
+        _fe.IMAGE_PARTS = _fe.IMAGE_PARTS + _fe.AV_PARTS
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     if (cfg.get("arch") or "") == "deepseek41":
@@ -10412,6 +10648,16 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
+    for marker in cfg.get("hide_tokens") or ():        # local: control tokens that must not show in replies (LFM3's <|text_end|>)
+        got = tok.encode(str(marker), parse_special=True)
+        if len(got) == 1:
+            svc.hide_ids.add(int(got[0]))
+        else:
+            print(f"[strata] hide_tokens: {marker!r} is not one token - ignored")
+    if cfg.get("thinking") is False:                    # local: a non-reasoning model (LFM3-Omni)
+        svc.thinking_model = False
+    if cfg.get("bos_token"):                             # local: a template that opens with bos_token (LFM3)
+        svc.template.bos_token = str(cfg["bos_token"])
     svc.launch_attestation = launch_attestation
     svc.structured_compact = cfg.get("structured_compact") is True   # xolotl
     if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine == "strata":
@@ -10622,6 +10868,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if cfg.get("vision") and cfg["vision"].get("lazy"):    # local: lazy vision
         svc.start_lazy_vision(int(cfg["vision"].get("lazy_reserve_mib", 2400)),
                               float(cfg["vision"].get("lazy_idle_s", 300)))
+    svc.port = bound_port
+    if isinstance(cfg.get("speech"), dict):                # local: the engine's own speech (xolotl-lfm3 GENA)
+        svc.speech_cfg = cfg["speech"]
+    if isinstance(cfg.get("asr_native"), dict):            # local: the model's own transcription (LFM3-Omni)
+        svc.asr_native = cfg["asr_native"]
     voice_cfg = cfg.get("voice") or {}                     # local: the voice sidecar (ASR/TTS)
     if voice_cfg:
         servers = {kind: VoiceServer(kind, voice_cfg[kind]) for kind in ("asr", "tts")

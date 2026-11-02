@@ -298,37 +298,55 @@ int main(int argc, char** argv) {
         mtmd_input_text txt{prompt.c_str(), prompt.size(), false, true};
         const mtmd_bitmap* bm[1] = {bw.bitmap};
         std::string err;
-        const mtmd_input_chunk* ichunk = nullptr;
         if (mtmd_tokenize(ctx, chunks, &txt, bm, 1) != 0) err = "the image could not be preprocessed";
+        // every media chunk in order: one picture is one image chunk (the record and the OK line as before); an audio
+        // clip is audio chunks ('SVA1' records, 1-D), a video its frames and soundtrack (local, Indra's Mirror: LFM3-Omni)
+        struct Rec { int32_t tag, n, nx, ny; size_t at; };
+        std::vector<Rec> recs;
+        std::vector<float> rows;
         for (size_t c = 0; err.empty() && c < mtmd_input_chunks_size(chunks); ++c) {
             const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks, c);
-            if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_IMAGE) ichunk = ch;
-        }
-        if (err.empty() && !ichunk) err = "no image chunk";
-        if (err.empty() && mtmd_encode_chunk(ctx, ichunk) != 0) err = "the vision encoder failed";
-        if (err.empty()) {
-            const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(ichunk);
-            const int n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
-            // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token
-            const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
-            const int nx = (int) last.x + 1, ny = (int) last.y + 1;
-            if (nx * ny != n) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
-            // never silently produce many times the budget (I7, #3690): over the limit (a rounding margin of an eighth) the picture is refused
-            if (err.empty() && max_tokens > 0 && n > max_tokens + max_tokens / 8)
-                err = "the picture became " + std::to_string(n) + " image tokens, over the limit of " + std::to_string(max_tokens) +
-                      " (vision.max_tokens); send a smaller picture or raise the limit";
-            const float* embd = mtmd_get_output_embd(ctx);
-            FILE* f = err.empty() ? std::fopen(out.c_str(), "wb") : nullptr;
-            if (err.empty() && !f) err = "cannot write " + out;
-            if (f) {
-                const int32_t hdr[5] = {0x31455653, n, nx, ny, n_embd};
-                const bool ok = std::fwrite(hdr, sizeof hdr, 1, f) == 1 &&
-                                std::fwrite(embd, sizeof(float) * (size_t) n_embd, (size_t) n, f) == (size_t) n;
-                std::fclose(f);
-                if (!ok) err = "short write to " + out;
-                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                if (ok) std::printf("OK %d %d %d %.0f\n", n, nx, ny, ms);
+            const auto type = mtmd_input_chunk_get_type(ch);
+            if (type != MTMD_INPUT_CHUNK_TYPE_IMAGE && type != MTMD_INPUT_CHUNK_TYPE_AUDIO) continue;
+            if (mtmd_encode_chunk(ctx, ch) != 0) { err = type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "the vision encoder failed" : "the audio encoder failed"; break; }
+            const int n = (int) mtmd_input_chunk_get_n_tokens(ch);
+            int nx = n, ny = 1;
+            if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(ch);
+                // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token
+                const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
+                nx = (int) last.x + 1; ny = (int) last.y + 1;
+                // the grid only matters for M-RoPE models (Qwen: 2-D positions).  A 1-D model (LFM3-Omni: 120 tokens
+                // of tiles + thumbnail, plain positions) records its run as n x 1 (local, Indra's Mirror)
+                if (nx * ny != n && !mtmd_decode_use_mrope(ctx)) { nx = n; ny = 1; }
+                if (nx * ny != n) { err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)"; break; }
             }
+            const float* embd = mtmd_get_output_embd(ctx);
+            recs.push_back({type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? 0x31455653 : 0x31415653, n, nx, ny, rows.size()});
+            rows.insert(rows.end(), embd, embd + (size_t) n * n_embd);
+        }
+        if (err.empty() && recs.empty()) err = "no image or audio chunk";
+        int total = 0;
+        for (const Rec& r : recs) total += r.n;
+        // never silently produce many times the budget (I7, #3690): over the limit (a rounding margin of an eighth) the picture is refused
+        if (err.empty() && max_tokens > 0 && recs.size() == 1 && recs[0].tag == 0x31455653 && total > max_tokens + max_tokens / 8)
+            err = "the picture became " + std::to_string(total) + " image tokens, over the limit of " + std::to_string(max_tokens) +
+                  " (vision.max_tokens); send a smaller picture or raise the limit";
+        if (err.empty()) {
+            FILE* f = std::fopen(out.c_str(), "wb");
+            if (!f) err = "cannot write " + out;
+            bool ok = f != nullptr;
+            for (const Rec& r : recs) {
+                if (!ok) break;
+                const int32_t hdr[5] = {r.tag, r.n, r.nx, r.ny, n_embd};
+                ok = std::fwrite(hdr, sizeof hdr, 1, f) == 1 &&
+                     std::fwrite(rows.data() + r.at, sizeof(float) * (size_t) n_embd, (size_t) r.n, f) == (size_t) r.n;
+            }
+            if (f) std::fclose(f);
+            if (f && !ok) err = "short write to " + out;
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const bool one = recs.size() == 1;
+            if (ok) std::printf("OK %d %d %d %.0f\n", total, one ? recs[0].nx : total, one ? recs[0].ny : 1, ms);
         }
         if (!err.empty()) std::printf("ERR %s\n", err.c_str());
         std::fflush(stdout);

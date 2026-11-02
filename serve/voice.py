@@ -40,6 +40,9 @@ class VoiceServer:
         self.args = [str(a) for a in cfg.get("args", [])]
         self.port = int(cfg.get("port", 5110 if kind == "asr" else 5210))
         self.health_path = str(cfg.get("health", "/health"))
+        # the child's own route for the forwarded path, when it differs (llama-server speaks at /tts, not
+        # /v1/audio/speech; the OpenAI body's input / voice / response_format are the same keys)
+        self.path = str(cfg["path"]) if cfg.get("path") else None
         self.start_timeout_s = float(cfg.get("start_timeout_s", 120))
         self.reserve_mib = int(cfg.get("lazy_reserve_mib", 1800))   # VRAM the child needs, freed before it starts
         self.proc = None
@@ -128,7 +131,7 @@ class VoiceServer:
     def forward(self, path: str, body: bytes, content_type: str, timeout: float = FORWARD_TIMEOUT_S):
         """POST `body` to the child at `path`; return (status, bytes, content_type).  Never raises on an
         HTTP error status - the child's own error body is passed back to the caller."""
-        req = urllib.request.Request(self.base_url + path, data=body, method="POST")  # noqa: S310
+        req = urllib.request.Request(self.base_url + (self.path or path), data=body, method="POST")  # noqa: S310
         if content_type:
             req.add_header("Content-Type", content_type)
         try:

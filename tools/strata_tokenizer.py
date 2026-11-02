@@ -86,11 +86,26 @@ JOYAI_LLM_PATTERNS = [
      r"|\s+"),
 ]
 
+# The `lfm2` pre-tokenizer (Liquid AI's LFM2 / LFM3 vocabulary, local: LFM3-Omni): llama.cpp maps it to
+# LLAMA_VOCAB_PRE_TYPE_LLAMA3 (src/llama-vocab.cpp, upstream f3586e6: the `tokenizer_pre == "lfm2"` case) with
+# ignore_merges = true - a pre-token piece that is itself in the vocabulary is that one token, not merged (see _bpe).
+LLAMA3_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 # pre type -> the pattern list llama.cpp applies, in order.  The `pre` string in GGUF metadata selects it.
 PRE_PATTERNS = {
     "qwen35": [QWEN35_PATTERN],
     "joyai-llm": JOYAI_LLM_PATTERNS,
+    "lfm2": [LLAMA3_PATTERN],
 }
+IGNORE_MERGES = {"lfm2"}   # llama.cpp's ignore_merges: a whole piece found in the vocabulary is taken as it is
 
 
 # The `deepseek-v3` pre-tokenizer (DeepSeek-V3 / V4.1; llama.cpp LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM, the same regex list as
@@ -230,6 +245,7 @@ class Tokenizer:
                              % (pre, ", ".join(sorted(PRE_PATTERNS))))
         self._pre_res = [regex.compile(p) for p in pats]
         self._split = self._pre_split
+        self.ignore_merges = pre in IGNORE_MERGES
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -310,6 +326,8 @@ class Tokenizer:
         bytes) goes to _bpe_heap, which applies the same merges in the same order without rescanning every pair
         after each merge (#268: that rescan is O(n^2) and took seconds on an 8K-character CJK run).
         """
+        if getattr(self, "ignore_merges", False) and word in self.ids:   # llama.cpp ignore_merges (lfm2)
+            return [word]
         if len(word) > self.HEAP_MIN:
             return self._bpe_heap(word)
         # `self` is read ONCE, here.  #1385: an interpreter (CPython 3.14.4) was seen handing this frame an int

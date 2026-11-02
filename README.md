@@ -51,6 +51,7 @@ loops), greedy, thinking on with a 32K-token thinking budget.
 | **GLM-5.3-Flash** | 320B MoE | **290-375 tok/s** | **25.3 tok/s** | 19/21 | 10/10 | 3/3 | 512K |
 | **Qwen3.8-Flash-Next** | 125B MoE | **3,000-3,430 tok/s** | **127.8 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
 | **Qwen3.8-27B** (dense) | 27B | **1,240-1,390 tok/s** | **98.5 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
+| **[LFM3-Omni-2B](https://huggingface.co/IndrasMirror/LFM3-Omni-2B-XQ-Uncensored)** (XQ-6.0, omni) | 2B | **26,000-32,800 tok/s** | **~300 tok/s** | 13/21 | 9/10 | 0/3 | 32K |
 
 <sub>Decode = generation speed during those tasks. Prefill = a fresh 6K-17K-token prompt through the server
 (`tools/throughput.py`; Qwen3.8-Flash-Next: 3,430 / 3,005 tok/s at 6.5K / 16.7K, Qwen3.8-27B: 1,385 / 1,244 tok/s,
@@ -61,7 +62,10 @@ DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts
 (`tools/glm/serve/strata-glm-maya-abl-512k-bias.json`), prefill 301 / 374 tok/s at 6.1K / 15.6K and 368-376 on fresh
 30K / 44K prompts. DeepSeek-V4.1-Flash-1017 V4 (25 Oct): dense half Q8_0, `rank-1017-v4.bin` + `--tier-batch-pcie 0.25`,
 prefill 289-297 / 395-409 tok/s at 6.1K / 16.5K; full HumanEval (164) 162/164. How close the DeepSeek quant gets to DeepSeek's own API on the same tasks:
-[docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md#deepseek-v41-quant-vs-the-deepseek-api).</sub>
+[docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md#deepseek-v41-quant-vs-the-deepseek-api).
+LFM3-Omni-2B (2 Nov, `xolotl-lfm3`, alone on the card): a non-reasoning model, so thinking off; prefill 32,796 / 26,049
+tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speech out at 12x real time) - see
+[docs/LFM3.md](docs/LFM3.md). Its agentic 0/3 is the 2B model calling a tool the agent does not have.</sub>
 
 **What that means in practice:**
 
@@ -74,6 +78,10 @@ prefill 289-297 / 395-409 tok/s at 6.1K / 16.5K; full HumanEval (164) 162/164. H
 
 ## Recently added
 
+- **LFM3-Omni-2B, natively** (`xolotl-lfm3`, [docs/LFM3.md](docs/LFM3.md)): Liquid AI's omni model (text, pictures,
+  audio and video in; text and speech out) in its own engine behind the usual server - ~300 tok/s decode, 26-33K tok/s
+  prefill, `/v1/audio/speech` and `/v1/audio/transcriptions` from the model itself, and park/unpark in ~50 ms so it can
+  sit beside a big model as its ears, eyes and voice. Logits match llama.cpp's (KL 1.3e-7 on an exact-layout run).
 - **Nine community pull requests** (#86-#95): IQ1_S routed experts for Unsloth's DeepSeek-V4.1 UD-IQ1_M (#86) and
   opt-in fused router ops and batched state copies in the DeepSeek-V4.1 engine (#87, Xiaomi2008); opt-in request-owned
   batch cancellation (#95), learned checkpoints for edited prompt suffixes (#90), shared immutable checkpoint payloads
@@ -213,6 +221,7 @@ pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up
 | [DeepSeek-V4.1-Flash engine](docs/DEEPSEEK_V41.md) | GSQ quantisation, DSpark, the fp4 KV cache, Engram |
 | [DeepSeek-V4.1 on Windows](docs/WINDOWS.md) | native MSVC + CUDA build, configs, RTX 50 notes |
 | [GLM-5.3-Flash engine](docs/glm) | KDA + MLA attention, the LoRA on routed experts, soft pruning |
+| [LFM3-Omni engine](docs/LFM3.md) | pictures, audio, video and speech on a 2B model, park/unpark beside a big one |
 | [Qwen3.8 / upstream Strata](README.strata.md) | the Strata engine this grew from |
 | [Brand kit](docs/brand/XOLOTL_BRAND.md) | logo, banner, palette |
 
@@ -224,7 +233,8 @@ Built on **[Strata](https://github.com/Niko1221/Strata)** by Niko1221 (its engin
 0.1.44.1) and [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp); the Qwen3.8-27B dense port is
 [perronemirko](https://github.com/perronemirko/Strata)'s. The DeepSeek-V4.1 and GLM-5.3-Flash engines, the GSQ quant
 and the unification are Indras Mirror's. Model weights: DeepSeek, Zhipu AI, Qwen, with quants and fine-tunes by
-peasantsmith, ukisai, d0xin and gcsa-abliterix.
+peasantsmith, ukisai, d0xin and gcsa-abliterix; LFM3-Omni by [Liquid AI](https://huggingface.co/LiquidAI), its engine
+following llama.cpp's LFM3 and libmtmd work.
 
 Contributors, with thanks: [NektoDron](https://github.com/NektoDron) (MMQ id slack, forced tool calls, the arena pipe
 and indexer WMMA opt-ins, #48-#52; checked #55; the Q3_K + GPTQ Q2_0 lite calibration and allocation tooling, #58;

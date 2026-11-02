@@ -1,0 +1,54 @@
+{
+ "_comment": "LFM3-Omni-2B XQ-6.0 on xolotl-lfm3 (Xolotl's LFM3 engine: llama.cpp's LFM3 graph on ggml-backend). Pictures, audio and video through xolotl-lfm3-vision (tools/vision on llama.cpp f3586e6's mtmd, LFM3-Omni projector); the rows replace the template's <|image|> marker. Greedy by default, as Liquid AI's generation_config.",
+ "exe": "build-xolotl/xolotl-lfm3",
+ "args": [
+  "--native",
+  "/path/to/lfm3/LFM3-Omni-2B-XQ-6.0-Uncensored.gguf",
+  "--context",
+  "32768",
+  "--ubatch",
+  "512",
+  "--speech-exe",
+  "build-xolotl/xolotl-lfm3-speech",
+  "--speech-mmproj",
+  "/path/to/lfm3/mmproj-LFM3-Omni-2B-Q8_0.gguf"
+ ],
+ "cwd": ".",
+ "tokenizer": "/path/to/lfm3/tokenizer",
+ "model_name": "lfm3-omni-2b-xq6",
+ "log": "xol-lfm3.log",
+ "port": 8132,
+ "gpu": 0,
+ "sampling": {
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "top_k": 1
+ },
+ "image_pad": "<|image|>",
+ "vision": {
+  "exe": "build-xolotl/xolotl-lfm3-vision",
+  "mmproj": "/path/to/lfm3/mmproj-LFM3-Omni-2B-Q8_0.gguf",
+  "model": "/path/to/lfm3/LFM3-Omni-2B-XQ-6.0-Uncensored.gguf",
+  "gpu": true,
+  "av": true
+ },
+ "speech": {
+  "language": "en",
+  "voice": "female",
+  "max_frames": 1500
+ },
+ "asr_native": {
+  "language": "en",
+  "max_tokens": 1024
+ },
+ "_speech": "speech out (/v1/audio/speech) natively: xolotl-lfm3 GENA runs the text model, its xolotl-lfm3-speech child (tools/lfm3/lfm3_speech.cpp on llama.cpp f3586e6's mtmd) the depthformer + Liquid codec; /v1/audio/transcriptions by the model itself (asr_native: 'Perform ASR in <language>.'). The llama-server /tts sidecar version: xol-lfm3-sidecar.json",
+ "bos_token": "<|startoftext|>",
+ "thinking": false,
+ "hide_tokens": [
+  "<|mixed_start|>",
+  "<|text_end|>",
+  "<|audio_start|>",
+  "<|text_start|>"
+ ],
+ "_tokenizer": "tokenizer: a folder with LiquidAI/LFM3-Omni-2B's tokenizer.json, tokenizer_config.json and chat_template.jinja"
+}

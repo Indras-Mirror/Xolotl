@@ -2991,3 +2991,11 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND N
     target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
   endif()
 endif()
+
+# LFM3 / LFM3-Omni (Liquid AI) behind the serve protocol: llama.cpp's LFM3 graph on ggml-backend (CUDA + CPU fallback),
+# src/program/lfm3_main.cpp.  Needs the CUDA ggml backend (STRATA_GGML_CUDA) and strata_kernels' sampler.
+if(STRATA_DENSE AND TARGET ggml-cuda AND TARGET strata_kernels)
+  add_executable(xolotl-lfm3 src/program/lfm3_main.cpp)
+  target_include_directories(xolotl-lfm3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_link_libraries(xolotl-lfm3 PRIVATE strata_kernels ggml ggml-cuda ggml-cpu ggml-base ${_strata_gpu_runtime_target})
+endif()

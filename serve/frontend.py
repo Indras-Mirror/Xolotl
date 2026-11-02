@@ -27,6 +27,19 @@ from pathlib import Path
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+import jinja2.ext
+
+
+class GenerationTag(jinja2.ext.Extension):
+    """local (Indra's Mirror): HF's {% generation %} ... {% endgeneration %} (transformers marks the assistant's tokens with
+    it for return_assistant_tokens_mask; LFM3-Omni's template wraps every assistant turn in it).  Rendering keeps the body
+    unchanged; a template without the tag renders exactly as before."""
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return jinja2.nodes.Scope(body, lineno=lineno)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +53,8 @@ class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
+    bos_token = ""     # local (Indra's Mirror): the template's bos_token, from the config (none = as before)
+
     def __init__(self, path: str | Path):
         def raise_exception(message):
             raise TemplateRequestError(message)
@@ -47,7 +62,7 @@ class ChatTemplate:
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols", GenerationTag])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
@@ -62,6 +77,8 @@ class ChatTemplate:
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
+        if self.bos_token and "bos_token" not in kwargs:   # local: the config's "bos_token" (LFM3: <|startoftext|>)
+            kwargs["bos_token"] = self.bos_token
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 
@@ -128,6 +145,11 @@ def _text_of(content, cache_marker=None) -> str:
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
+# audio / video parts (local, Indra's Mirror: LFM3-Omni): read only when the run config's vision section has
+# "av": true - the server then adds these to IMAGE_PARTS and they go to the same encoder as the pictures
+# (xolotl-lfm3-vision reads them with mtmd).  OpenAI {"type": "input_audio", "input_audio": {"data", "format"}},
+# llama.cpp {"type": "input_video", "input_video": {"data" | "url"}}, vLLM {"type": "video_url", "video_url": {"url"}}.
+AV_PARTS = ("input_audio", "input_video", "video_url")
 
 # Snapshot markers are private frontend metadata, never a reserved client-text character.
 # The fresh suffix is checked against all request strings before any marker is inserted.
@@ -227,6 +249,14 @@ def _image_source(part: dict) -> str:
         if src.get("type") == "base64":
             return f"data:{src.get('media_type', 'image/png')};base64,{src.get('data', '')}"
         return src.get("url") or src.get("path") or ""
+    if part.get("type") == "input_audio":
+        a = part.get("input_audio") or {}
+        return f"data:audio/{a.get('format') or 'wav'};base64,{a.get('data', '')}" if a.get("data") else (a.get("url") or "")
+    if part.get("type") in ("input_video", "video_url"):
+        v = part.get(part["type"]) or {}
+        if isinstance(v, str):
+            return v
+        return f"data:video/mp4;base64,{v['data']}" if v.get("data") else (v.get("url") or "")
     url = part.get("image_url")
     if isinstance(url, dict):
         url = url.get("url")
