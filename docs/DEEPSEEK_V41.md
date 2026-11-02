@@ -424,6 +424,60 @@ chimpera measured a 24-core Threadripper 5965WX (~150 GB/s) + RTX 5090 on gen4 g
 ([#3](https://github.com/Indras-Mirror/Xolotl/issues/3)).  FreeToken's rule of thumb: the pool pays when its expert
 bandwidth is well above PCIe's (about 2x).  Sweep 1.0 / 0.5 / 0.0 on your box.
 
+#### Measured 2026-11-02: the layer-major prefill batch never uses the CPU pool (open)
+
+Observed on the served Q6 config (`private/serve/strata-ds41-1017-v4-serve-q6.json`: `--prompt-batch 12288`,
+`--tier-batch-pcie 0.25`, DSpark on, 512K ctx, RTX 4090 / 5700X / 90 GB DDR4) while a QuetzaCodetl session ran
+normally. **Read-only observation - nothing here has been tested as a change.**
+
+Across 25 prompt reads and 24 decodes in `/tmp/strata-v4-serve-q6.log`:
+
+| phase | requests | CPU-pool runs | PCIe DMAs | CPU share |
+|---|---|---|---|---|
+| prefill | 25 | **0** | 8,283,151 | **0.0 %** |
+| decode | 24 | 371,556 | 144,946 | 71.9 % |
+
+Decode matches `--tier-batch-pcie 0.25` (75 % expected). Prefill sends every miss down the single PCIe link. The
+`tier_batch_pcie` value is read at exactly one site - `gpu_run_n_ex` (`tools/v41/engine/ds41_moe.cpp:4220`) - while the
+layer-major batch runs the experts once per layer over the whole batch (`ds41_generate.cpp:1269`), so with
+`--prompt-batch` in use the knob has no effect on prompt reads. The earlier note that `--tier-batch-pcie` covers
+"prompt chunks" refers to the `--prefill-chunk` path, not this one.
+
+The same mechanism makes short reads slow. Prompt-phase expert time vs DMA rate:
+
+| new tokens | PCIe fetches | experts | DMA rate |
+|---|---|---|---|
+| 35 | 8,922 | 3.60 s | 2,478/s |
+| 287 | 54,528 | 5.44 s | 10,024/s |
+| 734 | 73,082 | 7.15 s | 10,221/s |
+| 1,164 | 105,053 | 8.36 s | 12,566/s |
+| 3,868 | 715,543 | ~13 s | ~55,000/s |
+
+`kMaxParts = 8` (`ds41_moe.cpp:77`) caps the grouped launch's staging slots. If the layer-major path stages per call
+the same way, a short read has too few distinct misses per layer to fill a wave and the link idles between them, while
+a long prompt fills the queue and runs ~22x faster. **Not verified:** that the layer-major path uses this staging -
+the throughput shape matches, but the call was not traced.
+
+The fixed cost this creates is ~3.6-5 s per turn, independent of context: a request with **0 new tokens** logs
+`0.00 s` prefill, while 287 new tokens over a 40K context logs 6.18 s (dense 0.41, experts 5.44). Fitting the phase
+split gives dense 672 tok/s (no fixed cost) and experts 364 tok/s marginal + ~4.7 s fixed. The blended "prefill
+tok/s" a turn reports (46-232) is that fixed cost divided by the number of new tokens, not a change in rate.
+
+Two untried directions, in order of cost:
+
+1. Measure whether routing layer-major prefill misses through the CPU-pool split helps at all. The pool runs in
+   parallel with the card (`gpu_run_n`'s design), but this host's DDR4 at 2133 MT/s is the documented wall and
+   `--tier-batch-pcie 0.25` was provisional and not significant at 8K (`RESUME_PROMPT_2026-10-25_SPEED4.md`, n=5,
+   p=0.016) - so expect little until it is measured on the actual serve path.
+2. Fill the staging waves from across layers rather than per layer, or raise the depth above 8, so a short read is
+   not limited to ~8 experts per wave.
+
+Reproduce: run the served config under real load, then
+`grep -a "prompt phases" /tmp/strata-v4-serve-q6.log` for the dense/experts split and
+`grep -a "serve: prompt" ... ` for `experts N hit / N cpu / N pcie / N file`. A monitor that samples
+`GET /metrics` (offers `live`, per-request `prompt_read`/`prompt_ms`/`decode_tok_s`/`hit_rate`, and `hardware`) is
+at `~/v41-work/ds41mon/monitor.py`.
+
 ### Cache-aware routing (`--route-bias`, lossy, off by default)
 Adds `D` to the router's *selection* score of experts already in VRAM (the mixing weights stay exact), so near-ties
 resolve toward the cache. It trades quality for speed - measured: 0.05 → +9% decode / +1.1% perplexity, 0.2 → +29% /
