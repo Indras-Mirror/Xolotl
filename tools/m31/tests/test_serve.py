@@ -83,6 +83,22 @@ class ParserTests(unittest.TestCase):
             "cities": [{"name": "東京", "count": 2}], "enabled": True}})
         self.assertEqual("".join(event.text for event in events if event.kind == "content"), "beforeafter")
 
+    def test_declared_only_option_preserves_strict_minimax_tool_validation(self):
+        tools = [{"name": "echo", "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}]
+        call = (P.CALL_START + P.NS + '<invoke name="echo">' + P.NS + '<text>hello' +
+                P.NS + '</text>' + P.INVOKE_END + P.CALL_END)
+        for declared_only in (False, True):
+            parser = P.M31OutputParser(tools=tools, declared_only=declared_only)
+            self.assertTrue(parser.clean)
+            self.assertEqual(parser.unread, 0)
+            events = parser.feed(call) + parser.finish()
+            self.assertEqual([event.call.arguments for event in events if event.kind == "tool_call"],
+                             [{"text": "hello"}])
+            parser = P.M31OutputParser(tools=tools, declared_only=declared_only)
+            with self.assertRaisesRegex(ValueError, "unknown MiniMax tool"):
+                parser.feed(call.replace('name="echo"', 'name="unknown"'))
+
     def test_incomplete_tool_is_error(self):
         parser = P.M31OutputParser(tools=TOOLS)
         parser.feed(P.CALL_START + P.NS + '<invoke name="lookup">')

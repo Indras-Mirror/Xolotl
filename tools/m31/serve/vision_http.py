@@ -55,9 +55,9 @@ def install_video_reader():
     frontend.IMAGE_PARTS += VIDEO_PARTS
     frontend.ANTHROPIC_BLOCKS += VIDEO_PARTS
 
-    def parts(content):
+    def parts(content, cache_marker=None):
         if not isinstance(content, list) or not any(isinstance(p, dict) and p.get('type') in VIDEO_PARTS for p in content):
-            return original(content)
+            return original(content, cache_marker)
         result = []
         for part in content:
             if not isinstance(part, dict):
@@ -65,8 +65,12 @@ def install_video_reader():
             if part.get('type') in frontend.IMAGE_PARTS:
                 source, kind, fps = _source(part)
                 result.append({'type': 'image', 'source': source, 'media_type': kind, 'fps': fps})
+                if cache_marker and frontend._cache_marked(part):
+                    result.append({'type': 'text', 'text': cache_marker})
             elif part.get('type') in frontend.TEXT_PARTS:
-                result.append({'type': 'text', 'text': part.get('text', '')})
+                text = part.get('text', '')
+                result.append({'type': 'text', 'text': frontend._with_mark(text, cache_marker)
+                               if frontend._cache_marked(part) else text})
         return result
 
     frontend._parts_of = parts

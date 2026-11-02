@@ -358,7 +358,9 @@ class M31Service(_BaseService):
         self.stop_ids = set(eos)
         self.effort_end = False
 
-    def encode_prompt(self, messages, tools, kwargs):
+    def encode_prompt(self, messages, tools, kwargs, store=True):
+        # This family encodes directly, without the common prompt LRU; a
+        # count-only store=False request therefore needs no cache mutation.
         # Follow the GGUF template and PR tokenizer oracle exactly. The common
         # Qwen literal-tag substitution changes MiniMax's template token IDs.
         prompt = self.template.render(messages, tools=tools, **kwargs)
@@ -475,7 +477,7 @@ class M31Service(_BaseService):
             chat["assistant_prefix"] = force
         return PreparedIds(ids, chat, cache), thinking, maximum
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None):
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, declared_only=False):
         if isinstance(max_new, bool) or not isinstance(max_new, int) or max_new < 0:
             raise ValueError("prepared generation limit must be a nonnegative integer")
         if max_new == 0:
@@ -494,7 +496,8 @@ class M31Service(_BaseService):
         previous = getattr(self._m31_request, "ignore_eos", False)
         self._m31_request.ignore_eos = ignore_eos
         try:
-            yield from super().run(ids, thinking, tools, max_new, sampling, cancel, force)
+            yield from super().run(ids, thinking, tools, max_new, sampling, cancel, force,
+                                   declared_only=declared_only)
         finally:
             self._m31_request.ignore_eos = previous
 
