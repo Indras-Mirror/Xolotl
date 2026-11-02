@@ -83,6 +83,22 @@ class ParserTests(unittest.TestCase):
             "cities": [{"name": "東京", "count": 2}], "enabled": True}})
         self.assertEqual("".join(event.text for event in events if event.kind == "content"), "beforeafter")
 
+    def test_declared_only_option_preserves_strict_minimax_tool_validation(self):
+        tools = [{"name": "echo", "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}]
+        call = (P.CALL_START + P.NS + '<invoke name="echo">' + P.NS + '<text>hello' +
+                P.NS + '</text>' + P.INVOKE_END + P.CALL_END)
+        for declared_only in (False, True):
+            parser = P.M31OutputParser(tools=tools, declared_only=declared_only)
+            self.assertTrue(parser.clean)
+            self.assertEqual(parser.unread, 0)
+            events = parser.feed(call) + parser.finish()
+            self.assertEqual([event.call.arguments for event in events if event.kind == "tool_call"],
+                             [{"text": "hello"}])
+            parser = P.M31OutputParser(tools=tools, declared_only=declared_only)
+            with self.assertRaisesRegex(ValueError, "unknown MiniMax tool"):
+                parser.feed(call.replace('name="echo"', 'name="unknown"'))
+
     def test_incomplete_tool_is_error(self):
         parser = P.M31OutputParser(tools=TOOLS)
         parser.feed(P.CALL_START + P.NS + '<invoke name="lookup">')
@@ -109,9 +125,9 @@ class TokenAwareRuntimeTests(unittest.TestCase):
         engine = S.MockEngine(self.tok, "")
         engine.script = ids + self.tok.encode("[e~[", parse_special=True)
         engine.scripts = [engine.script]
-        service = M.M31Service(engine, self.tok, Template())
         with mock.patch.object(S, "OutputParser", P.M31OutputParser), \
                 mock.patch.object(S, "Detokenizer", M.M31Detokenizer):
+            service = M.M31Service(engine, self.tok, Template())
             items = list(service.run([1], True, self.tools, 2000, {"temperature": 0}, threading.Event()))
         return [value for kind, value in items if kind == "event"]
 
@@ -156,6 +172,17 @@ class TokenAwareRuntimeTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_m31_recovery_default_matches_strict_parser_without_changing_config(self):
+        config = {}
+        self.assertFalse(M.tool_call_recovery_setting(config))
+        self.assertEqual(config, {})
+        self.assertFalse(M.tool_call_recovery_setting({"tool_call_recovery": False}))
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            M.tool_call_recovery_setting({"tool_call_recovery": True})
+        for value in (None, "false", 0):
+            with self.assertRaises(SystemExit):
+                M.tool_call_recovery_setting({"tool_call_recovery": value})
+
     def test_cache_and_native_grammar_metadata(self):
         key = M.M31Engine.sampling_keys({"cache_prompt": False, "m31_chat_b64": M.chat_key({"a": "é"})})
         self.assertIn(" cache_prompt=0", key)
@@ -279,6 +306,7 @@ for line in sys.stdin:
         service = M.M31Service(self.engine, S.ByteTokenizer(), Template())
         service.stop_ids = set()
         with mock.patch.object(S, "OutputParser", P.M31OutputParser):
+            service.parser_cls = S.OutputParser
             with self.assertRaisesRegex(ValueError, "unknown MiniMax tool"):
                 list(service.run([1], False, TOOLS, 100, {}, threading.Event()))
             self.assertFalse(service.fifo.locked())
@@ -313,6 +341,7 @@ for line in sys.stdin:
         self.script.with_suffix(".hang").touch()
         started = time.monotonic()
         with mock.patch.object(S, "OutputParser", P.M31OutputParser):
+            service.parser_cls = S.OutputParser
             with self.assertRaises(S.EngineSilent):
                 list(service.run([1], False, TOOLS, 100, {}, threading.Event()))
             self.assertLess(time.monotonic() - started, 3)
@@ -356,6 +385,7 @@ for line in sys.stdin:
         patch.start()
         self.addCleanup(patch.stop)
         engine = M.M31Engine(str(script), [])
+        engine.deep_sleep = "native"
         engine.silence_s = 5
         self.addCleanup(engine.close)
         return engine, script

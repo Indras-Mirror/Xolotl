@@ -165,16 +165,23 @@ def parse_calls(text, schemas, controls=None):
 
 
 class M31OutputParser:
-    def __init__(self, thinking=True, tools=None, stream_tools=False, recover=False):
+    def __init__(self, thinking=True, tools=None, stream_tools=False, recover=False, declared_only=False):
+        # Common Service passes this option; MiniMax always validates declared
+        # names and schemas, including its existing declared_only=False path.
         if recover:
             raise ValueError("Qwen tool-call recovery is unavailable for MiniMax")
         self.schemas = {tool.get("name", (tool.get("function") or {}).get("name")):
                         tool.get("function", tool) for tool in tools or []}
         self.thinking = thinking
         self.state, self.buf, self.pending = "initial", "", []
-        self.rescued = self.refused = 0
+        self.rescued = self.refused = self.unread = 0
         self._reasoning_space = False
         self._controls = {}
+
+    @property
+    def clean(self):
+        """Match the common parser's safe reasoning-stop boundary."""
+        return not self.buf
 
     def _append(self, delta):
         offset = len(self.buf)

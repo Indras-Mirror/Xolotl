@@ -294,6 +294,7 @@ class M31Engine(_BaseEngine):
 _BaseService = S.Service
 _engine_silence_s = S.engine_silence_s
 _sampling_defaults_from_config = S.sampling_defaults_from_config
+_tool_call_recovery_setting = S.tool_call_recovery_setting
 _engine_args = S.engine_args
 
 
@@ -323,7 +324,15 @@ def engine_silence_s(config):
     return seconds
 
 
+def tool_call_recovery_setting(config):
+    recovery = _tool_call_recovery_setting({"tool_call_recovery": False, **config})
+    if recovery:
+        raise ValueError("Qwen tool-call recovery is unavailable for MiniMax")
+    return recovery
+
+
 def validate_config(config):
+    tool_call_recovery_setting(config)
     vision = config.get("vision")
     if vision is not None and (not isinstance(vision, dict) or not all(
             isinstance(vision.get(key), str) and vision[key] for key in ("exe", "model", "mmproj"))):
@@ -350,6 +359,7 @@ class M31Service(_BaseService):
         self._m31_request = threading.local()
         kwargs["fit_max_tokens"] = True
         super().__init__(engine, tokenizer, template, *args, **kwargs)
+        self.tool_call_recovery = False  # MiniMax keeps its strict native tool-call syntax.
         self.sampling_defaults = {"temperature": 1.0, "top_p": 0.95, "top_k": 40, "min_p": 0.05,
                                   **self.sampling_defaults}
         eos = tokenizer.encode("[e~[", parse_special=True)
@@ -358,7 +368,9 @@ class M31Service(_BaseService):
         self.stop_ids = set(eos)
         self.effort_end = False
 
-    def encode_prompt(self, messages, tools, kwargs):
+    def encode_prompt(self, messages, tools, kwargs, store=True):
+        # This family encodes directly, without the common prompt LRU; a
+        # count-only store=False request therefore needs no cache mutation.
         # Follow the GGUF template and PR tokenizer oracle exactly. The common
         # Qwen literal-tag substitution changes MiniMax's template token IDs.
         prompt = self.template.render(messages, tools=tools, **kwargs)
@@ -475,7 +487,7 @@ class M31Service(_BaseService):
             chat["assistant_prefix"] = force
         return PreparedIds(ids, chat, cache), thinking, maximum
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None):
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, declared_only=False):
         if isinstance(max_new, bool) or not isinstance(max_new, int) or max_new < 0:
             raise ValueError("prepared generation limit must be a nonnegative integer")
         if max_new == 0:
@@ -494,7 +506,8 @@ class M31Service(_BaseService):
         previous = getattr(self._m31_request, "ignore_eos", False)
         self._m31_request.ignore_eos = ignore_eos
         try:
-            yield from super().run(ids, thinking, tools, max_new, sampling, cancel, force)
+            yield from super().run(ids, thinking, tools, max_new, sampling, cancel, force,
+                                   declared_only=declared_only)
         finally:
             self._m31_request.ignore_eos = previous
 
@@ -515,6 +528,7 @@ def install():
     install_video_reader()
     S.engine_silence_s = engine_silence_s
     S.sampling_defaults_from_config = sampling_defaults_from_config
+    S.tool_call_recovery_setting = tool_call_recovery_setting
     S.engine_args = engine_args
 
 

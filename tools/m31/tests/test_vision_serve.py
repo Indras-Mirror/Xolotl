@@ -151,6 +151,39 @@ class MediaTests(unittest.TestCase):
                 else:
                     setattr(F, name, value)
 
+    def test_video_reader_preserves_frontend_cache_marker_arguments(self):
+        names = ("IMAGE_PARTS", "ANTHROPIC_BLOCKS", "_parts_of", "_m31_video_reader")
+        before = {name: getattr(F, name, None) for name in names}
+        try:
+            install_video_reader()
+            self.assertEqual(F._parts_of("old default"), "old default")
+            for content in ("plain", [{"type": "text", "text": "plain"}]):
+                messages, _, _ = F.openai_to_messages({"messages": [{"role": "user", "content": content}]})
+                self.assertEqual(messages[0]["content"], "plain")
+            image = {"type": "image_url", "image_url": {"url": "image.png"}}
+            messages, _, _ = F.openai_to_messages({"messages": [{"role": "user", "content": [image]}]})
+            self.assertEqual(messages[0]["content"], [{"type": "image", "source": "image.png"}])
+            marked_text = {"type": "text", "text": "before \n", "cache_control": {"type": "ephemeral"}}
+            self.assertEqual(F._parts_of([marked_text], cache_marker="POINT"), "beforePOINT \n")
+            parts = [marked_text, {**image, "cache_control": {"type": "ephemeral"}},
+                     {"type": "video_url", "video_url": {"url": "clip.mp4", "fps": 2},
+                      "cache_control": {"type": "ephemeral"}}, {"type": "text", "text": "after"}]
+            messages, _, kwargs = F.openai_to_messages({"messages": [{"role": "user", "content": parts}]})
+            marker = kwargs[F.CACHE_MARK_KEY]
+            self.assertEqual(messages[0]["content"], [
+                {"type": "text", "text": "before" + marker + " \n"},
+                {"type": "image", "source": "image.png", "media_type": "image", "fps": None},
+                {"type": "text", "text": marker},
+                {"type": "image", "source": "clip.mp4", "media_type": "video", "fps": 2},
+                {"type": "text", "text": marker}, {"type": "text", "text": "after"}])
+        finally:
+            for name, value in before.items():
+                if value is None:
+                    if hasattr(F, name):
+                        delattr(F, name)
+                else:
+                    setattr(F, name, value)
+
     def test_cancel_before_media_read_and_fps_limits(self):
         with tempfile.TemporaryDirectory() as tmp:
             media = MediaInput(tmp)
@@ -313,6 +346,64 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(S.VisionUnavailable):
             self.service.prepare([self.message], [], {}, 20)
         self.assertEqual(list(self.vision.dir.glob("request-*.sve")), [])
+
+    def test_http_text_image_video_tools_and_count_tokens_with_installed_reader(self):
+        names = ("IMAGE_PARTS", "ANTHROPIC_BLOCKS", "_parts_of", "_m31_video_reader")
+        before = {name: getattr(F, name, None) for name in names}
+        def restore_reader():
+            for name, value in before.items():
+                if value is None:
+                    if hasattr(F, name):
+                        delattr(F, name)
+                else:
+                    setattr(F, name, value)
+        self.addCleanup(restore_reader)
+        install_video_reader()
+        tok = M.M31Tokenizer(list(M.ST.BYTE_TO_UNICODE.values()) + list(M.P.CONTROL_PIECES) + ["[e~["],
+                             [], [1] * 256 + [4] * len(M.P.CONTROL_PIECES) + [3])
+        with mock.patch.object(S, "IM_END", "[e~["), mock.patch.object(S, "Detokenizer", M.M31Detokenizer):
+            engine = S.MockEngine(tok, "ok", max_context=512)
+            service = M.M31Service(engine, tok, Template(), vision=self.vision)
+            parsers = []
+            def parser(**kwargs):
+                parsers.append(kwargs)
+                return M.P.M31OutputParser(**kwargs)
+            service.parser_cls = parser
+            server = S.serve(service, port=0)
+            try:
+                def post(path, body):
+                    request = urllib.request.Request("http://127.0.0.1:" + str(server.server_address[1]) + path,
+                        json.dumps(body).encode(), {"Content-Type": "application/json"})
+                    try:
+                        with urllib.request.urlopen(request, timeout=3) as response:
+                            return response.status, json.load(response)
+                    except urllib.error.HTTPError as error:
+                        with error:
+                            return error.code, json.load(error)
+                with mock.patch.object(engine, "generate") as generate:
+                    status, result = post("/v1/messages/count_tokens", {"model": "m31", "messages": [{"role": "user", "content": "count me"}]})
+                    self.assertEqual(status, 200, result)
+                    self.assertGreater(result["input_tokens"], 0)
+                    generate.assert_not_called()
+                    self.assertIsNone(getattr(service.embeddings, "path", None))
+                for content in ("text", [{"type": "image_url", "image_url": {"url": "test.png"}}],
+                                [{"type": "video_url", "video_url": {"url": "clip.mp4", "fps": 2}}]):
+                    status, result = post("/v1/chat/completions", {"messages": [{"role": "user", "content": content}],
+                                                               "max_tokens": 16, "chat_template_kwargs": {"enable_thinking": False}})
+                    self.assertEqual(status, 200, result)
+                    self.assertEqual(result["choices"][0]["message"]["content"], "ok")
+                call = (M.P.CALL_START + M.P.NS + '<invoke name="echo">' + M.P.NS + '<text>hello' +
+                        M.P.NS + '</text>' + M.P.INVOKE_END + M.P.CALL_END)
+                engine.script = tok.encode(call, parse_special=True) + tok.encode("[e~[", parse_special=True)
+                status, result = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "call echo"}],
+                    "max_tokens": 128, "chat_template_kwargs": {"enable_thinking": False}, "tools": [{"type": "function", "function": {
+                    "name": "echo", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}}]})
+                self.assertEqual(status, 200, result)
+                tool = result["choices"][0]["message"]["tool_calls"][0]["function"]
+                self.assertEqual(tool["name"], "echo"); self.assertEqual(json.loads(tool["arguments"]), {"text": "hello"})
+                self.assertTrue(parsers and all(p["declared_only"] for p in parsers))
+            finally:
+                server.shutdown(); server.server_close(); service.drop_embeddings()
 
     def test_http_helper_failure_returns_503_then_text_still_works(self):
         self.vision.failure = True
