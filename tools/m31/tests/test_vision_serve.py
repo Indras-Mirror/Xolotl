@@ -364,7 +364,6 @@ class ServiceTests(unittest.TestCase):
         with mock.patch.object(S, "IM_END", "[e~["), mock.patch.object(S, "Detokenizer", M.M31Detokenizer):
             engine = S.MockEngine(tok, "ok", max_context=512)
             service = M.M31Service(engine, tok, Template(), vision=self.vision)
-            service.tool_call_recovery = False  # required by the real M31 launcher config
             parsers = []
             def parser(**kwargs):
                 parsers.append(kwargs)

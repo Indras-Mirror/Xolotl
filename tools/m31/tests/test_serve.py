@@ -125,9 +125,9 @@ class TokenAwareRuntimeTests(unittest.TestCase):
         engine = S.MockEngine(self.tok, "")
         engine.script = ids + self.tok.encode("[e~[", parse_special=True)
         engine.scripts = [engine.script]
-        service = M.M31Service(engine, self.tok, Template())
         with mock.patch.object(S, "OutputParser", P.M31OutputParser), \
                 mock.patch.object(S, "Detokenizer", M.M31Detokenizer):
+            service = M.M31Service(engine, self.tok, Template())
             items = list(service.run([1], True, self.tools, 2000, {"temperature": 0}, threading.Event()))
         return [value for kind, value in items if kind == "event"]
 
@@ -172,6 +172,17 @@ class TokenAwareRuntimeTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_m31_recovery_default_matches_strict_parser_without_changing_config(self):
+        config = {}
+        self.assertFalse(M.tool_call_recovery_setting(config))
+        self.assertEqual(config, {})
+        self.assertFalse(M.tool_call_recovery_setting({"tool_call_recovery": False}))
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            M.tool_call_recovery_setting({"tool_call_recovery": True})
+        for value in (None, "false", 0):
+            with self.assertRaises(SystemExit):
+                M.tool_call_recovery_setting({"tool_call_recovery": value})
+
     def test_cache_and_native_grammar_metadata(self):
         key = M.M31Engine.sampling_keys({"cache_prompt": False, "m31_chat_b64": M.chat_key({"a": "é"})})
         self.assertIn(" cache_prompt=0", key)
@@ -295,6 +306,7 @@ for line in sys.stdin:
         service = M.M31Service(self.engine, S.ByteTokenizer(), Template())
         service.stop_ids = set()
         with mock.patch.object(S, "OutputParser", P.M31OutputParser):
+            service.parser_cls = S.OutputParser
             with self.assertRaisesRegex(ValueError, "unknown MiniMax tool"):
                 list(service.run([1], False, TOOLS, 100, {}, threading.Event()))
             self.assertFalse(service.fifo.locked())
@@ -329,6 +341,7 @@ for line in sys.stdin:
         self.script.with_suffix(".hang").touch()
         started = time.monotonic()
         with mock.patch.object(S, "OutputParser", P.M31OutputParser):
+            service.parser_cls = S.OutputParser
             with self.assertRaises(S.EngineSilent):
                 list(service.run([1], False, TOOLS, 100, {}, threading.Event()))
             self.assertLess(time.monotonic() - started, 3)
@@ -372,6 +385,7 @@ for line in sys.stdin:
         patch.start()
         self.addCleanup(patch.stop)
         engine = M.M31Engine(str(script), [])
+        engine.deep_sleep = "native"
         engine.silence_s = 5
         self.addCleanup(engine.close)
         return engine, script
