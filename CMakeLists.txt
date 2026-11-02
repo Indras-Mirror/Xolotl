@@ -2025,9 +2025,18 @@ if(STRATA_NATIVE_EXPERTS)
     execute_process(COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${_xolotl_ggml_parent}
                             git apply --reverse --check ${_xolotl_ggml_patch} WORKING_DIRECTORY ${STRATA_GGML_DIR}
                     RESULT_VARIABLE _xolotl_patched OUTPUT_QUIET ERROR_QUIET)
+    # the check re-runs whenever the patch changes (a pull that updates it reconfigures the build), and a stale tree
+    # stops here with the fix instead of failing later on an op the old patch did not add
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_xolotl_ggml_patch})
     if(NOT _xolotl_patched EQUAL 0)
-      message(WARNING "STRATA_GGML_DIR=${STRATA_GGML_DIR} does not carry tools/xolotl/ggml/xolotl-ggml.patch - "
-                      "the build may fail or differ (tools/xolotl/fetch-llama.sh makes a patched checkout)")
+      if(STRATA_GGML_ALLOW_UNPATCHED)
+        message(WARNING "STRATA_GGML_DIR=${STRATA_GGML_DIR} does not carry the current tools/xolotl/ggml/xolotl-ggml.patch "
+                        "(STRATA_GGML_ALLOW_UNPATCHED=ON: building anyway; it may fail or differ)")
+      else()
+        message(FATAL_ERROR "STRATA_GGML_DIR=${STRATA_GGML_DIR} does not carry the current tools/xolotl/ggml/xolotl-ggml.patch "
+                            "(an older patch, e.g. from before a pull). Fix: bash tools/xolotl/fetch-llama.sh ${STRATA_GGML_DIR} "
+                            "(or -DSTRATA_GGML_ALLOW_UNPATCHED=ON to build it as it is)")
+      endif()
     endif()
     add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   else()
