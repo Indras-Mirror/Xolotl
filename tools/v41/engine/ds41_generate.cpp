@@ -299,10 +299,17 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--head-device") a.head_device = next();
         else if (k == "--stage-pcie") a.stage_pcie = next();
         else if (k == "--split-skip-if-fits") a.split_skip_if_fits = true;
+        else if (k == "--peer-device") {
+            // accepted so a config shared with the strata binary still starts, but this engine has no peer tier:
+            // its second-card expert tier is --remote-device (#98: --peer-device 1 left the V100 at 0 MiB, silently)
+            const std::string v = next();
+            std::fprintf(stderr, "[ds41] --peer-device %s is ignored by the DeepSeek-V4.1 engine: use --remote-device %s to "
+                         "hold and compute experts on that card, or --layer-split to split the layers\n", v.c_str(), v.c_str());
+        }
         else if (k == "--pool-workers" || k == "--max-context" || k == "--kv-resident" ||
                  k == "--spec" || k == "--spec-min-p" || k == "--batch-mtp" ||
                  k == "--vram-reserve-mib" || k == "--vram-elastic" || k == "--vram-segment-mib" ||
-                 k == "--peer-device" || k == "--expert-profile" ||
+                 k == "--expert-profile" ||
                  k == "--expert-profile-save" || k == "--expert-profile-save-every" || k == "--calibrate")
             (void) next();
         else if (k == "--prompt-cache-tail" || k == "--no-vision") { /* flag only (--no-vision: vision is off unless --vision) */ }

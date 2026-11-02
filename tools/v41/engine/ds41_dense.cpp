@@ -2190,6 +2190,10 @@ size_t Ds41Dense::span_graph_bytes(int pos_end, int n) {
     std::set<std::array<int64_t, 6>> kinds;
     size_t mx = 0;
     for (int64_t l = 0; l < im.nl; ++l) {
+        // a layer split (#98): only the layers this stage RUNS have weights.  A shadowed layer (another stage's kv
+        // source this stage reads) holds state but no blk.N weights, so building its graph aborted with "missing
+        // weight blk.N.hc_attn_base.weight" at every boundary but the last kv source (20); head_only has no layers
+        if (im.cfg.head_only || !im.owns_layer(l)) continue;
         const Impl::Layer & L = im.ly[(size_t) l];
         if (!kinds.insert({ L.ratio, L.kv_src, L.idx_src, L.cand_src, L.uses_cand, L.eslot >= 0 }).second) continue;
         ggml_init_params p = { meta.size(), meta.data(), true };
@@ -2974,6 +2978,7 @@ std::string Ds41Dense::vram_ledger() const {
 bool Ds41Dense::snapshot(int pos) {
     Impl & im = *p_;
     for (auto & L : im.ly) {
+        if (!L.raw || !L.raw_snap) continue;   // another stage's layer (layer split, #98): no state here
         ggml_backend_tensor_copy(L.raw, L.raw_snap);
         if (L.st_kv) { ggml_backend_tensor_copy(L.st_kv, L.st_kv_snap); ggml_backend_tensor_copy(L.st_sc, L.st_sc_snap); }
     }
@@ -2986,6 +2991,7 @@ bool Ds41Dense::restore() {
     Impl & im = *p_;
     if (im.snap_pos < 0) return false;
     for (auto & L : im.ly) {
+        if (!L.raw || !L.raw_snap) continue;   // another stage's layer (layer split, #98): no state here
         ggml_backend_tensor_copy(L.raw_snap, L.raw);
         if (L.st_kv) { ggml_backend_tensor_copy(L.st_kv_snap, L.st_kv); ggml_backend_tensor_copy(L.st_sc_snap, L.st_sc); }
     }
