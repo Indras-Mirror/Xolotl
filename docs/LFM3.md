@@ -69,7 +69,16 @@ speed - a 96-token answer took 0.75 s while LFM3 streamed 3.5 s of speech. Turn-
 `/v1/decide` is a route on that server, so it does not move with the ears.
 
 QuetzaCodetl chooses the backends (`/voice-backend`, or `QUETZA_VOICE_BACKEND=lfm3`); the launcher sets that variable
-and `QUETZA_LFM3_URL` / `QUETZA_LFM3_SERVER` / `QUETZA_LFM3_VOICE`, and `/voice-auto` starts the pipeline.
+and `QUETZA_LFM3_URL` / `QUETZA_LFM3_SERVER` / `QUETZA_LFM3_VOICE`. It also sets `QUETZA_VOICE_AUTOSTART=1`, so the
+voice pipeline starts by itself when the REPL is up (`XOLQFN_VOICE_NO_AUTOSTART=1` opts out).
+
+Ctrl+C stops everything: the launcher runs the CLI as a child rather than `exec`-ing it (an `exec` replaces the shell
+and discards the cleanup traps, which is why the servers used to outlive the wrapper), then stops the QFN and LFM3
+units it started and sweeps orphaned voice listeners. Servers it only attached to are left running.
+
+Two things make the voice loop usable and were fixed on the QuetzaCodetl side: every playback path now holds the VAD
+off (the streamed sentence path used to speak with the microphone live, so the assistant answered its own voice), and
+the listener reports a live level for the footer meter.
 
 ## Voice: how LFM3 speaks, and what a voice LoRA would change
 

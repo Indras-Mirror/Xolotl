@@ -104,17 +104,47 @@ fi
 
 nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader 2>/dev/null | sed 's/^/[INFO] VRAM /'
 
-# ---- 4. voice on LFM3, then the CLI -----------------------------------------------------------
+# ---- 4. kill what the CLI leaves behind (Ctrl+C, /quit, a crash) --------------------------------
+# The CLI kills its own VAD/TTS children on exit; this sweeps any that outlived it (a SIGKILL, a
+# crash), but only ORPHANS - a listener whose parent is gone is reparented to init. A listener
+# belonging to another window has a live parent and is left alone.
+stop_orphan_voice() {
+    local pids
+    pids=$(ps -eo pid=,ppid=,args= 2>/dev/null | awk '
+        ($2 == 1 || $2 == 0) && (
+            /[q]uetza-vad-listener/ ||
+            /[p]aplay --raw --rate=24000/ ||
+            /[f]fmpeg .*-ar 24000.*-f s16le/
+        ) { print $1 }')
+    if [ -n "$pids" ]; then
+        log_info "stopping voice leftovers: $(echo $pids | tr '\n' ' ')"
+        kill $pids 2>/dev/null
+    fi
+    return 0
+}
+
+# ---- 5. voice on LFM3, then the CLI -----------------------------------------------------------
 [ -z "${QUETZA_VOICE_STT:-}" ] && [ -z "${QUETZA_VOICE_TTS:-}" ] && export QUETZA_VOICE_BACKEND=${QUETZA_VOICE_BACKEND:-lfm3}
 export QUETZA_LFM3_URL="$LFM3_URL"
 export QUETZA_LFM3_SERVER="$LFM3_CMD"
 export QUETZA_LFM3_VOICE=${QUETZA_LFM3_VOICE:-male}
-log_info "voice backends: ${QUETZA_VOICE_BACKEND:+all=$QUETZA_VOICE_BACKEND }${QUETZA_VOICE_STT:+ears=$QUETZA_VOICE_STT }${QUETZA_VOICE_TTS:+voice=$QUETZA_VOICE_TTS} (the pipeline starts with /voice-auto)"
+# start the pipeline on REPL up (useChronosWake's QUETZA_VOICE_AUTOSTART path), so no /voice-auto needed
+if [ "${XOLQFN_VOICE_NO_AUTOSTART:-0}" != 1 ]; then
+    export QUETZA_VOICE_AUTOSTART=1
+fi
+log_info "voice backends: ${QUETZA_VOICE_BACKEND:+all=$QUETZA_VOICE_BACKEND }${QUETZA_VOICE_STT:+ears=$QUETZA_VOICE_STT }${QUETZA_VOICE_TTS:+voice=$QUETZA_VOICE_TTS}${QUETZA_VOICE_AUTOSTART:+ (autostart)}"
 
 if [ "$SERVE_ONLY" = 1 ]; then
     log_ok "serve-only: QFN $QFN_URL, LFM3 $LFM3_URL left running"
-    trap - EXIT INT TERM
+    trap - EXIT INT TERM HUP
     exit 0
 fi
 
-exec "$QUETZA_CMD" "$@"
+# NOT exec: exec replaces this shell and drops the cleanup traps, which is why Ctrl+C used to
+# leave both servers running (2026-11-02).
+trap 'cleanup; stop_orphan_voice; exit 130' INT TERM HUP
+"$QUETZA_CMD" "$@"
+code=$?
+cleanup
+stop_orphan_voice
+exit $code
