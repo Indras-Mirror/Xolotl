@@ -110,12 +110,11 @@ nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader 2>/dev/nul
 # belonging to another window has a live parent and is left alone.
 stop_orphan_voice() {
     local pids
-    pids=$(ps -eo pid=,ppid=,args= 2>/dev/null | awk '
-        ($2 == 1 || $2 == 0) && (
-            /[q]uetza-vad-listener/ ||
-            /[p]aplay --raw --rate=24000/ ||
-            /[f]fmpeg .*-ar 24000.*-f s16le/
-        ) { print $1 }')
+    # awk will not accept a newline inside a parenthesized expression: keep the test on one line
+    pids=$(ps -eo pid=,ppid=,args= 2>/dev/null | awk '$2 == 1 || $2 == 0 {
+        if ($0 ~ /[q]uetza-vad-listener/ || $0 ~ /[p]aplay --raw --rate=24000/ ||
+            $0 ~ /[f]fmpeg .*-ar 24000.*-f s16le/) print $1
+    }')
     if [ -n "$pids" ]; then
         log_info "stopping voice leftovers: $(echo $pids | tr '\n' ' ')"
         kill $pids 2>/dev/null
@@ -128,6 +127,10 @@ stop_orphan_voice() {
 export QUETZA_LFM3_URL="$LFM3_URL"
 export QUETZA_LFM3_SERVER="$LFM3_CMD"
 export QUETZA_LFM3_VOICE=${QUETZA_LFM3_VOICE:-male}
+# Turn-taking: xol-quetza does NOT set QUETZA_DECIDE_URL (only xol-dense-quetza does), so without this the
+# end-of-turn controller falls back to its 1.2 s fixed rule and submits mid-sentence fragments - the model
+# then answers half a question.  LFM3 is the ears and answers /v1/decide in ~300 ms.
+export QUETZA_DECIDE_URL=${QUETZA_DECIDE_URL:-$LFM3_URL/v1/decide}
 # start the pipeline on REPL up (useChronosWake's QUETZA_VOICE_AUTOSTART path), so no /voice-auto needed
 if [ "${XOLQFN_VOICE_NO_AUTOSTART:-0}" != 1 ]; then
     export QUETZA_VOICE_AUTOSTART=1
