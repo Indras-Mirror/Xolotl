@@ -117,6 +117,17 @@ class Adapter(unittest.TestCase):
         for env,wanted in [({'MOCK_HOST_PARK':'1'},'slot_cache=1'),({'MOCK_HOST_PARK':'1','MOCK_NO_SNAPS':'1'},'slot_cache=0')]:
             s=Session(env);self.addCleanup(s.close)
             self.assertIn(wanted,next(l for l in s.lines if l.startswith('INFO engine=q36')))
+    def test_worker_image_binding_info_is_aggregated_without_protocol_fragments(self):
+        self.assertNotIn('persistent_images_bound=', ''.join(self.s.lines))
+        self.assertTrue(all(line.startswith(('INFO ', 'READY ')) for line in self.s.lines))
+        for bound in ('0', '1'):
+            s=Session({'MOCK_PERSISTENT_IMAGES_BOUND':bound});self.addCleanup(s.close)
+            infos=[line for line in s.lines if line.startswith('INFO engine=q36')]
+            self.assertEqual(len(infos),1)
+            self.assertIn('persistent_images_bound='+bound,infos[0])
+            self.assertTrue(all(line.startswith(('INFO ', 'READY ')) for line in s.lines), s.lines)
+            self.assertFalse(any('mock=1' in line for line in s.lines))
+
     def test_prefill_chunk_metadata_and_actual_owner_init(self):
         self.assertIn('batch_prefill_chunk=64',next(l for l in self.s.lines if l.startswith('INFO engine=q36')))
         s=Session({'MOCK_PREFILL_CHUNK':'256','MOCK_REQUIRE_CHUNK':'256'});self.addCleanup(s.close)

@@ -60,7 +60,9 @@ void serve(Engine& e,ImageCache&,int,size_t park_bytes,const std::string&){
     Q36Channel* c=q36_channel; std::thread generating;
     std::string line;
     if(e.batch_slot==3 && std::getenv("MOCK_DELAY_READY"))std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    c->write("INFO mock=1\n"); c->write("READY 262144 stop\n");
+    std::string info="INFO mock=1";
+    if(const char* bound=std::getenv("MOCK_PERSISTENT_IMAGES_BOUND"))info+=" persistent_images_bound="+std::string(bound);
+    c->write(info+"\n"); c->write("READY 262144 stop\n");
     while(c->read(line)){
         if(line=="STOP"){e.cancel->store(true);continue;}
         if(generating.joinable()) generating.join();

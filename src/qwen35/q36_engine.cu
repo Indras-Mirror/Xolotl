@@ -3361,10 +3361,11 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             std::fprintf(stderr,"strata-q36: persistent image save: invalid size; cache miss\n");
         }
     };
-    q36_printf("INFO engine=q36 img_refs=1 snapshots=%d snapshot_every=%d snapshot_mib=%.0f image_cache_mib=%zu n_embd=%lld park_pages=%zu",
-                E.max_snaps, snap_every, E.snap_bytes() / 1048576.0, icache.budget >> 20, (long long) N, E.host_page_count());
-    if(prefix_store->enabled())q36_printf(" persistent_images_bound=%d",int(bound_images));
-    q36_printf("\n");
+    const char* persistent_info=prefix_store->enabled() ?
+        (bound_images ? " persistent_images_bound=1" : " persistent_images_bound=0") : "";
+    // The batching channel routes whole writes; one INFO must be one message.
+    q36_printf("INFO engine=q36 img_refs=1 snapshots=%d snapshot_every=%d snapshot_mib=%.0f image_cache_mib=%zu n_embd=%lld park_pages=%zu%s\n",
+                E.max_snaps, snap_every, E.snap_bytes() / 1048576.0, icache.budget >> 20, (long long) N, E.host_page_count(),persistent_info);
     q36_printf("READY %d stop\n", E.ctx);
     q36_flush();
     std::mutex mu;

@@ -107,6 +107,7 @@ int serve_parallel(Engine& scratch, ImageCache& images, const std::string& model
         std::mutex mutex;
         std::condition_variable changed;
         std::deque<std::string> input;
+        bool persistent_enabled=false, persistent_images_bound=false;
         bool eof = false, ready = false, busy = false, gpu_active = false, batch = false, admitted = false, control_locked = false;
         int slot = -1;
         long long produced = 0, prompt = 0, reused = 0, configured_max_new = 0;
@@ -235,7 +236,16 @@ int serve_parallel(Engine& scratch, ImageCache& images, const std::string& model
                 { std::lock_guard<std::mutex> lock(worker->mutex); worker->ready=true; }
                 worker->changed.notify_all(); return;
             }
-            if (line.rfind("INFO", 0) == 0) return;
+            if (line.rfind("INFO", 0) == 0) {
+                // Retain the actual worker capability, including fail-closed
+                // store initialization; never infer it only from environment.
+                if(line.find(" persistent_images_bound=")!=std::string::npos) {
+                    std::lock_guard<std::mutex> lock(worker->mutex);
+                    worker->persistent_enabled=true;
+                    worker->persistent_images_bound=line.find(" persistent_images_bound=1")!=std::string::npos;
+                }
+                return;
+            }
             if (line.rfind("RESUME ", 0) == 0) worker->reused = std::strtoll(line.c_str()+7, nullptr, 10);
             if (line.rfind("PP ", 0) == 0) {
                 long long read = 0, total = 0; double ms = 0;
@@ -312,6 +322,10 @@ int serve_parallel(Engine& scratch, ImageCache& images, const std::string& model
 #ifdef STRATA_Q36_GRAMMAR
     output("INFO grammar=1\n");
 #endif
+    const bool persistent_enabled=std::all_of(workers.begin(),workers.end(),[](const auto& worker){return worker->persistent_enabled;});
+    const bool persistent_images_bound=std::all_of(workers.begin(),workers.end(),[](const auto& worker){return worker->persistent_images_bound;});
+    const std::string persistent_info=persistent_enabled ?
+        (persistent_images_bound ? " persistent_images_bound=1" : " persistent_images_bound=0") : "";
     output("INFO engine=q36 img_refs=1 n_embd=" + std::to_string(scratch.m->g.n_embd) +
            (scratch.snapshot_owner_lineage ? " snapshot_owner_lineage=1" : "") +
            " slot_cache=" + std::to_string(park_bytes>0 && snapshots>0 ? 1 : 0) +
@@ -319,7 +333,7 @@ int serve_parallel(Engine& scratch, ImageCache& images, const std::string& model
            " host_park_mib=" + std::to_string((host_hub->n_pages*host_hub->page_bytes)>>20) +
            (scratch.resident_prefix_reuse ? " resident_prefix_reuse=1 checkpoint_clock=1" : "") +
            " batch_prefill_chunk=" + std::to_string(prefill_chunk) +
-           " batch_slots=" + std::to_string(count) + " batch_mtp=1 batch_pinned=1 max_request_context=" + std::to_string(scratch.ctx) + " aggregate_kv_mib=" + std::to_string(budget.cap() >> 20) + "\nREADY " + std::to_string(scratch.ctx) + " stop\n");
+           persistent_info + " batch_slots=" + std::to_string(count) + " batch_mtp=1 batch_pinned=1 max_request_context=" + std::to_string(scratch.ctx) + " aggregate_kv_mib=" + std::to_string(budget.cap() >> 20) + "\nREADY " + std::to_string(scratch.ctx) + " stop\n");
     int foreground = 0;
     bool checkpoint_paused=false;
     Clock::time_point checkpoint_begin;
