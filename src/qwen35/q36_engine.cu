@@ -3083,6 +3083,11 @@ struct ImageCache {
         uint64_t used = 0;
     };
     std::recursive_mutex mutex;
+    // Shared batching HAVE can discover immutable disk rows without scheduling
+    // a model owner or touching live device state. Access under mutex.
+    std::function<void(uint64_t)> restore_persistent;
+    std::string restore_identity;
+    bool restore_conflict=false;
     bool parallel=false;  // batch1 retains the established image eviction order
     std::map<uint64_t, size_t> pinned;
     struct Pins {
@@ -3310,10 +3315,10 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
     }
     const bool bound_images=strata::core::prefix::bound_image_producer();
     auto image_namespace = [&](uint64_t key) { return prefix_identity+"/image/"+std::to_string(key); };
-    auto restore_image = [&](uint64_t key, const std::function<bool()>& cancelled) {
+    auto restore_image = [prefix_identity,bound_images,store=prefix_store,&icache](uint64_t key, const std::function<bool()>& cancelled) {
         try {
         if(!bound_images || prefix_identity.empty() || icache.find(key) || (cancelled && cancelled()))return;
-        auto record=prefix_store->find(image_namespace(key),{0},1,cancelled);
+        auto record=store->find(prefix_identity+"/image/"+std::to_string(key),{0},1,cancelled);
         if(!record || (cancelled && cancelled()))return;
         strata::q36::persistent::Reader r{record->payload};uint64_t magic,n,nx,ny,width;
         if(!r.u64(magic)||magic!=0x31494d363351ULL||!r.u64(n)||!r.u64(nx)||!r.u64(ny)||!r.u64(width)||
@@ -3332,8 +3337,8 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
         // Persistence must not oversubscribe the caller's image RAM budget
         // when other native owners have pinned every eviction candidate.
         if(size_t(n*width*sizeof(float))>icache.budget-retained)return;
-        icache.put(key,record->payload.data()+r.at,int64_t(n),int64_t(nx),int64_t(ny),{key});
-        std::fprintf(stderr,"strata-q36: persistent image restored key=%016llx tokens=%llu\n",
+        const auto* restored=icache.put(key,record->payload.data()+r.at,int64_t(n),int64_t(nx),int64_t(ny),{key});
+        if(restored)std::fprintf(stderr,"strata-q36: persistent image restored key=%016llx tokens=%llu\n",
                      (unsigned long long)key,(unsigned long long)n);
         } catch(const std::bad_alloc&) {
             std::fprintf(stderr,"strata-q36: persistent image restore: allocation failed; cache miss\n");
@@ -3341,6 +3346,16 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             std::fprintf(stderr,"strata-q36: persistent image restore: invalid size; cache miss\n");
         }
     };
+    {
+        std::lock_guard<std::recursive_mutex> cache_lock(icache.mutex);
+        if(!bound_images || prefix_identity.empty() ||
+           (!icache.restore_identity.empty() && icache.restore_identity!=prefix_identity)) {
+            icache.restore_persistent={};icache.restore_identity.clear();icache.restore_conflict=true;
+        } else if(!icache.restore_conflict && !icache.restore_persistent) {
+            icache.restore_identity=prefix_identity;
+            icache.restore_persistent=[restore_image](uint64_t key){restore_image(key,{});};
+        }
+    }
     auto persist_images = [&](const std::vector<Pic>& pics) {
         try {
         if(!bound_images || prefix_identity.empty())return;

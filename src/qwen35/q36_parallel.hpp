@@ -375,13 +375,24 @@ int serve_parallel(Engine& scratch, ImageCache& images, const std::string& model
         }
         if (line.rfind("BYIELD",0)==0) continue;
         if (line.rfind("HAVE",0)==0) {
-            std::lock_guard<std::recursive_mutex> cache_lock(images.mutex);
+            std::unique_lock<std::recursive_mutex> cache_lock(images.mutex);
             std::string response="HAVE"; bool first=true;
             std::string keys=line.size()>5?line.substr(5):""; size_t at=0;
             while(at<keys.size()) {
                 size_t end=keys.find(',',at); std::string key=keys.substr(at,end==std::string::npos?end:end-at);
                 char* tail=nullptr; uint64_t value=std::strtoull(key.c_str(),&tail,16);
-                auto* image=!key.empty() && tail && !*tail?images.find(value):nullptr;
+                const bool valid=!key.empty() && tail && !*tail;
+                auto* image=valid?images.find(value):nullptr;
+                const bool disk_key=valid && key.size()<=16 && std::all_of(key.begin(),key.end(),[](char c){
+                    return (c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F');
+                });
+                if(disk_key && !image && images.restore_persistent) {
+                    auto restore=images.restore_persistent;
+                    cache_lock.unlock(); // catalogue/host I/O never owns the image metadata mutex
+                    restore(value);
+                    cache_lock.lock();
+                    image=images.find(value);
+                }
                 response+=first?" ":","; first=false;
                 response+=image?std::to_string(image->n)+":"+std::to_string(image->nx)+":"+std::to_string(image->ny):"0";
                 if(end==std::string::npos)break; at=end+1;
