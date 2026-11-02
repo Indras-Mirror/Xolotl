@@ -27,6 +27,15 @@ struct PersistentPrefix {
 #define M31_PROTOCOL_TEST_PERSISTENT
 #define M31_PROTOCOL_TEST_ONLY
 #include "../m31_generate.cpp"
+namespace strata::m31 {
+// Model-free identity for the protocol fixture; do not link the native engine
+// configuration implementation merely to exercise completion ordering.
+std::string effective_config(const Config & config) {
+    return "protocol-fixture context=" + std::to_string(config.context) +
+           " chunk=" + std::to_string(config.max_chunk);
+}
+}
+
 namespace {
 struct FixtureEngine {
     struct Geometry { int vocab = 8, embd = 4; } geometry_;
