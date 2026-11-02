@@ -3626,6 +3626,9 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             if(!strata::q36::persistent::size_bytes(56,size_t(sn->pos),8,header) ||
                E.snap_bytes()>SIZE_MAX-header ||
                !strata::q36::persistent::size_bytes(header+E.snap_bytes(),count,E.page_bytes(),expected))continue;
+            std::vector<uint64_t> cells(c.val.begin(),c.val.begin()+sn->pos);
+            auto capture=prefix_store->claim_capture(prefix_identity,cells);
+            if(!capture)continue;
             auto reservation=prefix_store->reserve(expected);
             if(!reservation)continue;
             strata::q36::persistent::Writer w;w.bytes.reserve(expected);
@@ -3640,8 +3643,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
                 for(size_t off=0;off<E.page_bytes();off+=span)
                     std::memcpy(w.bytes.data()+base+pg*E.page_bytes()+off,c.pages[pg]+off,valid);
             }
-            std::vector<uint64_t> cells(c.val.begin(),c.val.begin()+sn->pos);
-            if(!prefix_store->enqueue_reserved(prefix_identity,std::move(cells),std::move(w.bytes),std::move(reservation)))break;
+            if(!prefix_store->enqueue_reserved(prefix_identity,std::move(cells),std::move(w.bytes),std::move(reservation),std::move(capture)))break;
         }
         } catch(const std::bad_alloc&) {
             std::fprintf(stderr,"strata-q36: persistent checkpoint save: allocation failed; cache miss\n");

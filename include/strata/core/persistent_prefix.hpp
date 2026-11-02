@@ -115,6 +115,47 @@ struct Stats {
 };
 class Store {
 public:
+    // A claim owns one immutable capture through queue completion. Pending claims are
+    // weakly cached: abandoning capture or a failed enqueue allows an immediate retry.
+    struct CaptureClaim {
+        // Destroy accounting last, after every buffer charged to the reservation.
+        std::shared_ptr<void> accounting;
+        std::string identity;
+        std::vector<uint64_t> cells;
+        std::string data, index;
+        std::string data_stamp, index_stamp;
+        bool committed = false, invalid = false;
+    };
+    using Capture = std::shared_ptr<CaptureClaim>;
+    Capture claim_capture(const std::string& identity, const std::vector<uint64_t>& cells) {
+        if (!enabled_ || identity.empty() || identity.size()>65536 || cells.empty() || cells.size()>max_cells) return {};
+        std::lock_guard<std::mutex> guard(capture_mu_);
+        size_t bytes = 0;
+        for (auto it=captures_.begin(); it!=captures_.end();) {
+            auto value=it->pending.lock();
+            if (!value || value->invalid) {
+                it=captures_.erase(it); continue;
+            }
+            if (value->identity==identity && value->cells==cells) {
+                if(!value->committed || (file_stamp(value->data)==value->data_stamp && file_stamp(value->index)==value->index_stamp)) return {};
+                value->invalid=true; it=captures_.erase(it); continue;
+            }
+            bytes += value->identity.size()+value->cells.size()*sizeof(uint64_t);
+            ++it;
+        }
+        const size_t needed=identity.size()+cells.size()*sizeof(uint64_t);
+        // The optimisation may miss when its bounded metadata budget is full;
+        // persistence itself remains available through the ordinary enqueue API.
+        // Claims retain a second exact key independently of queued metadata. Charge
+        // it even when the bounded dedupe catalogue cannot track another slot.
+        auto accounting=reserve(needed+sizeof(CaptureClaim)+2*config_.directory.size()+1024);
+        if(!accounting) return {};
+        auto value=std::make_shared<CaptureClaim>(); value->accounting=std::move(accounting);
+        value->identity=identity; value->cells=cells;
+        if (needed<=max_metadata && bytes<=max_metadata-needed && captures_.size()<config_.max_entries)
+            captures_.push_back({value,{}});
+        return value;
+    }
     using Writer = std::function<bool(const std::string&, std::string&)>;
     explicit Store(Config c = Config::from_env()) : config_(std::move(c)) {
         Finally notice{[this] {
@@ -196,14 +237,14 @@ public:
             });
     }
     bool enqueue_reserved(std::string identity, std::vector<uint64_t> cells, std::vector<uint8_t> payload,
-                          std::shared_ptr<void> reservation) {
+                          std::shared_ptr<void> reservation, Capture capture = {}) {
         const auto n = payload.size();
         std::vector<std::vector<uint64_t>> keys; keys.push_back(std::move(cells));
         return enqueue_file_keys_reserved(std::move(identity),std::move(keys),n,
             [data=std::move(payload)](const std::string& path,std::string&) {
                 std::ofstream out(path,std::ios::binary);
                 out.write(reinterpret_cast<const char*>(data.data()),data.size()); out.close(); return bool(out);
-            },std::move(reservation));
+            },std::move(reservation),std::move(capture));
     }
     bool enqueue_file(std::string identity, std::vector<uint64_t> cells, uint64_t expected_bytes, Writer writer) {
         std::vector<std::vector<uint64_t>> keys; keys.push_back(std::move(cells));
@@ -214,7 +255,12 @@ public:
         return enqueue_file_keys_reserved(std::move(identity), std::move(keys), expected_bytes, std::move(writer), {});
     }
     bool enqueue_file_keys_reserved(std::string identity, std::vector<std::vector<uint64_t>> keys,
-                           uint64_t expected_bytes, Writer writer, std::shared_ptr<void> reservation) {
+                           uint64_t expected_bytes, Writer writer, std::shared_ptr<void> reservation, Capture capture = {}) {
+        bool accepted=false;
+        Finally release_claim{[&] {
+            if(capture && !accepted) { std::lock_guard<std::mutex> guard(capture_mu_); capture->invalid=true; }
+        }};
+        if(capture && (capture->identity!=identity || keys.size()!=1 || capture->cells!=keys.front())) return false;
         if (!enabled_ || identity.empty() || identity.size() > 65536 || keys.empty() || keys.size() > 256 || !writer) return false;
         uint64_t metadata = identity.size();
         for (const auto& k : keys) {
@@ -237,8 +283,8 @@ public:
         if (!std::static_pointer_cast<Reservation>(reservation)->submitted.compare_exchange_strong(unsubmitted,true)) return false;
         std::lock_guard<std::mutex> g(queue_mu_);
         if (stopping_ || queue_.size() >= 16) { ++stats_.dropped; return false; }
-        queue_.push_back({std::move(identity), std::move(keys), expected_bytes, metadata, std::move(writer), std::move(reservation), std::move(extra)});
-        cv_.notify_one(); return true;
+        queue_.push_back({std::move(identity), std::move(keys), expected_bytes, metadata, std::move(writer), std::move(reservation), std::move(extra), std::move(capture)});
+        accepted=true; cv_.notify_one(); return true;
     }
     std::optional<FileRecord> find_file(const std::string& identity, const std::vector<uint64_t>& cells,
                 size_t limit = std::numeric_limits<size_t>::max(), const std::function<bool()>& cancel = {}, size_t minimum_cells = 0) {
@@ -262,8 +308,17 @@ public:
         for (const auto& choice : choices) {
             if (cancel && cancel()) break;
             uint64_t bytes = 0, hash = 0;
-            if (!hash_file(choice.entry->data, bytes, hash, cancel) || bytes != choice.entry->bytes || hash != choice.entry->hash) continue;
-            std::error_code ec; fs::last_write_time(choice.entry->index, fs::file_time_type::clock::now(), ec);
+            if (!hash_file(choice.entry->data, bytes, hash, cancel) || bytes != choice.entry->bytes || hash != choice.entry->hash) {
+                invalidate_capture(choice.entry->data.string()); continue;
+            }
+            {
+                std::lock_guard<std::mutex> guard(capture_mu_);
+                const auto old_stamp=file_stamp(choice.entry->index.string());
+                std::error_code ec; fs::last_write_time(choice.entry->index, fs::file_time_type::clock::now(), ec);
+                for(auto& slot:captures_) if(auto value=slot.pending.lock())
+                    if(value->committed && value->data==choice.entry->data.string() && value->index_stamp==old_stamp)
+                        value->index_stamp=file_stamp(value->index);
+            }
             ++stats_.hits; stats_.restored_bytes += bytes;
             stats_.restore_us += micros(start);
             report("lookup-hit");
@@ -310,7 +365,7 @@ private:
         ~Reservation() { *used -= bytes; }
     };
     struct Job { std::string identity; std::vector<std::vector<uint64_t>> keys; uint64_t expected, metadata; Writer writer;
-                 std::shared_ptr<void> reservation, extra; };
+                 std::shared_ptr<void> reservation, extra; Capture capture; };
     struct Entry {
         fs::path index, data;
         std::string identity;
@@ -319,6 +374,27 @@ private:
         uint64_t bytes = 0, hash = 0;
         fs::file_time_type touched;
     };
+    struct CaptureSlot { std::weak_ptr<CaptureClaim> pending; Capture committed; };
+    std::mutex capture_mu_;
+    std::vector<CaptureSlot> captures_;
+    static std::string file_stamp(const std::string& path) {
+#if defined(__linux__)
+        struct stat st{};
+        if (::lstat(path.c_str(), &st) || !S_ISREG(st.st_mode)) return {};
+        std::ostringstream out;
+        out<<st.st_dev<<':'<<st.st_ino<<':'<<st.st_size<<':'<<st.st_mtim.tv_sec<<':'<<st.st_mtim.tv_nsec
+           <<':'<<st.st_ctim.tv_sec<<':'<<st.st_ctim.tv_nsec;
+        return out.str();
+#else
+        (void)path; return {};
+#endif
+    }
+    void invalidate_capture(const std::string& data) {
+        std::lock_guard<std::mutex> guard(capture_mu_);
+        for(auto& slot:captures_) if(auto value=slot.pending.lock()) if(value->data==data) {
+            value->invalid=true; slot.committed.reset();
+        }
+    }
     Config config_;
     bool enabled_ = false, stopping_ = false, active_ = false;
     std::shared_ptr<std::atomic<uint64_t>> used_ = std::make_shared<std::atomic<uint64_t>>(0);
@@ -507,6 +583,14 @@ private:
         if (!sync_file(index_temp)) { cleanup(); return false; }
         fs::rename(index_temp,index,ec); if (ec) { cleanup(); return false; }
         if (!sync_file(config_.directory)) return false;
+        if(job.capture) {
+            std::lock_guard<std::mutex> guard(capture_mu_);
+            auto& value=*job.capture;
+            value.data=data.string(); value.index=index.string();
+            value.data_stamp=file_stamp(value.data); value.index_stamp=file_stamp(value.index);
+            value.committed=!value.data_stamp.empty() && !value.index_stamp.empty();
+            if(value.committed) for(auto& slot:captures_) if(slot.pending.lock()==job.capture) slot.committed=job.capture;
+        }
         ++stats_.writes; stats_.saved_bytes += bytes; return true;
     }
     void run() {
@@ -517,10 +601,13 @@ private:
               job = std::move(queue_.front()); queue_.pop_front(); active_ = true; }
             const auto start = std::chrono::steady_clock::now();
             bool ok = false; try { ok = save(job); } catch (...) {}
-            if (!ok) ++stats_.failures;
+            if (!ok) {
+                ++stats_.failures;
+                if(job.capture) { std::lock_guard<std::mutex> guard(capture_mu_); job.capture->invalid=true; }
+            }
             stats_.save_us += micros(start); report(ok ? "saved" : "save-miss");
             { std::lock_guard<std::mutex> g(queue_mu_); job.writer = nullptr; std::vector<std::vector<uint64_t>>().swap(job.keys); std::string().swap(job.identity);
-              job.reservation.reset(); job.extra.reset(); active_=false; if(queue_.empty()) drained_.notify_all(); }
+              job.reservation.reset(); job.extra.reset(); job.capture.reset(); active_=false; if(queue_.empty()) drained_.notify_all(); }
         }
     }
 };

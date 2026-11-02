@@ -45,6 +45,78 @@ int main() {
         assert(s.enqueue_file("bad",{9},10,[](const std::string&,std::string&)->bool {throw 1;}));
         s.flush(); assert(!s.find("bad",{9})); assert(s.stats().failures==1);
     }
+    // Capture claims suppress the expensive producer before copying payload bytes.
+    {
+        Config d=c; d.directory=std::string(dir)+"/claims"; d.queue_bytes=16384;
+        Store s(d);
+        auto first=s.claim_capture("model",{1,2}); assert(first);
+        assert(!s.claim_capture("model",{1,2})); // pending capture
+        first.reset();
+        first=s.claim_capture("model",{1,2}); assert(first); // abandoned capture retries
+        auto reservation=s.reserve(payload.size()); assert(reservation);
+        assert(s.enqueue_reserved("model",{1,2},payload,std::move(reservation),std::move(first)));
+        s.flush(); assert(s.stats().writes==1);
+        assert(!s.claim_capture("model",{1,2})); // committed duplicate, no producer call
+        assert(s.find("model",{1,2,3}));
+        assert(!s.claim_capture("model",{1,2})); // LRU touch retains suppression
+        auto different=s.claim_capture("other-model",{1,2}); assert(different);
+        auto tail=s.claim_capture("model",{1,3}); assert(tail);
+        auto shorter=s.claim_capture("model",{1}); assert(shorter); // retain every anchor
+        auto file=s.find_file("model",{1,2}); assert(file); auto path=file->path; file.reset();
+        {std::ofstream out(path,std::ios::binary|std::ios::trunc);
+         const std::vector<uint8_t> corrupt(payload.size(),11);
+         out.write(reinterpret_cast<const char*>(corrupt.data()),corrupt.size());}
+        assert(!s.find("model",{1,2}));
+        auto retry=s.claim_capture("model",{1,2}); assert(retry); // corruption retries
+        reservation=s.reserve(payload.size()); assert(reservation);
+        assert(s.enqueue_reserved("model",{1,2},payload,std::move(reservation),std::move(retry)));
+        s.flush(); assert(!s.claim_capture("model",{1,2}));
+        assert(s.enqueue("evict-a",{7},payload)); s.flush();
+        assert(s.enqueue("evict-b",{8},payload)); s.flush();
+        assert(!s.find("model",{1,2}));
+        assert(s.claim_capture("model",{1,2})); // externally evictable, never permanently seen
+        auto failed=s.claim_capture("failed",{9}); assert(failed);
+        auto held_failed=failed;
+        assert(s.enqueue_file_keys_reserved("failed",{{9}},10,
+            [](const std::string&,std::string&){return false;},{},std::move(failed)));
+        s.flush(); assert(s.claim_capture("failed",{9})); // writer failure retries
+        auto dropped=s.claim_capture("drop",{10}); assert(dropped);
+        auto held_dropped=dropped;
+        assert(!s.enqueue_file_keys_reserved("drop",{{10}},5000,
+            [](const std::string&,std::string&){return true;},{},std::move(dropped)));
+        assert(s.claim_capture("drop",{10})); // admission failure retries
+    }
+    {
+        Config d=c; d.directory=std::string(dir)+"/claim-bounds"; d.max_entries=1; d.queue_bytes=16384;
+        Store s(d);
+        auto pending=s.claim_capture("one",{1}); assert(pending);
+        auto uncached=s.claim_capture("two",{2}); assert(uncached); // cache full still captures
+        assert(!s.claim_capture("one",{1}));
+        auto reservation=s.reserve(payload.size()); assert(reservation);
+        assert(s.enqueue_reserved("two",{2},payload,std::move(reservation),std::move(uncached)));
+        s.flush(); assert(s.find("two",{2}));
+    }
+    {
+        Config d=c; d.directory=std::string(dir)+"/claim-race"; d.queue_bytes=16384;
+        Store s(d);
+        std::atomic<int> ready{0}, attempted{0}, winners{0}; std::atomic<bool> start{false};
+        std::vector<std::thread> producers;
+        for(int i=0;i<8;++i) producers.emplace_back([&] {
+            ++ready; while(!start.load())std::this_thread::yield();
+            auto claim=s.claim_capture("same",{1,2,3}); if(claim)++winners;
+            ++attempted; while(attempted.load()!=8)std::this_thread::yield();
+        });
+        while(ready.load()!=8)std::this_thread::yield(); start=true;
+        for(auto& producer:producers)producer.join();
+        assert(winners==1); assert(s.claim_capture("same",{1,2,3}));
+        // Even untracked claim metadata consumes the queue budget before host capture.
+        Config b=d;b.directory=std::string(dir)+"/claim-pressure";b.max_entries=1;b.disk_bytes=65536;
+        Store bounded(b); auto first=bounded.claim_capture("first",{1});assert(first);
+        auto pressure=bounded.reserve(b.queue_bytes-2048);assert(pressure);
+        auto untracked=bounded.claim_capture("second",std::vector<uint64_t>(1024,2));assert(!untracked);
+        pressure.reset();untracked=bounded.claim_capture("second",std::vector<uint64_t>(1024,2));assert(untracked);
+        assert(!bounded.reserve(b.queue_bytes-1024));
+    }
     // Independent model processes share the same byte quota rather than multiplying it.
     std::vector<pid_t> writers;
     for(int i=0;i<4;++i) {
