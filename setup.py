@@ -655,7 +655,8 @@ OWN_PATH_FAMILIES = {
                # pictures: Unsloth's mmproj (the same projector family as Flash-Next's: qwen3vl_merger) through
                # strata-vision; a parallel slot's session: its KV cache (kv_bytes_per_token) and the recurrent state of
                # the 30 GDN layers (state_gb)
-               "vision": True, "state_gb": 0.07}
+               # Official processor: min_pixels=65536, patch_size=16, merge_size=2 -> 64 image tokens.
+               "vision": True, "vision_min_tokens": 64, "state_gb": 0.07}
 }
 PREVIEW_FAMILIES = OWN_PATH_FAMILIES             # the earlier name (tools and tests that import it)
 
@@ -7761,6 +7762,19 @@ def own_path_vision(a, fam: dict, gpu: dict, hip: bool) -> str:
     return asked
 
 
+def own_path_vision_min_tokens(fam: dict, maximum: int, earlier: Path | None) -> int:
+    """The family's image floor, preserving an earlier explicit floor and the user's maximum budget."""
+    if earlier is not None:
+        try:
+            previous = json.loads(earlier.read_text(encoding="utf-8-sig")).get("vision")
+        except (OSError, ValueError, AttributeError):
+            previous = None
+        value = previous.get("min_tokens") if isinstance(previous, dict) else None
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return min(int(fam.get("vision_min_tokens", 0)), maximum)
+
+
 def own_path_parallel_slot_gb(fam: dict, ctx: int) -> float:
     """The VRAM one batch slot's session takes: its KV cache (fp32 K and V of the attention layers and the MTP block) and
     the recurrent state of the GDN layers."""
@@ -7991,6 +8005,8 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         cfg["args"].append("--vision")
         cfg["vision"] = {"exe": str(eng / VEXE), "mmproj": str(mmproj), "model": str(gguf), "gpu": vision == "gpu",
                          "max_tokens": vt}          # the text model, opened vocab-only
+        if fam.get("vision_min_tokens") is not None:
+            cfg["vision"]["min_tokens"] = own_path_vision_min_tokens(fam, vt, old_cfg)
         if reader is not None:                      # AMD: the HIP reader with the CPU reader behind it, or the CPU reader
             from strata_control import vision_reader as VR
             cfg["vision"] = VR.vision_section(reader, cfg["vision"])

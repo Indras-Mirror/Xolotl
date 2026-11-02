@@ -225,7 +225,20 @@ class InstallOwnPath(unittest.TestCase):
         self.assertTrue(v["model"].endswith("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"))   # the text model, opened vocab-only
         self.assertEqual(Path(v["exe"]).name, setup.VEXE)
         self.assertEqual(v["max_tokens"], 1024)
+        self.assertEqual(v["min_tokens"], 64)
         self.assertIn("images: on", out)
+
+    def test_image_floor_preserves_explicit_settings_and_maximum_budget(self):
+        path = self.root / "strata-qwen36-ud-q4_k_xl.json"
+        for old_vision, maximum, expected in (({"min_tokens": 0}, 1024, 0),
+                                              ({"min_tokens": 128}, 1024, 128),
+                                              ({}, 32, 32)):
+            with self.subTest(old_vision=old_vision, maximum=maximum):
+                path.write_text(json.dumps({"vision": {"gpu": True, **old_vision}}))
+                rc, out = self.install(model="UD-Q4_K_XL", vram=24.0, vision_tokens=maximum)
+                self.assertEqual(rc, 0, out)
+                self.assertEqual(self.cfg["vision"]["min_tokens"], expected)
+                self.assertEqual(self.cfg["vision"]["max_tokens"], maximum)
 
     def test_a_12gb_card_is_recommended_the_cpu_encoder_never_forced(self):
         rc, out = self.install(model="UD-Q4_K_XL", vram=12.0)               # the default answer is yes, with the CPU encoder
