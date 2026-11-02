@@ -37,6 +37,9 @@ Pictures are on by default, by the same rule as for every model on NVIDIA and AM
   `strata-vision-hip`, with the CPU reader as its fallback.
 
 Your explicit choice is kept, with a note. A picture becomes up to 1,024 tokens of the context (the CPU default is 300).
+Setup gives small pictures at least 64 image tokens, matching the model's
+[official processor minimum of 65,536 pixels](https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/995ad96eacd98c81ed38be0c5b274b04031597b0/preprocessor_config.json).
+An existing `vision.min_tokens` setting is kept, including `0`; an explicitly smaller maximum also limits this floor.
 The engine puts the encoder's rows where the prompt has `<|image_pad|>` tokens and gives every row its 2-D position,
 interleaved M-RoPE as llama.cpp does for this model (rotary sections 11 / 11 / 10).
 
