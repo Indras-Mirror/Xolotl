@@ -2959,6 +2959,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/fork.cmake OPTIONAL)
 # the GLM-5.3-Flash engine (GlmDense + the shared Ds4MoeTier) - needs the ds4 slices above
 include(${CMAKE_CURRENT_SOURCE_DIR}/tools/glm/cmake/glm.cmake OPTIONAL)
 
+# Flash uses the same pinned native grammar parser and vocabulary as q36.
+option(STRATA_FLASH_GRAMMAR "Enable native Flash GBNF constrained decoding" OFF)
 # q36 GBNF uses the same vocab-only llama library as M31, without common/chat.
 if(TARGET strata_qwen35)
   option(STRATA_Q36_GRAMMAR "Enable q36 GBNF constrained decoding" OFF)
@@ -2971,6 +2973,16 @@ if(TARGET strata_qwen35)
     target_compile_definitions(q36-grammar-check PRIVATE STRATA_Q36_GRAMMAR=1)
     target_link_libraries(q36-grammar-check PRIVATE q36_llama)
   endif()
+endif()
+
+if(STRATA_FLASH_GRAMMAR AND TARGET strata)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/tools/m31/cmake/grammar.cmake)
+  target_link_libraries(strata PRIVATE q36_llama)
+  target_compile_definitions(strata PRIVATE STRATA_Q36_GRAMMAR=1)
+  add_executable(flash-grammar-state-check EXCLUDE_FROM_ALL tools/flash_grammar_state_check.cpp)
+  target_include_directories(flash-grammar-state-check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35)
+  target_compile_definitions(flash-grammar-state-check PRIVATE STRATA_Q36_GRAMMAR=1)
+  target_link_libraries(flash-grammar-state-check PRIVATE q36_llama)
 endif()
 
 # the MiniMax-M3.1-Flash engine (community port, issue #62) - opt-in (-DSTRATA_M31=ON).

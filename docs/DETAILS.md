@@ -549,10 +549,21 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   tool the request did not declare. The server window prints the same names (`N <tool_call> block(s) ... went back as text`), and
   `/metrics/prometheus` counts the blocks in `strata:tool_calls_unread_total`. A block that is malformed (not an undeclared name) is counted
   there and in the window, but has no name to list.
+- Native Flash grammar is opt-in at build time: `-DSTRATA_FLASH_GRAMMAR=ON`, with the same pinned llama.cpp
+  source as ggml. A native GGUF model then advertises `INFO grammar=1`. The existing API accepts `grammar` or
+  `structured_outputs.grammar` without client changes; JSON schemas use the server's grammar conversion.
+  Each request and batch slot owns its parser state. Prefix/image caches and sleep do not restore that state.
+  MTP continues to propose tokens. Grammar requests replay the constrained target draw and accept a proposal only
+  when it matches, instead of applying the unconstrained draft's probability-ratio correction. This also covers
+  sampled requests and pipelined/batch windows. This opt-in path copies full vocabulary logits to the CPU for the
+  native grammar mask and back to the existing GPU sampler; its throughput needs separate measurement.
+  The vocabulary is loaded without GPU layers from the native model's metadata shard; its `<|im_end|>` token must
+  be included in `--eos-ids`. `grammar_after` activates the parser after the requested generated token (for thinking).
+  Invalid grammar is rejected before prompt state changes. A build without this option keeps the existing path.
 - JSON output: `response_format: {"type":"json_object"}` or `{"type":"json_schema", ...}` on `/v1/chat/completions`. The schema
   must accept only JSON objects at its root (`"type":"object"`, or `anyOf`/`oneOf` of object schemas). Local `#` references
-  work and remote ones are refused. This is schema prompting followed by server validation, not grammar-constrained
-  decoding, with one generation per request. `jsonschema` is used when installed (`python -m pip install "jsonschema>=4.23,<5"`);
+  work and remote ones are refused. Engines without native grammar use schema prompting followed by server validation,
+  with one generation per request. `jsonschema` is used when installed (`python -m pip install "jsonschema>=4.23,<5"`);
   without it the answer is only checked to be one JSON object. Malformed output returns **502** with
   `error.code: structured_output_failed`, an invalid schema **400**. JSON formats combined with tools or MCP are refused.
   Streaming buffers the answer and emits content only after validation. Math answers often hold LaTeX such as `\alpha`, which is

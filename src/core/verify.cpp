@@ -4750,6 +4750,31 @@ bool Verifier::copy_logits(int t, float* host) const {
 }
 
 
+bool Verifier::resample_logits(int row, const float* logits, int64_t position, int slot,
+                              int32_t& out, std::string& err) {
+    if (next_) return next_->resample_logits(row, logits, position, slot, out, err);
+    const OnDevice on_device(device_);
+    if (!logits || row < 0 || row >= last_t_ || !head_logits_) {
+        err = "verify: constrained row unavailable"; return false;
+    }
+    auto sp = slot >= 0 ? slot_sp_.at((size_t) slot) : sampling_;
+    sp.counter = (uint64_t) position;
+    const int32_t* history = slot < 0 && hist_d_ ? hist_d_ + (size_t) row * hist_len_ : nullptr;
+    const int history_len = history ? hist_len_ : 0;
+    if (slot >= 0) sp.penalty_last_n = 0; // same policy as sample_rows
+    float* target = head_logits_ + (size_t) row * n_vocab_;
+    if (cudaMemcpyAsync(target, logits, (size_t) n_vocab_ * sizeof(float), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        err = "verify: constrained logits upload failed"; return false;
+    }
+    strata::kernels::sample_tokens(target, 1, (int) n_vocab_, history, history_len, sp, m_out_ + row, cs_);
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: constrained sampling failed"; return false;
+    }
+    out = ((volatile int32_t*) h_out_)[row];
+    return true;
+}
+
+
 // ================================ PIPELINED WINDOWS (see verify.hpp) ================================
 //
 // The window is run()'s, step for step: the same graph, the same staging, the same per-layer service (the PLE rows
