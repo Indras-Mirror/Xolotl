@@ -454,6 +454,11 @@ class EngineNonFinite(ValueError):
     ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
 
 
+class EngineGrammarStarved(ValueError):
+    """The request's grammar has no next token. Its terminal marker was consumed;
+    the engine and unrelated slots remain usable. Never retry as a numerical fault."""
+
+
 class SessionRefused(ValueError):
     """Disk sessions: the engine refused or failed a SAVE / RESTORE and is still in step (`SERR <kind> <published>
     <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500); `published`:
@@ -1888,7 +1893,7 @@ class StrataEngine:
                         break
 
     @staticmethod
-    def sampling_keys(sampling: dict) -> str:
+    def sampling_keys(sampling: dict, *, grammar_replay: bool = False) -> str:
         keys = ""
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
@@ -1983,6 +1988,12 @@ class StrataEngine:
             after = sampling.get("_grammar_after")
             if after is not None:
                 keys += f" grammar_after={int(after)}"
+            replay = sampling.get("_grammar_prefix")
+            if grammar_replay and replay:
+                if (not isinstance(replay, (list, tuple)) or
+                        not all(isinstance(t, int) and not isinstance(t, bool) and t >= 0 for t in replay)):
+                    raise ValueError("grammar replay must contain emitted token IDs")
+                keys += " grammar_prefix=" + ",".join(str(t) for t in replay)
         # logprobs: the engine writes an `LP` line after each `T` line (an engine without them ignores
         # the key, so an older engine answers exactly as it did).  Absent = no LP lines at all.
         k = top_logprobs(sampling)
@@ -2196,7 +2207,7 @@ class StrataEngine:
                         tail = []
                 if line.startswith("BDONE "):
                     completed = True
-                    if line.split()[3:4] == ["nonfinite"]:   # #879: the engine dropped the slot's state
+                    if line.split()[3:4] in (["nonfinite"], ["grammar"]):   # invalidated request state
                         tail = []
                     break
             held[slot] = tail[:-1] if completed and stream and tail else []
@@ -2364,7 +2375,16 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
-        keys = self.sampling_keys(sampling or {})
+        replay_grammar = str((self.info or {}).get("grammar_replay", 0)) == "1"
+        keys = self.sampling_keys(sampling or {}, grammar_replay=replay_grammar)
+        def leg_keys():
+            # Only outputs of this request enter the parser. The prompt may have
+            # image expansion or a different cached representation, so no prompt
+            # position is used to infer where the constrained answer began.
+            if replay_grammar and (sampling or {}).get("_grammar_path") is not None and out:
+                prefix = list((sampling or {}).get("_grammar_prefix") or ()) + out
+                return self.sampling_keys({**(sampling or {}), "_grammar_prefix": prefix}, grammar_replay=True)
+            return keys
         # logprobs: only an admission's token can have an LP line here (the slot's "BT" lines carry none), so the
         # server refuses these requests unless max_tokens is 1.  The lines go to the request itself, through its
         # cancel Event: several requests read control lines at once, and the engine's lp_lines is one attribute.
@@ -2407,7 +2427,8 @@ class StrataEngine:
                 # request. Replaying generated text as a fresh GEN/BGEN prompt
                 # would restart that state, so this capability pins the owner.
                 if alone and left > 1 and str((self.info or {}).get("batch_pinned", 0)) != "1":
-                    head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+                    current_keys = leg_keys()
+                    head = f"GENI {left}{current_keys} {embeddings}" if embeddings else f"GEN {left}{current_keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
@@ -2450,6 +2471,8 @@ class StrataEngine:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
+                    if self._done_finish() == "grammar":
+                        raise EngineGrammarStarved("the grammar permits no next token")
                     if self._done_finish() == "nonfinite":    # #879 (never promoted to a slot)
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
@@ -2540,7 +2563,8 @@ class StrataEngine:
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
-                    head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
+                    current_keys = leg_keys()
+                    head = f"BGENI {slot} {left}{current_keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{current_keys}"
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
                             "started": time.time(), "first_token": None}
@@ -2647,6 +2671,8 @@ class StrataEngine:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
+                    if not cont and self._done_finish() == "grammar":
+                        raise EngineGrammarStarved("the grammar permits no next token")
                     if not cont and self._done_finish() == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
@@ -2695,6 +2721,9 @@ class StrataEngine:
                         self._apply_bdone(f)
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        if f[3:4] == ["grammar"]:
+                            self.slot_held[slot] = []
+                            raise EngineGrammarStarved("the grammar permits no next token")
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
                             self.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
@@ -2913,8 +2942,9 @@ class StrataEngine:
         self.lp_lines = LPLines(cancel)
         carry = NO_LINE                  # a line read for a token's LP line, held until it is used
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        keys = self.sampling_keys(sampling or {}, grammar_replay=str((self.info or {}).get("grammar_replay", 0)) == "1")
+        head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else \
+            f"GEN {int(max_new)}{keys}"
         if prefill_only:                                 # split serving (serve/split.py): read the prompt, make no token
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
@@ -3016,6 +3046,8 @@ class StrataEngine:
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
+                    if self.last.get("finish") == "grammar":
+                        raise EngineGrammarStarved("the grammar permits no next token")
                     if self.last.get("finish") == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     return
@@ -3027,7 +3059,7 @@ class StrataEngine:
                         print("[strata] the engine no longer holds a picture sent by reference: sending the rows",
                               flush=True)
                         embeddings = refill()
-                        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}"
+                        head = f"GENI {int(max_new)}{keys} {embeddings}"
                         self._send(f"{head} {','.join(str(int(t)) for t in ids)}")
                         continue
                     done = True
@@ -6727,7 +6759,11 @@ class Service:
                             segment_sampling = {**(sampling or {}), "_grammar_path": grammar_path}
                             # An injected reasoning close is in raw_ids as well. A new
                             # native segment then starts with the grammar already active.
-                            if grammar_trigger is not None and grammar_trigger not in raw_ids:
+                            if str((getattr(self.engine, "info", {}) or {}).get("grammar_replay", 0)) == "1":
+                                segment_sampling["_grammar_prefix"] = list(raw_ids)
+                                if grammar_trigger is not None:
+                                    segment_sampling["_grammar_after"] = grammar_trigger
+                            elif grammar_trigger is not None and grammar_trigger not in raw_ids:
                                 segment_sampling["_grammar_after"] = grammar_trigger
                         gen = self.engine.generate(prompt, max_new - n, segment_sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, segment_sampling, cancel)

@@ -88,6 +88,7 @@
 #include "strata/program/adapt_decay.hpp"
 #include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
+#include "strata/program/grammar_row.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/program/stage_reserve.hpp"
@@ -8399,7 +8400,7 @@ int main(int argc, char** argv) {
     //
     // and each generated token is written to stdout as `T <id>` as soon as its verify window is done, followed by
     //
-    //     DONE <generated> <prompt_tokens> <prompt_ms> <decode_ms> <stop|length|cancel|nonfinite> <drafts accepted>
+    //     DONE <generated> <prompt_tokens> <prompt_ms> <decode_ms> <stop|length|cancel|nonfinite|grammar> <drafts accepted>
     //          <drafts offered> <prompt tokens reused> ... <prompt tokens read>   (see the DONE line below; #471)
     //
     // `nonfinite` (#879): a window's head logits held a NaN or an infinity (Verifier::nonfinite_row).  None of that
@@ -12262,7 +12263,7 @@ int main(int argc, char** argv) {
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
 #ifdef STRATA_Q36_GRAMMAR
-            if (!o.native_shards.empty()) std::printf("INFO grammar=1\n");
+            if (!o.native_shards.empty()) std::printf("INFO grammar=1 grammar_replay=1\n");
 #endif
             std::printf("INFO %slogit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
@@ -12529,28 +12530,37 @@ int main(int argc, char** argv) {
         // Exact target replay: drafts remain proposals, even when they were sampled
         // from an unconstrained q. A proposal stands only if the constrained target
         // draw agrees. Never use an unconstrained p/q residual as a grammar token.
+        enum class GrammarResult { ok, starved, failed };
         auto constrain_rows = [&](strata::core::Verifier& verifier, const Q36Grammar& grammar,
                                   int first, int count, const int32_t* tokens, const int64_t* positions,
-                                  int64_t position, int slot, int32_t* outputs) -> bool {
-            if (!grammar.active()) return true;
+                                  int64_t position, int slot, int32_t* outputs) -> GrammarResult {
+            if (!grammar.active()) return GrammarResult::ok;
+            // Preserve the whole window/slot's existing numerical-fault handling,
+            // even if a preceding row would already starve its grammar.
+            if (slot < 0 && verifier.nonfinite_row() >= 0) return GrammarResult::ok;
+            for (int row = first; row < first + count; ++row)
+                if (verifier.nonfinite_in(row)) return GrammarResult::ok;
             Q36Grammar preview(grammar);
             std::vector<float> logits((size_t) n_vocab);
             std::vector<int> ids((size_t) n_vocab);
             std::iota(ids.begin(), ids.end(), 0);
             for (int row = first; row < first + count; ++row) {
-                if (verifier.nonfinite_in(row)) break;
-                if (!verifier.copy_logits(row, logits.data())) { err = "grammar logits copy failed"; return false; }
-                preview.mask(logits.data(), ids.data(), (int) n_vocab);
-                if (std::none_of(logits.begin(), logits.end(), [](float x) { return std::isfinite(x); })) {
-                    err = "grammar permits no token"; return false;
+                if (!verifier.copy_logits(row, logits.data())) { err = "grammar logits copy failed"; return GrammarResult::failed; }
+                const auto status = strata::program::mask_grammar_row(logits.data(), logits.size(),
+                    [&](float* values, size_t count) { preview.mask(values, ids.data(), (int) count); });
+                if (status == strata::program::GrammarRowStatus::invalid_logits) {
+                    err = "invalid raw logits during grammar replay"; return GrammarResult::failed;
+                }
+                if (status == strata::program::GrammarRowStatus::starved) {
+                    err.clear(); return GrammarResult::starved;
                 }
                 if (!verifier.resample_logits(row, logits.data(), positions ? positions[row] : position + row,
-                                               slot, outputs[row], err)) return false;
+                                               slot, outputs[row], err)) return GrammarResult::failed;
                 if (row + 1 == first + count || outputs[row] != tokens[row + 1] ||
                     std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outputs[row]) != o.eos_ids.end()) break;
                 preview.accept(outputs[row]);
             }
-            return true;
+            return GrammarResult::ok;
         };
         struct BSlot {
             Q36Grammar grammar;
@@ -12583,6 +12593,18 @@ int main(int argc, char** argv) {
             ConvCheckpoint::PromptPlan partial_plan;   ///< --prefill-pipe: the segment it stopped in, read on in its chunks
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        auto grammar_abort_slot = [&](int b) {
+            BSlot& sl = bs[(size_t) b];
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+            std::printf("BDONE %d %lld grammar %.1f\n", b, (long long) sl.produced, ms);
+            sl.active = false;
+            sl.stop = true;
+            sl.cached = false;
+            sl.draft_ready = false;
+            sl.checks.clear();
+            sl.grammar = Q36Grammar{};
+            cancel_mailbox->retire(b, sl.cancel_epoch);
+        };
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -12945,8 +12967,10 @@ int main(int argc, char** argv) {
             }
             for (int a = 0; a < A; ++a) {
                 const int b = active[a], first_row = first[a];
-                if (!constrain_rows(ver, bs[(size_t) b].grammar, first_row, batch_mtp ? 2 : 1,
-                                    tok, pos, 0, b, outb)) { std::printf("ERR %s\n", err.c_str()); return false; }
+                const auto result = constrain_rows(ver, bs[(size_t) b].grammar, first_row, batch_mtp ? 2 : 1,
+                                                   tok, pos, 0, b, outb);
+                if (result == GrammarResult::failed) { std::printf("ERR %s\n", err.c_str()); return false; }
+                if (result == GrammarResult::starved) grammar_abort_slot(b);
             }
             const Clock::time_point w1 = Clock::now();
             // The adaptive VRAM tier, as the solo loop runs it: every --adapt-every windows, on a thread beside the commit and
@@ -12968,7 +12992,7 @@ int main(int argc, char** argv) {
                 const int b = active[a], i = first[a];
                 const BSlot& sl = bs[(size_t) b];
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
-                keep[b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
+                keep[b] = sl.active && batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
             }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
@@ -12987,6 +13011,7 @@ int main(int argc, char** argv) {
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
+                if (!sl.active) continue; // a request-local grammar abort emitted its terminal marker
                 bool nf = false;   // #879: a row of this slot held non-finite logits: the slot ends, nothing emitted
                 for (int r = first[t]; r < first[t] + (batch_mtp ? 2 : 1); ++r) nf = nf || ver.nonfinite_in(r);
                 if (nf) {
@@ -13219,7 +13244,7 @@ int main(int argc, char** argv) {
                 blk.b = b;
                 blk.f = f;
                 blk.n = t - f;
-                while (blk.keep < blk.n && !sl.stop && outb[f + blk.keep - 1] == G.tok[f + blk.keep] &&
+                while (blk.keep < blk.n && sl.active && !sl.stop && outb[f + blk.keep - 1] == G.tok[f + blk.keep] &&
                        !is_eos(outb[f + blk.keep - 1]))
                     ++blk.keep;
                 keep[(size_t) b] = blk.keep;
@@ -13393,10 +13418,10 @@ int main(int argc, char** argv) {
                         ++row;
                         if (pmtp) while (row < G.S && G.rows[row] == b) ++row;
                         if (!bs[(size_t) b].active) continue;
-                        if (!constrain_rows(vk, bs[(size_t) b].grammar, first, row - first,
-                                            G.tok, G.pos, 0, b, constrained.data())) {
-                            std::printf("ERR %s\n", err.c_str()); return false;
-                        }
+                        const auto result = constrain_rows(vk, bs[(size_t) b].grammar, first, row - first,
+                                                           G.tok, G.pos, 0, b, constrained.data());
+                        if (result == GrammarResult::failed) { std::printf("ERR %s\n", err.c_str()); return false; }
+                        if (result == GrammarResult::starved) grammar_abort_slot(b);
                     }
                     outb = constrained.data();
                 }
@@ -13979,6 +14004,7 @@ int main(int argc, char** argv) {
             std::string req_grammar_path;
             int req_grammar_after = -1;
             bool req_grammar_bad = false;
+            std::vector<int64_t> req_grammar_prefix;
             std::string req_bias_text;
             bool req_bias_present = false;
             // local (Indra's Mirror, /v1/decide): score=ID,ID,... prints `SCORE <id>:<logprob> ... top=<id>:<logprob>`
@@ -14031,6 +14057,15 @@ int main(int argc, char** argv) {
                     else if (key == "grammar") {
                         req_grammar_path = tok.substr(eq + 1);
                         req_grammar_bad = req_grammar_bad || req_grammar_path.empty();
+                    } else if (key == "grammar_prefix") {
+                        std::string parse_error;
+                        const std::string csv = tok.substr(eq + 1);
+                        if (csv.empty() || csv.front() == ',' || csv.back() == ',' || csv.find(",,") != std::string::npos ||
+                            std::any_of(csv.begin(), csv.end(), [](char c) { return (c < '0' || c > '9') && c != ','; }) ||
+                            !parse_i64_list(csv.c_str(), req_grammar_prefix, parse_error) ||
+                            req_grammar_prefix.size() > (size_t) o.max_context) req_grammar_bad = true;
+                        for (int64_t id : req_grammar_prefix)
+                            if (id < 0 || id >= n_vocab) req_grammar_bad = true;
                     } else if (key == "grammar_after") {
                         const char* value = tok.c_str() + eq + 1;
                         char* end = nullptr;
@@ -14084,7 +14119,18 @@ int main(int argc, char** argv) {
                 }
             }
             if (req_grammar_bad) { std::printf("ERR grammar: invalid path or grammar_after token id\n"); continue; }
-            try { prepare_grammar(req_grammar, req_grammar_path, req_grammar_after); }
+            try {
+                if (!req_grammar_prefix.empty() && req_grammar_path.empty())
+                    throw std::runtime_error("grammar_prefix requires grammar");
+                prepare_grammar(req_grammar, req_grammar_path, req_grammar_after);
+                for (int64_t id : req_grammar_prefix) {
+                    const int token = (int) id;
+                    float permitted = 0.f;
+                    req_grammar.mask(&permitted, &token, 1);
+                    if (!std::isfinite(permitted)) throw std::runtime_error("invalid emitted grammar prefix");
+                    req_grammar.accept(token);
+                }
+            }
             catch (const std::exception& e) { std::printf("ERR grammar: %s\n", e.what()); continue; }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
             std::vector<float> req_bias;
@@ -16097,6 +16143,7 @@ int main(int argc, char** argv) {
             consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < p; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
+            bool grammar_starved = false;
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
@@ -16446,7 +16493,13 @@ int main(int argc, char** argv) {
                         if (v.service(&drive_pool_split, SDf(A), err) < 0) return die(err);
                         if (v.done(err)) {
                             if (!v.pl_finish(outp.data(), err)) return die(err);
-                            if (!constrain_rows(v, req_grammar, 0, A.T, A.tok, nullptr, A.p, -1, outp.data())) return die(err);
+                            const auto result = constrain_rows(v, req_grammar, 0, A.T, A.tok, nullptr, A.p, -1, outp.data());
+                            if (result == GrammarResult::failed) return die(err);
+                            if (result == GrammarResult::starved) {
+                                grammar_starved = true;
+                                finish = "grammar";
+                                break; // the common pipeline drain settles every speculative window
+                            }
                             A.s1_done = true;
                             tre("F1", A.seq, A.T);
                         } else if (!err.empty()) return die(err);
@@ -17072,9 +17125,13 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
-                if (!constrain_rows(ver, req_grammar, merged ? T - 1 : 0, merged ? 1 : T,
-                                    window.data(), nullptr, p, -1, outv.data())) {
-                    std::printf("ERR %s\n", err.c_str()); return 1;
+                const auto grammar_result = constrain_rows(ver, req_grammar, merged ? T - 1 : 0, merged ? 1 : T,
+                                                           window.data(), nullptr, p, -1, outv.data());
+                if (grammar_result == GrammarResult::failed) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                if (grammar_result == GrammarResult::starved) {
+                    grammar_starved = true;
+                    finish = "grammar";
+                    break;
                 }
                 if (aflipped) apply_pending(true);   // 0.1.43: every layer's copies were waited for in the window; the bookkeeping now
                 // Diagnostics (as in generate): STRATA_DUMP_FIRST_LOGITS=<path> writes the logits of each request's first
@@ -17299,7 +17356,7 @@ int main(int argc, char** argv) {
                 live.swap(consumed);
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0 && req_ckpt;   // ckpt=0: nothing to continue or park (#830)
-                if (nf_hit) live_ok = false;   // #879 (the next request's start drops the rest)
+                if (nf_hit || grammar_starved) live_ok = false; // the discarded window cannot become a live cache
             } else if (!nf_hit && pp_exact && pp_reached > 0 && o.prompt_cache > 0 && req_ckpt &&
                        pp_reached <= (int64_t) cur.size()) {
                 // #1620: stopped between two windows (or before the first token was read): the session is exactly at
@@ -17333,7 +17390,7 @@ int main(int argc, char** argv) {
                              (long long) checked, std::chrono::duration<double, std::milli>(Clock::now() - rt0).count());
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
-            if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
+            if (state_hash && !cancelled && !grammar_starved && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
                 if (cudaDeviceSynchronize() != cudaSuccess) {

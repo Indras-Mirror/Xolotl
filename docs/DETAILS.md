@@ -553,6 +553,14 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   source as ggml. A native GGUF model then advertises `INFO grammar=1`. The existing API accepts `grammar` or
   `structured_outputs.grammar` without client changes; JSON schemas use the server's grammar conversion.
   Each request and batch slot owns its parser state. Prefix/image caches and sleep do not restore that state.
+  Engines advertising `grammar_replay=1` can move a request between the solo and batch paths: the server sends
+  `grammar_prefix` with only that request's previously emitted token IDs, and a fresh parser replays them. This
+  internal field is never inferred from prompt positions, image placeholders or a cached conversation. A reasoning
+  budget continuation uses the same replay and the original `grammar_after` trigger. Engines without this
+  capability keep their existing protocol.
+  If the grammar has no next token after a valid prefix, only that request/slot ends with `DONE`/`BDONE` reason
+  `grammar`. The server consumes that terminal marker and reports a request error; the engine stays available.
+  The affected live/slot cache is invalidated. Raw non-finite logits and GPU failures keep their existing handling.
   MTP continues to propose tokens. Grammar requests replay the constrained target draw and accept a proposal only
   when it matches, instead of applying the unconstrained draft's probability-ratio correction. This also covers
   sampled requests and pipelined/batch windows. This opt-in path copies full vocabulary logits to the CPU for the
