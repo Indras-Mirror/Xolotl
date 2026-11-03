@@ -29,6 +29,8 @@ Payloads and metadata have corruption checks. Data is flushed before an atomic c
 
 The native completion counters continue reporting reused and newly computed tokens. Family logs report actual restore/capture times and bytes; the common store exposes cumulative hit/miss, write/drop/error, byte and I/O-time counters. Prompt text is not logged by this feature.
 
+For Qwen3.6 and DeepSeek capture diagnostics, set `STRATA_PREFIX_CAPTURE_TRACE=1`. The opt-in lifecycle records contain only engine/source, PID, slot, capture instance, monotonic timestamp, event and request epoch (when available; otherwise `-1`), with no prompts or payloads. Events identify capture begin, observed cancellation, abort/discard, and admission to the write queue or request-local pending list. They observe request-owned capture, not the asynchronous disk writer. In Qwen3.6 parallel serving, internal DONE can precede capture; the actual BDONE is deferred until capture and slot cleanup finish. Pair the capture instance with the native slot/request owner and slot-release event when qualifying cancellation; these records do not establish a strict latency bound or resource-release counters.
+
 ## Current limits and qualification
 
 The initial adapters target native Linux single-stage serving, including the existing Qwen/DeepSeek batching paths. Layer-split, peer and multi-device paths retain their existing behavior and have no persistent tier where the adapter cannot represent complete native state. Storage is disabled outside Linux in this initial implementation. Builds and hardware execution for other backends must be reported separately; a host codec test does not establish GPU correctness.

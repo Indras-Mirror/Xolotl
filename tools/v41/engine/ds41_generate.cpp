@@ -1708,9 +1708,12 @@ int main(int argc, char ** argv) {
                 std::vector<uint8_t> payload;
                 payload.reserve((size_t) estimate);
                 std::string error;
-                if (!ds41_capture_persistent(dense, state, payload, error, cancelled) || cancelled()) return;
+                core::prefix::CaptureTrace trace("ds41","completed",slot);
+                auto capture_cancelled = [&] { return trace.cancelled(cancelled()); };
+                if (!ds41_capture_persistent(dense, state, payload, error, capture_cancelled) || capture_cancelled()) return;
                 const bool queued = persistent_prefix.enqueue_reserved(identity, ds41_persistent_cells(tokens, images, boundary),
                                                                         std::move(payload), std::move(reservation));
+                trace.finish(queued ? "enqueued" : "dropped");
                 std::fprintf(stderr, "serve: persistent prefix save tokens=%d queued=%d\n", boundary, queued ? 1 : 0);
             } catch (...) { std::fprintf(stderr, "serve: persistent prefix save skipped (host allocation)\n"); }
         };
@@ -2899,8 +2902,11 @@ int main(int argc, char ** argv) {
                         pending.cells = ds41_persistent_cells(ids, rid, (size_t) boundary);
                         pending.payload.reserve((size_t) estimate);
                         std::string error;
-                        if (!ds41_capture_persistent(dense, image, pending.payload, error, cancelled) || cancelled()) return;
+                        core::prefix::CaptureTrace trace("ds41","anchor",my_slot);
+                        auto capture_cancelled = [&] { return trace.cancelled(cancelled()); };
+                        if (!ds41_capture_persistent(dense, image, pending.payload, error, capture_cancelled) || capture_cancelled()) return;
                         request_prefix_pending.push_back(std::move(pending));
+                        trace.finish("pending");
                         last_prefix_anchor = boundary;
                     } catch (...) { std::fprintf(stderr, "serve: persistent prefix anchor skipped (host allocation)\n"); }
                 };

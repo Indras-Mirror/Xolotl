@@ -3665,24 +3665,28 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
             auto reservation=prefix_store->reserve(expected);
             if(!reservation)continue;
             if(cancelled())return;
+            strata::core::prefix::CaptureTrace trace("q36","checkpoint",E.batch_slot,(long long)E.batch_epoch);
+            auto capture_cancelled=[&]{return trace.cancelled(cancelled());};
             strata::q36::persistent::Writer w;w.bytes.reserve(expected);
             w.u64(0x315043363351ULL);w.u64(uint64_t(sn->pos));w.u64(E.page_bytes());w.u64(E.snap_bytes());
             w.u64(sn->hash);w.u64(uint64_t(std::min(3,std::max(0,sn->prio))));w.u64(count*E.page_bytes());
             for(size_t i=0;i<size_t(sn->pos);++i) {
-                if((i&4095)==0 && cancelled())return;
+                if((i&4095)==0 && capture_cancelled())return;
                 w.u64(uint32_t(c.tok[i]));
             }
-            if(!w.capture(sn->host,E.snap_bytes(),cancelled))return;
+            if(!w.capture(sn->host,E.snap_bytes(),capture_cancelled))return;
             const size_t row=size_t(E.m->g.head_dim)*sizeof(__half), span=row*Engine::kPage;
             for(size_t pg=0;pg<count;++pg) {
                 const size_t valid=std::min<size_t>(Engine::kPage,size_t(sn->pos)-pg*Engine::kPage)*row;
                 for(size_t off=0;off<E.page_bytes();off+=span) {
-                    if(!w.capture(c.pages[pg]+off,valid,cancelled) ||
-                       !w.capture(nullptr,span-valid,cancelled))return;
+                    if(!w.capture(c.pages[pg]+off,valid,capture_cancelled) ||
+                       !w.capture(nullptr,span-valid,capture_cancelled))return;
                 }
             }
-            if(cancelled())return;
-            if(!prefix_store->enqueue_reserved(prefix_identity,std::move(cells),std::move(w.bytes),std::move(reservation),std::move(capture)))break;
+            if(capture_cancelled())return;
+            const bool queued=prefix_store->enqueue_reserved(prefix_identity,std::move(cells),std::move(w.bytes),std::move(reservation),std::move(capture));
+            trace.finish(queued ? "enqueued" : "dropped");
+            if(!queued)break;
         }
         } catch(const std::bad_alloc&) {
             std::fprintf(stderr,"strata-q36: persistent checkpoint save: allocation failed; cache miss\n");

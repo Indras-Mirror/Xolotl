@@ -31,6 +31,42 @@
 
 namespace strata::core::prefix {
 namespace fs = std::filesystem;
+// Opt-in lifecycle metadata for qualifying request-owned capture cancellation.
+// This observes private capture work, never the asynchronous disk writer.
+class CaptureTrace {
+    bool enabled_ = std::getenv("STRATA_PREFIX_CAPTURE_TRACE") != nullptr;
+    bool cancelled_ = false, finished_ = false;
+    const char* engine_;
+    const char* source_;
+    int slot_;
+    long long request_epoch_;
+    uint64_t id_ = 0;
+    void event(const char* name) const {
+        if (!enabled_) return;
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+#ifndef _WIN32
+        const auto pid = ::getpid();
+#else
+        const int pid = 0;
+#endif
+        std::fprintf(stderr,"strata-prefix-capture: engine=%s source=%s pid=%lld slot=%d request_epoch=%lld capture=%llu monotonic_ns=%lld event=%s\n",
+                     engine_,source_,(long long)pid,slot_,request_epoch_,(unsigned long long)id_,(long long)ns,name);
+    }
+public:
+    CaptureTrace(const char* engine,const char* source,int slot,long long request_epoch=-1)
+        : engine_(engine),source_(source),slot_(slot),request_epoch_(request_epoch) {
+        if (enabled_) { static std::atomic<uint64_t> next{0}; id_=++next; event("begin"); }
+    }
+    CaptureTrace(const CaptureTrace&) = delete;
+    CaptureTrace& operator=(const CaptureTrace&) = delete;
+    bool cancelled(bool value) {
+        if (value && !cancelled_) { cancelled_=true; event("cancel_observed"); }
+        return value;
+    }
+    void finish(const char* outcome) { finished_=true; event(outcome); }
+    ~CaptureTrace() { if (!finished_) event(cancelled_ ? "aborted" : "discarded"); }
+};
 struct Config {
     std::string directory;
     uint64_t disk_bytes = uint64_t(64) << 30, min_free_bytes = uint64_t(1) << 30;
