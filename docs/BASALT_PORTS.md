@@ -64,6 +64,13 @@ unconditional gathers are tuned for their hardware, not this one.
 
 ## What landed
 
+**Status on `public` (2026-11-04).** Only **107** is on `public` (opt-in `STRATA_PREFILL_STREAM_PRICED=1`). The
+2026-10-31 upstream Strata merge overtook the other two, so they were not carried over from `basalt-ports`:
+**98** removes `wait_parked()`, which the merged pool now also uses to read the NUMA slice stamps (and the pool
+gained stall detection and `strata_cpu_pause`); **112**'s kernel is superseded by upstream's EXPDEC down kernels
+(`STRATA_EXPDEC_DOWN`, `STRATA_EXPDEC_DR` rows per lane, 4 measured best for Q2_0). The October notes below
+describe the `basalt-ports` branch as it was.
+
 - **98** (`8a644809`) — pool: the batch ends with its last job; a parked worker yields its core after
   50 µs. The park barrier was redundant once claims became epoch-tagged, which this header's own
   comment already argued. `wait_parked()` is deleted. `pool.cpp` syntax-checks clean.
