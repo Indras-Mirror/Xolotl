@@ -203,6 +203,12 @@ class DsmlOutputParser(OutputParser):
         return self._watch(super().feed(self.dsml.feed(delta)))
 
     def finish(self, reason: str | None = None):
+        if reason not in (None, "stop") and self.dsml.held:
+            # The turn was cut (max_tokens, a cancel) inside a DSML tag: `<｜DSML｜ invoke nam` before the call's name was
+            # complete, or `</｜DSML｜ ` after a whole call.  It is no text the model meant, and as text it reached clients
+            # as DSML in the content (an agent read it as the answer).  Held text is only ever a tag that may still be
+            # arriving (_could_still_be_a_tag), so this drops nothing else; a natural stop keeps it as text, as before.
+            self.dsml.buf = ""
         rest = self.dsml.flush()
         out = self._watch(super().feed(rest) if rest else [])
         out += self._watch(super().finish(reason))

@@ -253,6 +253,26 @@ class Parser(unittest.TestCase):
         evs = p.feed(raw) + p.finish("length")
         self.assertEqual(sum(e.kind == "tool_call" for e in evs), 0)
 
+    def test_a_turn_cut_inside_a_dsml_tag_sends_no_dsml(self):
+        # max_tokens can land anywhere in the call: inside `<｜DSML｜ invoke name="get_we` (before the name is whole) or
+        # inside the closing `</｜DSML｜ calls>` after a whole call.  The held tag used to go out as content text.
+        raw = "Checking.\n\n" + call(("get_weather", [("city", "Zagreb", True), ("days", "3", False)]))
+        for thinking in (False, True):
+            text = ("plan</think>" if thinking else "") + raw
+            for cut in range(text.index("<｜DSML｜"), len(text)):
+                for step in (1, 7, 4096):
+                    p = DsmlOutputParser(thinking=thinking, tools=self.TOOLS, stream_tools=True)
+                    evs = []
+                    for i in range(0, cut, step):
+                        evs += p.feed(text[i:min(i + step, cut)])
+                    evs += p.finish("length")
+                    content = "".join(e.text for e in evs if e.kind == "content")
+                    self.assertEqual(content.strip(), "Checking.", (thinking, cut, step, content[-40:]))
+        # a natural stop inside a tag keeps it as text, as before (the translator's own rule)
+        p = DsmlOutputParser(thinking=False, tools=self.TOOLS, stream_tools=True)
+        evs = p.feed("ok <｜DSML｜ inv") + p.finish("stop")
+        self.assertEqual("".join(e.text for e in evs if e.kind == "content"), "ok <｜DSML｜ inv")
+
     def test_the_plain_parser_is_unchanged(self):
         p = OutputParser(thinking=False, tools=self.TOOLS)
         evs = p.feed("<tool_call>\n<function=lookup>\n<parameter=id>\n5\n</parameter>\n</function>\n</tool_call>")
