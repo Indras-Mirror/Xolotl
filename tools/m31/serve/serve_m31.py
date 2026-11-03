@@ -240,7 +240,7 @@ class M31Engine(_BaseEngine):
         super().__init__(exe, args, cwd, log, child, lazy, cpus, _attempt)
 
     @staticmethod
-    def sampling_keys(sampling):
+    def sampling_keys(sampling, *, grammar_replay=False):
         for name, lower, upper, strict_lower in (
                 ("temperature", 0, 100, False), ("top_p", 0, 1, True), ("min_p", 0, 1, False),
                 ("repetition_penalty", 0, 100, True), ("frequency_penalty", -100, 100, False),
@@ -256,7 +256,7 @@ class M31Engine(_BaseEngine):
         if not isinstance(cache, bool):
             raise ValueError("cache_prompt must be boolean")
         forwarded = {key: value for key, value in sampling.items() if key not in ("top_k", "seed")}
-        result = _BaseEngine.sampling_keys(forwarded) + " cache_prompt=" + str(int(cache))
+        result = _BaseEngine.sampling_keys(forwarded, grammar_replay=grammar_replay) + " cache_prompt=" + str(int(cache))
         if window == 0:
             result = result.replace(" penalty_last_n=64", " penalty_last_n=0")
         top_k = sampling.get("top_k")
