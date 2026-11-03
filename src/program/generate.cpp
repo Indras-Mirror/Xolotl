@@ -28,6 +28,7 @@
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/persistent_prefix.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/auto_cache.hpp"
@@ -10398,6 +10399,7 @@ int main(int argc, char** argv) {
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
         // K/V format and the arithmetic switches.  Sampling, seeds, draft tuning and the expert tier are not in it.
         std::optional<uint64_t> model_fp, config_fp;
+        std::vector<strata::core::SessionModelFile> persistent_model_files;
         auto session_identity = [&](strata::core::SessionFileIdentity& id, std::string& e,
                                     const std::function<void()>& next_file) -> bool {
             if (!model_fp) {
@@ -10429,6 +10431,7 @@ int main(int argc, char** argv) {
                 if (next_file) next_file();
                 if (!strata::core::session_model_fingerprint(files, fp, e, next_file))
                     return false;
+                persistent_model_files = files;
                 model_fp = fp;
             }
             if (!config_fp) {
@@ -10466,6 +10469,137 @@ int main(int argc, char** argv) {
             id.model = *model_fp;
             id.config = *config_fp;
             return true;
+        };
+        // A disk entry is an immutable host snapshot. The background writer never reads
+        // device buffers or a live slot; those remain owned by the native scheduler.
+        strata::core::prefix::Store persistent_prefix(strata::core::prefix::Config::from_env());
+        auto persistent_cells = [](const auto& tokens, const std::vector<ImgKey>& images, bool steering) {
+            std::vector<uint64_t> cells;
+            cells.reserve(tokens.size() + images.size() * 3 + 1);
+            cells.push_back(steering ? 1 : 0);
+            size_t image = 0;
+            for (size_t k = 0; k < tokens.size(); ++k) {
+                // Tagged cells preserve every token bit and every image hash bit. Image
+                // keys precede their first token, so an image mismatch stops prefix reuse.
+                while (image < images.size() && images[image].start == (int64_t) k) {
+                    cells.push_back(UINT64_MAX);
+                    cells.push_back(images[image].hash);
+                    ++image;
+                }
+                cells.push_back((uint64_t) (uint32_t) tokens[k] + 2);
+            }
+            return cells;
+        };
+        auto persistent_identity = [&](std::string& key, strata::core::SessionFileIdentity& identity,
+                                       std::string& why) {
+            if (!session_identity(identity, why, {})) return false;
+            std::vector<std::string> files;
+            for (const auto& input : persistent_model_files) {
+                std::error_code ec;
+                if (input.optional && !std::filesystem::exists(input.path, ec)) continue;
+                files.push_back(input.path);
+            }
+            // Persistence is stricter than the manual session-file format: prompt
+            // chunking and arithmetic switches can change the computed cells' bits.
+            strata::core::SessionIdentityBuilder arithmetic(0x4650524546495832ULL);
+            arithmetic.i64("prefill_chunk", o.prefill_chunk);
+            arithmetic.i64("prefill_auto", o.prefill_auto);
+            arithmetic.i64("prefill_auto_max", o.prefill_auto_max);
+            arithmetic.i64("prefill_auto_cap", o.prefill_auto_cap);
+            arithmetic.i64("prefill_until", o.prefill_until);
+            arithmetic.f64("prefill_pipe", o.prefill_pipe);
+            for (int k = 1; k < argc; ++k) arithmetic.str("argument", argv[k]);
+#if defined(__linux__)
+            extern char** environ;
+            std::vector<std::string> environment;
+            for (char** entry = environ; entry && *entry; ++entry) {
+                const std::string value(*entry);
+                if (value.rfind("STRATA_", 0) == 0 || value.rfind("CUDA_", 0) == 0 ||
+                    value.rfind("HIP_", 0) == 0 || value.rfind("GGML_", 0) == 0 ||
+                    value.rfind("OMP_", 0) == 0) environment.push_back(value);
+            }
+            std::sort(environment.begin(), environment.end());
+            for (const auto& value : environment) arithmetic.str("environment", value);
+#endif
+            int device = 0, runtime = 0, driver = 0;
+            cudaDeviceProp properties{};
+            if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties(&properties, device) != cudaSuccess ||
+                cudaRuntimeGetVersion(&runtime) != cudaSuccess || cudaDriverGetVersion(&driver) != cudaSuccess) {
+                why = "backend runtime identity unavailable"; return false;
+            }
+            arithmetic.i64("device", device);
+            arithmetic.str("device_name", properties.name);
+            arithmetic.i64("device_major", properties.major);
+            arithmetic.i64("device_minor", properties.minor);
+            arithmetic.i64("runtime", runtime);
+            arithmetic.i64("driver", driver);
+            key = strata::core::prefix::model_identity("flash/session-v2",
+                std::to_string(identity.model) + "/" + std::to_string(identity.config) + "/" +
+                std::to_string(arithmetic.digest()), std::move(files));
+            if (key.empty()) { why = "model input identity unavailable"; return false; }
+            return true;
+        };
+        struct PersistentPrepared {
+            // Immutable bytes must be destroyed before releasing their budget.
+            std::shared_ptr<void> reservation;
+            std::shared_ptr<strata::core::SavedConversation> snapshot;
+            std::string identity;
+            strata::core::SessionFileIdentity sid;
+            std::vector<std::vector<uint64_t>> keys;
+            explicit operator bool() const { return snapshot != nullptr; }
+        };
+        auto persistent_prepare = [&](const std::vector<int32_t>& tokens, const std::vector<ImgKey>& images,
+                                      const std::vector<ConvCheckpoint>& checkpoints, bool steering,
+                                      const strata::core::SessionState& source,
+                                      const strata::core::QsaState* draft) -> PersistentPrepared {
+            PersistentPrepared prepared;
+            if (!persistent_prefix.enabled() || tokens.empty() ||
+                !strata::core::prefix::image_state_allowed(!images.empty())) return prepared;
+            try {
+                std::string why;
+                if (!persistent_identity(prepared.identity, prepared.sid, why)) return {};
+                strata::core::conversation_park_join();
+                strata::core::conversation_checkpoint_join(nullptr);
+                const strata::core::ConversationView view{tokens, images, checkpoints, steering};
+                size_t estimate = 0;
+                if (!strata::core::conversation_snapshot_capture_bytes({}, view, source, g, draft, estimate, why)) return {};
+                prepared.reservation = persistent_prefix.reserve(estimate);
+                if (!prepared.reservation) return {};
+                const auto memory = strata::core::sample_host_memory();
+                if (!strata::core::conversation_memory_admit(
+                        memory ? std::optional<uint64_t>(memory->available) : std::nullopt, estimate,
+                        (uint64_t) o.conversation_cache_min_free_mib << 20)) return {};
+                prepared.snapshot = std::make_shared<strata::core::SavedConversation>();
+                if (!strata::core::conversation_snapshot_save(*prepared.snapshot, view, source, g, draft, why)) return {};
+                prepared.keys.push_back(persistent_cells(prepared.snapshot->live.ids, prepared.snapshot->live.imgs, steering));
+                for (const auto& checkpoint : prepared.snapshot->checkpoints)
+                    if (!checkpoint.ids.empty()) prepared.keys.push_back(persistent_cells(checkpoint.ids, checkpoint.imgs, steering));
+                return prepared;
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr, "strata serve: persistent prefix: host allocation failed; skip save\n");
+                return {};
+            }
+        };
+        auto persistent_publish = [&](PersistentPrepared prepared) {
+            if (!prepared) return;
+            const auto sid = prepared.sid;
+            const size_t bytes = prepared.snapshot->bytes();
+            persistent_prefix.enqueue_file_keys_reserved(std::move(prepared.identity), std::move(prepared.keys), bytes,
+                [snapshot = std::move(prepared.snapshot), sid](const std::string& path, std::string& error) {
+                    size_t written = 0;
+                    const auto started = Clock::now();
+                    const bool saved = strata::core::session_file_write(path, *snapshot, sid, written, error);
+                    std::fprintf(stderr, "strata serve: persistent prefix: save=%s tokens=%zu bytes=%zu write_ms=%.1f\n",
+                                 saved ? "committed" : "miss", snapshot->live.ids.size(), written,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+                    return saved;
+                }, std::move(prepared.reservation));
+        };
+        auto persistent_save = [&](const std::vector<int32_t>& tokens, const std::vector<ImgKey>& images,
+                                   const std::vector<ConvCheckpoint>& checkpoints, bool steering,
+                                   const strata::core::SessionState& source,
+                                   const strata::core::QsaState* draft) {
+            persistent_publish(persistent_prepare(tokens, images, checkpoints, steering, source, draft));
         };
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
@@ -12587,6 +12721,8 @@ int main(int argc, char** argv) {
             // a prompt read that gave way to a waiting request (BYIELD): `ids` is the part read so far, and the same
             // request continues from it (the read goes on with the same chunks; `from0`: it had started at token 0)
             bool partial = false, partial_from0 = false;
+            bool persistent_pending = false; // natural completion; captured only after all slot commits settle
+            PersistentPrepared persistent_admission; // a valid main draft, retained until this request commits
             // #879: it was running when non-finite logits dropped the cached state; its state may have started from
             // that state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends
             bool tainted = false;
@@ -13042,6 +13178,7 @@ int main(int argc, char** argv) {
                         sl.active = false;
                         cancel_mailbox->retire((int) (&sl-bs.data()),sl.cancel_epoch);
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+                        sl.persistent_pending = !sl.tainted && std::strcmp(fin, "cancel") != 0;
                         break;
                     }
                     sl.x = y;
@@ -13295,6 +13432,7 @@ int main(int argc, char** argv) {
                         // a cache again (#857), as on the pipelined path without drafts: final once its commits have run
                         // (pmtp_settle, before anything reads the slot's sessions)
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+                        sl.persistent_pending = !sl.tainted && std::strcmp(fin, "cancel") != 0;
                         break;
                     }
                     sl.x = y;
@@ -13462,6 +13600,7 @@ int main(int argc, char** argv) {
                         // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
                         // row writes this slot clears the flag (below, where the group starts), so a stale state is never reused
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+                        sl.persistent_pending = !sl.tainted && std::strcmp(fin, "cancel") != 0;
                     } else {
                         sl.x = y;
                         sl.p += 1;
@@ -13634,6 +13773,41 @@ int main(int argc, char** argv) {
             return pmtp_settle();
         };
         for (;;) {
+            if (persistent_prefix.enabled() && stages.empty() && !multi_gpu && o.peer_device < 1 &&
+                !pipe_inflight()) {
+                bool pending_save = false;
+                for (auto& slot : bs) {
+                    if (!slot.active && (slot.tainted || (!slot.persistent_pending && (slot.stop || !slot.cached))))
+                        slot.persistent_admission = {};
+                    pending_save = pending_save || slot.persistent_pending;
+                }
+                if (pending_save && (!pmtp_settle() || !ver.wait_commit(err))) return 1;
+                for (size_t b = 0; b < bs.size(); ++b) {
+                    auto& slot = bs[b];
+                    if (!slot.persistent_pending) continue;
+                    slot.persistent_pending = false;
+                    // persistent_pending was latched at a natural native completion. A later
+                    // frontend stop cannot invalidate that already committed immutable state.
+                    if (slot.active || slot.tainted) {
+                        slot.persistent_admission = {};
+                        continue;
+                    }
+                    if (slot.persistent_admission) {
+                        persistent_publish(std::move(slot.persistent_admission));
+                        slot.persistent_admission = {};
+                        continue;
+                    }
+                    if (slot.cached && (!use_mtp || batch_mtp)) {
+                        if (batch_mtp) {
+                            std::string why;
+                            if (!slot_mtp[b]->idle(why)) continue;
+                        }
+                        static const std::vector<ImgKey> no_images;
+                        persistent_save(slot.ids, no_images, slot.checks, slot.cvec, *bslot_ss[0][b],
+                                        batch_mtp ? &slot_mtp[b]->kv_state() : nullptr);
+                    }
+                }
+            }
             if (poll_batch_cancellations && !poll_batch_cancellations(err)) return 1;
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
@@ -14474,7 +14648,75 @@ int main(int argc, char** argv) {
                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
                 }
             }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            auto parked = conversations.best(ids, req_imgs, want_cvec);
+            std::shared_ptr<void> disk_incoming_budget; // image must die before its byte reservation
+            std::optional<strata::core::SavedConversation> disk_incoming;
+            double persistent_read_ms = 0;
+            size_t persistent_read_bytes = 0;
+            // The catalogue is searched before any live state is parked or overwritten.
+            // A read, identity, checksum or cancellation failure is just a cache miss.
+            if (persistent_prefix.enabled() && stages.empty() && !multi_gpu && o.peer_device < 1 &&
+                o.prompt_cache > 0 && !request_cancelled() && strata::core::prefix::image_state_allowed(!req_imgs.empty())) {
+                struct PersistentReadCancelled {};
+                try {
+                    std::string identity, why;
+                    strata::core::SessionFileIdentity sid;
+                    if (persistent_identity(identity, sid, why)) {
+                        auto cells = persistent_cells(ids, req_imgs, want_cvec);
+                        if (!cells.empty()) cells.pop_back(); // the last token starts the next verify window
+                        const int64_t ram_tokens = std::max({resume, slot_tokens, parked.tokens});
+                        const std::vector<int64_t> ram_prefix(ids.begin(), ids.begin() + ram_tokens);
+                        const size_t ram_cells = persistent_cells(ram_prefix, imgs_below(req_imgs, ram_tokens), want_cvec).size();
+                        const auto disk_started = Clock::now();
+                        auto record = persistent_prefix.find_file(identity, cells, cells.size(), request_cancelled, ram_cells);
+                        if (record && !request_cancelled()) {
+                            std::error_code size_error;
+                            const uint64_t file_bytes = std::filesystem::file_size(record->path, size_error);
+                            auto read_budget = size_error ? std::shared_ptr<void>() :
+                                persistent_prefix.reserve(strata::core::session_read_peak_bytes(file_bytes));
+                            if (!read_budget) record.reset();
+                            if (record) {
+                                strata::core::SavedConversation image;
+                                strata::core::SessionReadLimits limits;
+                                limits.progress = [&](uint64_t, uint64_t) {
+                                    strata::core::progress_beat();
+                                    if (request_cancelled()) throw PersistentReadCancelled{};
+                                };
+                                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                                limits.admit = [floor](uint64_t need, std::string&) {
+                                    const auto memory = strata::core::sample_host_memory();
+                                    return strata::core::conversation_memory_admit(memory ?
+                                        std::optional<uint64_t>(memory->available) : std::nullopt, need, floor);
+                                };
+                                size_t bytes = 0;
+                                if (strata::core::conversation_session_read_limits(limits, ss, g, mtp.kv_state(),
+                                        (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), why) &&
+                                    strata::core::session_file_read(record->path, sid, image, bytes, why, limits) &&
+                                    !request_cancelled()) {
+                                    strata::core::ConversationCache::Match match;
+                                    match.tokens = strata::core::conversation_prefix(image.live, ids, req_imgs);
+                                    match.live = match.tokens > 0;
+                                    for (const auto& checkpoint : image.checkpoints) {
+                                        const int64_t length = strata::core::conversation_prefix(checkpoint, ids, req_imgs);
+                                        if (length > match.tokens) { match.tokens = length; match.live = false; }
+                                    }
+                                    if (image.cvec == want_cvec && match.tokens > std::max({resume, slot_tokens, parked.tokens})) {
+                                        parked = match;
+                                        disk_incoming.emplace(std::move(image));
+                                        disk_incoming_budget = std::move(read_budget);
+                                        persistent_read_bytes = bytes;
+                                        persistent_read_ms = std::chrono::duration<double, std::milli>(Clock::now() - disk_started).count();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (const PersistentReadCancelled&) {
+                    // The parse owns only host memory; no live session was touched.
+                } catch (const std::bad_alloc&) {
+                    std::fprintf(stderr, "strata serve: persistent prefix: host allocation failed; reread prompt\n");
+                }
+            }
             // Learn where this prompt diverged before parking/rewinding changes
             // the outgoing metadata. This is only a future read boundary: all
             // existing snapshot and positional-KV validation still runs below.
@@ -14499,15 +14741,16 @@ int main(int argc, char** argv) {
                 branch_common = std::max(branch_common, conversations.common_prefix(ids, req_imgs, want_cvec, floor));
             }
 
-            std::optional<strata::core::SavedConversation> incoming;
+            const bool incoming_from_disk = disk_incoming.has_value();
+            std::optional<strata::core::SavedConversation> incoming = std::move(disk_incoming);
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
             // own next turn (ConversationCache::borrows).  Everything else is taken whole, as before.
             // (a layer split restores whole stage images only, so it never borrows; a batch slot that holds a longer
             // start of this prompt wins as before)
-            bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
+            bool borrow = !incoming && stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
                           conversations.borrows(parked);
-            if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
+            if (!incoming && parked.tokens > std::max(resume, slot_tokens) && !borrow)
                 incoming.emplace(conversations.take(parked.index));
             if (incoming || borrow) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
@@ -14585,6 +14828,7 @@ int main(int argc, char** argv) {
                     err.clear();
                 }
             }
+            if (incoming_from_disk && request_cancelled()) { incoming.reset(); disk_incoming_budget.reset(); }
             // Preserve the outgoing branch before any checkpoint rewind, reset,
             // or incoming restore overwrites the positional state it requires.
             // pin=N: this request resumes exactly at the pinned shared prefix of the conversation the session holds
@@ -14823,7 +15067,12 @@ int main(int argc, char** argv) {
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), live);
                 }
+                if (incoming_from_disk)
+                    std::fprintf(stderr, "strata serve: persistent prefix: restored=%lld bytes=%zu read_ms=%.1f device_ms=%.1f\n",
+                                 (long long) resume, persistent_read_bytes, persistent_read_ms,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
+                disk_incoming_budget.reset();
                 lent_slot = -1;   // (the main session holds the parked conversation now)
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
                              (long long) resume, from_live ? "live" : "checkpoint",
@@ -17368,6 +17617,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
                              (long long) pp_reached);
             }
+            // The consumer can close its stream as soon as EOS is emitted, before
+            // this scheduler publishes the completed state. Classify completion from
+            // the native outcome; a late transport cancellation cannot undo it.
+            const bool persistent_completed = !cancelled && !nf_hit &&
+                (std::strcmp(finish, "stop") == 0 || std::strcmp(finish, "length") == 0);
+            if (persistent_prefix.enabled() && live_ok && persistent_completed && admit_slot < 0 &&
+                stages.empty() && !multi_gpu && o.peer_device < 1)
+                persistent_save(live, live_imgs, checks, cvec_cached, ss, use_mtp ? &mtp.kv_state() : nullptr);
             if (nib::config().recheck && nib::any_on() && !cancelled) {
                 // STRATA_EXPERT_NIBBLE_RECHECK=1 (debug): every converted slot's hash again on its own device, against the
                 // hash recorded at load - a path that wrote a slot after the seal is found here
@@ -17532,9 +17789,17 @@ int main(int argc, char** argv) {
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && (!batch_cancel_enabled || !request_cancelled()) && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
+                // GEN 1 admission reaching its own cap is not a completed BGEN
+                // request when a real cancellation prevents slot handoff.
+                const bool completed_in_main = !cont && persistent_completed && live_ok &&
+                    (std::strcmp(finish, "stop") == 0 || produced_n >= admit_max_new || p + 2 > o.max_context);
                 const auto tc0 = Clock::now();
                 if (cont) park_slot(admit_slot);   // the conversation the slot holds, before this one overwrites it
                 if (cont && batch_cancel_enabled && request_cancelled()) cont = false;
+                PersistentPrepared admission_snapshot;
+                if (cont && persistent_prefix.enabled() && ((use_mtp && !batch_mtp) || !live_imgs.empty()) && stages.empty() &&
+                    !multi_gpu && o.peer_device < 1)
+                    admission_snapshot = persistent_prepare(live, live_imgs, checks, cvec_cached, ss, use_mtp ? &mtp.kv_state() : nullptr);
                 bool copy_cancelled = false;
                 if (cont && !copy_to_slot(admit_slot, live, err, batch_cancel_enabled ? std::function<bool()>(request_cancelled) : std::function<bool()>(), &copy_cancelled)) {
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
@@ -17555,6 +17820,9 @@ int main(int argc, char** argv) {
                     cont = false;
                 }
                 const auto tc1 = Clock::now();
+                if (completed_in_main && persistent_prefix.enabled() &&
+                    stages.empty() && !multi_gpu && o.peer_device < 1)
+                    persistent_save(live, live_imgs, checks, cvec_cached, ss, use_mtp ? &mtp.kv_state() : nullptr);
                 if (cont) {
                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
                     BSlot& sl = bs[(size_t) admit_slot];
@@ -17562,6 +17830,7 @@ int main(int argc, char** argv) {
                         for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
                     sl = BSlot{};
                     sl.grammar = req_grammar;
+                    sl.persistent_admission = std::move(admission_snapshot);
                     sl.cancel_epoch=admit_cancel_epoch;
                     const auto tc2 = Clock::now();   // (the slot's old checkpoints freed)
                     sl.active = true;

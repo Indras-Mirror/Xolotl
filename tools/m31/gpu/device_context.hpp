@@ -9,6 +9,9 @@ namespace strata::m31 {
 // holds no device memory until the next CUDA call creates a new context.
 // Returns an empty string on success, otherwise the CUDA error.
 std::string release_cuda_device(int device);
+// Query only after the native engine has already initialized its CUDA device.
+// Returns empty on failure so a persistent adapter can fail closed.
+std::string cuda_prefix_runtime_identity();
 
 // Page-locks an existing, already resident host range for the current CUDA
 // context while it lives, so large copies run at DMA speed. A failed

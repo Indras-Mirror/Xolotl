@@ -46,6 +46,7 @@
 #include "ds41_exec.hpp"
 #include "ds41_moe.hpp"
 #include "ds41_conv_reuse.hpp"
+#include "ds41_persistent_state.hpp"
 #include "ds41_batch_slots.hpp"
 #include "ds41_batch.hpp"
 #include "../../../src/qwen35/q36_grammar.hpp"
@@ -1186,6 +1187,9 @@ int main(int argc, char ** argv) {
     // read's last one; then its enc-skip cut ends at the batch's own end (the replay window before it is computed in
     // full, so the read can go on from there) and feed() stops after it with feed_stopped = the tokens fed.
     std::function<bool(int, int)> feed_yield;
+    // Optional host snapshot at an already completed chunk. It never changes
+    // prefill widths or yields the native slot to another owner.
+    std::function<void(int, int)> persistent_chunk;
     int feed_stopped = -1;
     // The serve stdin reader can receive STOP while a long layer-major prompt is
     // running. Poll only between completed graph/tier operations; one-shot has no
@@ -1206,6 +1210,7 @@ int main(int argc, char ** argv) {
         for (int c0 = 0; c0 < n; ) {
             if (stop_prefill()) return false;
             bool yield_here = false;
+            int completed_last_row = 0;
             if (PB > 1 && n - c0 >= 2) {
                 // ---- layer-major: up to B tokens of every layer, the experts run once per layer over the whole batch
                 int B = std::min(pb_cap, n - c0);
@@ -1361,6 +1366,7 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "vram trace: batch at %d (B %d) done: free %.2f GiB; %s\n", pos0 + c0, B,
                                  tf / 1073741824.0, dense.vram_ledger().c_str());
                 }
+                completed_last_row = B - 1;
                 c0 += B;
             } else {
                 // ---- the sequential chunk path (unchanged): one pass of up to NP tokens through every layer
@@ -1415,8 +1421,10 @@ int main(int argc, char ** argv) {
                 } else if (c0 + m == n && !head_logits(m - 1, 1, last_logits.data())) return false;
                 if (!capture_tail(n, c0, m, 0)) return false;
                 fd_logits += now_ms() - tl;
+                completed_last_row = m - 1;
                 c0 += m;
             }
+            if (persistent_chunk) persistent_chunk(pos0 + c0, completed_last_row);
             progress(c0);
             if (yield_here) { feed_stopped = c0; break; }
         }
@@ -1526,6 +1534,122 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        // No filesystem/model inventory work occurs on the disabled path.
+        core::prefix::Store persistent_prefix(core::prefix::Config::from_env());
+        std::string persistent_base, live_prefix_identity;
+        if (persistent_prefix.enabled() && pipe.n_stages() == 1 && pool_on) {
+            std::vector<std::string> inputs{a.model};
+            inputs.insert(inputs.end(), a.engram.begin(), a.engram.end());
+            if (!a.engram_hot.empty()) inputs.push_back(a.engram_hot);
+            if (!a.rank.empty()) inputs.push_back(a.rank);
+            if (!a.prune.empty()) inputs.push_back(a.prune);
+            if (dsp_path) inputs.push_back(dsp_path);
+            std::vector<std::string> environment;
+#ifdef __linux__
+            for (char ** variable = ::environ; variable && *variable; ++variable) {
+                const std::string value(*variable);
+                if ((value.rfind("STRATA_", 0) == 0 && value.rfind("STRATA_PREFIX_CACHE_", 0) != 0) ||
+                    value.rfind("DS41_", 0) == 0 || value.rfind("GGML_", 0) == 0 ||
+                    value.rfind("V41_", 0) == 0 || value.rfind("CUDA_", 0) == 0 ||
+                    value.rfind("HIP_", 0) == 0 || value.rfind("ROCR_", 0) == 0 || value.rfind("OMP_", 0) == 0)
+                    environment.push_back(value);
+            }
+#endif
+            auto query_runtime = [&]() -> std::string {
+                // Identify the backend that actually owns dense state, not the
+                // requested CLI backend or a CUDA current device left by a helper.
+                const auto backend = dense.backend();
+                const auto device = backend ? ggml_backend_get_device(backend) : nullptr;
+                if (!device) return {};
+                ggml_backend_dev_props props{};
+                ggml_backend_dev_get_props(device, &props);
+                const char * name = ggml_backend_name(backend);
+                if (!name || !*name || !props.name || !*props.name || !props.description || !*props.description) return {};
+                std::ostringstream out;
+                auto field = [&](const char * value) { const std::string text = value ? value : "";
+                    out << text.size() << ':' << text << ':'; };
+                field(name); field(props.name); field(props.description); field(props.device_id);
+                out << int(props.type) << ':' << props.memory_total << ':';
+                // The expert tier may execute CPU kernels even with a CUDA dense backend.
+                out << ggml_cpu_has_avx2() << ':' << ggml_cpu_has_avx_vnni() << ':'
+                    << ggml_cpu_has_avx512() << ':' << ggml_cpu_has_avx512_vnni() << ':'
+                    << ggml_cpu_has_avx512_bf16() << ':' << ggml_cpu_has_amx_int8() << ':'
+                    << ggml_cpu_has_neon() << ':' << ggml_cpu_has_sve() << ':' << ggml_cpu_get_sve_cnt() << ':';
+                if (ggml_backend_is_cpu(backend)) { out << "cpu"; return out.str(); }
+#ifdef STRATA_ENABLE_CUDA
+                if (ggml_backend_is_cuda(backend)) {
+                    int ordinal = -1, runtime = 0, driver = 0;
+                    cudaDeviceProp properties{};
+                    if (!props.device_id || !*props.device_id ||
+                        cudaDeviceGetByPCIBusId(&ordinal, props.device_id) != cudaSuccess ||
+                        cudaGetDeviceProperties(&properties, ordinal) != cudaSuccess ||
+                        cudaRuntimeGetVersion(&runtime) != cudaSuccess || cudaDriverGetVersion(&driver) != cudaSuccess ||
+                        runtime <= 0 || driver <= 0) return {};
+                    out << "cuda:" << ordinal << ':' << properties.major << ':' << properties.minor << ':'
+                        << runtime << ':' << driver << ':';
+                    field(properties.name);
+                    return out.str();
+                }
+#endif
+                // No opaque GPU backend is accepted without its runtime descriptor.
+                return {};
+            };
+            persistent_base = ds41_persistent_identity_if_enabled(true, argc, argv, inputs, environment, query_runtime);
+        }
+        if (persistent_prefix.enabled() && persistent_base.empty())
+            std::fprintf(stderr, "serve: persistent prefix unavailable: requires a single-stage conversation pool and valid immutable input/runtime identity\n");
+        struct PrefixPending {
+            // Destroy host bytes before releasing their queue reservation.
+            std::shared_ptr<void> reservation;
+            std::string identity;
+            std::vector<uint64_t> cells;
+            std::vector<uint8_t> payload;
+        };
+        std::vector<PrefixPending> live_prefix_pending;
+        auto publish_prefixes = [&](std::vector<PrefixPending> & pending, bool committed) {
+            if (committed) for (auto & image : pending) {
+                try {
+                    const auto tokens = image.cells.size() / 2;
+                    const bool queued = persistent_prefix.enqueue_reserved(std::move(image.identity), std::move(image.cells),
+                                                                           std::move(image.payload), std::move(image.reservation));
+                    std::fprintf(stderr, "serve: persistent prefix anchor tokens=%zu queued=%d\n", tokens, queued ? 1 : 0);
+                } catch (...) { std::fprintf(stderr, "serve: persistent prefix anchor skipped (host allocation)\n"); }
+            }
+            pending.clear();
+        };
+        auto persistent_cancelled = [&](int slot) {
+            std::lock_guard<std::mutex> guard(qm);
+            for (const auto & command : q)
+                if (command == "STOP" || (slot >= 0 && command == "BSTOP " + std::to_string(slot))) return true;
+            return false;
+        };
+        auto persistent_save = [&](const std::string & identity, const std::vector<int> & tokens,
+                                   const std::vector<uint64_t> & images, int boundary,
+                                   const std::vector<float> & logits, const std::vector<float> & seed, int seed_rows, int slot) {
+            auto cancelled = [&] { return persistent_cancelled(slot); };
+            if (identity.empty() || boundary < std::max(1, park_min) || tokens.size() < (size_t) boundary || cancelled()) return;
+            try {
+                Ds41PersistentBoundary state;
+                state.pos = boundary; state.logits = logits; state.seed_rows = seed_rows;
+                const size_t seed_count = (size_t) std::max(0, seed_rows) * 3 * (size_t) dense.geom().n_embd;
+                if (seed_count > seed.size()) return;
+                state.seed.assign(seed.begin(), seed.begin() + seed_count);
+                uint64_t estimate = 48 + logits.size() * 4 + seed_count * 4;
+                for (const auto & region : dense.state_regions(boundary)) estimate += region.bytes + 88;
+                auto reservation = persistent_prefix.reserve(estimate + (uint64_t) boundary * 16 + identity.size());
+                if (!reservation) return;
+                std::vector<uint8_t> payload;
+                payload.reserve((size_t) estimate);
+                std::string error;
+                core::prefix::CaptureTrace trace("ds41","completed",slot);
+                auto capture_cancelled = [&] { return trace.cancelled(cancelled()); };
+                if (!ds41_capture_persistent(dense, state, payload, error, capture_cancelled) || capture_cancelled()) return;
+                const bool queued = persistent_prefix.enqueue_reserved(identity, ds41_persistent_cells(tokens, images, boundary),
+                                                                        std::move(payload), std::move(reservation));
+                trace.finish(queued ? "enqueued" : "dropped");
+                std::fprintf(stderr, "serve: persistent prefix save tokens=%d queued=%d\n", boundary, queued ? 1 : 0);
+            } catch (...) { std::fprintf(stderr, "serve: persistent prefix save skipped (host allocation)\n"); }
+        };
         std::vector<uint64_t> live_id;   // hist's position identities (its prompt part; past it: text = 0)
         // the live conversation's turn boundary into the pool (logged as serve/server.py ConvCacheLog reads it)
         auto save_live = [&](const char * why) {
@@ -1636,6 +1760,8 @@ int main(int argc, char ** argv) {
         struct Conv {
             std::vector<int> hist;
             std::vector<uint64_t> live_id;
+            std::string persistent_identity;
+            std::vector<PrefixPending> prefix_pending;
             int snap_len = -1;
             std::vector<float> snap_logits, snap_seed;
             int snap_seed_n = 0;
@@ -1657,6 +1783,7 @@ int main(int argc, char ** argv) {
             std::mt19937_64 rng;
             RouteCls cls;
             Q36Grammar grammar;
+            std::vector<PrefixPending> prefix_pending;
         };
         std::vector<Conv> cv((size_t) NS);
         std::vector<BSlot> bs((size_t) NS);
@@ -1695,6 +1822,8 @@ int main(int argc, char ** argv) {
             std::swap(snap_seed, c.snap_seed);
             std::swap(snap_seed_n, c.snap_seed_n);
             std::swap(live_dirty, c.live_dirty);
+            std::swap(live_prefix_identity, c.persistent_identity);
+            std::swap(live_prefix_pending, c.prefix_pending);
         };
         // exchange two idle slots' conversations (device state and records): a conversation moves to the slot id the
         // server asked for, or the one a yielded read waits in
@@ -1748,7 +1877,13 @@ int main(int argc, char ** argv) {
             for (auto it = q.begin(); it != q.end();) {
                 if (it->rfind("BSTOP ", 0) == 0) {
                     const int b = std::atoi(it->c_str() + 6);
-                    if (b >= 0 && b < NS) bs[(size_t) b].stop = true;
+                    if (b >= 0 && b < NS) {
+                        bs[(size_t) b].stop = true;
+                        if (!bs[(size_t) b].active) {
+                            if (b == gslot) live_prefix_pending.clear();
+                            else cv[(size_t) b].prefix_pending.clear();
+                        }
+                    }
                     it = q.erase(it);
                 } else if (it->rfind("BYIELD", 0) == 0) {
                     if (yield) *yield = it->size() > 7 ? std::atoi(it->c_str() + 7) : -1;
@@ -1807,12 +1942,21 @@ int main(int argc, char ** argv) {
             sl.active = false;
             sl.stop = false;
             sl.grammar = Q36Grammar();
+            publish_prefixes(sl.prefix_pending, std::strcmp(fin, "cancel") != 0 &&
+                             std::strcmp(fin, "error") != 0 && std::strcmp(fin, "nonfinite") != 0 &&
+                             std::strcmp(fin, "grammar") != 0);
             if (std::strcmp(fin, "nonfinite") == 0 || std::strcmp(fin, "grammar") == 0) {   // its state is not worth keeping
                 cv[(size_t) b].hist.clear();
                 cv[(size_t) b].live_id.clear();
                 cv[(size_t) b].snap_len = -1;
             } else {
                 save_conv(b, "slot done");
+                if (!cv[(size_t) b].persistent_identity.empty() && std::strcmp(fin, "cancel") != 0 &&
+                    std::strcmp(fin, "error") != 0 && bind(b)) {
+                    const Conv & c = cv[(size_t) b];
+                    persistent_save(c.persistent_identity, c.hist, c.live_id, c.snap_len,
+                                    c.snap_logits, c.snap_seed, c.snap_seed_n, b);
+                }
             }
             cv[(size_t) b].used = now_ms();
         };
@@ -2030,7 +2174,10 @@ int main(int argc, char ** argv) {
             long long admit_max = 0;
             if (line.rfind("BSTOP ", 0) == 0) {
                 const int b = std::atoi(line.c_str() + 6);
-                if (b >= 0 && b < NS) bs[(size_t) b].stop = true;
+                if (b >= 0 && b < NS) {
+                    bs[(size_t) b].stop = true;
+                    if (!bs[(size_t) b].active) cv[(size_t) b].prefix_pending.clear();
+                }
                 continue;
             }
             if (line.rfind("BYIELD", 0) == 0) continue;
@@ -2238,6 +2385,78 @@ int main(int argc, char ** argv) {
 #endif
                 if (admit >= 0) ++batch_epoch;
             }
+            // A source-KV anchor is not a reusable live conversation until its
+            // native late-layer replay completes. Early errors must not leave an
+            // apparently valid short history in a reused slot.
+            bool restore_needs_replay = false;
+            SlotScope replay_scope;
+            if (!persistent_base.empty()) replay_scope.f = [&]() {
+                if (restore_needs_replay) {
+                    hist.clear(); live_id.clear(); snap_len = -1;
+                    snap_logits.clear(); snap_seed.clear(); snap_seed_n = 0;
+                    live_prefix_identity.clear();
+                    live_prefix_pending.clear();
+                }
+            };
+            std::string request_prefix_identity;
+            if (!persistent_base.empty() && core::prefix::image_state_allowed(
+                    std::any_of(rid.begin(),rid.end(),[](uint64_t value){return value!=0;}))) {
+                // Preserve exact float bits in the computation identity (decimal rounding is unsafe).
+                uint32_t rb, rbf, rbr;
+                std::memcpy(&rb, &req_rb, 4); std::memcpy(&rbf, &req_rbf, 4); std::memcpy(&rbr, &req_rbr, 4);
+                request_prefix_identity = persistent_base + "/route/" + std::to_string(rb) + "/" +
+                    std::to_string(rbf) + "/" + std::to_string(rbr) + "/" + std::to_string(req_rprot) + "/" + std::to_string(req_rpool);
+                try {
+                    const auto cells = ds41_persistent_cells(ids, rid, ids.size());
+                    const size_t common = conv_common_prefix(hist.data(), live_id.data(), live_id.size(), hist.size(),
+                                                             ids.data(), rid.data(), rid.size(), ids.size());
+                    int64_t offered = snap_len > 0 && common >= (size_t) snap_len ? snap_len : 0;
+                    if (!hist.empty() && common == hist.size() && common < ids.size()) offered = common;
+                    if (pool_on) {
+                        const auto match = pool.best_prefix(ids.data(), rid.data(), rid.size(), ids.size());
+                        int64_t pool_offer = match.resume();
+                        const bool exact = match.pos > 0 && match.pos == (int64_t) ids.size();
+                        if ((exact && !match.has_logits) || (!exact && pool_offer >= (int64_t) ids.size())) pool_offer = 0;
+                        offered = std::max(offered, pool_offer);
+                    }
+                    auto cancelled = [&]() { return persistent_cancelled(my_slot); };
+                    const double start = now_ms();
+                    auto disk = persistent_prefix.find(request_prefix_identity, cells, cells.size(), cancelled, (size_t) offered * 2);
+                    bool disk_replay = false;
+                    if (enc_skip && ER > 0 && ids.size() > (size_t) ER) {
+                        const size_t floor = disk ? disk->cells.size() : (size_t) offered * 2;
+                        auto anchor = persistent_prefix.find(request_prefix_identity + "/anchor-replay/" + std::to_string(ER),
+                                                             cells, (ids.size() - (size_t) ER) * 2, cancelled, floor);
+                        if (anchor) { disk = std::move(anchor); disk_replay = true; }
+                    }
+                    if (disk && disk->cells.size() % 2 == 0 && disk->cells.size() / 2 > (size_t) offered) {
+                        // Allocate request metadata before the native commit. Allocation failure
+                        // must leave the previous slot and its owner/history consistent.
+                        const size_t restored_tokens = disk->cells.size() / 2;
+                        std::vector<int> restored_hist(ids.begin(), ids.begin() + restored_tokens);
+                        std::vector<uint64_t> restored_images(rid.begin(), rid.begin() + std::min(rid.size(), restored_tokens));
+                        std::string restored_identity = request_prefix_identity;
+                        Ds41PersistentBoundary state;
+                        std::string error;
+                        if (ds41_restore_persistent(dense, disk->payload, disk->cells.size() / 2, (size_t) nv, disk_replay,
+                                                     cancelled, state, error)) {
+                            hist.swap(restored_hist);
+                            live_id.swap(restored_images);
+                            snap_len = disk_replay ? -1 : (int) state.pos;
+                            snap_logits = std::move(state.logits);
+                            snap_seed = std::move(state.seed); snap_seed_n = state.seed_rows;
+                            live_dirty = false; live_prefix_identity.swap(restored_identity);
+                            restore_needs_replay = disk_replay;
+#if defined(DS41_HAVE_DSPARK)
+                            dsp_next = -1;
+#endif
+                            std::fprintf(stderr, "serve: persistent prefix restored=%lld new=%zu replay=%lld io_ms=%.3f\n",
+                                         (long long) state.pos, ids.size() - (size_t) state.pos,
+                                         (long long) (disk_replay ? ER : 0), now_ms() - start);
+                        } else std::fprintf(stderr, "serve: persistent prefix miss (%s)\n", error.c_str());
+                    }
+                } catch (...) { std::fprintf(stderr, "serve: persistent prefix miss (host allocation)\n"); }
+            }
             size_t lcp = conv_common_prefix(hist.data(), live_id.data(), live_id.size(), hist.size(), ids.data(), rid.data(),
                                             rid.size(), ids.size());
             // batch slots: the live state holds the WHOLE prompt (a solo request STOPped for a promotion fed its last token
@@ -2296,6 +2515,7 @@ int main(int argc, char ** argv) {
                         live_id.assign(rid.begin(), rid.begin() + std::min<size_t>(rid.size(), (size_t) pr));
                         if (pr == rs.pos) { snap_len = (int) rs.pos; snap_logits = rs.logits; }
                         else snap_len = -1;
+                        live_prefix_identity.clear(); // RAM records predate computation identities
                         snap_seed_n = 0;   // no DSpark seed rows in a record: a repeat decodes its first tokens draftless
                         live_dirty = false;
                         reuse_override = (int) pr;
@@ -2626,6 +2846,56 @@ int main(int argc, char ** argv) {
                 std::printf("PP %d %d %.0f %.1f\n", reused + done, total, ms, 1000.0 * done / std::max(ms, 1e-9));
                 std::fflush(stdout);
             };
+            std::vector<PrefixPending> request_prefix_pending;
+            if (!live_prefix_pending.empty()) {
+                try {
+                    if (!request_prefix_identity.empty() && live_prefix_identity == request_prefix_identity && reused > 0) {
+                        const auto cells = ds41_persistent_cells(ids, rid, (size_t) reused);
+                        const std::string replay_identity = request_prefix_identity + "/anchor-replay/" + std::to_string(ER);
+                        for (auto & pending : live_prefix_pending)
+                            if ((pending.identity == request_prefix_identity || pending.identity == replay_identity) &&
+                                pending.cells.size() <= cells.size() &&
+                                std::equal(pending.cells.begin(), pending.cells.end(), cells.begin()))
+                                request_prefix_pending.push_back(std::move(pending));
+                    }
+                } catch (...) { request_prefix_pending.clear(); }
+                live_prefix_pending.clear();
+            }
+            int last_prefix_anchor = reused;
+            if (!request_prefix_identity.empty() && (reused == 0 || live_prefix_identity == request_prefix_identity)) {
+                persistent_chunk = [&](int boundary, int last_row) {
+                    auto cancelled = [&] { return prefill_cancelled ||
+                        (my_slot >= 0 && bs[(size_t) my_slot].stop) || persistent_cancelled(my_slot); };
+                    if (boundary >= total || boundary < std::max(8192, park_min) ||
+                        boundary - last_prefix_anchor < 8192 || request_prefix_pending.size() >= 64 || cancelled()) return;
+                    try {
+                        uint64_t estimate = 48 + (uint64_t) nv * 4;
+                        for (const auto & region : dense.state_regions(boundary)) estimate += region.bytes + 88;
+                        auto reservation = persistent_prefix.reserve(estimate + (uint64_t) boundary * 16 + request_prefix_identity.size());
+                        if (!reservation) return;
+                        Ds41PersistentBoundary image;
+                        image.pos = boundary; image.replay = enc_skip;
+                        if (!enc_skip) {
+                            image.logits.resize((size_t) nv);
+                            if (!head_logits(last_row, 1, image.logits.data())) return;
+                        }
+                        if (!dense.snapshot(boundary)) return;
+                        PrefixPending pending;
+                        pending.reservation = std::move(reservation);
+                        pending.identity = request_prefix_identity;
+                        if (enc_skip) pending.identity += "/anchor-replay/" + std::to_string(ER);
+                        pending.cells = ds41_persistent_cells(ids, rid, (size_t) boundary);
+                        pending.payload.reserve((size_t) estimate);
+                        std::string error;
+                        core::prefix::CaptureTrace trace("ds41","anchor",my_slot);
+                        auto capture_cancelled = [&] { return trace.cancelled(cancelled()); };
+                        if (!ds41_capture_persistent(dense, image, pending.payload, error, capture_cancelled) || capture_cancelled()) return;
+                        request_prefix_pending.push_back(std::move(pending));
+                        trace.finish("pending");
+                        last_prefix_anchor = boundary;
+                    } catch (...) { std::fprintf(stderr, "serve: persistent prefix anchor skipped (host allocation)\n"); }
+                };
+            }
             prefill_cancelled = false;
             auto feed_steps = [&]() -> bool {   // the short-turn path: passes of up to pass_max tokens (a lone token: a step)
                 int last_rows = 1;
@@ -2753,7 +3023,8 @@ int main(int argc, char ** argv) {
                     if (ys < 0) return false;
                     const int rest = dh - (c0 + B);
                     const bool can = ys < NS && !bs[(size_t) ys].active && (admit < 0 || ys == admit) && rest > std::max(SB, 16) &&
-                                     (!enc_skip || B >= ER || c0 == 0);
+                                     (!enc_skip || B >= ER || c0 == 0) &&
+                                     (!restore_needs_replay || (int64_t) c0 + B >= ER);
                     if (!can) {
                         std::fprintf(stderr, "strata batch: BYIELD %d not taken at %d of %d new tokens\n", ys, c0, dh);
                         return false;
@@ -2766,6 +3037,7 @@ int main(int argc, char ** argv) {
             dense.reset_span_width();   // a sub-batch narrowed by the last prompt's tight card starts wide again
             bool ok = total == reused || dh == 0 || (mix_read ? feed_mixed() : by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
             feed_yield = nullptr;
+            persistent_chunk = nullptr;
             bcap_n = 0;
             if (kept) {   // the batch is done: the tail slots back (exactly the evicted experts), decode biases on
                 std::string kerr;
@@ -2791,6 +3063,11 @@ int main(int argc, char ** argv) {
             if (ok && feed_stopped >= 0 && yield_slot >= 0 && !by_step && !mix_read) {   // BYIELD taken: the read goes on later
                 const int qn = reused + feed_stopped;
                 feed_stopped = -1;
+                // BYIELD is admitted only after this anchor's ER replay is complete.
+                restore_needs_replay = false;
+                if (reused == 0) live_prefix_identity = request_prefix_identity;
+                else if (live_prefix_identity != request_prefix_identity) live_prefix_identity.clear();
+                live_prefix_pending = std::move(request_prefix_pending);
                 hist.assign(ids.begin(), ids.begin() + qn);
                 live_id.assign(rid.begin(), rid.begin() + std::min<size_t>(rid.size(), (size_t) qn));
                 snap_len = -1;
@@ -2942,6 +3219,9 @@ int main(int argc, char ** argv) {
                 snap_len = -1;
                 continue;
             }
+            restore_needs_replay = false;
+            if (reused == 0) live_prefix_identity = request_prefix_identity;
+            else if (live_prefix_identity != request_prefix_identity) live_prefix_identity.clear();
             hist = ids;
             live_id = rid;
             // the single park: no snapshot for an image prompt (a text request with the same ids would restore its
@@ -3251,26 +3531,39 @@ int main(int argc, char ** argv) {
                     sl.rng = rng;
                     sl.grammar = grammar;
                     sl.cls = RouteCls{ a.route_bias, a.route_bias_file, cur_rprot, cur_rpool };
+                    sl.prefix_pending = std::move(request_prefix_pending);
                     std::fprintf(stderr, "strata batch: slot %d decodes on from %d tokens (%d reused; route bias %.2f/%.2f)\n",
                                  admit, total, reused, a.route_bias, a.route_bias_file);
                 }
                 std::printf("BADM %d %d\n", admit, cont ? 1 : 0);
                 std::fflush(stdout);
                 ++batch_epoch;
-                if (!cont) save_live("turn end");   // (a slot that decodes on goes to the pool at its BDONE)
+                if (!cont) {
+                    publish_prefixes(request_prefix_pending, std::strcmp(finish, "cancel") != 0 && std::strcmp(finish, "error") != 0);
+                    save_live("turn end");
+                    if (std::strcmp(finish, "cancel") != 0 && std::strcmp(finish, "error") != 0)
+                        persistent_save(live_prefix_identity, hist, live_id, snap_len, snap_logits, snap_seed, snap_seed_n, my_slot);
+                }   // (a slot that decodes on goes to the pool at its BDONE)
             }
             // batch slots: every turn's boundary into the pool at once (an async copy of the new tail).  With one live
             // state the pool got it when the next request overwrote it; with slots a side request takes another slot,
             // nothing is overwritten, and an earlier boundary of this conversation (an edited turn's resume point) would
             // be gone with the slot's next snapshot (20.10 card: c3edit read 8185 tokens again instead of resuming at 8081)
             else if (my_slot >= 0) {
+                publish_prefixes(request_prefix_pending, std::strcmp(finish, "cancel") != 0 && std::strcmp(finish, "error") != 0);
                 save_live("turn end");
+                if (std::strcmp(finish, "cancel") != 0 && std::strcmp(finish, "error") != 0)
+                    persistent_save(live_prefix_identity, hist, live_id, snap_len, snap_logits, snap_seed, snap_seed_n, my_slot);
 #if defined(DS41_HAVE_DSPARK)
                 dsp_slot = my_slot;         // a solo request: DSpark's window is this slot's conversation now
                 dsp_epoch = batch_epoch;
 #endif
+            } else if (std::strcmp(finish, "cancel") != 0 && std::strcmp(finish, "error") != 0) {
+                publish_prefixes(request_prefix_pending, true);
+                persistent_save(live_prefix_identity, hist, live_id, snap_len, snap_logits, snap_seed, snap_seed_n, my_slot);
             }
         }
+        persistent_prefix.flush();
         tier.close();
         // the stdin reader thread (detached) sits in getline holding cin's lock: a normal exit's stream teardown waits
         // on it until the client closes the pipe - leave without the static destructors

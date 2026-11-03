@@ -1,7 +1,19 @@
 #include "device_context.hpp"
 #include <cuda_runtime.h>
+#include <sstream>
 
 namespace strata::m31 {
+std::string cuda_prefix_runtime_identity() {
+    int device = -1, runtime = 0, driver = 0;
+    cudaDeviceProp properties{};
+    if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties(&properties, device) != cudaSuccess ||
+        cudaRuntimeGetVersion(&runtime) != cudaSuccess || cudaDriverGetVersion(&driver) != cudaSuccess) return {};
+    std::ostringstream out;
+    out << "cuda-runtime=" << runtime << " driver=" << driver << " ordinal=" << device
+        << " arch=" << properties.major << '.' << properties.minor << " name=" << properties.name
+        << " pci=" << properties.pciDomainID << ':' << properties.pciBusID << ':' << properties.pciDeviceID;
+    return out.str();
+}
 std::string release_cuda_device(int device) {
     auto failed = [](const char * step, cudaError_t status) {
         (void) cudaGetLastError();

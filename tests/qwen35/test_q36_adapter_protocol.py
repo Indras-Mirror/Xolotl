@@ -117,6 +117,29 @@ class Adapter(unittest.TestCase):
         for env,wanted in [({'MOCK_HOST_PARK':'1'},'slot_cache=1'),({'MOCK_HOST_PARK':'1','MOCK_NO_SNAPS':'1'},'slot_cache=0')]:
             s=Session(env);self.addCleanup(s.close)
             self.assertIn(wanted,next(l for l in s.lines if l.startswith('INFO engine=q36')))
+    def test_parallel_have_restores_only_missing_valid_image_keys(self):
+        self.s.send('HAVE 2a,2b')
+        self.assertEqual(self.s.until(lambda line:line.startswith('HAVE')), 'HAVE 3:1:1,0')
+        s=Session({'MOCK_IMAGE_DISK_RESTORE':'1'});self.addCleanup(s.close)
+        s.send('HAVE 2a,+2b,-1,0000000000000002b,zz,2b')
+        self.assertEqual(s.until(lambda line:line.startswith('HAVE')), 'HAVE 3:1:1,0,0,0,0,3:1:1')
+        s.send('HAVE 2b')
+        self.assertEqual(s.until(lambda line:line.startswith('HAVE')), 'HAVE 3:1:1')
+        self.assertEqual(s.close(),0)
+        self.assertEqual([line for line in s.err if line.startswith('MOCK_IMAGE_DISK_RESTORE')],
+                         ['MOCK_IMAGE_DISK_RESTORE key=43'])
+
+    def test_worker_image_binding_info_is_aggregated_without_protocol_fragments(self):
+        self.assertNotIn('persistent_images_bound=', ''.join(self.s.lines))
+        self.assertTrue(all(line.startswith(('INFO ', 'READY ')) for line in self.s.lines))
+        for bound in ('0', '1'):
+            s=Session({'MOCK_PERSISTENT_IMAGES_BOUND':bound});self.addCleanup(s.close)
+            infos=[line for line in s.lines if line.startswith('INFO engine=q36')]
+            self.assertEqual(len(infos),1)
+            self.assertIn('persistent_images_bound='+bound,infos[0])
+            self.assertTrue(all(line.startswith(('INFO ', 'READY ')) for line in s.lines), s.lines)
+            self.assertFalse(any('mock=1' in line for line in s.lines))
+
     def test_prefill_chunk_metadata_and_actual_owner_init(self):
         self.assertIn('batch_prefill_chunk=64',next(l for l in self.s.lines if l.startswith('INFO engine=q36')))
         s=Session({'MOCK_PREFILL_CHUNK':'256','MOCK_REQUIRE_CHUNK':'256'});self.addCleanup(s.close)

@@ -3449,6 +3449,8 @@ class Vision:
         args = self.reader_args(cfg)
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
+        self.persistence_requested = bool((env if env is not None else os.environ).get("STRATA_PREFIX_CACHE_DIR"))
+        self.persistent_images = False  # enabled only after an eager reader is bound before native startup
         # AMD: the GPU reader (strata-vision-hip) has the CPU reader (strata-vision, same program, no GPU runtime) to
         # fall back on when it does not start; _start switches to it by itself
         cpu = vision_reader.cpu_fallback(cfg)
@@ -3504,6 +3506,71 @@ class Vision:
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
         return args
+
+    def persistence_namespace(self) -> str:
+        """Resolve the actual reader before a native HAVE may bypass encoding.
+
+        Its configured GPU reader can fall back to a CPU reader. The selected
+        executable, options and loaded library inventory, rather than only the
+        originally configured pair, therefore belong to the image identity.
+        Inputs must remain immutable while this reader is running.
+        """
+        if not self.persistence_requested:
+            return ""
+        if not self.alive():
+            if self.on_start is not None:
+                self.on_start()
+            self._start()
+        args, _, env = self.spawn
+        files = {str(Path(__file__).resolve()), str(Path(vision_reader.__file__).resolve())}
+        # Optional normalization code can change a UUID's pixels without changing
+        # the UUID. Include its installed implementation, without decoding a picture.
+        from importlib.util import find_spec
+        pillow = find_spec("PIL")
+        if pillow and pillow.origin:
+            package = Path(pillow.origin).resolve().parent
+            files.update(str(p.resolve()) for p in package.iterdir()
+                         if p.is_file() and (p.suffix == ".py" or ".so" in p.name))
+            libraries = package.parent / "pillow.libs"
+            if libraries.is_dir():
+                files.update(str(p.resolve()) for p in libraries.iterdir() if p.is_file())
+        for i in (0, 2, 4):
+            path = shutil.which(args[i], path=(env or os.environ).get("PATH")) if i == 0 else args[i]
+            if not path:
+                raise ValueError("persistent image identity requires a resolved reader")
+            original = Path(path)
+            files.add(str(original.resolve(strict=True)))
+            # Keep the configured spelling: HF snapshot shards can be symlinks
+            # to opaque blob names, while the loader finds siblings by shard name.
+            split = re.fullmatch(r"(.*-)\d{5}-of-(\d{5})(\.gguf)", original.name)
+            if i != 0 and split:
+                count = int(split[2])
+                if not 1 <= count <= 4096:
+                    raise ValueError("persistent image reader split inventory is not bounded")
+                for part in range(1, count + 1):
+                    files.add(str((original.parent / f"{split[1]}{part:05d}-of-{count:05d}{split[3]}").resolve(strict=True)))
+        # Persistent native storage is Linux-only. Refuse unbound image reuse
+        # when the actual loaded implementation cannot be inspected.
+        proc = Path("/proc") / str(self.proc.pid)
+        files.add(str((proc / "exe").resolve(strict=True)))
+        for line in (proc / "maps").read_text().splitlines():
+            if "/" not in line:
+                continue
+            path = line[line.index("/"):]
+            if ".so" in path:
+                if path.endswith(" (deleted)"):
+                    raise ValueError("persistent image reader inventory changed; restart the reader")
+                files.add(str(Path(path).resolve(strict=True)))
+        inventory = []
+        for name in sorted(files):
+            stat = Path(name).stat()
+            inventory.append((name, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+        effective = {k: v for k, v in (env or os.environ).items()
+                     if (k.startswith(("STRATA_", "XOLOTL_", "CUDA_", "HIP_", "GGML_", "ROCR_", "OMP_", "MKL_", "OPENBLAS_"))
+                         or k in ("LD_LIBRARY_PATH", "PATH", "NVIDIA_TF32_OVERRIDE", "CUBLAS_WORKSPACE_CONFIG"))
+                     and not k.startswith("STRATA_PREFIX_CACHE_") and not (k.endswith("_LOG") or "_LOG_" in k)}
+        identity = json.dumps(["vision-pipeline-v1", args, effective, inventory], sort_keys=True).encode()
+        return hashlib.sha256(identity).hexdigest()
 
     def _ensure_dir(self):
         """#3370: a temp cleaner (Windows Storage Sense) removes the empty work folder while the encoder is unloaded; the next
@@ -4387,6 +4454,29 @@ def deepseek_slot_env(env: dict, cfg: dict) -> None:
         env["STRATA_DS4_SLOT_DIR"] = str(Path(log).parent / "ds4-slots")
 
 
+def bind_persistent_vision(env: dict, vision) -> None:
+    """Only an already selected eager reader can bind native disk image state.
+
+    Lazy, elastic and direct native callers remain unbound. Their normal image
+    path still works, but Qwen3.6 does not restore/publish image state on disk.
+    """
+    env.pop("STRATA_PREFIX_CACHE_VISION_ID", None)
+    vision.persistent_images = False
+    if env.get("STRATA_PREFIX_CACHE_DIR") and vision.alive():
+        try:
+            identity = vision.persistence_namespace()
+            if not re.fullmatch(r"[0-9a-f]{64}", identity):
+                raise ValueError("reader identity unavailable")
+        except (OSError, ValueError) as error:
+            print(f"[strata] persistent image state disabled: reader identity unavailable ({type(error).__name__})", flush=True)
+            return
+        env["STRATA_PREFIX_CACHE_VISION_ID"] = "frontend-vision-pipeline-v1:" + identity
+        vision.persistent_images = True
+        print(f"[strata] persistent image producer bound: {identity}", flush=True)
+    elif env.get("STRATA_PREFIX_CACHE_DIR"):
+        print("[strata] persistent image state disabled: reader was not started before native startup", flush=True)
+
+
 def child_env(cfg: dict, *, offline: bool = False) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -4428,6 +4518,9 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         auto = hip_auto_devices(cfg, env)
         if auto:
             env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in auto)
+    # The native side rejects persisted image state from an unbound embedding
+    # producer. Runtime-specific reader identity is carried by the picture keys.
+    env.pop("STRATA_PREFIX_CACHE_VISION_ID", None)
     return env
 
 
@@ -6130,6 +6223,19 @@ class Service:
             encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
                        else [self.vision.encode(src) for src in images])
             return encoded, [None] * len(encoded)
+        namespace = ""
+        if getattr(self.vision, "persistent_images", False):
+            for idx, (src, uid) in enumerate(zip(images, image_ids)):
+                if src is None and uid not in self.image_ids:
+                    raise ImageCacheMiss(f"Cache miss for image at index {idx} but data is not provided.")
+            self._vision_up()
+            namespace = self.vision.persistence_namespace()
+            if namespace != getattr(self, "_persistent_image_namespace", None):
+                self.image_ids.clear()
+                self._raw_keys.clear()
+                self._persistent_image_namespace = namespace
+        def picture_key(key):
+            return hashlib.sha256(("vision-pipeline-v1\0" + namespace + "\0" + key).encode()).hexdigest()[:32] if namespace else key
         # vLLM's multimodal uuid: a picture with a uuid is that uuid (its cache key), data or not; one the server holds
         # by its uuid is not read again (the data, when sent too, is ignored, as vLLM ignores it); an unknown uuid
         # without data is vLLM's "Cache miss" 400.  A picture without a uuid is its normalized bytes' hash.
@@ -6148,7 +6254,7 @@ class Service:
                     raise ImageCacheMiss(f"Cache miss for image at index {idx} but data is not provided.")
                 raw = src if isinstance(src, bytes) else Vision.load(src)
                 data = Vision.normalize(raw)
-                key = hashlib.sha256(("uuid\0" + uid).encode("utf-8", "surrogatepass")).hexdigest()[:32]
+                key = picture_key(hashlib.sha256(("uuid\0" + uid).encode("utf-8", "surrogatepass")).hexdigest()[:32])
                 self.image_ids[uid] = key
                 self.image_ids.move_to_end(uid)
                 while len(self.image_ids) > self.IMAGE_IDS_MAX:
@@ -6164,7 +6270,7 @@ class Service:
             key = self._raw_keys.get(memo)       # a picture sent again as the same bytes: no decode, no hash
             if key is None or not by_reference:   # (a refill re-reads every picture)
                 data = Vision.normalize(raw)
-                key = Vision.key_of(data)
+                key = picture_key(Vision.key_of(data))
                 self._raw_keys[memo] = key
                 while len(self._raw_keys) > self.IMAGE_IDS_MAX:
                     self._raw_keys.popitem(last=False)
@@ -10646,6 +10752,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                       "encoder's GPU, or the first picture may not get it", flush=True)
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env), lazy=lazy)
+            bind_persistent_vision(env, vision)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080

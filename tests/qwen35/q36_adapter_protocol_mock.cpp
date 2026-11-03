@@ -52,7 +52,12 @@ struct Engine {
         return true;
     }
 };
-struct ImageCache {struct Img{int n=3,nx=1,ny=1;};std::recursive_mutex mutex;Img im;Img* find(uint64_t key){return key==42?&im:nullptr;}};
+struct ImageCache {
+    struct Img{int n=3,nx=1,ny=1;};
+    std::recursive_mutex mutex; std::function<void(uint64_t)> restore_persistent;
+    Img im; bool disk_restored=false;
+    Img* find(uint64_t key){return key==42 || (key==43 && disk_restored)?&im:nullptr;}
+};
 void serve(Engine& e,ImageCache&,int,size_t park_bytes,const std::string&){
     if(e.cache_hub && ((e.max_snaps>0 && !e.cache_hub->snaps_initialized) || (park_bytes>0 && !e.cache_hub->pages_initialized)))throw std::runtime_error("shared host pool was not initialized before workers");
     if(e.snapshot_owner_lineage != (std::getenv("MOCK_SNAPSHOT_OWNER")!=nullptr))throw std::runtime_error("worker ignored snapshot owner option");
@@ -60,7 +65,9 @@ void serve(Engine& e,ImageCache&,int,size_t park_bytes,const std::string&){
     Q36Channel* c=q36_channel; std::thread generating;
     std::string line;
     if(e.batch_slot==3 && std::getenv("MOCK_DELAY_READY"))std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    c->write("INFO mock=1\n"); c->write("READY 262144 stop\n");
+    std::string info="INFO mock=1";
+    if(const char* bound=std::getenv("MOCK_PERSISTENT_IMAGES_BOUND"))info+=" persistent_images_bound="+std::string(bound);
+    c->write(info+"\n"); c->write("READY 262144 stop\n");
     while(c->read(line)){
         if(line=="STOP"){e.cancel->store(true);continue;}
         if(generating.joinable()) generating.join();
@@ -93,4 +100,4 @@ void serve(Engine& e,ImageCache&,int,size_t park_bytes,const std::string&){
     e.cancel->store(true);if(generating.joinable())generating.join();
 }
 #include "../../src/qwen35/q36_parallel.hpp"
-int main(){std::set_terminate([]{std::_Exit(86);});Model model;Engine scratch;scratch.init(model,262144,512);scratch.resident_prefix_reuse=std::getenv("MOCK_RESIDENT_PREFIX")!=nullptr;scratch.snapshot_owner_lineage=std::getenv("MOCK_SNAPSHOT_OWNER")!=nullptr;ImageCache images;strata::q36::kv::Budget budget;strata::q36::kv::Driver driver;int result=serve_parallel(scratch,images,"mock",std::getenv("MOCK_SLOTS")?std::atoi(std::getenv("MOCK_SLOTS")):4,1,std::getenv("MOCK_PREFILL_CHUNK")?std::atoi(std::getenv("MOCK_PREFILL_CHUNK")):64,std::getenv("MOCK_HOST_PARK")?1048576:0,std::getenv("MOCK_NO_SNAPS")?0:1,budget,driver,false);std::fprintf(stderr,"MOCK_HUB_ALLOCS snapshots=%d pages=%d\n",mock_snap_allocations.load(),mock_page_allocations.load());return result;}
+int main(){std::set_terminate([]{std::_Exit(86);});Model model;Engine scratch;scratch.init(model,262144,512);scratch.resident_prefix_reuse=std::getenv("MOCK_RESIDENT_PREFIX")!=nullptr;scratch.snapshot_owner_lineage=std::getenv("MOCK_SNAPSHOT_OWNER")!=nullptr;ImageCache images;if(std::getenv("MOCK_IMAGE_DISK_RESTORE"))images.restore_persistent=[&](uint64_t key){bool unlocked=false;std::thread probe([&]{unlocked=images.mutex.try_lock();if(unlocked)images.mutex.unlock();});probe.join();if(!unlocked)throw std::runtime_error("disk callback owns image mutex");std::fprintf(stderr,"MOCK_IMAGE_DISK_RESTORE key=%llu\n",(unsigned long long)key);std::lock_guard<std::recursive_mutex> lock(images.mutex);if(key==43)images.disk_restored=true;};strata::q36::kv::Budget budget;strata::q36::kv::Driver driver;int result=serve_parallel(scratch,images,"mock",std::getenv("MOCK_SLOTS")?std::atoi(std::getenv("MOCK_SLOTS")):4,1,std::getenv("MOCK_PREFILL_CHUNK")?std::atoi(std::getenv("MOCK_PREFILL_CHUNK")):64,std::getenv("MOCK_HOST_PARK")?1048576:0,std::getenv("MOCK_NO_SNAPS")?0:1,budget,driver,false);std::fprintf(stderr,"MOCK_HUB_ALLOCS snapshots=%d pages=%d\n",mock_snap_allocations.load(),mock_page_allocations.load());return result;}

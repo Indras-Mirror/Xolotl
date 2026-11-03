@@ -36,6 +36,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -1545,6 +1546,28 @@ bool Engine::release_prefill_workspace(std::string & error) {
     return p_->release_prefill_workspace(error);
 }
 
+std::string Engine::prefix_runtime_identity() const {
+    if (!p_->ready || p_->slumber.active || !p_->backend) return {};
+    const auto device = ggml_backend_get_device(p_->backend);
+    if (!device) return {};
+    ggml_backend_dev_props properties{};
+    ggml_backend_dev_get_props(device, &properties);
+    std::ostringstream out;
+    out << "backend=" << ggml_backend_name(p_->backend)
+        << " name=" << (properties.name ? properties.name : "")
+        << " description=" << (properties.description ? properties.description : "")
+        << " type=" << int(properties.type) << " id=" << (properties.device_id ? properties.device_id : "")
+        << " memory=" << properties.memory_total;
+#ifdef M31_ENGINE_CUDA
+    if (ggml_backend_is_cuda(p_->backend)) {
+        const auto cuda = cuda_prefix_runtime_identity();
+        if (cuda.empty()) return {};
+        out << ' ' << cuda;
+    }
+#endif
+    return out.str();
+}
+
 size_t Engine::prefix_checkpoint_bytes() const {
     if (!p_->ready || p_->poisoned || p_->pos <= 0) return 0;
     return size_t(p_->g.kv_bytes(p_->pos));
@@ -1552,8 +1575,8 @@ size_t Engine::prefix_checkpoint_bytes() const {
 
 bool Engine::checkpoint_prefix(size_t maximum_bytes, PrefixCheckpointPtr & out, std::string & error) {
     try {
-        require(p_->ready && !p_->poisoned && p_->pos > 0 && p_->last_n > 0,
-                "prefix checkpoint requires a completed nonempty forward");
+        require(p_->ready && !p_->poisoned && !p_->slumber.active && p_->pos > 0,
+                "prefix checkpoint requires valid nonempty KV rows");
         const size_t total = prefix_checkpoint_bytes();
         require(total > 0 && total <= maximum_bytes, "prefix checkpoint exceeds host cache budget");
         auto checkpoint = std::shared_ptr<PrefixCheckpoint>(new PrefixCheckpoint);
@@ -1617,6 +1640,27 @@ bool Engine::restore_prefix(const PrefixCheckpointPtr & checkpoint, std::string 
         error = exception.what();
         return false;
     }
+}
+
+bool Engine::import_prefix(int64_t position, std::vector<uint8_t> payload,
+                           PrefixCheckpointPtr & out, std::string & error) const {
+    try {
+        require(p_->ready && !p_->poisoned && !p_->slumber.active,
+                "prefix import requires a valid awake engine");
+        require(position > 0 && position <= p_->cfg.context &&
+                payload.size() == size_t(p_->g.kv_bytes(position)),
+                "invalid imported prefix size/context");
+        for (const auto & kv : p_->cache)
+            for (auto * tensor : {kv.k, kv.v, kv.index})
+                require(tensor && tensor->type == GGML_TYPE_F16 && ggml_is_contiguous(tensor),
+                        "prefix import requires contiguous F16 cache tensors");
+        auto checkpoint = std::shared_ptr<PrefixCheckpoint>(new PrefixCheckpoint);
+        checkpoint->owner_ = p_->checkpoint_owner;
+        checkpoint->position_ = position;
+        checkpoint->bytes_ = std::move(payload);
+        out = std::move(checkpoint);
+        return true;
+    } catch (const std::exception & exception) { error = exception.what(); return false; }
 }
 
 bool Engine::asleep() const { return p_->slumber.active; }
