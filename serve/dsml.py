@@ -23,26 +23,74 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from serve.frontend import Event, OutputParser
+from serve.frontend import CALL_START, FUNC_START, Event, OutputParser
 
 DSML = "｜DSML｜"
 _OPEN = "<" + DSML
 _CLOSE = "</" + DSML
 _TAG_MAX = 600                  # a tag (a tool name, a parameter name) longer than this is text, not held any further
 
-_CALLS = re.compile(r"<｜DSML｜\s*(?:tool_|function_)?calls\s*>")
-_CALLS_END = re.compile(r"</｜DSML｜\s*(?:tool_|function_)?calls\s*>")
-_INVOKE = re.compile(r'<｜DSML｜\s*invoke\s+name\s*=\s*"([^"]*)"\s*>')
-_INVOKE_END = re.compile(r"</｜DSML｜\s*invoke\s*>")
-_PARAM = re.compile(r'<｜DSML｜\s*parameter\s+name\s*=\s*"([^"]*)"(?:\s+string\s*=\s*"(true|false)")?\s*>')
-_PARAM_END = re.compile(r"</｜DSML｜\s*parameter\s*>")
+# The tag marker.  The model's own is the ｜DSML｜ token; low-bit quants also write the tags without it - `< invoke
+# name="write">` - or with a backslash (ASCII or U+FF3C) where the token goes (2026-11-02, UD-IQ1_M: such calls reached
+# clients as text).  group "m": the token (any spacing after it), a backslash (any spacing), or nothing - then at least
+# one space, so `<invoke>` / `<calls>` in prose are never tags.  A tag without the token opens a call only for a tool the
+# request declared (DsmlTranslator's `known`), the rule tool_call_recovery uses.
+_M = r"(?P<m>｜DSML｜\s*|[\\＼｜]DSML[\\＼｜]\s*|[\\＼]\s*|\s+)"   # ... or the token misspelled: ＼DSML＼, \DSML\
+_CALLS = re.compile(rf"<{_M}(?:tool_|function_)?calls\s*>")
+_CALLS_END = re.compile(rf"</{_M}(?:tool_|function_)?calls\s*>")
+_INVOKE = re.compile(rf'<{_M}invoke\s+name\s*=\s*"(?P<name>[^"]*)"\s*>')
+_INVOKE_END = re.compile(rf"</{_M}invoke\s*>")
+_PARAM = re.compile(rf'<{_M}parameter\s+name\s*=\s*"(?P<name>[^"]*)"(?:\s+string\s*=\s*"(?P<s>true|false)")?\s*>')
+_PARAM_END = re.compile(rf"</{_M}parameter\s*>")
 # a tag cut short is held while it can still become one of those: "<", "<｜DS", '<｜DSML｜ invoke name="get_we'
 _PARTIAL = re.compile(r"^</?(?:｜(?:D(?:S(?:M(?:L(?:｜[^<>]*)?)?)?)?)?)?$")
+# ... and in the token-less forms: "< ", "<\\", "< inv", '< invoke name="wr', "</ param"
+_BARE_HEAD = re.compile(r"^</?(?:[\\＼]\s*|\s+)(?P<rest>[^<>]*)$")
+_ALT_PARTIAL = re.compile(r"^</?[\\＼｜](?:D(?:S(?:M(?:L)?)?)?)?$")    # "<＼", "<＼DSM"
+_ALT = re.compile(r"^(</?)[\\＼｜]DSML[\\＼｜]")
+_WORDS = ("calls", "tool_calls", "function_calls", "invoke", "parameter")
 
 
 def _could_still_be_a_tag(s: str) -> bool:
     """`s` starts with '<' and has no '>' yet: it may be the start of a DSML tag."""
-    return len(s) <= _TAG_MAX and _PARTIAL.match(s) is not None
+    if len(s) > _TAG_MAX:
+        return False
+    if _PARTIAL.match(s) is not None:
+        return True
+    if _ALT_PARTIAL.match(s) is not None:
+        return True
+    s = _ALT.sub(r"\1 ", s, count=1)          # `<＼DSML＼ inv` is held as `< inv` is
+    m = _BARE_HEAD.match(s)
+    if m is None:
+        return s in ("<\\", "</\\", "<＼", "</＼")
+    rest = m.group("rest")
+    if any(w.startswith(rest) for w in _WORDS):
+        return True
+    for w in ("invoke", "parameter"):          # the word is whole: its attributes are still arriving
+        if rest.startswith(w) and (rest == w or rest[len(w)].isspace()) and "\n" not in rest:
+            return True
+    return any(rest.startswith(w) and rest[len(w):].strip() == "" for w in _WORDS[:3])
+
+
+def _is_tag_start(head: str) -> bool:
+    """`head` (up to its '>') starts like a DSML tag: `<｜DSML｜`, `<\\`, `<＼` or `< ` (closing forms too)."""
+    i = 2 if head.startswith("</") else 1
+    return head.startswith(DSML, i) or head[i:i + 1] in ("\\", "＼", "｜") or head[i:i + 1].isspace()
+
+
+def _qwen_opener_cut(held: str) -> bool:
+    """The parser's held text is the start of a call in the Qwen form and nothing else: `<tool_`, `<tool_call>\n<func`,
+    `<function=get_w` (what the output ends on when max_tokens lands in a call's opener)."""
+    s = held.lstrip()
+    if not s:
+        return False
+    if any(t.startswith(s) for t in (CALL_START, FUNC_START)):
+        return True
+    if s.startswith(CALL_START):
+        s = s[len(CALL_START):].lstrip()
+        if not s or FUNC_START.startswith(s):
+            return True
+    return s.startswith(FUNC_START) and ">" not in s and "\n" not in s
 
 
 class DsmlTranslator:
@@ -51,11 +99,12 @@ class DsmlTranslator:
     on_param(tool, name, is_string) is called when a parameter tag is read, before its text is returned, so the parser
     behind it can treat a string="true" value as the string it is."""
 
-    def __init__(self, on_param=None):
+    def __init__(self, on_param=None, known=None):
         self.buf = ""
         self.state = "text"        # text | calls (inside the block) | invoke | param (inside a value)
         self.tool = None
         self.on_param = on_param
+        self.known = known         # tool name -> declared?  A call opened without the DSML token needs a declared tool
 
     @property
     def held(self) -> str:
@@ -108,7 +157,7 @@ class DsmlTranslator:
         if gt < 0:
             return "wait" if _could_still_be_a_tag(s) else None
         head = s[:gt + 1]
-        if not (head.startswith(_OPEN) or head.startswith(_CLOSE)):
+        if not _is_tag_start(head):
             return None
         out = outl.append
         m = _PARAM_END.fullmatch(head)
@@ -146,19 +195,22 @@ class DsmlTranslator:
             return True
         m = _INVOKE.fullmatch(head)
         if m:
+            name = m.group("name")
+            if not m.group("m").startswith(DSML) and not (self.known is not None and self.known(name)):
+                return None                     # `< invoke name="X">` without the token: a call only for a declared tool
             if self.state == "invoke":          # the previous call's closing tag was left out
                 out("</function>\n</tool_call>\n")
             self.buf = s[gt + 1:]
-            self.state, self.tool = "invoke", m.group(1)
-            out(f"<tool_call>\n<function={m.group(1)}>\n")
+            self.state, self.tool = "invoke", name
+            out(f"<tool_call>\n<function={name}>\n")
             return True
         m = _PARAM.fullmatch(head)
         if m and self.state in ("calls", "invoke"):
             self.buf = s[gt + 1:]
             self.state = "param"
             if self.on_param is not None:
-                self.on_param(self.tool, m.group(1), m.group(2) != "false")
-            out(f"<parameter={m.group(1)}>\n")
+                self.on_param(self.tool, m.group("name"), m.group("s") != "false")
+            out(f"<parameter={m.group('name')}>\n")
             return True
         return None
 
@@ -168,7 +220,7 @@ class DsmlOutputParser(OutputParser):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.dsml = DsmlTranslator(self._on_param)
+        self.dsml = DsmlTranslator(self._on_param, known=lambda name: name in self.schemas)
         # The 2-bit sets often write the whole answer after <think> and stop (EOS) without </think>: everything would be reasoning and
         # the reply empty (P2003 install test, 4 of 4 prompts).  The reasoning text is kept here; finish() hands it over as the answer
         # when the turn ended on a stop with no answer and no call.
@@ -211,6 +263,16 @@ class DsmlOutputParser(OutputParser):
             self.dsml.buf = ""
         rest = self.dsml.flush()
         out = self._watch(super().feed(rest) if rest else [])
+        if reason not in (None, "stop") and self.state == "content" and _qwen_opener_cut(self.buf):
+            self.buf = ""                  # ... and inside the opener of a call the model wrote in the Qwen form (`<tool_`)
+        elif reason not in (None, "stop") and self.state in ("call", "json") and self.scall is None:
+            self.buf = ""                  # ... or after it, before the call had a name (`<tool_call>\n<func`): no call to report
+        elif reason not in (None, "stop") and self.state == "call" and self.stream_tools and self.scall is not None:
+            # ... or a call already announced: it stays the unfinished call the stream shows (tool_start + its arguments,
+            # no tool_call).  The base parser sends a call cut right after its </function> as text, markup and all.
+            out += self._watch(self._scan())
+            self.buf, self.state = "", "content"
+            self._reset_scan()
         out += self._watch(super().finish(reason))
         text = "".join(self._reasoning).strip()
         if reason in (None, "stop") and text and not self._answered:
