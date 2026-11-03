@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -167,8 +168,33 @@ class Ds41Template:
 
     def render(self, messages, tools=None, add_generation_prompt=True, **kw):
         mode = "chat" if kw.get("enable_thinking") is False else "thinking"
-        prompt = E.encode_messages(to_encoder_messages(messages, tools), thinking_mode=mode,
+        encoder_messages = to_encoder_messages(messages, tools)
+        reference_markers = []
+        for message in encoder_messages:
+            parts = message.get("content")
+            if not isinstance(parts, list):
+                continue
+            for index, part in enumerate(parts):
+                uid = part.get("uuid")
+                if not isinstance(uid, str) or not uid:
+                    continue
+                kind = part.get("type")
+                source = part.get("image_url") if kind == "image_url" else None
+                if isinstance(source, dict):
+                    source = source.get("url")
+                reference = (kind == "image_url" and not source) or (kind == "image" and
+                    not any(part.get(key) for key in ("source", "url", "data")))
+                if reference:
+                    # Only the encoder copy becomes a text sentinel. Its image
+                    # preprocessor requires bytes/URL, but Service._pictures owns
+                    # UUID lookup and the original source-less part must reach it.
+                    marker = "[strata-ds41-image-reference-" + uuid.uuid4().hex + "]"
+                    reference_markers.append(marker)
+                    parts[index] = {"type": "text", "text": marker}
+        prompt = E.encode_messages(encoder_messages, thinking_mode=mode,
                                    reasoning_effort=_level(kw.get("reasoning_effort")))
+        for marker in reference_markers:
+            prompt = prompt.replace(marker, E.IMAGE_PLACEHOLDER)
         if not add_generation_prompt:
             for s in GEN_SUFFIXES:
                 if prompt.endswith(s):
