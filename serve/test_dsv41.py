@@ -273,6 +273,96 @@ class Parser(unittest.TestCase):
         evs = p.feed("ok <｜DSML｜ inv") + p.finish("stop")
         self.assertEqual("".join(e.text for e in evs if e.kind == "content"), "ok <｜DSML｜ inv")
 
+    # The invariant: call markup never reaches the content.  Every way the model has written a call - the DSML token,
+    # tags without it (`< invoke`), a backslash or U+FF3C where it goes, the token misspelled (＼DSML＼), markers mixed
+    # within one call, and the Qwen form - for a declared tool, whole (one real call) and cut at every character.
+    MARKERS = {"dsml": ("｜DSML｜ ",) * 3, "bare": (" ",) * 3, "backslash": ("\\ ",) * 3, "fullwidth": ("＼ ",) * 3,
+               "misspelled": ("＼DSML＼ ",) * 3, "mixed": ("｜DSML｜ ", " ", "\\ ")}
+    MARKUP = ("DSML", "｜", "invoke", "parameter", "<tool_call>", "<function=", "</function>")
+
+    def forms(self, tool="get_weather"):
+        for name, (a, b, c) in self.MARKERS.items():
+            yield name, (f'<{a}calls>\n<{a}invoke name="{tool}">\n<{b}parameter name="city" string="true">Zagreb'
+                         f'</{c}parameter>\n<{b}parameter name="days" string="false">3</{c}parameter>\n</{c}invoke>\n'
+                         f'</{a}calls>')
+        yield "qwen", (f"<tool_call>\n<function={tool}>\n<parameter=city>\nZagreb\n</parameter>\n"
+                       "<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>")
+
+    def feed_all(self, text, thinking, step, reason, upto=None):
+        p = DsmlOutputParser(thinking=thinking, tools=self.TOOLS, stream_tools=True, recover=True)
+        upto = len(text) if upto is None else upto
+        evs = []
+        for i in range(0, upto, step):
+            evs += p.feed(text[i:min(i + step, upto)])
+        return evs + p.finish(reason)
+
+    def test_invariant_call_markup_never_reaches_content(self):
+        for form, raw in self.forms():
+            for thinking in (False, True):
+                text = ("plan</think>" if thinking else "") + "Checking.\n\n" + raw
+                start = text.index("Checking.") + len("Checking.\n\n")
+                for step in (1, 3, 4096):                     # whole: exactly the call, no markup in the content
+                    evs = self.feed_all(text, thinking, step, "stop")
+                    calls = [(e.call.name, e.call.arguments) for e in evs if e.kind == "tool_call"]
+                    content = "".join(e.text for e in evs if e.kind == "content")
+                    self.assertEqual(calls, [("get_weather", {"city": "Zagreb", "days": 3})], (form, thinking, step))
+                    self.assertEqual(content.strip(), "Checking.", (form, thinking, step))
+                for cut in range(start, len(text)):           # cut by max_tokens anywhere in the call
+                    for step in (1, 7, 4096):
+                        evs = self.feed_all(text, thinking, step, "length", upto=cut)
+                        content = "".join(e.text for e in evs if e.kind == "content")
+                        bad = [m for m in self.MARKUP if m in content]
+                        self.assertFalse(bad, (form, thinking, cut, step, content[-60:]))
+                        self.assertEqual(content.strip(), "Checking.", (form, thinking, cut, step))
+
+    def test_a_dsml_call_to_an_undeclared_tool_is_a_call(self):
+        # 2026-11-03: history with a settled `bash` call, tools = [write]: the model called bash again and the base rule
+        # (#3075, an undeclared name is text) sent the call to the content as <tool_call> markup (4 of 6 replies).  In a
+        # calls block (or with the token) it is a call: whole -> that call; cut anywhere -> no markup in the content.
+        for form, raw in self.forms(tool="bash"):
+            text = "Checking.\n\n" + raw
+            start = len("Checking.\n\n")
+            for step in (1, 3, 4096):
+                evs = self.feed_all(text, False, step, "stop")
+                calls = [(e.call.name, e.call.arguments) for e in evs if e.kind == "tool_call"]
+                self.assertEqual(calls, [("bash", {"city": "Zagreb", "days": 3})], (form, step))
+                self.assertEqual("".join(e.text for e in evs if e.kind == "content").strip(), "Checking.", (form, step))
+            for cut in range(start, len(text)):
+                for step in (1, 7, 4096):
+                    evs = self.feed_all(text, False, step, "length", upto=cut)
+                    content = "".join(e.text for e in evs if e.kind == "content")
+                    self.assertEqual(content.strip(), "Checking.", (form, cut, step, content[-60:]))
+
+    def test_tags_without_the_token_are_calls_only_for_declared_tools(self):
+        for text in ('Use < invoke name="rm"> carefully.', "if a < b and c <invoke> then x < calls",
+                     '<div class="x"> < p > hi </p>', "x <calls> y <\\ z", "a < invoke b"):
+            for step in (1, 4096):
+                evs = self.feed_all(text, False, step, "stop")
+                self.assertEqual("".join(e.text for e in evs if e.kind == "content"), text, (text, step))
+                self.assertFalse([e for e in evs if e.kind in ("tool_call", "tool_start")], text)
+
+    def test_a_lone_call_to_an_undeclared_tool_at_the_start_of_a_line_is_a_call(self):
+        for raw in ('< invoke name="bash">\n< parameter name="command" string="true">ls</ parameter>\n</ invoke>',
+                    '<\\ invoke name="bash">\n<\\ parameter name="command" string="true">ls</\\ parameter>\n</\\ invoke>',
+                    "<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>"):
+            for lead in ("", "Checking.\n\n"):
+                for step in (1, 7, 4096):
+                    evs = self.feed_all(lead + raw, False, step, "stop")
+                    calls = [(e.call.name, e.call.arguments) for e in evs if e.kind == "tool_call"]
+                    self.assertEqual(calls, [("bash", {"command": "ls"})], (raw, lead, step))
+                    self.assertEqual("".join(e.text for e in evs if e.kind == "content").strip(), lead.strip(), (raw, lead, step))
+
+    def test_a_quoted_call_to_an_undeclared_tool_stays_text(self):
+        # At the start of a line a call without the token is an act; quoted, it is what the model is talking about.
+        call = "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>"
+        bare = '< invoke name="bash">\n< parameter name="command" string="true">ls</ parameter>\n</ invoke>'
+        for raw in (call, bare):
+            for text in (f"Calls look like {raw}", f"Calls look like:\n\n```\n{raw}\n```\nThat is all.", f"Use `{raw}` here."):
+                for step in (1, 7, 4096):
+                    evs = self.feed_all(text, False, step, "stop")
+                    self.assertFalse([e for e in evs if e.kind in ("tool_call", "tool_start")], (text, step))
+                    self.assertEqual("".join(e.text for e in evs if e.kind == "content"), text, (text, step))
+
     def test_the_plain_parser_is_unchanged(self):
         p = OutputParser(thinking=False, tools=self.TOOLS)
         evs = p.feed("<tool_call>\n<function=lookup>\n<parameter=id>\n5\n</parameter>\n</function>\n</tool_call>")
