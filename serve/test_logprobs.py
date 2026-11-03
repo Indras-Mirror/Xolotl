@@ -191,6 +191,7 @@ class Generate(unittest.TestCase):
 
     def engine(self, *lines):
         e = StrataEngine.__new__(StrataEngine)
+        e.info = {}  # bare fixtures still model the initialized capability map
         e.proc = __import__("types").SimpleNamespace(
             stdin=__import__("io").StringIO(), poll=lambda: None)
         e.lines, e.can_stop, e.max_context, e.silence_s = queue.Queue(), False, 262144, 0

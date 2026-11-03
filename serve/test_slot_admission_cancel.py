@@ -53,7 +53,6 @@ class SlotAdmissionCancel(unittest.TestCase):
         engine.alive = lambda: True
         engine.can_stop = True
         engine.proc = types.SimpleNamespace(stdin=io.StringIO())
-        engine.sampling_keys = lambda request: ""
         engine.pick_slot = lambda prompt: None
         engine._reap_orphan_slots = lambda: None
 
