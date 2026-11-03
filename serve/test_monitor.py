@@ -66,7 +66,7 @@ class Monitor(unittest.TestCase):
         self.httpd.shutdown()
         self.httpd.server_close()
 
-    def request(self, path, body=None, headers=None):
+    def request(self, path, body=None, headers=None, *, wait_completed=False):
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode() if body is not None else None,
                                      headers={"Content-Type": "application/json", **(headers or {})})
         try:
@@ -74,15 +74,35 @@ class Monitor(unittest.TestCase):
         except urllib.error.HTTPError as error:
             response = error
         with response:
-            raw = response.read().decode()
+            if wait_completed:
+                # Reading the final byte can close urllib's connection even
+                # inside this context. Leave it unread until finalization.
+                length = int(response.headers["Content-Length"])
+                self.assertGreater(length, 0)
+                raw = response.read(length - 1)
+                # These completion/attribution tests keep the client connected;
+                # early-close/disconnect behavior is tested separately.
+                deadline = time.monotonic() + 5
+                while True:
+                    with self.svc.status_lock:
+                        states = [record["state"] for record in self.svc.api_requests]
+                    if states and all(state == "completed" for state in states):
+                        break
+                    if time.monotonic() >= deadline:
+                        self.fail(f"monitor records did not complete: {states}")
+                    time.sleep(0.01)
+                raw += response.read()
+            else:
+                raw = response.read()
+            raw = raw.decode()
             return response.status, json.loads(raw) if "application/json" in response.headers.get("Content-Type", "") else raw
 
-    def chat(self, api="openai", **kwargs):
+    def chat(self, api="openai", *, wait_completed=False, **kwargs):
         # Anthropic thinks only when asked (#278): "thinking" there, reasoning_effort for OpenAI
         think = {"thinking": {"type": "enabled", "budget_tokens": 1024}} if api == "anthropic" else             {"reasoning_effort": "low"}
         return self.request("/v1/messages" if api == "anthropic" else "/v1/chat/completions",
                             {"messages": [{"role": "user", "content": "Say hello."}],
-                             "max_tokens": 256, **think, **kwargs})
+                             "max_tokens": 256, **think, **kwargs}, wait_completed=wait_completed)
 
     def latest(self):
         summary = self.request("/api/requests")[1]["requests"][0]
@@ -92,7 +112,7 @@ class Monitor(unittest.TestCase):
         for api in ("openai", "anthropic"):
             for stream in (False, True):
                 with self.subTest(api=api, stream=stream):
-                    code, reply = self.chat(api, stream=stream)
+                    code, reply = self.chat(api, stream=stream, wait_completed=not stream)
                     self.assertEqual(code, 200)
                     record = self.latest()
                     self.assertEqual(record["state"], "completed")
@@ -166,9 +186,11 @@ class Monitor(unittest.TestCase):
             self.assertTrue(release.wait(5))
             original()
         with mock.patch.object(self.engine, "restart", side_effect=restart), ThreadPoolExecutor(max_workers=2) as pool:
-            first = pool.submit(self.chat)
+            # This test requires completed records, so neither client closes
+            # its response before the handler publishes that terminal state.
+            first = pool.submit(self.chat, wait_completed=True)
             self.assertTrue(entered.wait(5))
-            second = pool.submit(self.chat)
+            second = pool.submit(self.chat, wait_completed=True)
             deadline = time.monotonic() + 5
             while len(self.svc.api_requests) < 2 and time.monotonic() < deadline:
                 time.sleep(0.01)
@@ -181,11 +203,12 @@ class Monitor(unittest.TestCase):
             release.set()
             self.assertEqual(first.result()[0], 200)
             self.assertEqual(second.result()[0], 200)
-        records = list(self.svc.api_requests)
+        with self.svc.status_lock:
+            records = [dict(record) for record in self.svc.api_requests]
         self.assertGreater(records[0]["load_s"], 0.02)
         self.assertGreater(records[1]["queue_s"], 0.02)
         self.assertLess(records[1]["load_s"], records[0]["load_s"])
-        self.assertTrue(all(r["state"] == "completed" for r in records))
+        self.assertTrue(all(r["state"] == "completed" for r in records), records)
 
     def test_page_and_relative_assets_are_served(self):
         code, html = self.request("/api-monitor")

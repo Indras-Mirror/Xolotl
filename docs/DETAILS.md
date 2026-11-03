@@ -569,6 +569,14 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   The vocabulary is loaded without GPU layers from the native model's metadata shard; its `<|im_end|>` token must
   be included in `--eos-ids`. `grammar_after` activates the parser after the requested generated token (for thinking).
   Invalid grammar is rejected before prompt state changes. A build without this option keeps the existing path.
+- Native DeepSeek V4.1 GBNF is opt-in for source builds: configure with
+  `-DSTRATA_DS41_GRAMMAR=ON`. The `ds41_generate` serving path then advertises `grammar=1` and accepts the
+  existing `grammar` / `structured_outputs.grammar` API fields. It uses the pinned native grammar parser,
+  DeepSeek's end-of-turn token, and request-local state in both solo and batch decoding. DSpark and lookup
+  proposals remain enabled; verification uses the constrained target distribution. The server privately replays
+  committed output when a request changes between solo and batch modes. Checkpoint sleep and conversation caches
+  retain model state, while a new request always starts its own grammar. Builds without this option retain their
+  previous capability and reject GBNF requests. This build option does not change model or sampling defaults.
 - JSON output: `response_format: {"type":"json_object"}` or `{"type":"json_schema", ...}` on `/v1/chat/completions`. The schema
   must accept only JSON objects at its root (`"type":"object"`, or `anyOf`/`oneOf` of object schemas). Local `#` references
   work and remote ones are refused. Engines without native grammar use schema prompting followed by server validation,
