@@ -1394,6 +1394,27 @@ class UnfinishedToolCall(unittest.TestCase):
                 self.assertEqual([c["id"] for c in msg["tool_calls"]], want)
         msg = openai_collect([chunk({"tool_calls": [cut]}), chunk({}, "stop")])["choices"][0]["message"]
         self.assertNotIn("tool_calls", msg)
+        # opt-in "keep_cut_tool_calls": the call cut at the token limit stays, its arguments as far as they got (as a
+        # stream shows them); a turn that stopped inside a call still leaves it out
+        for finish, want in (("stop", ["a"]), ("length", ["a", "b"]), ("tool_calls", ["a", "b"])):
+            with self.subTest(keep_cut=True, finish=finish):
+                msg = openai_collect([chunk({"tool_calls": [whole]}), chunk({"tool_calls": [cut]}),
+                                      chunk({}, finish)], keep_cut=True)["choices"][0]["message"]
+                self.assertEqual([c["id"] for c in msg["tool_calls"]], want)
+        msg = openai_collect([chunk({"tool_calls": [cut]}), chunk({}, "length")], keep_cut=True)["choices"][0]["message"]
+        self.assertEqual(msg["tool_calls"][0]["function"]["arguments"], '{"y": "ha')
+
+    def test_keep_cut_tool_calls_is_opt_in(self):
+        from serve.server import keep_cut_tool_calls_setting
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertIs(svc.keep_cut_tool_calls, False)
+        self.assertIs(keep_cut_tool_calls_setting({}), False)
+        self.assertIs(keep_cut_tool_calls_setting({"keep_cut_tool_calls": True}), True)
+        self.assertIs(keep_cut_tool_calls_setting({"keep_cut_tool_calls": False}), False)
+        for bad in ("true", 0, 1, None):
+            with self.assertRaises(SystemExit):
+                keep_cut_tool_calls_setting({"keep_cut_tool_calls": bad})
 
     def test_a_whole_call(self):
         whole = {"path": "notes.txt", "content": "all of it"}
