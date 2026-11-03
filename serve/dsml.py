@@ -33,8 +33,8 @@ _TAG_MAX = 600                  # a tag (a tool name, a parameter name) longer t
 # The tag marker.  The model's own is the ｜DSML｜ token; low-bit quants also write the tags without it - `< invoke
 # name="write">` - or with a backslash (ASCII or U+FF3C) where the token goes (2026-11-02, UD-IQ1_M: such calls reached
 # clients as text).  group "m": the token (any spacing after it), a backslash (any spacing), or nothing - then at least
-# one space, so `<invoke>` / `<calls>` in prose are never tags.  A tag without the token opens a call only for a tool the
-# request declared (DsmlTranslator's `known`), the rule tool_call_recovery uses.
+# one space, so `<invoke>` / `<calls>` in prose are never tags.  A tag without the token opens a call at the start of a line
+# outside a code fence, or elsewhere for a tool the request declared (DsmlTranslator's `known`).
 _M = r"(?P<m>｜DSML｜\s*|[\\＼｜]DSML[\\＼｜]\s*|[\\＼]\s*|\s+)"   # ... or the token misspelled: ＼DSML＼, \DSML\
 _CALLS = re.compile(rf"<{_M}(?:tool_|function_)?calls\s*>")
 _CALLS_END = re.compile(rf"</{_M}(?:tool_|function_)?calls\s*>")
@@ -105,7 +105,9 @@ class DsmlTranslator:
         self.tool = None
         self.on_param = on_param
         self.known = known         # tool name -> declared?  A call opened without the DSML token needs a declared tool
-        self.opened: set[str] = set()    # tools a call was opened for with the token or inside a calls block: calls, declared or not
+        self.opened: set[str] = set()    # tools a call was opened for with the token, in a calls block or alone on a line: calls, declared or not
+        self.line = ""             # the text of the current line, and whether it is inside a code fence
+        self.fenced = False
 
     @property
     def held(self) -> str:
@@ -149,6 +151,10 @@ class DsmlTranslator:
                 return                          # the layout between tags
             # stray text inside the block: it is shown as text, and the block goes on
         out.append(text)
+        *done, self.line = (self.line + text).split("\n")
+        for line in done:
+            if line.lstrip().startswith("```"):
+                self.fenced = not self.fenced
 
     def _tag(self, outl: list[str]):
         """Handle the tag at the start of self.buf.  Returns True (a tag was consumed), "wait" (it may still become
@@ -197,9 +203,12 @@ class DsmlTranslator:
         m = _INVOKE.fullmatch(head)
         if m:
             name = m.group("name")
-            sure = m.group("m").startswith(DSML) or self.state in ("calls", "invoke")   # the token, or inside a calls block
+            # the token, inside a calls block, or at the start of a line outside a code fence: in the middle of a line or
+            # in a fence, `< invoke name="X">` is what the model is talking about, a call only for a declared tool
+            sure = (m.group("m").startswith(DSML) or self.state in ("calls", "invoke")
+                    or (not self.line.strip() and not self.fenced))
             if not sure and not (self.known is not None and self.known(name)):
-                return None                     # a lone `< invoke name="X">` without the token: a call only for a declared tool
+                return None
             if sure:
                 self.opened.add(name)
             if self.state == "invoke":          # the previous call's closing tag was left out
@@ -243,8 +252,26 @@ class DsmlOutputParser(OutputParser):
         """A call the model opened with the DSML token (or inside a calls block) is a call even for a tool the request did
         not declare.  The token is never text, so the base rule (#3075: an undeclared name is text) sent it to the content as `<tool_call>` markup
         and the client read it as the answer (2026-11-03: history with a `bash` call, tools = [write] only: the model
-        called bash again, 4 of 6 replies were that markup).  The client gets the call it can answer with an error."""
-        return super()._callable(name) or name in self.dsml.opened
+        called bash again, 4 of 6 replies were that markup).  The client gets the call it can answer with an error.
+        A call the model wrote in the Qwen form is one too where it acts: at the start of a line, outside code."""
+        if super()._callable(name) or name in self.dsml.opened:
+            return True
+        at = self.buf.find(CALL_START)
+        return self.state == "content" and at >= 0 and self._ok_at(at)
+
+    def _bare_opener(self) -> tuple[int, bool]:
+        """... and so is `<function=NAME>` with no wrapper, where the base parser wants a declared tool.  Not on the line
+        after a `<tool_call>` that was already read as text: that is the rest of a quote."""
+        found = super()._bare_opener()
+        if found[0] >= 0:
+            return found
+        p = self.buf.find(FUNC_START)
+        while p >= 0:
+            quoted = (self.line + self.buf[:p]).rstrip().endswith(CALL_START)
+            if not quoted and self.buf.find(">", p) >= 0 and self._ok_at(p):
+                return p, True
+            p = self.buf.find(FUNC_START, p + 1)
+        return -1, False
 
     def _on_param(self, tool, name, is_string) -> None:
         """string="true": the value is a string whatever it looks like ("123", "true"), as the template wrote it."""

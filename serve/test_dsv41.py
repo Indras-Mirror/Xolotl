@@ -285,9 +285,7 @@ class Parser(unittest.TestCase):
             yield name, (f'<{a}calls>\n<{a}invoke name="{tool}">\n<{b}parameter name="city" string="true">Zagreb'
                          f'</{c}parameter>\n<{b}parameter name="days" string="false">3</{c}parameter>\n</{c}invoke>\n'
                          f'</{a}calls>')
-        if tool != "get_weather":
-            return
-        yield "qwen", ("<tool_call>\n<function=get_weather>\n<parameter=city>\nZagreb\n</parameter>\n"
+        yield "qwen", (f"<tool_call>\n<function={tool}>\n<parameter=city>\nZagreb\n</parameter>\n"
                        "<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>")
 
     def feed_all(self, text, thinking, step, reason, upto=None):
@@ -342,6 +340,28 @@ class Parser(unittest.TestCase):
                 evs = self.feed_all(text, False, step, "stop")
                 self.assertEqual("".join(e.text for e in evs if e.kind == "content"), text, (text, step))
                 self.assertFalse([e for e in evs if e.kind in ("tool_call", "tool_start")], text)
+
+    def test_a_lone_call_to_an_undeclared_tool_at_the_start_of_a_line_is_a_call(self):
+        for raw in ('< invoke name="bash">\n< parameter name="command" string="true">ls</ parameter>\n</ invoke>',
+                    '<\\ invoke name="bash">\n<\\ parameter name="command" string="true">ls</\\ parameter>\n</\\ invoke>',
+                    "<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>"):
+            for lead in ("", "Checking.\n\n"):
+                for step in (1, 7, 4096):
+                    evs = self.feed_all(lead + raw, False, step, "stop")
+                    calls = [(e.call.name, e.call.arguments) for e in evs if e.kind == "tool_call"]
+                    self.assertEqual(calls, [("bash", {"command": "ls"})], (raw, lead, step))
+                    self.assertEqual("".join(e.text for e in evs if e.kind == "content").strip(), lead.strip(), (raw, lead, step))
+
+    def test_a_quoted_call_to_an_undeclared_tool_stays_text(self):
+        # At the start of a line a call without the token is an act; quoted, it is what the model is talking about.
+        call = "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>"
+        bare = '< invoke name="bash">\n< parameter name="command" string="true">ls</ parameter>\n</ invoke>'
+        for raw in (call, bare):
+            for text in (f"Calls look like {raw}", f"Calls look like:\n\n```\n{raw}\n```\nThat is all.", f"Use `{raw}` here."):
+                for step in (1, 7, 4096):
+                    evs = self.feed_all(text, False, step, "stop")
+                    self.assertFalse([e for e in evs if e.kind in ("tool_call", "tool_start")], (text, step))
+                    self.assertEqual("".join(e.text for e in evs if e.kind == "content"), text, (text, step))
 
     def test_the_plain_parser_is_unchanged(self):
         p = OutputParser(thinking=False, tools=self.TOOLS)
