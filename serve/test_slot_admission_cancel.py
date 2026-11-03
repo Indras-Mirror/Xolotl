@@ -3,10 +3,12 @@
 Uses real StrataEngine admission and watcher methods, with no model or GPU.
 """
 import io
+import queue
 import threading
 import time
 import types
 import unittest
+from unittest import mock
 
 from serve import server
 
@@ -40,6 +42,97 @@ class ForbiddenCondition:
 
 
 class SlotAdmissionCancel(unittest.TestCase):
+    @mock.patch.object(server, "EOS_IDS", {257})
+    def test_eos_drain_keeps_watcher_owner_until_cancel_handoff(self, epoch=False, admission_eos=False):
+        engine, cancel = self.engine(), threading.Event()
+        if epoch:
+            engine._batch_cancel_enabled = True
+            engine.info["batch_cancel_epoch"] = 1
+            engine.cancel_owner_lock = threading.RLock()
+        engine.slot_busy = [False, False]
+        engine.slot_q = [queue.Queue(), queue.Queue()]
+        engine.slot_live = [None, None]
+        engine.slot_held = [[], []]
+        engine.slot_used = [0, 0]
+        engine.slot_claims = set()
+        engine.pick_slot = lambda prompt: 0
+        engine._running_cancel = None
+        engine._send = lambda text: None
+        engine.last = {}
+        engine._yielded = None
+        engine._ctl_erred = False
+        engine._drain_control = lambda *args, **kwargs: "BADM 0 1"
+        handed_off = []
+        engine._release_slot_when_done = lambda *args: handed_off.append(args)
+
+        def control(cancel, emit, **kwargs):
+            emit(257 if admission_eos else 11)
+            engine._ctl_result = (0, True)
+            yield False
+            engine.slot_q[0].put("BT 0 257")
+
+        engine._control = control
+        gen = engine.generate_batched([1, 2], 32, {}, cancel)
+        if not admission_eos:
+            self.assertEqual(next(gen), 11)
+        self.assertEqual(next(gen), 257)
+        drained = threading.Event()
+        original_get = engine.slot_q[0].get
+
+        def get(*args, **kwargs):
+            drained.set()
+            return original_get(*args, **kwargs)
+
+        engine.slot_q[0].get = get
+        errors = []
+        def close():
+            try:
+                gen.close()
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=close, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(drained.wait(1), "EOS drain did not start")
+            cancel.set()
+            engine.stop_if_running(cancel)
+            self.assertIn("BSTOP 0 1\n" if epoch else "BSTOP 0\n", engine.proc.stdin.getvalue(),
+                          "watcher lost native owner before BDONE")
+            thread.join(.3)
+            self.assertFalse(thread.is_alive(), "cancelled EOS drain retained its two-second wait")
+            self.assertEqual(errors, [])
+            self.assertEqual(len(handed_off), 1)
+            self.assertNotIn(cancel, engine._slot_cancel_owners)
+            # A late old watcher must not send STOP to the slot's next owner.
+            sent = engine.proc.stdin.getvalue()
+            engine._slot_cancel_tokens[0] = object()
+            engine.stop_if_running(cancel)
+            self.assertEqual(engine.proc.stdin.getvalue(), sent)
+        finally:
+            cancel.set()
+            engine.slot_q[0].put("BDONE 0 2 stop 1.0")
+            thread.join(3)
+
+    def test_eos_drain_keeps_epoch_watcher_owner_until_cancel_handoff(self):
+        self.test_eos_drain_keeps_watcher_owner_until_cancel_handoff(epoch=True)
+
+    def test_admission_eos_drain_keeps_watcher_owner_until_cancel_handoff(self):
+        self.test_eos_drain_keeps_watcher_owner_until_cancel_handoff(admission_eos=True)
+
+    def test_eos_drain_restart_does_not_consume_successor_completion(self):
+        engine = self.engine()
+        old, successor = queue.Queue(), queue.Queue()
+        successor.put("BDONE 0 9 length 1.0")
+        engine.slot_q = [old]
+        def restart(**kwargs):
+            engine.gen += 1
+            engine.slot_q = [successor]
+            raise queue.Empty
+        old.get = restart
+        self.assertIsNone(engine._bdone_after_eos(0, cancel=threading.Event(), born=1))
+        self.assertEqual(successor.get_nowait(), "BDONE 0 9 length 1.0")
+
     def engine(self):
         engine = server.StrataEngine.__new__(server.StrataEngine)
         engine.gen = 1
