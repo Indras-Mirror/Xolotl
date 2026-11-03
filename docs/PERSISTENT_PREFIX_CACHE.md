@@ -44,3 +44,27 @@ A lazy or elastic encoder that has not started is unbound. Qwen3.6 does not pers
 A full frontend restart still forgets its public UUID-to-image registry. An unknown UUID receives the existing cache-miss response; resend image bytes before testing prefix reuse. Persisted native image state is not a persistent picture gallery. DeepSeek and MiniMax retain their existing bytes-based image protocol. Native Qwen3.6 image-row entries can be lazily restored when the frontend supplies a known identity.
 
 For qualification, compare a clean computation, warm RAM and the first request after a real process restart. Use unchanged synthetic 20K/40K prefixes with different suffixes across fresh sessions, and retain actual prompt/cached/new token counts. Record native PID/start identity, active concurrency, restore/capture I/O times, TTFT, complete short-response latency and decode throughput. Also test A/B/A, cancellation during prefill/decode/I/O, image miss/refill, sleep/wake, model/config mismatch, truncation, interrupted writes, disk exhaustion and shared quota/LRU. Do not count an identical whole-prompt replay alone as evidence of changed-tail shared-prefix reuse.
+
+### Optional real storage-failure host check
+
+`persistent_prefix_storage_fault` is a CPU-only opt-in test of the real shared Store. Without `STRATA_PREFIX_FAULT_DIR` it exits 77 and CTest marks it skipped. It requires a dedicated, initially empty 8 MiB tmpfs owned by the unprivileged test user; it refuses ordinary filesystems and tmpfs volumes larger than 16 MiB. Never point it at a shared cache or fill a data filesystem.
+
+From the repository root, compile outside the mounted directory (the mount is deliberately `noexec`):
+
+```sh
+HOST_BUILD=$(mktemp -d)
+FAULT_MOUNT=$(mktemp -d)
+c++ -std=c++17 -O1 -pthread -Iinclude tests/persistent_prefix_storage_fault.cpp \
+  -o "$HOST_BUILD/persistent_prefix_storage_fault"
+sudo mount -t tmpfs -o size=8M,uid=$(id -u),gid=$(id -g),mode=0700,nosuid,nodev,noexec \
+  tmpfs "$FAULT_MOUNT"
+STRATA_PREFIX_FAULT_DIR="$FAULT_MOUNT" "$HOST_BUILD/persistent_prefix_storage_fault"
+# After the test and its child have exited:
+sudo umount "$FAULT_MOUNT"
+```
+
+The same executable is registered with CTest when `STRATA_BUILD_CONVERSATION_TESTS=ON`. Retain the log/binary and temporary parent directories as needed; no cleanup of unrelated files is required.
+
+The first case consumes free space with its own pressure file inside the admitted writer callback, then observes actual `write(2)` errno `ENOSPC` while writing the admitted payload. It checks no visible checkpoint, released queue budget and successful small-write and fresh-Store lookup after truncating only its pressure file. This exercises space exhaustion after the Store's preflight, rather than preflight refusal.
+
+The second case kills only its own child writer at a pipe barrier after payload `fsync` but before its callback returns for catalogue publication. It checks that the interrupted entry is a miss, an earlier committed checkpoint survives, and a subsequent write plus fresh-Store lookup recovers. It does not exercise a crash after catalogue rename or every filesystem's durability semantics.
