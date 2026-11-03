@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import contextlib
 import io
+import http.client
 import json
 import os
 import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -175,6 +177,66 @@ class On(unittest.TestCase):
         srv = Server(engine, self.path, **kw)
         self.addCleanup(srv.close)
         return srv
+
+    def test_complete_response_close_before_handler_cleanup_is_not_disconnect(self):
+        # Hold the handler after delivery until its actual EOF watcher exits. The client
+        # closes after reading Content-Length bytes, before do_POST's finally can run.
+        import serve.server as server_module
+        watcher_exited = threading.Event()
+        real_thread = threading.Thread
+
+        def thread(*args, **kwargs):
+            if kwargs.get("name") == "strata-client-watch":
+                target = kwargs["target"]
+                def watched():
+                    try:
+                        target()
+                    finally:
+                        watcher_exited.set()
+                kwargs["target"] = watched
+            return real_thread(*args, **kwargs)
+
+        srv = self.server(ClockedEngine(ByteTokenizer(), "</think>\n\nok", max_context=CTX))
+        handler = srv.httpd.RequestHandlerClass
+        deliver = handler._json
+        def deliver_before_cleanup(instance, *args, **kwargs):
+            deliver(instance, *args, **kwargs)
+            if not watcher_exited.wait(3):
+                raise AssertionError("client watcher did not exit before handler cleanup")
+
+        with mock.patch.object(server_module.threading, "Thread", side_effect=thread), \
+                mock.patch.object(handler, "_json", deliver_before_cleanup):
+            code, body = srv.post("/v1/chat/completions", chat())
+            self.assertEqual(code, 200)
+            self.assertIn("choices", json.loads(body))
+            (row,) = lines(self.path, 1)
+        self.assertTrue(watcher_exited.is_set())
+        self.assertEqual((row["outcome"], row["finish"], row["cancelled"]),
+                         ("completed", "stop", False))
+
+    def test_response_write_failure_still_records_disconnect(self):
+        srv = self.server(ClockedEngine(ByteTokenizer(), "</think>\n\nok", max_context=CTX))
+        handler = srv.httpd.RequestHandlerClass
+        deliver = handler._json
+        failed = threading.Event()
+
+        def fail_body_write(instance, *args, **kwargs):
+            write = instance.wfile.write
+            def send(data):
+                if data.startswith(b"HTTP/"):
+                    return write(data)
+                failed.set()
+                raise BrokenPipeError("deterministic response body write failure")
+            with mock.patch.object(instance.wfile, "write", side_effect=send):
+                return deliver(instance, *args, **kwargs)
+
+        with mock.patch.object(handler, "_json", fail_body_write), \
+                mock.patch.object(srv.httpd, "handle_error"):
+            with self.assertRaises(http.client.IncompleteRead):
+                srv.post("/v1/chat/completions", chat())
+            (row,) = lines(self.path, 1)
+        self.assertTrue(failed.is_set())
+        self.assertEqual((row["outcome"], row["cancelled"]), ("disconnected", True))
 
     def test_one_line_per_request_with_its_figures(self):
         tok = ByteTokenizer()
