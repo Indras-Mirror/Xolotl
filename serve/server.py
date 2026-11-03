@@ -4868,6 +4868,7 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
+        self.keep_cut_tool_calls = False                  # opt-in: a whole OpenAI answer keeps a call cut at the token limit (openai_collect)
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = end_token_ids(tokenizer)
@@ -7600,7 +7601,10 @@ def openai_stream_usage(chunks):
         chunks.close()
 
 
-def openai_collect(chunks) -> dict:
+def openai_collect(chunks, keep_cut: bool = False) -> dict:
+    """The streamed chunks as one chat.completion.  keep_cut (the config's "keep_cut_tool_calls", opt-in): a call the
+    output ended inside at the token limit (finish_reason "length") stays in tool_calls with its arguments as far as
+    they got - never valid JSON - as a streaming client sees it; by default it is left out (#211)."""
     content, reasoning, by_index, last, mcp = [], [], {}, None, []
     lps = {}                                       # "content" / "reasoning_content" -> logprob entries
     for c in chunks:
@@ -7622,7 +7626,8 @@ def openai_collect(chunks) -> dict:
             cur["function"]["arguments"] += fn.get("arguments") or ""
         last = c
     calls = [by_index[i] for i in sorted(by_index)]
-    if last["choices"][0]["finish_reason"] != "tool_calls":
+    finish = last["choices"][0]["finish_reason"]
+    if finish != "tool_calls" and not (keep_cut and finish == "length"):
         calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
     msg = {"role": "assistant", "content": "".join(content) or None}
     if "".join(reasoning).strip() and "".join(reasoning).strip() == "".join(content).strip():
@@ -9299,7 +9304,7 @@ def make_handler(svc: Service):
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                return self._json(200, openai_collect(chunks, keep_cut=svc.keep_cut_tool_calls))
             if (req.get("stream_options") or {}).get("include_usage") is True:
                 chunks = openai_stream_usage(chunks)
             self._sse()
@@ -10307,6 +10312,15 @@ def tool_call_recovery_setting(cfg: dict) -> bool:
     return recovery
 
 
+def keep_cut_tool_calls_setting(cfg: dict) -> bool:
+    """The config's "keep_cut_tool_calls" (see openai_collect's keep_cut): off when the config does not name it.  Anything
+    but true or false stops the start."""
+    keep = cfg.get("keep_cut_tool_calls", False)
+    if not isinstance(keep, bool):
+        raise SystemExit(f"[strata] config \"keep_cut_tool_calls\" must be true or false, not {keep!r}")
+    return keep
+
+
 def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
@@ -10829,6 +10843,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
+    svc.keep_cut_tool_calls = keep_cut_tool_calls_setting(cfg)
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")
