@@ -10473,6 +10473,20 @@ int main(int argc, char** argv) {
         // A disk entry is an immutable host snapshot. The background writer never reads
         // device buffers or a live slot; those remain owned by the native scheduler.
         strata::core::prefix::Store persistent_prefix(strata::core::prefix::Config::from_env());
+        const uint64_t persistent_min_capture_tokens = []() -> uint64_t {
+            const char* value = std::getenv("STRATA_FLASH_PREFIX_MIN_CAPTURE_TOKENS");
+            if (!value) return 0;
+            bool digits = *value != 0;
+            for (const char* p = value; *p; ++p) if (*p < '0' || *p > '9') digits = false;
+            char* end = nullptr;
+            errno = 0;
+            const auto count = std::strtoull(value, &end, 10);
+            if (!digits || errno || !end || *end) {
+                std::fprintf(stderr, "strata serve: invalid Flash prefix capture threshold; disk capture disabled\n");
+                return UINT64_MAX;
+            }
+            return count;
+        }();
         auto persistent_cells = [](const auto& tokens, const std::vector<ImgKey>& images, bool steering) {
             std::vector<uint64_t> cells;
             cells.reserve(tokens.size() + images.size() * 3 + 1);
@@ -10553,7 +10567,7 @@ int main(int argc, char** argv) {
                                       const strata::core::SessionState& source,
                                       const strata::core::QsaState* draft) -> PersistentPrepared {
             PersistentPrepared prepared;
-            if (!persistent_prefix.enabled() || tokens.empty() ||
+            if (!persistent_prefix.enabled() || tokens.empty() || tokens.size() < persistent_min_capture_tokens ||
                 !strata::core::prefix::image_state_allowed(!images.empty())) return prepared;
             try {
                 std::string why;
