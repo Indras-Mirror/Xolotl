@@ -80,7 +80,7 @@ class Monitor(unittest.TestCase):
                 length = int(response.headers["Content-Length"])
                 self.assertGreater(length, 0)
                 raw = response.read(length - 1)
-                # This queue/load attribution test keeps the client connected;
+                # These completion/attribution tests keep the client connected;
                 # early-close/disconnect behavior is tested separately.
                 deadline = time.monotonic() + 5
                 while True:
@@ -112,7 +112,7 @@ class Monitor(unittest.TestCase):
         for api in ("openai", "anthropic"):
             for stream in (False, True):
                 with self.subTest(api=api, stream=stream):
-                    code, reply = self.chat(api, stream=stream)
+                    code, reply = self.chat(api, stream=stream, wait_completed=not stream)
                     self.assertEqual(code, 200)
                     record = self.latest()
                     self.assertEqual(record["state"], "completed")
