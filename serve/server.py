@@ -2135,18 +2135,24 @@ class StrataEngine:
                 if sep and key in names and value.isdigit():
                     self.last = {**self.last, names[key]: int(value)}
 
-    def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
+    def _bdone_after_eos(self, slot: int, wait_s: float = 2.0, cancel=None, born=None):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
         in the same window).  Read it here, so the request's figures are the slot leg's (the background wait would eat it,
         and the request kept the admission's single token).  None when it does not come in `wait_s`: then the background
         wait takes over."""
         if slot >= len(self.slot_q):
             return None
+        q = self.slot_q[slot]  # a restart must not redirect this drain to its successor's queue
         end = time.monotonic() + wait_s
         while time.monotonic() < end:
+            if (cancel is not None and cancel.is_set()) or (born is not None and self.gen != born):
+                return None
             try:
-                line = self.slot_q[slot].get(timeout=max(0.05, end - time.monotonic()))
+                timeout = max(0.05, end - time.monotonic())
+                line = q.get(timeout=min(timeout, WATCH_CLIENT_S) if cancel is not None else timeout)
             except queue.Empty:
+                if cancel is not None:
+                    continue
                 return None
             if line is None:
                 return None
@@ -2718,30 +2724,37 @@ class StrataEngine:
                             break
                         return
         finally:
-            # Unpublish before a slot can be freed/reused. An old watcher cannot stop its successor.
-            self._forget_batch_owner(cancel, cancel_owner)
+            # EOS can precede request-owned native capture and BDONE. Keep its
+            # watcher owner while draining that work, then revoke before reuse.
+            eos_wait = phase in ("slot", "admit") and slot is not None and out and out[-1] in EOS_IDS and self.gen == born
+            if not eos_wait:
+                self._forget_batch_owner(cancel, cancel_owner)
             # a consumer that left early (or an error): keep the engine and this server in step
             btrace("finally phase", phase, "slot", slot, "holding", holding)
-            try:
-                if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
-                    phase = "none"                      # #1012: its engine is gone: nothing to stop or drain
-                if phase in ("solo", "admit") and self._ctl_erred:
-                    phase = "none"                      # #1059: it ended on the engine's ERR: no DONE to wait 300 s for
-                if phase == "solo":
-                    self._send("STOP")
-                    self._drain_control("DONE", born=born)
-                elif phase == "admit":
-                    line = self._drain_control("BADM", born=born)
-                    if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
-                        phase = "slot"
-            except EngineDied:
-                pass
             bdone_in = False
-            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
-                bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
-                if bd is not None:
-                    self._apply_bdone(bd.split())
-                    bdone_in = True
+            try:
+                try:
+                    if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
+                        phase = "none"                      # #1012: its engine is gone: nothing to stop or drain
+                    if phase in ("solo", "admit") and self._ctl_erred:
+                        phase = "none"                      # #1059: it ended on the engine's ERR: no DONE to wait 300 s for
+                    if phase == "solo":
+                        self._send("STOP")
+                        self._drain_control("DONE", born=born)
+                    elif phase == "admit":
+                        line = self._drain_control("BADM", born=born)
+                        if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
+                            phase = "slot"
+                except EngineDied:
+                    pass
+                if eos_wait and phase == "slot":
+                    bd = self._bdone_after_eos(slot, cancel=cancel, born=born)  # (#1869) keep the slot leg's figures
+                    if bd is not None:
+                        self._apply_bdone(bd.split())
+                        bdone_in = True
+            finally:
+                if eos_wait:
+                    self._forget_batch_owner(cancel, cancel_owner)
             if reused0 is not None and isinstance(self.last, dict):
                 self.last = {**self.last, "reused": reused0}
             if carry and isinstance(self.last, dict):
