@@ -67,6 +67,12 @@ public:
           after(other.after), eos(other.eos), waiting(other.waiting) {
         if (other.sampler && !sampler) throw std::runtime_error("cannot clone grammar");
     }
+    Q36Grammar(Q36Grammar&&) noexcept = default;
+    Q36Grammar& operator=(Q36Grammar&&) noexcept = default;
+    Q36Grammar& operator=(const Q36Grammar& other) {
+        if (this != &other) *this = Q36Grammar(other);
+        return *this;
+    }
     void init(const llama_vocab * v, const std::string & path, int trigger, Caches & caches) {
         sampler.reset(); vocab = v; after = trigger; waiting = trigger >= 0;
         cache.reset(); node = nullptr; node_checked = false;
@@ -109,6 +115,7 @@ public:
         if (!sampler) throw std::runtime_error("cannot clone compiled grammar");
     }
     bool active() const { return bool(sampler); }
+    int eos_token() const { return eos; }
     int vocab_size() const { return vocab ? llama_vocab_n_tokens(vocab) : 0; }
     const std::vector<int> * allowed_ids() const {
         if (!sampler || waiting) return nullptr;
@@ -175,6 +182,7 @@ public:
 class Q36Grammar {
 public:
     bool active() const { return false; }
+    int eos_token() const { return -1; }
     int vocab_size() const { return 0; }
     const std::vector<int> * allowed_ids() const { return nullptr; }
     void mask(float *, const int *, int) const {}

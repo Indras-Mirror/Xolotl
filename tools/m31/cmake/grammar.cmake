@@ -1,7 +1,7 @@
 # Native tokenization and GBNF support from the SAME source tree as ggml.
 # Shared by M31 and q36. This adds no vendor patches,
 # process-wide compiler flags, external downloads, or llama.cpp server.
-if(NOT STRATA_M31 AND NOT STRATA_Q36_GRAMMAR)
+if(NOT STRATA_M31 AND NOT STRATA_Q36_GRAMMAR AND NOT STRATA_FLASH_GRAMMAR)
   return()
 endif()
 
@@ -68,7 +68,7 @@ function(m31_add_grammar)
   target_include_directories(m31_llama PRIVATE "${_src}/src" "${_generated}"
     PUBLIC "${_src}/include")
 
-  if(STRATA_Q36_GRAMMAR)
+  if(STRATA_Q36_GRAMMAR OR STRATA_FLASH_GRAMMAR)
     # q36 already supplies the ggml CUDA host symbols used by its MMQ kernels.
     # Vocab-only llama needs no GPU backend: use the same core sources with a
     # CPU-only registry so it never pulls in a second copy of those symbols.
