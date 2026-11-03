@@ -48,6 +48,11 @@ __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
     x32 |= x16[2 * i32 + 1] << 16;
     return x32;
 }
+// Byte `index` of a packed word by shift: the reads below take bytes out of register values, not through a pointer.
+__device__ __forceinline__ uint32_t packed_byte(uint32_t word, int index) { return (word >> (8 * index)) & 0xffu; }
+__device__ __forceinline__ uint32_t packed_byte(int2 words, int index) {
+    return packed_byte(index < 4 ? (uint32_t) words.x : (uint32_t) words.y, index & 3);
+}
 __device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return ((const int*) x)[i32]; }
 #include "fork/fork_helpers.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
@@ -168,18 +173,17 @@ __device__ __forceinline__ float vec_dot_iq2_s_q8_1(const void* __restrict__ vbq
                                                     const int& kbx, const int& iqs) {
     const block_iq2_s* bq2 = (const block_iq2_s*) vbq + kbx;
     const int qs_packed = get_int_b2(bq2->qs, iqs / 2);
-    const uint8_t* qs = (const uint8_t*) &qs_packed;
     const int qh = bq2->qh[iqs / 2];
     const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
-    const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
     const int ls0 = bq2->scales[iqs / 2] & 0x0F;
     const int ls1 = bq2->scales[iqs / 2] >> 4;
     int sumi0 = 0, sumi1 = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int* grid_pos = (const int*) (iq2s_grid + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
-        const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+        const int* grid_pos = (const int*) (iq2s_grid + (packed_byte(qs_packed, l0 / 2) | ((qh << (8 - l0)) & 0x300)));
+        const uint32_t sgn = packed_byte(signs_packed_32, l0 / 2);
+        const int signs0 = __vcmpne4(((sgn & 0x03) << 7) | ((sgn & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((sgn & 0x30) << 3) | ((sgn & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
@@ -227,17 +231,16 @@ __device__ __forceinline__ float vec_dot_iq3_s_q8_1(const void* __restrict__ vbq
                                                     const int& kbx, const int& iqs) {
     const block_iq3_s* bq3 = (const block_iq3_s*) vbq + kbx;
     const int2 qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
-    const uint8_t* qs = (const uint8_t*) &qs_packed;
     const int qh = bq3->qh[iqs / 2];
     const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
-    const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
-                                        iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
-        const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
-        const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+        const int2 grid_pos = make_int2(iq3s_grid[packed_byte(qs_packed, l0 + 0) | ((qh << (8 - l0)) & 0x100)],
+                                        iq3s_grid[packed_byte(qs_packed, l0 + 1) | ((qh << (7 - l0)) & 0x100)]);
+        const uint32_t sgn = packed_byte(signs_packed_32, l0 / 2);
+        const int signs0 = __vcmpne4(((sgn & 0x03) << 7) | ((sgn & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((sgn & 0x30) << 3) | ((sgn & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
@@ -1008,10 +1011,8 @@ template<> struct Split<22> : SplitLs2 {   // IQ2_S
     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq2_s* bq2 = (const block_iq2_s*) vbq + kbx;
         const int qs_packed = get_int_b2(bq2->qs, iqs / 2);
-        const uint8_t* qs = (const uint8_t*) &qs_packed;
         const int qh = bq2->qh[iqs / 2];
         const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
-        const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
         const uint64_t* grid_lut;
         if constexpr (STAGE_GRID) grid_lut = (const uint64_t*) s_grid;
         else grid_lut = iq2s_grid;
@@ -1020,9 +1021,10 @@ template<> struct Split<22> : SplitLs2 {   // IQ2_S
         r.ls1 = bq2->scales[iqs / 2] >> 4;
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
-            const int* grid_pos = (const int*) (grid_lut + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
-            const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
-            const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+            const int* grid_pos = (const int*) (grid_lut + (packed_byte(qs_packed, l0 / 2) | ((qh << (8 - l0)) & 0x300)));
+            const uint32_t sgn = packed_byte(signs_packed_32, l0 / 2);
+            const int signs0 = __vcmpne4(((sgn & 0x03) << 7) | ((sgn & 0x0C) << 21), 0x00000000);
+            const int signs1 = __vcmpne4(((sgn & 0x30) << 3) | ((sgn & 0xC0) << 17), 0x00000000);
             r.g[l0 + 0] = __vsub4(grid_pos[0] ^ signs0, signs0);
             r.g[l0 + 1] = __vsub4(grid_pos[1] ^ signs1, signs1);
         }
@@ -1087,25 +1089,24 @@ template<> struct Split<21> {   // IQ3_S
     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq3_s* bq3 = (const block_iq3_s*) vbq + kbx;
         const int2 qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
-        const uint8_t* qs = (const uint8_t*) &qs_packed;
         const int qh = bq3->qh[iqs / 2];
         const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
-        const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
         const uint32_t* grid = STAGE_GRID ? s_grid : iq3s_grid;
         W r;
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
-            const int2 grid_pos = make_int2(grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
-                                            grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+            const int2 grid_pos = make_int2(grid[packed_byte(qs_packed, l0 + 0) | ((qh << (8 - l0)) & 0x100)],
+                                            grid[packed_byte(qs_packed, l0 + 1) | ((qh << (7 - l0)) & 0x100)]);
+            const uint32_t sgn = packed_byte(signs_packed_32, l0 / 2);
             if constexpr (STAGE_GRID) {
                 // The staged tables hold the byte masks of a sign byte's bits 0-3 and 4-7; every iq3s_grid byte is
                 // odd, so (g ^ mask) + (mask & 0x01010101) negates the masked bytes with no carry into the next.
-                const uint32_t ml = s_grid[512 + signs_packed_8[l0 / 2]], mh = s_grid[768 + signs_packed_8[l0 / 2]];
+                const uint32_t ml = s_grid[512 + sgn], mh = s_grid[768 + sgn];
                 r.g[l0 + 0] = (int) (((uint32_t) grid_pos.x ^ ml) + (ml & 0x01010101u));
                 r.g[l0 + 1] = (int) (((uint32_t) grid_pos.y ^ mh) + (mh & 0x01010101u));
             } else {
-                const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
-                const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
+                const int signs0 = __vcmpne4(((sgn & 0x03) << 7) | ((sgn & 0x0C) << 21), 0x00000000);
+                const int signs1 = __vcmpne4(((sgn & 0x30) << 3) | ((sgn & 0xC0) << 17), 0x00000000);
                 r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
                 r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
             }
