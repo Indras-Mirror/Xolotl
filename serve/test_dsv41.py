@@ -280,11 +280,13 @@ class Parser(unittest.TestCase):
                "misspelled": ("＼DSML＼ ",) * 3, "mixed": ("｜DSML｜ ", " ", "\\ ")}
     MARKUP = ("DSML", "｜", "invoke", "parameter", "<tool_call>", "<function=", "</function>")
 
-    def forms(self):
+    def forms(self, tool="get_weather"):
         for name, (a, b, c) in self.MARKERS.items():
-            yield name, (f'<{a}calls>\n<{a}invoke name="get_weather">\n<{b}parameter name="city" string="true">Zagreb'
+            yield name, (f'<{a}calls>\n<{a}invoke name="{tool}">\n<{b}parameter name="city" string="true">Zagreb'
                          f'</{c}parameter>\n<{b}parameter name="days" string="false">3</{c}parameter>\n</{c}invoke>\n'
                          f'</{a}calls>')
+        if tool != "get_weather":
+            return
         yield "qwen", ("<tool_call>\n<function=get_weather>\n<parameter=city>\nZagreb\n</parameter>\n"
                        "<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>")
 
@@ -314,6 +316,24 @@ class Parser(unittest.TestCase):
                         bad = [m for m in self.MARKUP if m in content]
                         self.assertFalse(bad, (form, thinking, cut, step, content[-60:]))
                         self.assertEqual(content.strip(), "Checking.", (form, thinking, cut, step))
+
+    def test_a_dsml_call_to_an_undeclared_tool_is_a_call(self):
+        # 2026-11-03: history with a settled `bash` call, tools = [write]: the model called bash again and the base rule
+        # (#3075, an undeclared name is text) sent the call to the content as <tool_call> markup (4 of 6 replies).  In a
+        # calls block (or with the token) it is a call: whole -> that call; cut anywhere -> no markup in the content.
+        for form, raw in self.forms(tool="bash"):
+            text = "Checking.\n\n" + raw
+            start = len("Checking.\n\n")
+            for step in (1, 3, 4096):
+                evs = self.feed_all(text, False, step, "stop")
+                calls = [(e.call.name, e.call.arguments) for e in evs if e.kind == "tool_call"]
+                self.assertEqual(calls, [("bash", {"city": "Zagreb", "days": 3})], (form, step))
+                self.assertEqual("".join(e.text for e in evs if e.kind == "content").strip(), "Checking.", (form, step))
+            for cut in range(start, len(text)):
+                for step in (1, 7, 4096):
+                    evs = self.feed_all(text, False, step, "length", upto=cut)
+                    content = "".join(e.text for e in evs if e.kind == "content")
+                    self.assertEqual(content.strip(), "Checking.", (form, cut, step, content[-60:]))
 
     def test_tags_without_the_token_are_calls_only_for_declared_tools(self):
         for text in ('Use < invoke name="rm"> carefully.', "if a < b and c <invoke> then x < calls",

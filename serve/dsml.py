@@ -105,6 +105,7 @@ class DsmlTranslator:
         self.tool = None
         self.on_param = on_param
         self.known = known         # tool name -> declared?  A call opened without the DSML token needs a declared tool
+        self.opened: set[str] = set()    # tools a call was opened for with the token or inside a calls block: calls, declared or not
 
     @property
     def held(self) -> str:
@@ -196,8 +197,11 @@ class DsmlTranslator:
         m = _INVOKE.fullmatch(head)
         if m:
             name = m.group("name")
-            if not m.group("m").startswith(DSML) and not (self.known is not None and self.known(name)):
-                return None                     # `< invoke name="X">` without the token: a call only for a declared tool
+            sure = m.group("m").startswith(DSML) or self.state in ("calls", "invoke")   # the token, or inside a calls block
+            if not sure and not (self.known is not None and self.known(name)):
+                return None                     # a lone `< invoke name="X">` without the token: a call only for a declared tool
+            if sure:
+                self.opened.add(name)
             if self.state == "invoke":          # the previous call's closing tag was left out
                 out("</function>\n</tool_call>\n")
             self.buf = s[gt + 1:]
@@ -234,6 +238,13 @@ class DsmlOutputParser(OutputParser):
             elif ev.kind in ("tool_start", "tool_call") or (ev.kind == "content" and ev.text.strip()):
                 self._answered = True
         return evs
+
+    def _callable(self, name: str) -> bool:
+        """A call the model opened with the DSML token (or inside a calls block) is a call even for a tool the request did
+        not declare.  The token is never text, so the base rule (#3075: an undeclared name is text) sent it to the content as `<tool_call>` markup
+        and the client read it as the answer (2026-11-03: history with a `bash` call, tools = [write] only: the model
+        called bash again, 4 of 6 replies were that markup).  The client gets the call it can answer with an error."""
+        return super()._callable(name) or name in self.dsml.opened
 
     def _on_param(self, tool, name, is_string) -> None:
         """string="true": the value is a string whatever it looks like ("123", "true"), as the template wrote it."""
