@@ -1,0 +1,87 @@
+# Porting Basalt engine work into Xolotl (survey, 2026-10-29)
+
+[Basalt](https://github.com/jesdga95/basalt) (MIT, 276 stars) is a local inference engine for
+Qwen3.8-Flash-Next on NVIDIA Blackwell. It is **not a separate codebase that happens to solve the
+same problem** — it is the same engine lineage as this repo's `src/` tree, forked and renamed
+(`strata::` → `basalt::`, `include/strata/…` → `include/basalt/…`). Several files it patches are
+the same file here, line for line:
+
+| Basalt file | Xolotl counterpart | Status |
+|---|---|---|
+| `src/kernels/cpu/iq_avx512.cpp` | `src/kernels/cpu/iq_avx512.cpp` | same file, 298 vs 273 lines |
+| `src/prefill/prefill.cpp` | `src/prefill/prefill.cpp` | same file |
+| `src/core/verify.cpp` | `src/core/verify.cpp` | same file |
+| `src/kernels/cpu/pool.cpp` | `src/kernels/cpu/pool.cpp` | same file |
+| `src/kernels/cuda/qsa_select.cu` | `src/kernels/cuda/qsa_select.cu` | same file |
+| `src/platform/memory.cpp` | `src/platform/memory.cpp` | same file |
+| `src/core/expert_source.cpp` | `src/core/expert_source.cpp` | same file |
+| `src/kernels/cpu/nvfp4_avx512.cpp` | `src/kernels/cpu/nvfp4_avx512.cpp` | same file |
+| `src/kernels/cuda/dec_moe.cuh` | `src/kernels/cuda/iq_kernels.cu` | different layout |
+
+**This distinction decides the port strategy.** For the Qwen3.8-Flash-Next / GLM engines built from
+`src/`, a port is mostly a namespace/header rewrite and can be reviewed hunk by hunk. For the
+DeepSeek-V4.1 engine (`tools/v41/engine/`, a separate implementation) nothing copies: those items
+have to be re-derived against that engine's own structures.
+
+Two axes matter more than size:
+
+- **Bit-identity.** A change that produces identical output on a same-path A/B is cheap to accept:
+  it cannot regress quality, only speed. Most kernel items below are in this class, and each says so.
+- **Where it pays.** Decode on this box is dominated by expert-tier file/RAM waits, not arithmetic
+  (measured elsewhere in this tree: 79 % of a decode step is file-read wait on a 152 GB model). A
+  kernel that speeds up arithmetic moves a small fraction of the step. Prefill and the CPU pool are
+  where the remaining headroom actually is.
+
+## Survey
+
+| # | Change | Our counterpart | Class | Value |
+|---|---|---|---|---|
+| 107 | prefill chunk size priced from the link and non-resident bytes | `src/prefill/prefill.cpp:164 stream_all_min()` (constant 1024) | same output on the measured placement | **Prefill — best item** |
+| 98 | pool: a batch ends with its last job; a parked worker yields after a short spin | `src/kernels/cpu/pool.cpp` (`kWaitParked`, `parked_ == n_`) | output unchanged | **Decode — best item** |
+| 101 | CPU warm-up runs on mixed-format packs and reads the 3 likeliest experts | `src/core/verify.cpp`; v41 has mixed per-expert formats | output unchanged (reads only) | Decode concept → also v41 |
+| 112 | Q2_0 expert down in 64-row blocks, 4 lanes a row | `src/kernels/cuda/iq_kernels.cu:1509 native_down_multi_kernel` | bit-identical | Decode kernel |
+| 111 | AVX-512 sign masks via `pdep`, IQ3_S/IQ2_S grid gathers | `src/kernels/cpu/iq_avx512.cpp` | bit-identical | CPU decode |
+| 74 | NVFP4 CPU expert rows at 1–2 tokens | `src/kernels/cpu/nvfp4_avx512.cpp` | bit-identical (documented) | Decode |
+| 105 | QSA window of 5–8 queries as two rows of four | `src/kernels/cuda/qsa_select.cu` | bit-identical scores | Decode attention |
+| 113 | RAM guard sheds and waits instead of stopping the request | `src/platform/memory.cpp` | behaviour change (serve) | Robustness |
+| 114 | elastic KV tail keeps no RAM copies of its experts | `src/core/expert_source.cpp` | output unchanged | VRAM, medium |
+| 13 | APR trellis types (TQ2_T…TQP7) + Hadamard-folded experts | — | new formats | Large (+2757), research |
+| 100 | lazy L2 prefetch also takes the next layer's FFN read matrices | — | output unchanged | **Skip** |
+
+Details that change how each item should be taken:
+
+- **107 must be reconciled, not copied.** Its pricing formula replaces a constant default. Our
+  `stream_all_min()` also serves `STRATA_PREFILL_CPU_SHARE`/`arm_cpu_share`, which Basalt does not
+  have: below the threshold we hand some non-resident experts to the idle decode CPU pool instead of
+  streaming them. Port the *pricing* (link rate × non-resident bytes, between floor and default) and
+  keep our share logic on top. A straight copy silently deletes the share.
+- **100 is below the noise floor.** Its own author measures +0.32 % against a 0.39 % box noise floor
+  and filed it as a draft asking whether to keep it. Not worth the review.
+- **111 needs `-mbmi2`** for `_pdep_u64`/`_pext_u64` on GCC/Clang. Check the build flag lands on the
+  right target only; a global `-mbmi2` would raise the binary's CPU floor.
+- **112 is not a file-level copy.** Basalt's `dec_moe.cuh` glue layer does not exist here; the
+  equivalent launch site is `iq_kernels.cu:2883`. The kernel body ports; the call site has to be
+  re-derived against `native_down_multi_kernel`.
+- **13 is a format decision, not a speed patch.** It adds six ggml types (144–149) and a Hadamard
+  fold. Worth attention only if a Gyro-L/APR pack is actually wanted; it is not a drop-in.
+- **Basalt #68** ("an image is a data URL unless a host or a directory is allowed") is a
+  security hardening unrelated to speed and should be judged on its own, separately from this list.
+
+Repo state at survey time: `Indras-Mirror/Strata`, `Indras-Mirror/Strata-GLM`, `mab776/Strata-DS4`,
+`musicurgy/delta-inference-engine` and `NektoDron/Xolotl` had **no open pull requests**. Basalt had
+26 open. This survey covers them.
+
+## Method
+
+Ports land one at a time on `basalt-ports`, each with the bar its class demands:
+
+- **bit-identical items** are accepted only on a same-path A/B producing identical output — for the
+  kernels that means the existing parity harnesses (`native_expert_parity`, `iq_avx512_test`,
+  `qsa_scores_parity`), not a tolerance.
+- **output-unchanged items** (pool, warm-up, prefetch) are accepted on identical token streams over a
+  real model *and* a timing delta that clears this box's noise floor. A delta inside the floor is not
+  evidence of a win, and will be reported as "no measurable change", not as an improvement.
+
+Two bars stay separate: bit-exact for same-path arms, the ~1e-2 relative class only for arms that
+genuinely take different paths (cpu-vs-gpu expert compute). Collapsing them into one number hides
+which question was asked.
