@@ -86,6 +86,14 @@ tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speec
   then QuetzaCodetl in voice mode. QFN's elastic expert cache has to hand ~4.5 GB back (`POST /v1/vram`) or LFM3's
   encoder cannot load; after that both are resident at 22.8 GB, and LFM3 transcribes and speaks while QFN keeps its
   speed - 0.75 s for a 96-token answer while 3.5 s of speech streamed.
+- **Grammar, a disk prefix cache and serving fixes** (#99, #105-#113): native GBNF (`grammar` /
+  `structured_outputs.grammar`) for Qwen Flash and DeepSeek V4.1 behind the build options `-DSTRATA_FLASH_GRAMMAR=ON` /
+  `-DSTRATA_DS41_GRAMMAR=ON`, with MTP/DSpark drafts kept (#112, #113); an opt-in Linux disk tier that keeps exact prefix
+  checkpoints across restarts ([docs/PERSISTENT_PREFIX_CACHE.md](docs/PERSISTENT_PREFIX_CACHE.md), #99); completed JSON
+  responses out of disconnect accounting and batch cancellation kept through the EOS drain (#107, #108); HIP shared int4
+  alignment (#105) - NektoDron. DSML tool calls no longer reach the content as text, a turn cut inside a DSML tag sends
+  none, and opt-in `keep_cut_tool_calls` keeps a call cut at the token limit (#106, #109, #110, Xiaomi2008). Every new
+  option is off by default.
 - **More community fixes** (#96, #101, #102, #104, NektoDron): MiniMax M3.1 serving works with the current frontend again
   (#96), Qwen picture numbering (`chat_template_kwargs: {"add_vision_id": true}`) reaches the template (#101) and can be
   a server default (`"add_vision_id": true` in the run config, #104), and new
@@ -249,8 +257,8 @@ following llama.cpp's LFM3 and libmtmd work.
 Contributors, with thanks: [NektoDron](https://github.com/NektoDron) (MMQ id slack, forced tool calls, the arena pipe
 and indexer WMMA opt-ins, #48-#52; checked #55; the Q3_K + GPTQ Q2_0 lite calibration and allocation tooling, #58;
 the ggml 6050b467 pool-hook link fix, #72; the control-queue wakeup fix, #79; Qwen3.6 vision, prefix cache and
-batched MTP, #76; deep sleep, #75; resident prefix reuse, #80; complete Unsloth GGUF and DSpark support, #84; cancelled-request slot wakeups, #88; shared host checkpoint payloads, #89; learned suffix-edit checkpoints, #90; the bounded tokenizer span cache, #91; Qwen3.6 snapshot ownership, #92; the Metal fallback signature sync, #93; request-owned Flash batch cancellation, #95),
-[Xiaomi2008](https://github.com/Xiaomi2008) (IQ1_S routed experts for Unsloth's DeepSeek-V4.1 UD-IQ1_M, #86; ds41 fused router ops and batched state copies, #87),
+batched MTP, #76; deep sleep, #75; resident prefix reuse, #80; complete Unsloth GGUF and DSpark support, #84; cancelled-request slot wakeups, #88; shared host checkpoint payloads, #89; learned suffix-edit checkpoints, #90; the bounded tokenizer span cache, #91; Qwen3.6 snapshot ownership, #92; the Metal fallback signature sync, #93; request-owned Flash batch cancellation, #95; MiniMax M3.1 serving, Qwen picture numbering and image minimum fixes, #96, #101, #102, #104; HIP shared int4 alignment, #105; completed-response and EOS-drain cancellation fixes, #107, #108; the persistent prefix cache, #99; native GBNF for Qwen Flash and DeepSeek V4.1, #112, #113),
+[Xiaomi2008](https://github.com/Xiaomi2008) (IQ1_S routed experts for Unsloth's DeepSeek-V4.1 UD-IQ1_M, #86; ds41 fused router ops and batched state copies, #87; DSML tool-call fixes and the opt-in keep_cut_tool_calls, #106, #109, #110),
 [AlexeyMatskevich](https://github.com/AlexeyMatskevich) (the upstream deepseek41 GGUF layout, #82; OpenZFS ARC
 accounting, #83; IQ3_S expert downs for Unsloth's UD-Q2_K_XL, #85),
 [paul123637-lab](https://github.com/paul123637-lab) (the DSpark seed fixes, #54 and #56; RTX 5080 and 5060 Ti helper
