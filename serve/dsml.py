@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from serve.frontend import CALL_START, FUNC_START, Event, OutputParser
+from serve.frontend import CALL_START, FUNC_START, Event, OutputParser, _declared, _tool_properties
 
 DSML = "｜DSML｜"
 _OPEN = "<" + DSML
@@ -281,8 +281,8 @@ class DsmlOutputParser(OutputParser):
         if spec is None:
             return
         params = dict(spec.get("parameters") or {})
-        props = dict(params.get("properties") or {})
-        if (props.get(name) or {}).get("type") != "string":
+        props = dict(_tool_properties(spec))          # a union's variants too (#208)
+        if _declared(props.get(name)) != "string":
             props[name] = {**(props.get(name) or {}), "type": "string"}
             params["properties"] = props
             self.schemas[tool] = {**spec, "parameters": params}
