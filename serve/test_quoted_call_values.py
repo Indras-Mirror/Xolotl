@@ -17,6 +17,7 @@ VALUES = {
     "repeated parameter": f"head part\n{PARAM_END}\n{PARAM_START}content>\ntail part",
     "unclosed opener in prose": f"A call starts with `{FUNC_START}NAME>` and its parameters follow.",
     "unclosed opener in code": f'opener = "{FUNC_START}"\n',
+    "unclosed function with parameter": f"example:\n{FUNC_START}foo>\n{PARAM_START}x>\nunfinished",
 }
 
 
@@ -51,6 +52,31 @@ class QuotedCallValues(unittest.TestCase):
         parser = OutputParser(thinking=False, tools=[SCHEMA], stream_tools=True)
         events = parser.feed(first + "\nnow the second:\n" + second) + parser.finish()
         self.assertEqual([e.call.arguments["content"] for e in events if e.kind == "tool_call"], ["one", "two"])
+
+    def test_unclosed_quoted_function_preserves_following_text_and_calls(self):
+        value = VALUES["unclosed function with parameter"]
+        first, second = call_text(value), call_text("two")
+        for tail in ("\nafter the call", "\nnow the second:\n" + second):
+            text = first + tail
+            for stream, tools in ((False, [SCHEMA]), (True, [SCHEMA]), (True, None)):
+                for size in (1, 7, len(text)):
+                    with self.subTest(tail=tail, stream=stream, tools=tools, size=size):
+                        parser = OutputParser(thinking=False, tools=tools, stream_tools=stream)
+                        events = []
+                        for i in range(0, len(text), size):
+                            events.extend(parser.feed(text[i:i + size]))
+                        self.assertFalse(any(e.kind == "tool_call" for e in events))
+                        events.extend(parser.finish())
+                        calls = [e.call for e in events if e.kind == "tool_call"]
+                        expected = [value, "two"] if tail.endswith(second) else [value]
+                        self.assertEqual([c.arguments["content"] for c in calls], expected)
+                        self.assertEqual("".join(e.text for e in events if e.kind == "content"),
+                                         "now the second:" if len(expected) == 2 else "after the call")
+                        if stream:
+                            for call in calls:
+                                pieces = "".join(e.text for e in events
+                                                 if e.kind == "tool_args" and e.call.id == call.id)
+                                self.assertEqual(json.loads(pieces), call.arguments)
 
 
 if __name__ == "__main__":

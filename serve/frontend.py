@@ -860,26 +860,34 @@ def param_end(text: str, final: bool = False, name: str | None = None) -> int:
     same text inside a value (a file that documents the call format, #210) is
     part of the value.  #4078: a close inside a call the value itself quotes (more _QUOTED_OPEN than FUNC_END before
     it), or one followed by the same parameter `name` again, is part of the value too.  `text` starts at the value.
-    -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
+    -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it).
+    A quoted call the value opens but never closes must not hide the enclosing call's own close (Basalt #167): the
+    first structural close inside it is held while streaming (-2) and taken at the end of output (`final`)."""
     at = text.find(PARAM_END)
+    fallback = -1
     while at >= 0:
-        if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
-            after = text[at + len(PARAM_END):].lstrip()
-            if after.startswith(PARAM_START):
-                gt = after.find(">")
-                if gt < 0:
-                    return at if final else -2
-                if name is None or after[len(PARAM_START):gt].strip() != name:
-                    return at
-            elif after.startswith((FUNC_END, CALL_END)):          # #4427: the model left out its `</function>`
-                return at
-            elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after) or CALL_END.startswith(after):
-                return at if final else -2
+        after = text[at + len(PARAM_END):].lstrip()
+        candidate = -1
+        if after.startswith(PARAM_START):
+            gt = after.find(">")
+            if gt < 0:
+                candidate = at if final else -2
+            elif name is None or after[len(PARAM_START):gt].strip() != name:
+                candidate = at
+        elif after.startswith((FUNC_END, CALL_END)):              # #4427: the model left out its `</function>`
+            candidate = at
+        elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after) or CALL_END.startswith(after):
+            candidate = at if final else -2
+        if candidate != -1:
+            if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
+                return candidate
+            if fallback < 0:
+                fallback = at
         at = text.find(PARAM_END, at + 1)
-    return -1
+    return fallback if final else (-2 if fallback >= 0 else -1)
 
 
-def call_end(text: str) -> int:
+def call_end(text: str, final: bool = False) -> int:
     """Where a tool call's body ends (#210): the `</tool_call>` after the call's own `</function>`, found by walking
     its parameters with param_end, so a value may contain either tag.  -1: not complete yet.  A body that is not in
     the call format ends at the first `</tool_call>`, as before."""
@@ -899,7 +907,7 @@ def call_end(text: str) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:], name=text[pos:gt].split("=", 1)[1].strip())
+            end = param_end(text[gt + 1:], final=final, name=text[pos:gt].split("=", 1)[1].strip())
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -1137,12 +1145,115 @@ def lenient_json(text: str):
     return v
 
 
+def _text_kinds(schema) -> tuple[bool, bool]:
+    """(text, null) for a parameter schema: whether the grammar lets the model write it as raw text (type "string",
+    a type list naming "string", or an anyOf/oneOf/one-branch allOf of plain strings and null), and whether null is
+    one of its types."""
+    if not isinstance(schema, dict):
+        return False, False
+    t = schema.get("type")
+    if isinstance(t, str):
+        return t == "string", t == "null"
+    if isinstance(t, list):
+        return "string" in t, "null" in t
+    if t is not None or any(k in schema for k in ("enum", "const", "properties", "items")):
+        return False, False
+    union = [schema[k] for k in ("anyOf", "oneOf", "allOf") if isinstance(schema.get(k), list)]
+    if len(union) != 1 or not union[0] or ("allOf" in schema and len(union[0]) != 1):
+        return False, False
+    text = null = False
+    for b in union[0]:
+        bt = b.get("type") if isinstance(b, dict) else None
+        types = bt if isinstance(bt, list) else [bt]
+        if (not types or any(x not in ("string", "null") for x in types)
+                or any(k in b for k in ("enum", "const", "anyOf", "oneOf", "allOf", "properties", "items", "$ref"))):
+            return False, False
+        text = text or "string" in types
+        null = null or "null" in types
+    return text, null
+
+
+def _declared(schema):
+    """A parameter's declared kind for coerce_value: "string" when the model may write it as raw text, "string?" when
+    null is a type too (the text `null` is then None), else the schema's own `type` (Basalt #208)."""
+    text, null = _text_kinds(schema)
+    if text:
+        return "string?" if null else "string"
+    return schema.get("type") if isinstance(schema, dict) else None
+
+
+def _deref(root: dict, schema):
+    """Follows local $ref links ("#/a/b") to the schema they name; None if one does not resolve."""
+    for _ in range(32):
+        ref = schema.get("$ref") if isinstance(schema, dict) else None
+        if not isinstance(ref, str):
+            return schema
+        if not ref.startswith("#/"):
+            return None
+        cur = root
+        for part in ref[2:].split("/"):
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+            elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+                cur = cur[int(part)]
+            else:
+                return None
+        schema = cur
+    return schema
+
+
+def _union_variants(root: dict, schema, out: list, depth: int = 0) -> None:
+    """The object variants of a oneOf/anyOf union, nested unions flattened."""
+    schema = _deref(root, schema)
+    if not isinstance(schema, dict) or depth > 8:
+        return
+    unions = [schema[k] for k in ("oneOf", "anyOf") if isinstance(schema.get(k), list)]
+    for alts in unions:
+        for alt in alts:
+            _union_variants(root, alt, out, depth + 1)
+    if not unions and isinstance(schema.get("properties"), dict):
+        out.append(schema)
+
+
+def _tool_properties(tool: dict | None) -> dict:
+    """A tool's parameter schemas by name. Parameters sent as a union ({"properties": {}, "oneOf": [...]}) take the
+    properties of every variant, string enums united, as the tool-call grammar does."""
+    params = (tool or {}).get("parameters") or {}
+    props = params.get("properties") if isinstance(params, dict) else None
+    if props or not isinstance(params, dict):
+        return props or {}
+    variants = []
+    for k in ("oneOf", "anyOf"):
+        for alt in params.get(k) if isinstance(params.get(k), list) else []:
+            _union_variants(params, alt, variants)
+    merged = {}
+    for v in variants:
+        for name, prop in v["properties"].items():
+            value = _deref(params, prop)
+            value = value if value is not None else {}
+            cur = merged.get(name)
+            if cur is None:
+                merged[name] = value
+            elif cur == value:
+                continue
+            elif all(isinstance(s, dict) and isinstance(s.get("enum"), list)
+                     and all(isinstance(e, str) for e in s["enum"]) for s in (cur, value)):
+                merged[name] = dict(cur, enum=cur["enum"] + [e for e in value["enum"] if e not in cur["enum"]])
+            elif isinstance(cur, dict) and list(cur) == ["anyOf"]:
+                merged[name] = {"anyOf": cur["anyOf"] + ([value] if value not in cur["anyOf"] else [])}
+            else:
+                merged[name] = {"anyOf": [cur, value]}
+    return merged
+
+
 def coerce_value(value: str, declared, notes: list | None = None):
     """A non-string parameter's text -> its value by the tool's declared type: JSON when it parses; else an array or an
     object read with lenient_json (a note says so in `notes`); else the text itself, as before.  An array or object that
     arrived as a JSON string of itself is decoded once more."""
     if declared == "string":
         return value
+    if declared == "string?":
+        return None if value.strip() == "null" else value
     try:
         v = json.loads(value)
     except ValueError:
@@ -1172,7 +1283,7 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
         raise ValueError("malformed tool call: " + body[:80])
     name = body[len("<function="):body.index(">")].strip()      # `<function= capture>`: the model's stray space
     rest = body[body.index(">") + 1:]
-    props = ((schema or {}).get("parameters") or {}).get("properties") or {}
+    props = _tool_properties(schema)
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
@@ -1185,7 +1296,7 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        args[pname] = coerce_value(value, (props.get(pname) or {}).get("type"), notes)
+        args[pname] = coerce_value(value, _declared(props.get(pname)), notes)
     return ToolCall(name=name, arguments=args)
 
 
@@ -1195,6 +1306,7 @@ RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning that
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
+    _at_end = False         # set only during finish()'s own feed: held parameter closes are taken (#167)
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  recover: bool = False, declared_only: bool = False):
@@ -1447,20 +1559,21 @@ class OutputParser:
         self.svstart = 0
 
     def _wrapped_call_end(self) -> int:
+        final = self._at_end
         # Without a closing tag the structural walk cannot finish. Search only
         # newly appended text plus enough overlap for a tag split across feeds.
         # A literal closing tag inside a value needs structural disambiguation:
         # once any candidate appears, keep the original full walk for this call.
         # Recovery can rewrite the buffer, so it always uses the full walk.
-        if not self.recover and self._call_end_checked >= 0:
+        if not self.recover and not final and self._call_end_checked >= 0:
             start = max(0, self._call_end_checked - len(CALL_END) + 1)
             if self.buf.find(CALL_END, start) < 0:
                 self._call_end_checked = len(self.buf)
                 return -1
             self._call_end_checked = -1
-        return call_end(self.buf)
+        return call_end(self.buf, final=final)
 
-    def _scan(self) -> list[Event]:
+    def _scan(self, final: bool = False) -> list[Event]:
         """Advance the streaming view of the call body in self.buf (see stream_tools)."""
         out = []
 
@@ -1480,8 +1593,7 @@ class OutputParser:
                 if raw_name != raw_name.strip() and name not in self.schemas:
                     return out
                 self.scall = ToolCall(name=name, arguments={})
-                props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
-                self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+                self.sdeclared = {k: _declared(v) for k, v in _tool_properties(self.schemas.get(name)).items()}
                 out.append(Event("tool_start", call=self.scall))
                 args("{")
                 self.sp += b + 1
@@ -1518,7 +1630,7 @@ class OutputParser:
                     self.sval_started = True
                     self.svstart = self.sp
                 # the walk starts at the value (a quoted call's opener counts); only a close in the new text can end it
-                end = param_end(self.buf[self.svstart:], name=self.spname) if PARAM_END in rest else -1
+                end = param_end(self.buf[self.svstart:], final=final, name=self.spname) if PARAM_END in rest else -1
                 end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
                     value = rest[:end]
@@ -1537,7 +1649,7 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest, name=self.spname)
+                end = param_end(rest, final=final, name=self.spname)
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -1586,6 +1698,7 @@ class OutputParser:
         return best
 
     def feed(self, delta: str) -> list[Event]:
+        final = self._at_end                # only finish() sets it, for its own empty feed
         self.buf += delta
         out: list[Event] = []
         while True:
@@ -1859,11 +1972,11 @@ class OutputParser:
                 if self.stream_tools:
                     if i >= 0:
                         whole, self.buf = self.buf, self.buf[:i]     # scan only the body
-                        out += self._scan()
+                        out += self._scan(final=final)
                         out += self._close_scan()
                         self.buf = whole
                     else:
-                        out += self._scan()
+                        out += self._scan(final=final)
                 if i < 0 or drop is None:
                     return out
                 body = self.buf[:i]
@@ -1878,7 +1991,14 @@ class OutputParser:
         already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211).  `reason` is
         how the turn ended: calls waiting from the reasoning become real calls only on a natural stop (None = stop);
         a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
+        # A call whose end was held for an unclosed quoted call in a value takes its structural close now (#167).
         out = []
+        if self.state == "call" and not self.bare:
+            self._at_end = True
+            try:
+                out = OutputParser.feed(self, "")
+            finally:
+                self._at_end = False
         if self.state == "rcall" and reason in (None, "stop"):
             # #4427: a call in the reasoning whose `</function>` is the end of the output (the `</tool_call>` left out)
             # is as whole as one in the answer: it waits for the turn's end like the others
@@ -1905,7 +2025,7 @@ class OutputParser:
                 out.append(Event("content", self._track(rest)))
             return out
         if self.state == "call" and self.stream_tools and self.scall is not None:
-            out += self._scan()                 # the output ended inside a call that was already announced
+            out += self._scan(final=True)       # the output ended inside a call that was already announced
             if self.ss == "function_done" and not self.buf[self.sp:].strip() and reason in (None, "stop"):
                 # A natural end immediately after </function> retains native streaming recovery.
                 out += self._close_scan()
