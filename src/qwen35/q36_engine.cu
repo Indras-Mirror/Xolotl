@@ -3318,7 +3318,7 @@ int serve(Engine& E, ImageCache& icache, int snap_every, size_t park_bytes, cons
     auto restore_image = [prefix_identity,bound_images,store=prefix_store,&icache](uint64_t key, const std::function<bool()>& cancelled) {
         try {
         if(!bound_images || prefix_identity.empty() || icache.find(key) || (cancelled && cancelled()))return;
-        auto record=store->find(prefix_identity+"/image/"+std::to_string(key),{0},1,cancelled);
+        auto record=store->find(prefix_identity+"/image/"+std::to_string(key),{0},1,cancelled,0,true);
         if(!record || (cancelled && cancelled()))return;
         strata::q36::persistent::Reader r{record->payload};uint64_t magic,n,nx,ny,width;
         if(!r.u64(magic)||magic!=0x31494d363351ULL||!r.u64(n)||!r.u64(nx)||!r.u64(ny)||!r.u64(width)||

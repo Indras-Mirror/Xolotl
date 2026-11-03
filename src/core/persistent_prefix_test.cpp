@@ -24,6 +24,23 @@ int main() {
         assert(!s.enqueue("a",{1},std::vector<uint8_t>(5000)));
     }
     // A genuine new process discovers only metadata and lazily reads the chosen payload.
+    {
+        Config d=c; d.directory=std::string(dir)+"/latency";
+        d.min_restore_cells=2; d.nonblocking_lookup=true;
+        Store s(d); assert(s.enabled());
+        assert(s.enqueue("model",{1,2},payload));
+        assert(s.enqueue("image",{0},payload)); s.flush();
+        assert(!s.find("model",{1}));
+        assert(!s.find("model",{1,2,3},SIZE_MAX,{},1)); // RAM already supplies all but one cell.
+        assert(s.find("model",{1,2,3}));
+        assert(!s.find("image",{0}));
+        assert(s.find("image",{0},1,{},0,true)); // Encoded images are not token prefixes.
+        int fd=::open((d.directory+"/lock").c_str(),O_RDWR|O_CLOEXEC);
+        assert(fd>=0 && ::flock(fd,LOCK_EX|LOCK_NB)==0);
+        assert(!s.find("model",{1,2,3})); // A busy writer is an immediate optional-cache miss.
+        assert(::flock(fd,LOCK_UN)==0); ::close(fd);
+        assert(s.find("model",{1,2,3})); // Contention never invalidates the saved record.
+    }
     auto child = fork(); assert(child >= 0);
     if (!child) { Store s(c); auto r=s.find("a",{1,2,4}); _exit(r && r->payload==payload ? 0:1); }
     int status=0; assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
