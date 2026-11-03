@@ -1842,6 +1842,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(split_ring_test src/program/split_ring_test.cpp)
   target_include_directories(split_ring_test PRIVATE include)
   add_test(NAME split_ring_test COMMAND split_ring_test)
+  # Model-free sampling/distribution checks for native DeepSeek grammar.
+  add_executable(ds41_grammar_sampling_test tools/v41/engine/test_ds41_grammar_sampling.cpp)
+  target_include_directories(ds41_grammar_sampling_test PRIVATE include)
+  add_test(NAME ds41_grammar_sampling_test COMMAND ds41_grammar_sampling_test)
   # the serve loop's conversation-cache retention policy (header-only, no library to link)
   add_executable(branch_boundary_test src/program/branch_boundary_test.cpp)
   target_include_directories(branch_boundary_test PRIVATE include)
@@ -2971,6 +2975,14 @@ if(TARGET strata_qwen35)
     target_compile_definitions(q36-grammar-check PRIVATE STRATA_Q36_GRAMMAR=1)
     target_link_libraries(q36-grammar-check PRIVATE q36_llama)
   endif()
+endif()
+
+# DeepSeek reuses the pinned vocabulary-only grammar parser; no GPU llama backend.
+option(STRATA_DS41_GRAMMAR "Enable native DeepSeek V4.1 GBNF" OFF)
+if(STRATA_DS41_GRAMMAR AND TARGET ds41_generate)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/tools/m31/cmake/grammar.cmake)
+  target_link_libraries(ds41_generate PRIVATE q36_llama)
+  target_compile_definitions(ds41_generate PRIVATE STRATA_Q36_GRAMMAR=1)
 endif()
 
 # the MiniMax-M3.1-Flash engine (community port, issue #62) - opt-in (-DSTRATA_M31=ON).

@@ -67,7 +67,13 @@ public:
           after(other.after), eos(other.eos), waiting(other.waiting) {
         if (other.sampler && !sampler) throw std::runtime_error("cannot clone grammar");
     }
-    void init(const llama_vocab * v, const std::string & path, int trigger, Caches & caches) {
+    Q36Grammar(Q36Grammar&&) noexcept = default;
+    Q36Grammar& operator=(Q36Grammar&&) noexcept = default;
+    Q36Grammar& operator=(const Q36Grammar& other) {
+        if (this != &other) *this = Q36Grammar(other);
+        return *this;
+    }
+    void init(const llama_vocab * v, const std::string & path, int trigger, Caches & caches, int end_token = -1) {
         sampler.reset(); vocab = v; after = trigger; waiting = trigger >= 0;
         cache.reset(); node = nullptr; node_checked = false;
         if (path.empty()) {
@@ -81,15 +87,19 @@ public:
         if (text.empty() || text.find('\0') != std::string::npos) throw std::runtime_error("empty grammar or NUL byte");
         if (caches.owner && caches.owner != v) throw std::runtime_error("grammar cache vocabulary changed");
         caches.owner = v;
-        auto it = caches.entries.find(text);
+        const std::string cache_key = end_token < 0 ? text : std::string(1, '\0') + std::to_string(end_token) + ":" + text;
+        auto it = caches.entries.find(cache_key);
         if (it == caches.entries.end()) {
             auto fresh = std::make_shared<Cache>();
             fresh->initial.reset(llama_sampler_init_grammar(v, text.c_str(), "root"));
             if (!fresh->initial) throw std::runtime_error("cannot compile GBNF (root rule required); see engine log");
             const char end[] = "<|im_end|>";
             llama_token token = -1;
-            if (llama_tokenize(v, end, sizeof(end) - 1, &token, 1, false, true) != 1)
+            if (end_token >= 0) token = end_token;
+            else if (llama_tokenize(v, end, sizeof(end) - 1, &token, 1, false, true) != 1)
                 throw std::runtime_error("missing im_end token");
+            if (end_token >= 0 && (token >= llama_vocab_n_tokens(v) || !llama_vocab_is_eog(v, token)))
+                throw std::runtime_error("invalid grammar end token");
             fresh->eos = token;
             if (caches.entries.size() >= 8) {
                 auto oldest = std::min_element(caches.entries.begin(), caches.entries.end(), [](const auto & a, const auto & b) {
@@ -97,7 +107,7 @@ public:
                 });
                 caches.entries.erase(oldest);   // live requests retain their shared cache and pristine sampler
             }
-            it = caches.entries.emplace(text, std::move(fresh)).first;
+            it = caches.entries.emplace(cache_key, std::move(fresh)).first;
             ++caches.compiles;
         } else {
             ++caches.hits;
@@ -109,6 +119,7 @@ public:
         if (!sampler) throw std::runtime_error("cannot clone compiled grammar");
     }
     bool active() const { return bool(sampler); }
+    int eos_token() const { return eos; }
     int vocab_size() const { return vocab ? llama_vocab_n_tokens(vocab) : 0; }
     const std::vector<int> * allowed_ids() const {
         if (!sampler || waiting) return nullptr;
@@ -167,14 +178,15 @@ public:
         model.reset(llama_model_load_from_file(path.c_str(), p));
         if (!model) throw std::runtime_error("cannot load grammar vocabulary");
     }
-    void prepare(Q36Grammar & grammar, const std::string & path, int after) {
-        grammar.init(llama_model_get_vocab(model.get()), path, after, caches);
+    void prepare(Q36Grammar & grammar, const std::string & path, int after, int eos = -1) {
+        grammar.init(llama_model_get_vocab(model.get()), path, after, caches, eos);
     }
 };
 #else
 class Q36Grammar {
 public:
     bool active() const { return false; }
+    int eos_token() const { return -1; }
     int vocab_size() const { return 0; }
     const std::vector<int> * allowed_ids() const { return nullptr; }
     void mask(float *, const int *, int) const {}
@@ -183,7 +195,7 @@ public:
 class Q36Vocabulary {
 public:
     explicit Q36Vocabulary(const std::string &) {}
-    void prepare(Q36Grammar &, const std::string & path, int after) const {
+    void prepare(Q36Grammar &, const std::string & path, int after, int = -1) const {
         if (!path.empty() || after >= 0) throw std::runtime_error("grammar unavailable in this build");
     }
 };

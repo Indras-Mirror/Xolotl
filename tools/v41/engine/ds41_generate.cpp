@@ -48,6 +48,8 @@
 #include "ds41_conv_reuse.hpp"
 #include "ds41_batch_slots.hpp"
 #include "ds41_batch.hpp"
+#include "../../../src/qwen35/q36_grammar.hpp"
+#include "ds41_sampling.hpp"
 #include "ds41_pipeline.hpp"
 #if defined(DS41_HAVE_DSPARK)
 #include "ds41_dspark.hpp"
@@ -324,75 +326,6 @@ double now_ms() {
 }
 
 // temperature + top-k / min-p / top-p over the top candidates (top_k 0 = the 256 best); temp 0 = argmax
-int sample_p(const float * logits, int n_vocab, float temp, int top_k, float top_p, float min_p, std::mt19937_64 & rng) {
-    if (temp <= 0.0f) return (int) (std::max_element(logits, logits + n_vocab) - logits);
-    const int K = std::min(n_vocab, top_k > 0 ? top_k : 256);
-    std::vector<int> idx((size_t) n_vocab);
-    for (int i = 0; i < n_vocab; ++i) idx[(size_t) i] = i;
-    std::partial_sort(idx.begin(), idx.begin() + K, idx.end(), [&](int x, int y) { return logits[x] > logits[y]; });
-    const double mx = logits[idx[0]];
-    std::vector<double> p((size_t) K);
-    for (int i = 0; i < K; ++i) p[(size_t) i] = std::exp(((double) logits[idx[(size_t) i]] - mx) / temp);
-    int n = K;
-    if (min_p > 0.0f) while (n > 1 && p[(size_t) n - 1] < (double) min_p * p[0]) --n;
-    if (top_p > 0.0f && top_p < 1.0f) {
-        double zn = 0, c = 0;
-        for (int i = 0; i < n; ++i) zn += p[(size_t) i];
-        for (int i = 0; i < n; ++i) { c += p[(size_t) i] / zn; if (c >= top_p) { n = i + 1; break; } }
-    }
-    double z = 0;
-    for (int i = 0; i < n; ++i) z += p[(size_t) i];
-    std::uniform_real_distribution<double> u(0.0, z);
-    double r = u(rng);
-    for (int i = 0; i < n; ++i) if ((r -= p[(size_t) i]) <= 0) return idx[(size_t) i];
-    return idx[(size_t) n - 1];
-}
-
-// the distribution sample_p draws from, as (token, probability) pairs summing to 1 (temp 0: the argmax alone) - the
-// trunk's p for --serve's speculative sampling (same candidates, same weights as sample_p)
-void sample_dist(const float * logits, int n_vocab, float temp, int top_k, float top_p, float min_p,
-                 std::vector<std::pair<int, double>> & out) {
-    out.clear();
-    if (temp <= 0.0f) { out.push_back({ (int) (std::max_element(logits, logits + n_vocab) - logits), 1.0 }); return; }
-    const int K = std::min(n_vocab, top_k > 0 ? top_k : 256);
-    std::vector<int> idx((size_t) n_vocab);
-    for (int i = 0; i < n_vocab; ++i) idx[(size_t) i] = i;
-    std::partial_sort(idx.begin(), idx.begin() + K, idx.end(), [&](int x, int y) { return logits[x] > logits[y]; });
-    const double mx = logits[idx[0]];
-    std::vector<double> p((size_t) K);
-    for (int i = 0; i < K; ++i) p[(size_t) i] = std::exp(((double) logits[idx[(size_t) i]] - mx) / temp);
-    int n = K;
-    if (min_p > 0.0f) while (n > 1 && p[(size_t) n - 1] < (double) min_p * p[0]) --n;
-    if (top_p > 0.0f && top_p < 1.0f) {
-        double zn = 0, c = 0;
-        for (int i = 0; i < n; ++i) zn += p[(size_t) i];
-        for (int i = 0; i < n; ++i) { c += p[(size_t) i] / zn; if (c >= top_p) { n = i + 1; break; } }
-    }
-    double z = 0;
-    for (int i = 0; i < n; ++i) z += p[(size_t) i];
-    for (int i = 0; i < n; ++i) out.push_back({ idx[(size_t) i], p[(size_t) i] / z });
-}
-
-// Speculative sampling with a DETERMINISTIC draft d (DSpark drafts by argmax: q = a point mass on d).  Leviathan /
-// Chen: accept with min(1, p(d) / q(d)) = p(d); on rejection sample from norm(max(0, p - q)) = p without d.  The
-// emitted token is then distributed exactly as p - the same as plain sampling.  true = d accepted; false = `out` is
-// the replacement token.
-bool spec_accept(const std::vector<std::pair<int, double>> & dist, int d, std::mt19937_64 & rng, int & out) {
-    double pd = 0;
-    for (const auto & c : dist) if (c.first == d) pd = c.second;
-    std::uniform_real_distribution<double> u(0.0, 1.0);
-    if (pd > 0 && u(rng) < pd) return true;
-    double r = u(rng) * (1.0 - pd);
-    int last = -1;
-    for (const auto & c : dist) {
-        if (c.first == d) continue;
-        last = c.first;
-        if ((r -= c.second) <= 0) { out = c.first; return false; }
-    }
-    out = last >= 0 ? last : d;   // rounding: the last candidate (d only if it was the sole candidate - then pd was 1)
-    return false;
-}
-
 double log_softmax_at(const float * lg, int nv, int tok) {
     const float mx = *std::max_element(lg, lg + nv);
     double z = 0;
@@ -1661,6 +1594,10 @@ int main(int argc, char ** argv) {
 #ifdef STRATA_ENABLE_CUDA
         if (!checkpoint_backends.empty()) std::printf(" checkpoint_clock=1");
 #endif
+#ifdef STRATA_Q36_GRAMMAR
+        std::printf(" grammar=1 grammar_replay=1");
+#endif
+        std::unique_ptr<Q36Vocabulary> grammar_vocab;
         if (pool_on) std::printf(" conversation_cache_mib=%d conversation_cache_slots=%d", a.conv_mib, a.conv_slots);
         if (NS > 0) std::printf(" batch_slots=%d slot_cache=1", NS);   // serve/server.py: the slot protocol (generate_batched)
         std::printf("\n");
@@ -1719,6 +1656,7 @@ int main(int argc, char ** argv) {
             int top_k = 0;
             std::mt19937_64 rng;
             RouteCls cls;
+            Q36Grammar grammar;
         };
         std::vector<Conv> cv((size_t) NS);
         std::vector<BSlot> bs((size_t) NS);
@@ -1868,7 +1806,8 @@ int main(int argc, char ** argv) {
             std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, now_ms() - sl.t0);
             sl.active = false;
             sl.stop = false;
-            if (std::strcmp(fin, "nonfinite") == 0) {   // its state is not worth keeping
+            sl.grammar = Q36Grammar();
+            if (std::strcmp(fin, "nonfinite") == 0 || std::strcmp(fin, "grammar") == 0) {   // its state is not worth keeping
                 cv[(size_t) b].hist.clear();
                 cv[(size_t) b].live_id.clear();
                 cv[(size_t) b].snap_len = -1;
@@ -1957,7 +1896,9 @@ int main(int argc, char ** argv) {
                     end_slot(b, "nonfinite");
                     continue;
                 }
-                const int y = sample_p(lg, nv, sl.temp, sl.top_k, sl.top_p, sl.min_p, sl.rng);
+                const int y = grammar_sample(sl.grammar, lg, nv, sl.temp, sl.top_k, sl.top_p, sl.min_p, sl.rng);
+                if (y < 0) { end_slot(b, y == -2 ? "nonfinite" : "grammar"); continue; }
+                sl.grammar.accept(y);
                 cv[(size_t) b].hist.push_back(sl.x);   // the fed token is in the slot's state now
                 std::printf("BT %d %d\n", b, y);
                 ++sl.produced;
@@ -2122,6 +2063,8 @@ int main(int argc, char ** argv) {
             std::istringstream ss(line);
             std::string w, csv, emb_file;
             int max_new = 0, tk = 0;
+            std::string grammar_path, grammar_prefix, grammar_after;
+            Q36Grammar grammar;
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
             float req_rb = cfg_route_bias, req_rbf = cfg_route_bias_file, req_rbr = cfg_route_bias_remote;
             int req_rprot = cfg_rprot, req_rpool = cfg_rpool;
@@ -2134,7 +2077,10 @@ int main(int argc, char ** argv) {
                     continue;
                 }
                 const std::string k = w.substr(0, eq), v = w.substr(eq + 1);
-                if (k == "temperature") temp = (float) std::atof(v.c_str());
+                if (k == "grammar") grammar_path = v;
+                else if (k == "grammar_after") grammar_after = v;
+                else if (k == "grammar_prefix") grammar_prefix = v;
+                else if (k == "temperature") temp = (float) std::atof(v.c_str());
                 else if (k == "top_p") top_p = (float) std::atof(v.c_str());
                 else if (k == "top_k") tk = std::atoi(v.c_str());
                 else if (k == "min_p") min_p = (float) std::atof(v.c_str());
@@ -2176,6 +2122,44 @@ int main(int argc, char ** argv) {
             if (ids.empty()) { std::printf("ERR empty prompt\n"); std::fflush(stdout); continue; }
             if ((int64_t) ids.size() + std::max(0, max_new) > ctxv) {
                 std::printf("ERR prompt (%zu) + max tokens (%d) exceed the context (%d)\n", ids.size(), max_new, ctxv);
+                std::fflush(stdout);
+                continue;
+            }
+            try {
+                auto strict_id = [&](const std::string & value) {
+                    if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos)
+                        throw std::runtime_error("invalid grammar token id");
+                    const unsigned long long token = std::stoull(value);
+                    if (token >= (unsigned long long) nv) throw std::runtime_error("grammar token out of vocabulary");
+                    return (int) token;
+                };
+                const int after = grammar_after.empty() ? -1 : strict_id(grammar_after);
+                if (grammar_path.empty() && (!grammar_prefix.empty() || after >= 0))
+                    throw std::runtime_error("grammar replay/after requires grammar");
+                if (!grammar_path.empty()) {
+                    if (!grammar_vocab) grammar_vocab.reset(new Q36Vocabulary(a.model));
+                    if ((uint64_t) G.eos >= (uint64_t) nv) throw std::runtime_error("invalid DeepSeek end token");
+                    grammar_vocab->prepare(grammar, grammar_path, after, (int) G.eos);
+                    if (grammar.vocab_size() != nv) throw std::runtime_error("grammar vocabulary size mismatch");
+                    if (!grammar_prefix.empty()) {
+                        if (grammar_prefix.back() == ',') throw std::runtime_error("invalid grammar_prefix");
+                        std::stringstream replay(grammar_prefix);
+                        std::string value;
+                        int count = 0;
+                        while (std::getline(replay, value, ',')) {
+                            if (++count > ctxv) throw std::runtime_error("grammar_prefix exceeds context");
+                            const int token = strict_id(value);
+                            float permitted = 0.f;
+                            grammar.mask(&permitted, &token, 1);
+                            if (!std::isfinite(permitted))
+                                throw std::runtime_error("grammar_prefix violates grammar");
+                            if (is_stop(token)) throw std::runtime_error("grammar_prefix contains terminal token");
+                            grammar.accept(token);
+                        }
+                    }
+                }
+            } catch (const std::exception & error) {
+                std::printf("ERR grammar: %s\n", error.what());
                 std::fflush(stdout);
                 continue;
             }
@@ -2855,7 +2839,8 @@ int main(int argc, char ** argv) {
                         spos.resize((size_t) m);
                         for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
                         const bool last = i0 + m == total;
-                        if (last) sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);   // the batch's last row
+                        if (last) { sp_t = grammar_sample(grammar, last_logits.data(), nv, temp, tk, top_p, min_p, rng);
+                            if (sp_t < 0) { ferr = sp_t == -2 ? "nonfinite logits" : "grammar has no valid token"; ok = false; break; } }   // the batch's last row
                         if (i0 == c0s) cur_seed_n = 0;
                         cur_seed.resize((size_t) (cur_seed_n + m) * 3 * n_embd);
                         std::copy_n(bcap_vh.data() + (vh0 + (size_t) (i0 - c0s)) * 3 * n_embd, (size_t) m * 3 * n_embd,
@@ -2877,7 +2862,8 @@ int main(int argc, char ** argv) {
                     const bool last = i0 + m == total;
                     if (last) {
                         std::copy(vlog.end() - nv, vlog.end(), last_logits.begin());
-                        sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);
+                        sp_t = grammar_sample(grammar, last_logits.data(), nv, temp, tk, top_p, min_p, rng);
+                        if (sp_t < 0) { ferr = sp_t == -2 ? "nonfinite logits" : "grammar has no valid token"; ok = false; break; }
                     }
                     if (i0 == total - sp_tail) cur_seed_n = 0;
                     cur_seed.resize((size_t) (cur_seed_n + m) * 3 * n_embd);
@@ -2900,7 +2886,8 @@ int main(int argc, char ** argv) {
                     spos.resize((size_t) m);
                     for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
                     const bool last = i0 + m == total;
-                    if (last) sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);
+                    if (last) { sp_t = grammar_sample(grammar, last_logits.data(), nv, temp, tk, top_p, min_p, rng);
+                            if (sp_t < 0) { ferr = sp_t == -2 ? "nonfinite logits" : "grammar has no valid token"; ok = false; break; } }
                     if (!dsp->step(snap_seed.data() + (size_t) (i0 - s0) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
                                    last ? sp_ids : sp_tmp, sp_conf)) {
                         std::fprintf(stderr, "serve: DSpark re-seed: %s (decoding without drafts)\n", dsp->last_error().c_str());
@@ -2928,7 +2915,15 @@ int main(int argc, char ** argv) {
             }
             tail_keep = 0;
             if (!ok) {
-                if (prefill_cancelled) {
+                if (grammar.active() && (ferr == "grammar has no valid token" || ferr == "nonfinite logits")) {
+                    snap_seed_n = cur_seed_n = 0;
+#if defined(DS41_HAVE_DSPARK)
+                    dsp_next = -1;
+#endif
+                    std::printf("DONE 0 %d %.1f 0.0 %s\n", total, now_ms() - tp0,
+                                ferr == "nonfinite logits" ? "nonfinite" : "grammar");
+                    if (admit >= 0) std::printf("BADM %d 0\n", admit);
+                } else if (prefill_cancelled) {
                     // No partial prompt can be reused as a valid conversation.
                     snap_seed_n = cur_seed_n = 0;
                     // feed returned before its ordinary elastic-column/chunk cleanup.
@@ -3036,6 +3031,7 @@ int main(int argc, char ** argv) {
                     std::printf("T %d\n", tok);
                     std::fflush(stdout);
                     ++gen;
+                    grammar.accept(tok);
                     if (is_stop(tok)) { finish = "stop"; return false; }
                     if (max_new > 0 && gen >= max_new) return false;
                     return true;
@@ -3100,11 +3096,19 @@ int main(int argc, char ** argv) {
                     if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
                     const double tq1 = now_ms();
                     int acc = 0, tn = -1;
+                    Q36Grammar trial = grammar;
+                    int grammar_status = 1;
                     for (; acc < k; ++acc) {
-                        sample_dist(vlog.data() + (size_t) (r0 + acc) * nv, nv, temp, tk, top_p, min_p, dist);
+                        grammar_status = grammar_dist(trial, vlog.data() + (size_t) (r0 + acc) * nv, nv, temp, tk, top_p, min_p, dist);
+                        if (grammar_status <= 0) break;
                         if (!spec_accept(dist, dr[acc], rng, tn)) break;
+                        trial.accept(dr[acc]);
+                        // Later verify rows are unreachable once an accepted draft ends the reply.
+                        if (grammar.active() && is_stop(dr[acc])) { tn = dr[acc]; ++acc; break; }
                     }
-                    if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, temp, tk, top_p, min_p, rng);
+                    if (grammar_status <= 0) { finish = grammar_status < 0 ? "nonfinite" : "grammar"; break; }
+                    if (acc == k && tn < 0) tn = grammar_sample(trial, vlog.data() + (size_t) (r0 + k) * nv, nv, temp, tk, top_p, min_p, rng);
+                    if (tn < 0) { finish = tn == -2 ? "nonfinite" : "grammar"; break; }
                     const double tq2 = now_ms();
                     ++rq_pass; rq_acc += acc;
                     // STRATA_BIAS_REFRESH=N (default 1, 0 = the old per-request snapshot; changes outputs like any residency change): the route bias + file penalty
@@ -3147,7 +3151,9 @@ int main(int argc, char ** argv) {
             int last_tok = -1;   // (an admission's first token: its slot feeds it first)
             while (sp_t < 0 && (gen < max_new || max_new <= 0)) {
                 if (stop_pending()) { finish = "cancel"; break; }
-                const int tok = sample_p(lg.data(), nv, temp, tk, top_p, min_p, rng);
+                const int tok = grammar_sample(grammar, lg.data(), nv, temp, tk, top_p, min_p, rng);
+                if (tok < 0) { finish = tok == -2 ? "nonfinite" : "grammar"; break; }
+                grammar.accept(tok);
                 last_tok = tok;
                 std::printf("T %d\n", tok);
                 std::fflush(stdout);
@@ -3167,6 +3173,13 @@ int main(int argc, char ** argv) {
                 live_id.clear();
                 snap_len = -1;
                 finish = "length";
+            }
+            if (std::strcmp(finish, "grammar") == 0 || std::strcmp(finish, "nonfinite") == 0) {
+                hist.clear(); live_id.clear(); snap_len = -1;
+                snap_seed_n = cur_seed_n = 0;
+#if defined(DS41_HAVE_DSPARK)
+                dsp_next = -1;
+#endif
             }
             std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file",
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
@@ -3236,6 +3249,7 @@ int main(int argc, char ** argv) {
                     sl.t0 = now_ms();
                     sl.temp = temp; sl.top_k = tk; sl.top_p = top_p; sl.min_p = min_p;
                     sl.rng = rng;
+                    sl.grammar = grammar;
                     sl.cls = RouteCls{ a.route_bias, a.route_bias_file, cur_rprot, cur_rpool };
                     std::fprintf(stderr, "strata batch: slot %d decodes on from %d tokens (%d reused; route bias %.2f/%.2f)\n",
                                  admit, total, reused, a.route_bias, a.route_bias_file);
