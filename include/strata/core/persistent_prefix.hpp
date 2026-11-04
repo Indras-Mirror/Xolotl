@@ -71,6 +71,8 @@ struct Config {
     std::string directory;
     uint64_t disk_bytes = uint64_t(64) << 30, min_free_bytes = uint64_t(1) << 30;
     uint64_t queue_bytes = uint64_t(2) << 30;
+    uint64_t min_restore_cells = 0;
+    bool nonblocking_lookup = false;
     size_t max_entries = 4096;
     static Config from_env() {
         Config c;
@@ -88,6 +90,9 @@ struct Config {
         read("STRATA_PREFIX_CACHE_BYTES", c.disk_bytes);
         read("STRATA_PREFIX_CACHE_MIN_FREE_BYTES", c.min_free_bytes);
         read("STRATA_PREFIX_CACHE_QUEUE_BYTES", c.queue_bytes);
+        read("STRATA_PREFIX_CACHE_MIN_RESTORE_CELLS", c.min_restore_cells);
+        if (const char* s = std::getenv("STRATA_PREFIX_CACHE_NONBLOCKING_LOOKUP"))
+            c.nonblocking_lookup = std::string(s) == "1";
         return c;
     }
 };
@@ -333,18 +338,22 @@ public:
         accepted=true; cv_.notify_one(); return true;
     }
     std::optional<FileRecord> find_file(const std::string& identity, const std::vector<uint64_t>& cells,
-                size_t limit = std::numeric_limits<size_t>::max(), const std::function<bool()>& cancel = {}, size_t minimum_cells = 0) {
+                size_t limit = std::numeric_limits<size_t>::max(), const std::function<bool()>& cancel = {}, size_t minimum_cells = 0, bool auxiliary = false) {
         try {
         if (!enabled_ || minimum_cells >= std::min(limit,cells.size()) || (cancel && cancel())) return {};
+        // Restoring a large state to save a few tokens can cost more than prefill.
+        // Auxiliary records (encoded images) have no token savings to estimate.
+        const uint64_t gain = auxiliary ? 0 : config_.min_restore_cells;
+        if (std::min(limit,cells.size()) - minimum_cells < gain) return {};
         const auto start = std::chrono::steady_clock::now();
-        auto lease = lock(cancel);
+        auto lease = lock(cancel, config_.nonblocking_lookup);
         if (!lease) { ++stats_.misses; return {}; }
         auto entries = scan(cancel);
         struct Choice { Entry* entry; const std::vector<uint64_t>* key; size_t count; };
         std::vector<Choice> choices;
         for (auto& e : entries) if (e.identity == identity) for (const auto& key : e.keys) {
             auto offer = [&](size_t n) {
-                if (n > minimum_cells && n <= limit && n <= cells.size() && std::equal(key.begin(),key.begin()+n,cells.begin()))
+                if (n > minimum_cells && n - minimum_cells >= gain && n <= limit && n <= cells.size() && std::equal(key.begin(),key.begin()+n,cells.begin()))
                     choices.push_back({&e,&key,n});
             };
             if (e.lengths.empty()) offer(key.size());
@@ -374,9 +383,9 @@ public:
         } catch (...) { ++stats_.failures; return {}; }
     }
     std::optional<Record> find(const std::string& identity, const std::vector<uint64_t>& cells,
-                size_t limit = std::numeric_limits<size_t>::max(), const std::function<bool()>& cancel = {}, size_t minimum_cells = 0) {
+                size_t limit = std::numeric_limits<size_t>::max(), const std::function<bool()>& cancel = {}, size_t minimum_cells = 0, bool auxiliary = false) {
         try {
-        auto file = find_file(identity, cells, limit, cancel, minimum_cells);
+        auto file = find_file(identity, cells, limit, cancel, minimum_cells, auxiliary);
         if (!file) return {};
         std::error_code ec; const auto n = fs::file_size(file->path, ec);
         if (ec || n > config_.queue_bytes || n > SIZE_MAX) return {};
@@ -452,13 +461,13 @@ private:
     static uint64_t micros(std::chrono::steady_clock::time_point start) {
         return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
     }
-    std::shared_ptr<void> lock(const std::function<bool()>& cancel = {}) const {
+    std::shared_ptr<void> lock(const std::function<bool()>& cancel = {}, bool nonblocking = false) const {
 #ifndef _WIN32
         const auto path = (fs::path(config_.directory) / "lock").string();
         int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
         if (fd < 0) return {};
         while (::flock(fd, LOCK_EX | LOCK_NB)) {
-            if (errno != EWOULDBLOCK || (cancel && cancel())) { ::close(fd); return {}; }
+            if (errno != EWOULDBLOCK || nonblocking || (cancel && cancel())) { ::close(fd); return {}; }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         return std::shared_ptr<void>(new int(fd), [](void* p) { auto* v = static_cast<int*>(p); ::flock(*v, LOCK_UN); ::close(*v); delete v; });

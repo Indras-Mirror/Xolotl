@@ -2,6 +2,10 @@
 
 The native serving engines can keep reusable prompt state in a shared disk directory. The feature is off unless `STRATA_PREFIX_CACHE_DIR` is set. Model loading still happens after a process restart.
 
+For latency-sensitive serving, `STRATA_PREFIX_CACHE_NONBLOCKING_LOOKUP=1` makes a busy shared-directory lease an optional cache miss instead of waiting behind a background writer. `STRATA_PREFIX_CACHE_MIN_RESTORE_CELLS=512` additionally skips disk records that improve on the available RAM prefix by fewer than 512 native key cells. Short requests are skipped before taking the lease. Cells are adapter-specific (DeepSeek uses two cells per token); this is not a token limit. Encoded-image auxiliary records are exempt from the minimum gain. Both policies default off, preserve exact-prefix validation and may trade a disk hit for fresh computation. They do not bound capture time or contention outside the disk lookup.
+
+Flash also supports `STRATA_FLASH_PREFIX_MIN_CAPTURE_TOKENS=512`. It skips disk snapshot preparation for shorter token histories before joining checkpoint work, reserving buffers or copying native state. Those histories keep the existing RAM cache behavior. The default is zero (no additional threshold); malformed explicit values disable Flash disk capture but do not disable compatible record lookup. Longer captures can still copy substantial state synchronously.
+
 Use a private local directory owned by the serving user (permissions `0700` on Linux). Each directory is one quota domain across model families and processes. Processes sharing it must use the same disk limit, free-space reserve and entry limit; a conflicting policy disables the tier for that process. A new directory records that policy. Use a different empty directory when changing the policy.
 
 ```sh
