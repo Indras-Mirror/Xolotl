@@ -172,6 +172,17 @@ class TokenAwareRuntimeTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_sampling_keys_accepts_and_forwards_common_replay_keyword(self):
+        for replay in (False, True):
+            with self.subTest(replay=replay), mock.patch.object(
+                    M._BaseEngine, "sampling_keys", return_value="base") as encode:
+                keys = M.M31Engine.sampling_keys(
+                    {"cache_prompt": False, "top_k": 0, "seed": 0}, grammar_replay=replay)
+                encode.assert_called_once_with({"cache_prompt": False}, grammar_replay=replay)
+                self.assertIn(" cache_prompt=0", keys)
+                self.assertIn(" top_k=0", keys)
+                self.assertIn(" seed=0", keys)
+
     def test_m31_recovery_default_matches_strict_parser_without_changing_config(self):
         config = {}
         self.assertFalse(M.tool_call_recovery_setting(config))
