@@ -177,6 +177,33 @@ The serve config's `gpu` becomes `--gpu`, which sets `CUDA_VISIBLE_DEVICES` itse
 launcher set (the engine warns when it does). With two cards, use the config's own numbering: `CUDA_VISIBLE_DEVICES=1`
 with `"gpu": [0]` still runs on physical GPU 0; set `"gpu": [1]` (#47).
 
+Pictures on a discrete card: start with `--reserve-mib 900`. The 600 MiB default leaves about 10 MiB of worst-case
+margin once 36 experts are resident, and the first picture's BLAS start plus the tower's buffers need more (taken from
+upstream Strata `c5ab5d400`; the engine default is unchanged).
+
+#### A bigger box: `--arena-gib` and `--kv-q8` (RTX 5090 32 GiB · Ryzen 7 9800X3D · 183 GiB DDR5, #114)
+
+Measured by cpacsm75 on the V4 XQ pack (163 GB) through `serve_ds41.py`, build `1dad2ad`, GPU power held at 450 W, one
+request per point, so these are single samples:
+
+| ctx / prompt | settings | VRAM experts | prompt tok/s | decode tok/s |
+| --- | --- | ---: | ---: | ---: |
+| 512K / 452,727 | `--arena-gib 110` | 1,494 | 968.3 | 42.0 |
+| 512K / 452,727 | `--arena-gib 130` | 1,494 | 1,056.4 | 42.0 |
+| 512K / 452,727 | `--arena-gib 130 --kv-q8` | 1,561 | **1,497.6** | **45.9** |
+| 256K / 232,201 | `--arena-gib 130` | 1,566 | 1,276.9 | 44.9 |
+| 256K / 232,201 | `--arena-gib 130 --kv-q8` | 1,596 | **1,572.4** | **46.2** |
+
+- With RAM to spare, raise the arena until the file tier is nearly empty. On that box 130 GiB left 1,609 experts on
+  NVMe (10,054 at the default 60) and left ~42 GiB free for page cache. Decode did not move, since it is bound by RAM
+  bandwidth.
+- `--kv-q8` speeds up the dense/attention phase of a long prompt (512K: 295 s down to 169 s). The expert phase is
+  unchanged and the VRAM expert seed barely moves, so the gain comes from reading less KV, not from fitting more
+  experts. The gain grows with context: +23% prompt at 256K, +42% at 512K.
+- Measured and not adopted: `--prompt-batch 4096`. It freed VRAM, but the expert seed is decided at load, so the prompt
+  only got slower.
+- Not measured there: `--kv-fp4` against BF16/Q8 at matched long context, and any quality check of these settings.
+
 ### Unsloth's UD-Q2_K_XL (UD 3.1)
 
 [Unsloth's DeepSeek-V4.1-Flash-1017 GGUFs](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) are in
