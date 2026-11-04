@@ -205,12 +205,11 @@ __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(const void* __restrict__ v
                                                       const int& kbx, const int& iqs) {
     const block_iq3_xxs* bq3 = (const block_iq3_xxs*) vbq + kbx;
     const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
-    const uint8_t* q3 = (const uint8_t*) &q3_packed;
     const uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const int2 grid_pos = make_int2(iq3xxs_grid[packed_byte(q3_packed, l0 + 0)], iq3xxs_grid[packed_byte(q3_packed, l0 + 1)]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
@@ -257,13 +256,12 @@ __device__ __forceinline__ float vec_dot_iq1_m_q8_1(const void* __restrict__ vbq
                                                     const int& kbx, const int& iqs) {
     const block_iq1_m* bq1 = (const block_iq1_m*) vbq + kbx;
     const int qs_packed = get_int_b4(bq1->qs, iqs);
-    const uint8_t* qs = (const uint8_t*) &qs_packed;
     int sumi[2] = {0, 0};
     float sumf[2] = {0.0f, 0.0f};
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int qhl = bq1->qh[2 * iqs + l0 / 4] >> (4 * ((l0 / 2) % 2));
-        const int grid = iq1s_grid_gpu[qs[l0 / 2] | ((qhl & 0x07) << 8)];
+        const int grid = iq1s_grid_gpu[packed_byte(qs_packed, l0 / 2) | ((qhl & 0x07) << 8)];
         const int grid0 = (grid >> 0) & 0x0F0F0F0F;
         const int grid1 = (grid >> 4) & 0x0F0F0F0F;
         const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
@@ -1039,13 +1037,12 @@ template<> struct Split<18> {   // IQ3_XXS
     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq3_xxs* bq3 = (const block_iq3_xxs*) vbq + kbx;
         const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
-        const uint8_t* q3 = (const uint8_t*) &q3_packed;
         const uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
         const uint32_t* grid = STAGE_GRID ? s_grid : iq3xxs_grid;
         W r;
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
-            const int2 grid_pos = make_int2(grid[q3[l0 + 0]], grid[q3[l0 + 1]]);
+            const int2 grid_pos = make_int2(grid[packed_byte(q3_packed, l0 + 0)], grid[packed_byte(q3_packed, l0 + 1)]);
             if constexpr (STAGE_GRID) {
                 // The staged tables hold one mask per 7-bit sign field; bit 7 of the field is the next group's
                 // first sign, which unpack_ksigns cancels, so masking it off is the same value.
@@ -1139,7 +1136,6 @@ template<> struct Split<29> {   // IQ1_M
     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
         const block_iq1_m* bq1 = (const block_iq1_m*) vbq + kbx;
         const int qs_packed = get_int_b4(bq1->qs, iqs);
-        const uint8_t* qs = (const uint8_t*) &qs_packed;
         const uint32_t* grid_lut;
         if constexpr (STAGE_GRID) grid_lut = s_grid;
         else grid_lut = iq1s_grid_gpu;
@@ -1147,7 +1143,7 @@ template<> struct Split<29> {   // IQ1_M
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const int qhl = bq1->qh[2 * iqs + l0 / 4] >> (4 * ((l0 / 2) % 2));
-            const int grid = grid_lut[qs[l0 / 2] | ((qhl & 0x07) << 8)];
+            const int grid = grid_lut[packed_byte(qs_packed, l0 / 2) | ((qhl & 0x07) << 8)];
             r.g[l0 + 0] = (grid >> 0) & 0x0F0F0F0F;
             r.g[l0 + 1] = (grid >> 4) & 0x0F0F0F0F;
             r.delta[l0 / 2] = -1.0f + IQ1M_DELTA - (qhl & 0x08) * (2.0f * IQ1M_DELTA / 0x08);
