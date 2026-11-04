@@ -14,28 +14,34 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 > DeepSeek-V4.1 engine (faster now), plus GLM-5.3-Flash and the Qwen3.8 models, in one tree. Old links and clones
 > redirect here; nothing DeepSeek-V4.1 was removed.
 
-> **Qwen 4, day one (prep, 30 Oct).** Qwen 4 isn't out yet, but we've been getting ready so Xolotl can run it as
-> close to release day as possible. If Qwen 4 Flash keeps Qwen3.8-Flash-Next's architecture, the engine already
-> runs it; the 27B looks dense, so it's going into `strata-dense` with the hyper-connections and QSA attention added.
-> What's known so far and the plan: [docs/QWEN4.md](docs/QWEN4.md).
+## Latest
 
-> **Qwen3.8-Flash-Next XQ 45 GB is up (31 Oct)** on [Hugging Face](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored).
-> It's Swift 1.5 (UkisAI's reasoning-efficient fine-tune) with the refusal direction removed, quantised with our XQ
-> pipeline: 44.9 GB of model plus the 28.8 GB n-gram (PLE) table, which is read from disk. On the 4090 it does
-> **199 tok/s decode and 3,204 tok/s prefill at a 16K prompt** (160 / 2,819 at 8K). On Gauntlet v2 it solved 5/7, score
-> 6.68 (our previous 55.8 GB build 6/7, 6.50; Qwen's own API 5/7, 5.50; one run each), and it
-> refused 0 of 100 held-out harmful prompts and 0 of 30 safe ones. Serve it with
-> `./scripts/xol-qfn.sh --model <shard 1 .gguf> --pack <pack-qfn45>`.
+Full notes for every item: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
-> **DeepSeek-V4.1 V4 (25 Oct)** on [Hugging Face](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)
-> (`v4/`, 152 GiB) is the best DeepSeek build so far. Through the real engine it agrees with the full-precision model
-> on the top-1 token 86.9% of the time vs V3's 82.9% (KL 0.306 vs 0.405; 85.7% vs 81.5% on the Python reference path),
-> its perplexity is within 0.4% of the full model's, and the 1,056 hottest experts stay in DeepSeek's native FP4. It
-> solved 21/21, 10/10 and 3/3 on the coding tasks below, 162/164 on the full HumanEval, and 6/7 (6.50) on Gauntlet v2
-> against the DeepSeek API's 5/7 (6.41). Run it with V4's own rank file, `--rank v4/rank-1017-v4.bin`, and
-> `--tier-batch-pcie 0.25`. If you downloaded V4 before 25 Oct, grab the rank file (123 KB):
-> `hf download IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored v4/rank-1017-v4.bin --local-dir V41-XQ-1017`.
-> Speeds in detail: [docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md#deepseek-v41-flash-1017-v4-25-oct).
+- **4 Nov - faster short requests with the disk prefix cache** (#115): 9.0 s -> 0.32 s for a short request after a
+  47K-token prompt, opt-in. Also the MiniMax replay fix (#116), the Basalt ports and RTX 5090 `--kv-q8` numbers (#114).
+  [Details](docs/xolotl/CHANGELOG.md#prefix-cache-latency-minimax-replay-and-the-basalt-ports-4-nov)
+- **3 Nov - LFM3 as the ears and voice of QFN** on one 4090 (`scripts/xol-qfn-voice.sh`).
+  [Details](docs/xolotl/CHANGELOG.md#lfm3-as-the-ears-and-voice-of-a-bigger-model-3-nov)
+- **2 Nov - LFM3-Omni-2B, natively**: text, pictures, audio and video in, text and speech out, ~300 tok/s.
+  [docs/LFM3.md](docs/LFM3.md)
+- **31 Oct - [Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored)**:
+  Swift 1.5, uncensored, 199 tok/s decode and 3,204 tok/s prefill at 16K on the 4090, Gauntlet v2 6.68.
+  [Details](docs/xolotl/CHANGELOG.md#qwen38-flash-next-xq-45-gb-31-oct)
+- **30 Oct - Qwen 4, day-one prep**: what's known and the plan. [docs/QWEN4.md](docs/QWEN4.md)
+- **25 Oct - [DeepSeek-V4.1 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)**, the best
+  DeepSeek build: 86.9% top-1 agreement with the full model, 162/164 HumanEval. Run it with `--rank v4/rank-1017-v4.bin`.
+  [Details](docs/xolotl/CHANGELOG.md#deepseek-v41-v4-25-oct)
+- **October - community work**:
+  - [grammar and a disk prefix cache](docs/xolotl/CHANGELOG.md#grammar-a-disk-prefix-cache-and-serving-fixes-99-105-113) (#99, #105-#113)
+  - [serving fixes](docs/xolotl/CHANGELOG.md#more-community-fixes-96-98-100-104) (#96-#104)
+  - [nine PRs](docs/xolotl/CHANGELOG.md#nine-community-pull-requests-86-95) (#86-#95)
+  - [ISTA-DASLab](docs/xolotl/CHANGELOG.md#ista-daslabs-ggufs-work-too) and [Unsloth](docs/xolotl/CHANGELOG.md#upstream-llamacpp-and-unsloth-deepseek-v41-ggufs-82-84-85) GGUFs
+  - [ZFS ARC](docs/xolotl/CHANGELOG.md#openzfs-arc-counted-as-available-ram-83) (#83)
+  - [deep sleep](docs/xolotl/CHANGELOG.md#deep-sleep-for-minimax-m31-and-deepseek-v41-75) (#75)
+  - [Qwen3.6 serving](docs/xolotl/CHANGELOG.md#qwen36-serving-76-79-80) (#76-#80)
+  - [GLM long-conversation fix](docs/xolotl/CHANGELOG.md#glm-53-flash-long-conversations-no-longer-crash-46) (#46)
+  - [batch slots, the conversation pool, multi-GPU and more](docs/xolotl/CHANGELOG.md#earlier-in-october)
 
 ## What one PC can do
 
@@ -75,100 +81,6 @@ tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speec
   carries up the experts each token needs.
 - **Fast where it counts.** The Qwen models run at 100-200 tok/s; an agent's small follow-up turn on DeepSeek-V4.1
   costs ~8 s on a 6K-16K context, and the engine learns the conversation's experts between turns.
-
-## Recently added
-
-- **LFM3-Omni-2B, natively** (`xolotl-lfm3`, [docs/LFM3.md](docs/LFM3.md)): Liquid AI's omni model (text, pictures,
-  audio and video in; text and speech out) in its own engine behind the usual server - ~300 tok/s decode, 26-33K tok/s
-  prefill, `/v1/audio/speech` and `/v1/audio/transcriptions` from the model itself, and park/unpark in ~50 ms so it can
-  sit beside a big model as its ears, eyes and voice. Logits match llama.cpp's (KL 1.3e-7 on an exact-layout run).
-- **LFM3 as the ears and voice of a bigger model** (`scripts/xol-qfn-voice.sh`): QFN 45 GB and LFM3-Omni on one 4090,
-  then QuetzaCodetl in voice mode. QFN's elastic expert cache has to hand ~4.5 GB back (`POST /v1/vram`) or LFM3's
-  encoder cannot load; after that both are resident at 22.8 GB, and LFM3 transcribes and speaks while QFN keeps its
-  speed - 0.75 s for a 96-token answer while 3.5 s of speech streamed.
-- **Grammar, a disk prefix cache and serving fixes** (#99, #105-#113): native GBNF (`grammar` /
-  `structured_outputs.grammar`) for Qwen Flash and DeepSeek V4.1 behind the build options `-DSTRATA_FLASH_GRAMMAR=ON` /
-  `-DSTRATA_DS41_GRAMMAR=ON`, with MTP/DSpark drafts kept (#112, #113); an opt-in Linux disk tier that keeps exact prefix
-  checkpoints across restarts ([docs/PERSISTENT_PREFIX_CACHE.md](docs/PERSISTENT_PREFIX_CACHE.md), #99); completed JSON
-  responses out of disconnect accounting and batch cancellation kept through the EOS drain (#107, #108); HIP shared int4
-  alignment (#105) - NektoDron. DSML tool calls no longer reach the content as text, a turn cut inside a DSML tag sends
-  none, and opt-in `keep_cut_tool_calls` keeps a call cut at the token limit (#106, #109, #110, Xiaomi2008). Every new
-  option is off by default.
-- **More community fixes** (#96, #101, #102, #104, NektoDron): MiniMax M3.1 serving works with the current frontend again
-  (#96), Qwen picture numbering (`chat_template_kwargs: {"add_vision_id": true}`) reaches the template (#101) and can be
-  a server default (`"add_vision_id": true` in the run config, #104), and new
-  Qwen3.6 setups keep the official 64-token image minimum (#102). Layer split no longer aborts on the first request at
-  boundaries other than 20 (#98, diagnosed by ghino18, confirmed by tragicwinds), and a request beyond the batch slots
-  waits for one again instead of a 503 (#100, reported by tragicwinds).
-- **Nine community pull requests** (#86-#95): IQ1_S routed experts for Unsloth's DeepSeek-V4.1 UD-IQ1_M (#86) and
-  opt-in fused router ops and batched state copies in the DeepSeek-V4.1 engine (#87, Xiaomi2008); opt-in request-owned
-  batch cancellation (#95), learned checkpoints for edited prompt suffixes (#90), shared immutable checkpoint payloads
-  (#89), a bounded tokenizer span cache (#91) and Qwen3.6 snapshot ownership (#92), cancelled requests no longer
-  waiting for a slot (#88) and the Metal fallback signatures synced (#93, NektoDron). The Windows DeepSeek-V4.1 build
-  compiles again (#94, kelheor). Every new option is off by default.
-- **ISTA-DASLab's GGUFs work too.** Xolotl loads [ISTA-DASLab](https://huggingface.co/ISTA-DASLab)'s
-  [GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) of DeepSeek-V4.1-Flash-1017
-  (the unedited model, IQ2_XXS and IQ2_XS), thanks heaps to ISTA for putting those out. IQ2_XS on the 4090: perplexity
-  3.93 on a 256-token test (our V3 3.60, same flags) and sane chat answers. Set `-m` to their first shard
-  (`...-00001-of-00004.gguf`), keep `--engram` on our Engram tables (identical hash tables), and leave the `vision`
-  section out of the config (their files don't carry the router's image bias).
-- **Upstream llama.cpp and Unsloth DeepSeek-V4.1 GGUFs** (#82, #85 AlexeyMatskevich; #84 NektoDron): `ds41_generate`
-  reads the `deepseek41` layout upstream's converter writes (ISTA-DASLab's GSQ-RCO files since Oct 27, Unsloth's), the
-  combined Engram table straight from its GGUF shard, the upstream DSpark sidecar, and IQ3_S routed-expert downs
-  (Unsloth's UD-Q2_K_XL). Running them, measured against ISTA IQ2_XS: [docs/DEEPSEEK_V41.md](docs/DEEPSEEK_V41.md).
-- **OpenZFS ARC counted as available RAM** (#83, AlexeyMatskevich, opt-in `STRATA_ZFS_ARC=1`): on a ZFS box the
-  reclaimable ARC no longer shrinks or refuses the ds41 arena, and `zfs_arc_max` no longer has to be capped by hand.
-- **Deep sleep** for MiniMax-M3.1 and DeepSeek-V4.1 (#75, NektoDron): opt-in `"deep_sleep": "auto" | "native" |
-  "checkpoint"` plus authenticated `POST /sleep` and `/wake` gives the GPU back while the loaded model and conversations
-  stay in host RAM. M3.1 sleeps natively (wake ~1.4-1.9 s); DeepSeek-V4.1 uses the CUDA driver checkpoint (restore
-  ~19-21 s). Off by default: [docs/DEEP_SLEEP.md](docs/DEEP_SLEEP.md). **Draft:** merged for testing, the GPU
-  numbers predate the rebase and the DeepSeek checkpoint/restore has not been re-run on current main yet (#74 stays
-  open until it is).
-- **Qwen3.6 vision, shared prefix cache and batched sampled MTP** (#76, NektoDron): text and image prefixes are reused
-  across callers and owners, native continuous batches keep each request's DeltaNet state, KV, grammar and MTP
-  separate, and GBNF / JSON-schema output is native: [docs/Q36_SERVING.md](docs/Q36_SERVING.md).
-- **Qwen3.6 resident prefix reuse** (#80, NektoDron, opt-in `--resident-prefix-reuse`): when the immutable host pages
-  still describe exactly the KV already on the card, it is kept instead of copied back (an image follow-up copied
-  14.7 MiB instead of 872.7 MiB; first content 195 -> 162 ms). `--resident-prefix-verify` byte-checks it.
-- **No more lost control-queue wakeups** (#79, NektoDron): a fairness waiter could miss its notification and sit out the
-  500 ms timeout; it now rechecks under the lock.
-- **GLM-5.3-Flash long conversations no longer crash** (#46, vthomasino): when the graph pool fills and gets rebuilt,
-  every cached graph (predict and rows included) and the CUDA backend's captured graphs are dropped too, so nothing
-  replays against freed memory. Regression tool: `tools/xolotl-glm-manylengths.py`.
-<details><summary>Earlier (October)</summary>
-
-- **Batch slots** for the DeepSeek-V4.1 engine (#22, NektoDron): `"parallel": N` in a ds41 config runs several
-  requests in one pass over the model, one token each, on the server's existing slot scheduler. How it works, what a
-  slot costs and the limits: [docs/BATCHING.md](docs/BATCHING.md).
-- **Conversation pool** (#19, #20, NektoDron): every conversation is kept at its turn boundary in pinned host RAM
-  (`--conversation-cache-mib`, default 8192) and a request resumes from the longest matching prefix, pictures
-  included. Agents taking turns no longer re-read their prompts (measured on a 5090: three agents at 30-60K tokens,
-  47.5 -> 3.96 s a turn).
-- **Long prompts** past 512K tokens no longer run out of memory or crash on the pass graph (#21, NektoDron): 768K and
-  1M prompts complete.
-- **Exact resumes** (#18, NektoDron): a partial unpark resumes only inside the window ring, and the Engram history is
-  written back on every resume (bit-identical to a fresh prefill). The **image encoder runs on the GPU** with fast
-  SDPA (#17, NektoDron).
-- **Multi-GPU layer split** (AtticusG3 / buster, Niko1221, bsvinay): `--layer-split` across cards with a PCIe hand-off,
-  an optional head device for the output head + DSpark, a VRAM expert cache per GPU and sm_70 (V100) support:
-  [docs/MULTI_GPU.md](docs/MULTI_GPU.md), [BUSTER.md](BUSTER.md). Under a split the engine serves one request at a
-  time with its own split-aware conversation cache; batch slots and the pool are single-card.
-- **Remote expert card** (`--remote-device`, masahiro hibi): a second GPU holds extra experts for the first, with
-  `--route-bias-remote`.
-- Serve: STOP cancels a long prefill (clawdia-saka), `--kv-q8` / `--kv-type` for the compressed KV + indexer keys,
-  a park window floor for agent side calls, cached DSpark verify-width graphs, forced tool calls in V4.1's DSML shape,
-  and the expert-cache fixes from clawdia-saka.
-- **DeepSeek-V4.1-Flash-1017 builds** of the October checkpoint:
-  [IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)
-  (V2 142 GiB; V3 152 GiB, recalibrated on a code + agentic heavy mix; **V4** 152 GiB, out 25 Oct, with our XQ
-  refinement on every expert and the hottest experts kept in native FP4: 85.7% top-1 agreement with the full model vs V3's 81.5% on the Python reference path).
-- **Native Windows** for the DeepSeek-V4.1 engine (MSVC + CUDA, RTX 50 notes from #14): [docs/WINDOWS.md](docs/WINDOWS.md).
-- **Vision** input for DeepSeek-V4.1 (#8), per-request routing options (#11), a 16-row tier call (#9) and a uniform
-  VRAM expert cache under the auto slot budget (#15).
-- Engine: a VRAM breakdown in the decode trace (dense weights, DSpark draft, free memory) and per-GPU one-time setup
-  in the dense kernels.
-
-</details>
 
 ## Quick start
 
@@ -236,6 +148,7 @@ pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up
 | --- | --- |
 | [How Xolotl works](docs/xolotl/HOW_IT_WORKS.md) | the three memory tiers, per-model engines, the server, the agent-loop work |
 | [Benchmarks](docs/xolotl/BENCHMARKS.md) | every measured number, exactness checks, how to measure your own PC |
+| [Changelog](docs/xolotl/CHANGELOG.md) | everything that landed, newest first, with the PR numbers and who did it |
 | [DeepSeek-V4.1-Flash engine](docs/DEEPSEEK_V41.md) | GSQ quantisation, DSpark, the fp4 KV cache, Engram |
 | [DeepSeek-V4.1 on Windows](docs/WINDOWS.md) | native MSVC + CUDA build, configs, RTX 50 notes |
 | [GLM-5.3-Flash engine](docs/glm) | KDA + MLA attention, the LoRA on routed experts, soft pruning |
