@@ -175,6 +175,9 @@ public:
     size_t blob_bytes(int64_t l) const override;
     void read(int64_t layer, int64_t expert, uint8_t* dst) const override;
     void read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const override;
+    /// Role r's slice of (layer, expert) in the file: the shard's (buffered) fd, its file offset and length.  false when
+    /// the slice is not file-backed.  Non-virtual on purpose (no vtable change): STRATA_P2P's raw NVMe -> VRAM reads.
+    bool raw_span(int r, int64_t layer, int64_t expert, int* fd, uint64_t* off, size_t* n) const;
 
 private:
     /// Bytes [lo, hi) of role r's slice of (layer, expert) into dst (O_DIRECT, pread, then the mmap as fallbacks).
@@ -226,6 +229,9 @@ public:
     const Ds41MoeGeom& geom() const { return g_; }
     /// bytes of expert e of layer l (its class's blob)
     size_t expert_bytes(int64_t l, int64_t e) const;
+    /// Role r's span of (layer, expert): its shard's (buffered) fd, the plain file offset and length.  Non-virtual (no
+    /// vtable change): STRATA_P2P's raw NVMe -> VRAM reads.  Ignores the mirror (those reads all go to the model drive).
+    bool raw_span(int r, int64_t layer, int64_t expert, int* fd, uint64_t* off, size_t* n) const;
     /// The mirror (STRATA_BLOB_MIRROR=<file>, written by `ds41_generate --build-mirror`): packed copies of the coldest
     /// experts on a SECOND drive.  read_part then reads a share of each mirrored blob's parts from it
     /// (STRATA_BLOB_MIRROR_SHARE, default 0.28), so both drives serve one blob at once.  Experts mirrored, 0 = none.
