@@ -403,11 +403,11 @@ struct Gpu {
     uint8_t* h_fstage = nullptr;       ///< run(): file-tier misses read here (pinned), then DMA'd (kMaxFg blobs)
 #ifdef STRATA_XOLP2P
     // STRATA_P2P=1: a VRAM ring the NVMe DMAs file-tier blobs into (xolp2p), STRATA_P2P_SLOTS slots, each = the blob's
-    // three role slices read 4 KiB-aligned (raw area) + the blob assembled from them on the card (asm area).
+    // three role slices read 4 KiB-aligned (raw area only: the PCIe site assembles them straight into its destination).
     std::unique_ptr<xolp2p::Window> p2p;
     bool p2p_tried = false;
     int p2p_slots = 0;
-    size_t p2p_raw = 0, p2p_slot = 0;  ///< bytes: raw area, whole slot
+    size_t p2p_raw = 0, p2p_slot = 0;  ///< bytes: raw area, whole slot (the same since the asm area went)
     std::unordered_map<int, std::unique_ptr<xolp2p::RawFile>> p2p_files;   ///< by the shard's (buffered) fd
     std::unordered_map<int, bool> p2p_nofile;                               ///< shards that cannot be read raw
 #endif
@@ -4403,9 +4403,14 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     static const bool p2p_on = std::getenv("STRATA_P2P") && std::atoi(std::getenv("STRATA_P2P")) != 0;
     static const bool p2p_verify = std::getenv("STRATA_P2P_VERIFY") && std::atoi(std::getenv("STRATA_P2P_VERIFY")) != 0;
     struct P2PJob { const xolp2p::RawFile* rf; uint64_t off, len; uint8_t* dst; int a; };
-    struct P2PAsm { int b; uint8_t* vslot; CUdeviceptr src[3], dst[3]; size_t n[3]; int nr; };
+    struct P2PAsm { int b; uint8_t* vslot; CUdeviceptr src[3]; size_t at[3], n[3]; int nr; };   // at = offset in the blob
     std::vector<P2PJob> p2p_jobs;
     P2PAsm p2p_asm[kMaxFg];
+    int p2p_of[kMaxFg];   // fg blob b -> its p2p_asm index, -1 = host path
+    std::fill(p2p_of, p2p_of + kMaxFg, -1);
+    static std::atomic<long> p2p_full{0};   // blobs that found every ring slot taken (host path)
+    static std::atomic<int> p2p_want_max{0};   // most file-tier blobs one call asked for
+    static std::atomic<long> p2p_checked{0}, p2p_bad{0};
     std::atomic<int> p2p_failed[kMaxFg];
     int n_p2p = 0;
     const Ds41GgufBlobs* p2p_gg = (p2p_on && nfr > 0) ? dynamic_cast<const Ds41GgufBlobs*>(im.blobs) : nullptr;
@@ -4422,7 +4427,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         gp.p2p_tried = true;
         gp.p2p_slots = std::getenv("STRATA_P2P_SLOTS") ? std::max(1, std::atoi(std::getenv("STRATA_P2P_SLOTS"))) : 8;
         gp.p2p_raw = ((size_t) B + 3 * 8192 + 65535) & ~(size_t) 65535;
-        gp.p2p_slot = gp.p2p_raw + (((size_t) B + 65535) & ~(size_t) 65535);
+        gp.p2p_slot = gp.p2p_raw;   // raw only: assembled into the PCIe site's d_stage / victim slot (half the VRAM)
         std::string why;
         gp.p2p = xolp2p::Window::open((size_t) gp.p2p_slots * gp.p2p_slot, &why);
         if (gp.p2p)
@@ -4452,10 +4457,12 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     };
     if (p2p_gb && gp.p2p) {
         int keep = 0;
+        for (int w = p2p_want_max.load(); nfr > w && !p2p_want_max.compare_exchange_weak(w, nfr);) {}
         for (int i = 0; i < nfr; ++i) {
             const int b = fread_b[i];
             const int64_t e = ue[fg_u[b]];
             bool ok = n_p2p < gp.p2p_slots;
+            if (!ok) ++p2p_full;
             P2PAsm a; a.b = b; a.nr = 0; a.vslot = nullptr;
             const size_t base = (size_t) n_p2p * gp.p2p_slot;
             size_t raw_at = 0, roff = 0;
@@ -4471,7 +4478,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                     p2p_jobs.push_back({rf, c, std::min<uint64_t>(1ull << 20, a1 - c),
                                         gp.p2p->dma_target() + base + raw_at + (c - a0), n_p2p});
                 a.src[a.nr] = gp.p2p->dev() + base + raw_at + (off - a0);
-                a.dst[a.nr] = gp.p2p->dev() + base + gp.p2p_raw + roff;
+                a.at[a.nr] = roff;
                 a.n[a.nr++] = n;
                 raw_at += a1 - a0;
                 roff += n;
@@ -4479,9 +4486,10 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             ok = ok && roff == (size_t) BLX(e);
             if (!ok) { p2p_jobs.resize(j0); fread_b[keep++] = b; continue; }   // this blob: the host path
             a.vslot = fg_vic[b] >= 0 ? (uint8_t*) fg_src[b] : nullptr;   // arena_adapt: promoted by a D2H after the DMA
-            fg_src[b] = (const uint8_t*) (uintptr_t) (gp.p2p->dev() + base + gp.p2p_raw);
+            fg_src[b] = nullptr;   // no assembled copy anywhere: p2p_put builds it in the PCIe site's destination
             fg_dev[b] = true;
             p2p_failed[n_p2p].store(0);
+            p2p_of[b] = n_p2p;
             p2p_asm[n_p2p++] = a;
         }
         nfr = keep;
@@ -4657,6 +4665,36 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             bank_read[bank] = true;
         }
     };
+#ifdef STRATA_XOLP2P
+    auto p2p_check = [&](int b, const uint8_t* to, int64_t BL) {   // STRATA_P2P_VERIFY: the assembled blob vs the host read
+        ck(cudaStreamSynchronize(cs), "p2p verify sync");
+        std::vector<uint8_t> got((size_t) BL), want((size_t) BL);
+        const int64_t e = ue[fg_u[b]];
+        ck(cudaMemcpy(got.data(), to, (size_t) BL, cudaMemcpyDeviceToHost), "p2p verify d2h");
+        im.blobs->read(layer, e, want.data());
+        ++p2p_checked;
+        if (std::memcmp(got.data(), want.data(), (size_t) BL) != 0) {
+            size_t k = 0;
+            while (k < (size_t) BL && got[k] == want[k]) ++k;
+            std::fprintf(stderr, "ds41: STRATA_P2P_VERIFY MISMATCH layer %lld expert %lld at byte %zu of %lld\n",
+                         (long long) layer, (long long) e, k, (long long) BL);
+            ++p2p_bad;
+        }
+    };
+#endif
+    // STRATA_P2P: fg blob b's three role slices, ring -> `to` (the PCIe site's d_stage or victim slot) by device copies on
+    // `cs`; then, still ordered before any later wave reuses `to`, the arena_adapt promotion (D2H) and the test-mode check.
+    auto p2p_put = [&](int b, uint8_t* to, int64_t BL) {
+#ifdef STRATA_XOLP2P
+        const P2PAsm& a = p2p_asm[p2p_of[b]];
+        for (int r = 0; r < a.nr; ++r)
+            ck(cudaMemcpyAsync(to + a.at[r], (const void*) (uintptr_t) a.src[r], a.n[r], cudaMemcpyDeviceToDevice, cs), "p2p assemble");
+        if (a.vslot) ck(cudaMemcpyAsync(a.vslot, to, (size_t) BL, cudaMemcpyDeviceToHost, cs), "p2p promote");
+        if (p2p_verify) p2p_check(b, to, BL);
+#else
+        (void) b; (void) to; (void) BL;
+#endif
+    };
     auto launch_site = [&](int want) {
         bool used[kMaxEnt] = {};
         auto in_site = [&](int u) { return cls[u] == want || (want == PCIE && cls[u] == FILEG); };
@@ -4677,12 +4715,12 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                     const int32_t e = ue[u];
                     const int64_t BL = BLX(e);
                     const uint8_t* src = gp.arena.ptr(layer, e);
-                    cudaMemcpyKind src_kind = cudaMemcpyHostToDevice;
+                    int p2p_b = -1;
                     if (cls[u] == FILEG) {   // its staging (or arena_adapt victim) slot = its index in fg_u
                         int b = 0;
                         while (fg_u[b] != u) ++b;
                         src = fg_src[b];
-                        if (fg_dev[b]) src_kind = cudaMemcpyDeviceToDevice;   // STRATA_P2P: assembled in the VRAM ring
+                        if (fg_dev[b]) p2p_b = b;   // STRATA_P2P: its slices are in the VRAM ring, p2p_put assembles them
                     }
                     // LRU admission (arena-held PCIe misses, as gpu_run).  STRATA_FILEG_ADMIT=1 (opt-in): a
                     // FILE-tier miss that RECURS (admit_ok: it also missed within the last kLruWin calls) is
@@ -4710,7 +4748,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                             }
                         }
                         uint8_t* to = (uint8_t*) gp.d_stage + (size_t) (bank * bank_w + si) * (size_t) B;
-                        ck(cudaMemcpyAsync(to, src, (size_t) BL, src_kind, cs), "pcie dma");
+                        if (p2p_b >= 0) p2p_put(p2p_b, to, BL);
+                        else ck(cudaMemcpyAsync(to, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
                         dptr[u] = (unsigned long long) to;
                         ++si;
                     }
@@ -4724,7 +4763,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                                                cudaMemcpyDeviceToHost, cs), "lru demote");
                             ck(cudaMemcpyAsync(vs, (const void*) dptr[u], (size_t) BL, cudaMemcpyDeviceToDevice, cs), "lru stage copy");
                         } else {        // the DMA lands in the victim slot: the kernel reads it there, and it stays
-                            ck(cudaMemcpyAsync(vs, src, (size_t) BL, src_kind, cs), "pcie dma");
+                            if (p2p_b >= 0) p2p_put(p2p_b, vs, BL);
+                            else ck(cudaMemcpyAsync(vs, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
                             dptr[u] = (unsigned long long) vs;
                         }
                         lru_old[n_lru] = v;
@@ -4773,51 +4813,26 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     }
 #ifdef STRATA_XOLP2P
     if (n_p2p > 0) {
-        static std::atomic<long> p2p_blobs{0}, p2p_checked{0}, p2p_bad{0}, p2p_fallback{0};
+        static std::atomic<long> p2p_blobs{0}, p2p_fallback{0};
         for (int i = 0; i < n_p2p; ++i) {
             if (!p2p_failed[i].load()) continue;
             P2PAsm& a = p2p_asm[i];   // the raw read failed: read it the host way, now
             uint8_t* dst = a.vslot ? a.vslot : gp.h_fstage + (size_t) a.b * (size_t) B;
             im.blobs->read(layer, ue[fg_u[a.b]], dst);
-            fg_src[a.b] = dst; fg_dev[a.b] = false; a.nr = 0; a.vslot = nullptr;
+            fg_src[a.b] = dst; fg_dev[a.b] = false; p2p_of[a.b] = -1; a.nr = 0; a.vslot = nullptr;
             ++p2p_fallback;
         }
         if (!xolp2p::flush()) { std::fprintf(stderr, "ds41: STRATA_P2P: cuFlushGPUDirectRDMAWrites failed\n"); std::abort(); }
-        for (int i = 0; i < n_p2p; ++i)
-            for (int r = 0; r < p2p_asm[i].nr; ++r)
-                ck(cudaMemcpyAsync((void*) (uintptr_t) p2p_asm[i].dst[r], (const void*) (uintptr_t) p2p_asm[i].src[r], p2p_asm[i].n[r],
-                                   cudaMemcpyDeviceToDevice, cs), "p2p assemble");
-        if (p2p_verify) {   // test mode: every assembled blob against the host read of the same expert
-            ck(cudaStreamSynchronize(cs), "p2p verify sync");
-            std::vector<uint8_t> got((size_t) B), want((size_t) B);
-            for (int i = 0; i < n_p2p; ++i) {
-                if (!p2p_asm[i].nr) continue;
-                const int64_t e = ue[fg_u[p2p_asm[i].b]];
-                const size_t bl = (size_t) BLX(e);
-                ck(cudaMemcpy(got.data(), fg_src[p2p_asm[i].b], bl, cudaMemcpyDeviceToHost), "p2p verify d2h");
-                im.blobs->read(layer, e, want.data());
-                ++p2p_checked;
-                if (std::memcmp(got.data(), want.data(), bl) != 0) {
-                    size_t k = 0;
-                    while (k < bl && got[k] == want[k]) ++k;
-                    std::fprintf(stderr, "ds41: STRATA_P2P_VERIFY MISMATCH layer %lld expert %lld at byte %zu of %zu\n",
-                                 (long long) layer, (long long) e, k, bl);
-                    ++p2p_bad;
-                }
-            }
-        }
         for (int i = 0; i < n_p2p; ++i) if (p2p_asm[i].nr) ++p2p_blobs;
         if (p2p_blobs > 0 && (p2p_blobs % 500) < n_p2p)
-            std::fprintf(stderr, "ds41: STRATA_P2P %ld blobs NVMe -> VRAM, %ld host fallbacks%s\n", p2p_blobs.load(), p2p_fallback.load(),
+            std::fprintf(stderr, "ds41: STRATA_P2P %ld blobs NVMe -> VRAM, %ld host fallbacks, %ld ring-full (host path), most per call %d of %d slots%s\n",
+                         p2p_blobs.load(), p2p_fallback.load(), p2p_full.load(), p2p_want_max.load(), gp.p2p_slots,
                          p2p_verify ? (", verified " + std::to_string(p2p_checked.load()) + ", MISMATCHES " + std::to_string(p2p_bad.load())).c_str() : "");
     }
 #endif
     launch_site(PCIE);
 #ifdef STRATA_XOLP2P
-    for (int i = 0; i < n_p2p; ++i)   // arena_adapt: the blob's new arena slot gets its bytes from the ring (D2H, ordered after its DMA)
-        if (p2p_asm[i].vslot && p2p_asm[i].nr)
-            ck(cudaMemcpyAsync(p2p_asm[i].vslot, fg_src[p2p_asm[i].b], (size_t) BLX(ue[fg_u[p2p_asm[i].b]]), cudaMemcpyDeviceToHost, cs),
-               "p2p promote");
+    // (the arena_adapt promotion of a P2P blob is p2p_put's, right after its assembly)
 #endif
     if (dn) {   // belt and braces: `s` has waited on every PCIe-site copy, so the sync that ends this call covers s_dn
         ck(cudaEventRecord(gp.dn_ev[1], gp.s_dn), "d3 dn tail record");
