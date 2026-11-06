@@ -58,8 +58,9 @@ A ready serve config lives at `strata-xol-qfn.json` (port 8099, model name `xol-
 **`STRATA_ROUTE_RESIDENT` is the one lever that mattered**, and it was already in the engine
 (`src/core/verify.cpp`). At margin 0.8, ranks 5-9 it swapped 99.0% of tail routing decisions back
 onto resident experts (`nonres_entries before=89686 after=25744`), taking CPU experts per layer
-from 2.33 to 1.03. It only re-orders ranks 5-9, so the top-4 routing — and therefore the output —
-is untouched.
+from 2.33 to 1.03. It only re-orders ranks 5-9, so the top-5 picks are untouched — but the swapped
+tail experts and the re-softmaxed weights do change the output (the kernel says so); how much is
+not measured yet (see "Routing levers: quality cost" below).
 
 ## Things that are NOT the bottleneck
 
@@ -68,6 +69,38 @@ is untouched.
 * **Model size.** The previous best on this box was 151.0 tok/s on a 71.59 GiB model; this build is
   78.83 GiB and reaches 152.58. A 10% larger file did not cost speed.
 * **Disk.** In the winning arm the expert tiers report **0 blob reads from the file**.
+
+## Routing levers: quality cost (to run when the GPU is free)
+
+Two lossy levers may be stacked on the served xol-qfn: `STRATA_ROUTE_RESIDENT=0.8` ranks 5-9 (the config's env)
+and `STRATA_ROUTE_TAIL_SKIP=7`, which upstream turned on by default for CUDA serve in 0.1.42 whenever less than 90%
+of the experts are cached (true on the 4090). Neither has a KL number on this model. Basalt's dev measured QFN on their
+engine (r/LocalLLaMA, 2026-11-01): exact KL 0.017 / top-1 96.6%, tail skip R=7 0.053 / 93.8%, routing bias 1.0
+0.177 / 88.8%.
+
+```sh
+tools/qwen38/route_lever_kl.sh            # arms off / tail / rr / both, ~5 min each, needs the GPU to itself
+```
+
+It runs the `quant_quality.py` yardstick at a served-like residency (`--gpu-experts 7500`) and compares each
+arm against `off` (the levers' own cost) and against the Q8 parent run (`runs/quality/parent-swift-abl.tsv`; the
+quant itself is KL 0.163 / top-1 86.29% there). Results land in `runs/quality/levers/RESULT.txt`.
+
+Result: _not run yet._
+
+## Zero-loop probe (optional)
+
+Basalt's dev reported (r/LocalLLaMA, 2026-11-01) that QFN, with no system prompt, thinking on and T=1.0 / top_p 0.95 /
+top_k 20, gets stuck in an endless run of `0` in its reasoning on one coding prompt: 3-4 of 4 seeds on Basalt, 3 of 4 on
+llama.cpp, 6 of 6 on the Alibaba API, so they blame the weights. We have not seen it here. Note that serve's
+`repeat_stop_tokens` (256 by default) would end such a reply as `"length"` rather than show the loop, so "not seen" needs
+checking against that too. The probe counts both as a loop:
+
+```sh
+python3 tools/qwen38/zero_loop_probe.py --url http://127.0.0.1:8099 --seeds 1-4   # exit 1 = a seed looped
+```
+
+Result: _not run yet._
 
 ## Related
 

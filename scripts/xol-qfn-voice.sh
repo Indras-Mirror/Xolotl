@@ -26,7 +26,7 @@ LFM3_CMD=${QUETZA_LFM3_SERVER:-$HOME/.local/bin/xol-lfm3-serve}
 QUETZA_CMD=${XOLQFN_CMD:-$HOME/.local/bin/xol-qfn}
 QFN_URL=${XOLQFN_VOICE_QFN_URL:-http://127.0.0.1:8131}
 LFM3_URL=${QUETZA_LFM3_URL:-http://127.0.0.1:8132}
-RESERVE_MIB=${XOLQFN_VOICE_RESERVE_MIB:-4608}
+RESERVE_MIB=${XOLQFN_VOICE_RESERVE_MIB:-5888}  # 4608 left QFN 6-54 MiB free mid-run (2026-11-02 log warning)
 QFN_PORT=${QFN_URL##*:}
 QFN_UNIT=xol-qfn-voice-qfn
 LFM3_UNIT=xol-qfn-voice-lfm3
@@ -127,10 +127,13 @@ stop_orphan_voice() {
 export QUETZA_LFM3_URL="$LFM3_URL"
 export QUETZA_LFM3_SERVER="$LFM3_CMD"
 export QUETZA_LFM3_VOICE=${QUETZA_LFM3_VOICE:-male}
-# Turn-taking: xol-quetza does NOT set QUETZA_DECIDE_URL (only xol-dense-quetza does), so without this the
-# end-of-turn controller falls back to its 1.2 s fixed rule and submits mid-sentence fragments - the model
-# then answers half a question.  LFM3 is the ears and answers /v1/decide in ~300 ms.
-export QUETZA_DECIDE_URL=${QUETZA_DECIDE_URL:-$LFM3_URL/v1/decide}
+# 1.25x playback (ffmpeg atempo in QuetzaCodetl, pitch kept): LFM3's pace at 1.0 felt slow (Mal, 2026-11-03)
+export QUETZA_VOICE_SPEED=${QUETZA_VOICE_SPEED:-1.25}
+# Turn-taking: xol-quetza does NOT set QUETZA_DECIDE_URL. Ask QFN, not the 2B LFM3: measured
+# 2026-11-02, LFM3 answered RESPOND (0.78-1.0) to every transcript, including an empty one, so it
+# could never extend a mid-thought pause; QFN answers WAIT for "can, can you look up" / "and um, so
+# the thing is" and RESPOND for a finished sentence, in ~0.7 s (timeout is 900 ms).
+export QUETZA_DECIDE_URL=${QUETZA_DECIDE_URL:-$QFN_URL/v1/decide}
 # start the pipeline on REPL up (useChronosWake's QUETZA_VOICE_AUTOSTART path), so no /voice-auto needed
 if [ "${XOLQFN_VOICE_NO_AUTOSTART:-0}" != 1 ]; then
     export QUETZA_VOICE_AUTOSTART=1
