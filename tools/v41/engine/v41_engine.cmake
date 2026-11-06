@@ -138,6 +138,32 @@ if(TARGET strata_kernels_cpu AND TARGET ggml-cpu)
         endif()
     endif()
 endif()
+# Xolotl Direct (opt-in, Linux): file-tier experts NVMe -> VRAM without system RAM (docs/XOLOTL_DIRECT.md).  Needs the
+# kernel/xolotl-direct modules loaded at run time and, to build, NVIDIA's open-gpu-kernel-modules source of the INSTALLED
+# driver version (its SDK headers: the RM 0x503C registration).  Off = the engine is exactly as before.
+option(XOLOTL_DIRECT "Xolotl Direct: NVMe -> VRAM expert reads for DeepSeek-V4.1 (Linux; docs/XOLOTL_DIRECT.md)" OFF)
+set(XOLOTL_DIRECT_NVSRC "" CACHE PATH "NVIDIA open-gpu-kernel-modules checkout matching the installed driver (Xolotl Direct)")
+if(XOLOTL_DIRECT AND TARGET ds41_moe_cuda)
+    if(WIN32)
+        message(FATAL_ERROR "XOLOTL_DIRECT is Linux only")
+    endif()
+    if(NOT EXISTS "${XOLOTL_DIRECT_NVSRC}/src/common/sdk/nvidia/inc/nvos.h" OR NOT EXISTS "${XOLOTL_DIRECT_NVSRC}/version.mk")
+        message(FATAL_ERROR "XOLOTL_DIRECT needs -DXOLOTL_DIRECT_NVSRC=<open-gpu-kernel-modules checkout of your driver version> "
+                            "(git clone --branch <version> https://github.com/NVIDIA/open-gpu-kernel-modules); see docs/XOLOTL_DIRECT.md")
+    endif()
+    file(STRINGS "${XOLOTL_DIRECT_NVSRC}/version.mk" _xd_ver REGEX "^NVIDIA_VERSION = ")
+    string(REGEX REPLACE "^NVIDIA_VERSION = " "" _xd_ver "${_xd_ver}")
+    set(_xd_dir ${CMAKE_CURRENT_SOURCE_DIR}/kernel/xolotl-direct/lib)
+    add_library(xolp2p STATIC ${_xd_dir}/xolp2p.cpp)
+    target_include_directories(xolp2p PUBLIC ${_xd_dir} PRIVATE ${XOLOTL_DIRECT_NVSRC}/src/common/sdk/nvidia/inc)
+    target_compile_definitions(xolp2p PRIVATE XOLP2P_NV_VERSION="${_xd_ver}")
+    target_link_libraries(xolp2p PUBLIC CUDA::cuda_driver)
+    target_link_libraries(ds41_moe_cuda PUBLIC xolp2p)
+    target_compile_definitions(ds41_moe_cuda PRIVATE STRATA_XOLP2P=1)
+    add_executable(xolotl-direct-selftest ${_xd_dir}/selftest_main.cpp)
+    target_link_libraries(xolotl-direct-selftest PRIVATE xolp2p)
+    message(STATUS "Xolotl Direct: ON (NVIDIA driver headers ${_xd_ver})")
+endif()
 # the end-to-end engine: CUDA tier when built, else the CPU-only tier
 if(TARGET ds41_dense AND TARGET ds41_moe_cuda)
     add_executable(ds41_generate ${_v41_dir}/ds41_generate.cpp ${_v41_dir}/ds41_cuda_policy.cpp ${_v41_dir}/ds41_pipeline.cpp

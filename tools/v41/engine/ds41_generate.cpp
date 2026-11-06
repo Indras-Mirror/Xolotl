@@ -876,40 +876,6 @@ int main(int argc, char ** argv) {
     double fd_dense = 0, fd_tier = 0, fd_logits = 0;   // prompt wall split (printed with the prompt line)
     std::vector<int> mids;
     std::vector<float> mw;
-    // STRATA_COST_SKIP=<t> (opt-in; CHANGES OUTPUTS - lossy, measure on short34): per pass token, a routed pick that is NOT
-    // the token's top pick, whose normalised weight is below t, and that is NOT resident in VRAM (it would cost a CPU-pool
-    // / PCIe / NVMe trip - the wall) is dropped and the token's other weights are scaled back to their sum.  Every expert
-    // stays reachable (it runs whenever a token gives it >= t, or it is resident).  The dropped entry becomes the token's top
-    // pick at weight 0, so the tier's union folds it away: nothing is fetched for it.  STRATA_COST_SKIP_FILE=1: only
-    // file-tier picks (not resident, not in the RAM arena) are skippable.  Applied on the decode side (verify passes and
-    // the short-prompt passes, so short34 measures it under the real VRAM residency), never in the layer-major batch.
-    // After PROMETHEVS's expert skip (Ryan Flavell, MAGNVS Ltd: a uniform 0.12 on every pick).
-    auto cost_skip = [&](Ds41MoeTier & tr, int l, int * ids, float * wts, int m) {
-        static const float cs_t = std::getenv("STRATA_COST_SKIP") ? (float) std::atof(std::getenv("STRATA_COST_SKIP")) : 0.0f;
-        static const bool cs_file = std::getenv("STRATA_COST_SKIP_FILE") && std::atoi(std::getenv("STRATA_COST_SKIP_FILE")) != 0;
-        static long cs_picks = 0, cs_drop = 0, cs_calls = 0;
-        if (cs_t <= 0.0f || mc.cpu_only) return;
-        for (int t = 0; t < m; ++t) {
-            int * id = ids + (size_t) t * top_k;
-            float * wt = wts + (size_t) t * top_k;
-            float sum = 0.0f;
-            int top = 0;
-            for (int k = 0; k < top_k; ++k) { sum += wt[k]; if (wt[k] > wt[top]) top = k; }
-            if (sum <= 0.0f) continue;
-            float kept = 0.0f;
-            for (int k = 0; k < top_k; ++k) {
-                ++cs_picks;
-                const int e = id[k];
-                const bool cheap = e < 0 || tr.resident(l, e) || (cs_file && tr.in_arena(l, e));
-                if (k != top && !cheap && wt[k] / sum < cs_t) { id[k] = id[top]; wt[k] = 0.0f; ++cs_drop; }
-                kept += wt[k];
-            }
-            if (kept > 0.0f && kept < sum) for (int k = 0; k < top_k; ++k) wt[k] *= sum / kept;
-        }
-        if (++cs_calls % 2560 == 0)
-            std::fprintf(stderr, "[cost-skip] t %.3f%s: %ld of %ld picks dropped (%.2f%%)\n", cs_t, cs_file ? " (file tier only)" : "",
-                         cs_drop, cs_picks, cs_picks ? 100.0 * cs_drop / cs_picks : 0.0);
-    };
     auto pass_m = [&](const int * toks, int m, int pos) -> bool {
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
@@ -921,7 +887,6 @@ int main(int argc, char ** argv) {
             float * rdev = (!mc.cpu_only && !std::getenv("STRATA_DEC_HOSTSUM")) ? d.routed_dev() : nullptr;
             const float * fn = nullptr;
             if (!d.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = d.last_error(); return false; }
-            cost_skip(tr, l, mids.data(), mw.data(), m);
             const double t1 = now_ms();
             fd_dense += t1 - t0;
             t0 = t1;
@@ -1145,7 +1110,6 @@ int main(int argc, char ** argv) {
                     }
                 } else la_prev_layer = -2;
             }
-            cost_skip(tr, l, mids.data(), mw.data(), m);
             if (rdev && !no_tier_batch) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
                 // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (16: a depth-4 pass and a 16-row

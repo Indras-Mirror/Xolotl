@@ -1,7 +1,8 @@
 # Xolotl Direct: NVMe straight into VRAM on a GeForce card
 
-> **DRAFT (2026-11-07), not shipped yet.** Everything below is measured on one box (RTX 4090, Linux 7.0, driver
-> 595.91, Samsung PM9A1 NVMe). The "Before it ships" list at the end is what still has to happen.
+> **Experimental, opt-in (7 Nov 2026).** Measured on one box so far (RTX 4090, Linux 7.0, driver 595.91, Samsung
+> PM9A1 NVMe). Off by default and off in every build that does not ask for it. Reports from other cards and drives
+> are very welcome (open an issue with the self-test output).
 
 When a model is bigger than your RAM, Xolotl reads the experts it is missing from the NVMe drive while it decodes.
 Normally those bytes take the long way: NVMe -> a bounce buffer in RAM -> pinned staging -> PCIe -> VRAM. That is four
@@ -47,42 +48,56 @@ lookahead fills a layer early with no RAM-bus cost.
 
 ## Set it up
 
-1. **Build the two kernel modules** (both GPL, a few hundred lines each):
+1. **Build the two kernel modules** (both GPL, a few hundred lines each, in `kernel/xolotl-direct/`):
    - `p2pgate`: asks the NVIDIA driver to pin a window of VRAM and keep it pinned (`nvidia_p2p_get_pages_persistent`).
    - `xolp2p`: registers that window with the kernel's PCI peer-to-peer support, so the NVMe drive may write into it.
 
    ```bash
-   cd kernel/xolotl-direct        # (path when shipped)
-   make                           # builds p2pgate.ko and xolp2p.ko against your running kernel
+   make -C kernel/xolotl-direct        # needs linux-headers-$(uname -r); finds the NVIDIA Module.symvers itself
+                                       # (DKMS installs) - else: make ... NV_SYMVERS=/path/to/Module.symvers
    ```
 
-2. **Secure Boot only:** sign both modules
-   (`/usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 MOK.priv MOK.der p2pgate.ko`, the same for xolp2p.ko)
-   after enrolling your key with `mokutil --import MOK.der`.
+2. **Secure Boot only:** sign both `.ko` files with your own MOK key
+   (`/usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 MOK.priv MOK.der <module>.ko`) after enrolling the
+   key with `mokutil --import MOK.der`.
 
-3. **Load them**, every boot (nothing loads them automatically, on purpose):
+3. **Build Xolotl with it.** The user-space side talks to the NVIDIA driver through its SDK headers, so it needs
+   NVIDIA's open-gpu-kernel-modules source **of the driver version you have installed**
+   (`cat /proc/driver/nvidia/version`):
 
    ```bash
-   sudo insmod p2pgate.ko && sudo insmod xolp2p.ko
+   git clone --depth 1 --branch 595.91.07 https://github.com/NVIDIA/open-gpu-kernel-modules ~/src/nvidia-ogkm
+   cmake -B build -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_DSV41=ON -DXOLOTL_DIRECT=ON \
+         -DXOLOTL_DIRECT_NVSRC=$HOME/src/nvidia-ogkm      # plus your usual options
+   cmake --build build --target ds41_generate xolotl-direct-selftest
    ```
 
-4. **Let your user open them.** The modules create `/dev/p2pgate` and `/dev/xolp2p`, root-only by default. This udev
-   rule gives them to group `disk`, which can already read raw disks, so it grants nothing new:
+   After a driver update, check out the matching tag and rebuild (the library refuses a driver it was not built for).
 
-   ```
-   # /etc/udev/rules.d/99-xolotl-direct.rules
-   KERNEL=="p2pgate", SUBSYSTEM=="misc", GROUP="disk", MODE="0660"
-   KERNEL=="xolp2p",  SUBSYSTEM=="misc", GROUP="disk", MODE="0660"
-   ```
-
-   Xolotl Direct reads the model's own partition raw at the file's extents, so the user that runs Xolotl needs to be
-   in group `disk` (`sudo usermod -aG disk $USER`, then log in again). Group `disk` can read every disk on the
-   machine; if that is too much for your setup, run the server as a dedicated user.
-
-5. **Self-test** (reads 64 MiB of your model both ways and compares every byte):
+4. **Let your user open the devices** (once). `/dev/p2pgate` and `/dev/xolp2p` are root-only by default; the rule in
+   `kernel/xolotl-direct/99-xolotl-direct.rules` gives them to group `disk`, which can already read raw disks, so it
+   grants nothing new:
 
    ```bash
-   xolotl-direct-selftest /path/to/model.gguf
+   sudo cp kernel/xolotl-direct/99-xolotl-direct.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+   sudo usermod -aG disk $USER        # then log in again
+   ```
+
+   Xolotl Direct reads the model's own partition raw, at the file's extents, so the user that runs Xolotl must be in
+   group `disk`. Group `disk` can read every disk on the machine; if that is too much for your setup, run the server
+   as a dedicated user.
+
+5. **Load the modules**, every boot (nothing loads them automatically, on purpose). The script checks Resizable BAR
+   and P2PDMA first:
+
+   ```bash
+   sudo kernel/xolotl-direct/load.sh            # sudo kernel/xolotl-direct/load.sh unload  to remove them
+   ```
+
+6. **Self-test** (reads 64 MiB of your model both ways and compares every byte):
+
+   ```bash
+   build/xolotl-direct-selftest /path/to/model.gguf
    ```
 
 ## Use it
@@ -102,7 +117,7 @@ At startup the log says `STRATA_P2P on - NVMe -> VRAM ring, ...` (the engine's i
 switch takes the XOLOTL_ name). If it says `STRATA_P2P unavailable (...)`, the reason follows and Xolotl carries on
 with the normal path.
 
-**Turn it off:** unset `XOLOTL_P2P`. To remove the modules: stop Xolotl, then `sudo rmmod xolp2p p2pgate`.
+**Turn it off:** unset `XOLOTL_P2P`. To remove the modules: stop Xolotl, then `sudo kernel/xolotl-direct/load.sh unload`.
 
 ## Safety
 
@@ -115,18 +130,14 @@ with the normal path.
   and the magic checks were added because of it. Load the modules on a machine where a reboot is acceptable the
   first time.
 
-## Before it ships (the to-do list)
+## Still to do
 
-- [ ] A clean decode win in the default serve config, confirmed over more rounds and prompts.
-- [ ] The file lookahead also on the normal path, so users without the modules get its gain too.
-- [ ] Module sources and the user-space library moved into the public tree (`kernel/xolotl-direct/`), a CMake option
-      (`-DXOLOTL_DIRECT=ON`) instead of the test build script, and the self-test as a shipped binary.
-- [ ] A one-command check script (BAR1 size, P2PDMA, modules, device permissions, filesystem, self-test).
-- [ ] Tested on a second card (RTX 30) and a second drive.
-- [ ] Prior-art check before any "first" claim.
+- [ ] Confirm the decode gain over more rounds and prompts, and on a second card (RTX 30) and drive.
+- [ ] The file lookahead on the normal path too, so users without the modules get its gain.
 - [ ] Faster model loading through the same path.
+- [ ] A prior-art check before any "first" claim.
 
-## README section (to paste when it ships)
+## README line
 
 > - **Xolotl Direct (Linux, opt-in): NVMe straight into VRAM on a GeForce card.** File-tier experts skip system RAM:
 >   one expert 11 -> 3.1 ms, no RAM-bus traffic, the same output. With the layer-ahead stash: +3 % decode on
