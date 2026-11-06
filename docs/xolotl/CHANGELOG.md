@@ -8,6 +8,17 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### DeepSeek-V4.1 fast mode: a 2-bit shadow of the biggest experts (7 Nov, opt-in, lossy)
+
+`ds41_generate --build-shadow F` writes a Q2_0 copy of every MXFP4 and Q3_K expert weight (3,543 experts, 54.7 ->
+35.1 GB; about half of the slow-lane bytes) to a sidecar file; `XOLOTL_SHADOW=$(cat F.list)` serves from it. The model file is only read,
+and the engine falls back to the normal experts if the sidecar does not match the model. On the 4090 (8K prompt,
+512 tokens): **83.8-90.4 vs 111.6-117.2 ms per decode pass, 34.1-36.7 vs 25.7-26.5 tok/s (+29 to +43 %, two runs each)**; ~450 more experts fit in VRAM and
+file-tier waits halve. Quality: short34 top-1 **84.46 % vs 87.01 %**, NLL 0.566 vs 0.512 - a real cost, hence
+opt-in. ggml's reference Q2_0 quantizer sets the scale to the block's max (relative error 0.72); the shadow builder
+searches each block's scale and sign (0.35). Next: a Q3_K-only shadow (the hot MXFP4 experts stay exact) and a
+calibrated encoder. Details: [docs/XOLOTL_FAST.md](../XOLOTL_FAST.md).
+
 ### Xolotl Direct: NVMe straight into VRAM (7 Nov, experimental)
 
 When DeepSeek-V4.1 decodes, the experts that are in neither VRAM nor the RAM arena are read from the NVMe drive. Until

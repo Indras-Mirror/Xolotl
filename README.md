@@ -18,6 +18,8 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 
 Full notes for every item: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
+- **7 Nov - DeepSeek-V4.1 fast mode (opt-in, lossy): +29-43 % decode** (~26 -> 34-37 tok/s on the 4090). A 2-bit copy
+  of the biggest experts in a sidecar file; short34 top-1 84.5 % vs 87.0 %. [How](docs/XOLOTL_FAST.md)
 - **7 Nov - Xolotl Direct (Linux, experimental, opt-in): NVMe straight into VRAM on a GeForce card.** Experts read
   from the drive skip system RAM: one expert 11 -> 3.1 ms, zero RAM-bus traffic, the same output. With the
   layer-ahead VRAM stash: +3 % decode on DeepSeek-V4.1. Needs Resizable BAR and two small kernel modules.
