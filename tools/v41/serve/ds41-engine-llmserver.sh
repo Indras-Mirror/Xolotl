@@ -3,6 +3,8 @@
 # no ComfyUI check / GPU lock / user scope; a 57 GiB RAM cap in a system scope instead of 84 GiB.  The engine settings
 # (DSpark, lookup drafts, Q6_K dense, prestage) are ds41-engine.sh's.
 set -u
+# Xolotl names: XOLOTL_<X> = STRATA_<X> (the Xolotl name wins; STRATA_* keeps working)
+for _v in $(compgen -e | grep '^XOLOTL_'); do export "STRATA_${_v#XOLOTL_}=${!_v}"; done; unset _v
 cd "$(dirname "$0")/../../.."
 export GGML_NO_BACKTRACE=1
 export STRATA_NO_LARGEPAGES="${STRATA_NO_LARGEPAGES:-1}"

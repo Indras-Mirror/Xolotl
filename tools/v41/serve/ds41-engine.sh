@@ -3,6 +3,8 @@
 # protections in the FOREGROUND (memguard.sh backgrounds its command, which would break the stdin/stdout protocol):
 # ComfyUI check, the shared GPU lock (held while the server runs), an 84 GiB RAM cap, no swap.  (= GLM's glm-engine.sh)
 set -u
+# Xolotl names: XOLOTL_<X> = STRATA_<X> (the Xolotl name wins; STRATA_* keeps working)
+for _v in $(compgen -e | grep '^XOLOTL_'); do export "STRATA_${_v#XOLOTL_}=${!_v}"; done; unset _v
 cd "$(dirname "$0")/../../.."
 if [ "${MEMGUARD_ALLOW_COMFY:-0}" != 1 ] && ss -ltn 2>/dev/null | grep -q ':8188 '; then
     echo "ds41-engine: refusing - ComfyUI is running on :8188 (RAM)" >&2; exit 3

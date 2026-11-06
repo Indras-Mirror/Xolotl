@@ -334,9 +334,27 @@ double log_softmax_at(const float * lg, int nv, int tok) {
     return (double) lg[tok] - mx - std::log(z);
 }
 
+// Xolotl names for the engine's switches: every XOLOTL_<X> in the environment is copied onto STRATA_<X> before anything
+// reads it (the Xolotl name wins when both are set), so XOLOTL_ARENA_PIN_AFTER=0 == STRATA_ARENA_PIN_AFTER=0.  The
+// STRATA_* names keep working unchanged; the code reads only STRATA_* (upstream Strata syncs stay conflict-free).
+void xolotl_env_aliases() {
+#ifndef _WIN32
+    std::vector<std::pair<std::string, std::string>> al;
+    for (char ** e = environ; e && *e; ++e) {
+        const char * kv = *e;
+        if (std::strncmp(kv, "XOLOTL_", 7) != 0) continue;
+        const char * eq = std::strchr(kv, '=');
+        if (!eq || eq == kv + 7) continue;
+        al.push_back({"STRATA_" + std::string(kv + 7, eq), std::string(eq + 1)});
+    }
+    for (const auto & [k, v] : al) setenv(k.c_str(), v.c_str(), 1);
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
+    xolotl_env_aliases();
     if (!std::getenv("DS41_GGML_DEBUG"))
         ggml_log_set([](ggml_log_level lv, const char * text, void *) { if (lv != GGML_LOG_LEVEL_DEBUG) std::fputs(text, stderr); }, nullptr);
     Args a;

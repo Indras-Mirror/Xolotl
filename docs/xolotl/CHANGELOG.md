@@ -8,6 +8,28 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### DeepSeek-V4.1 loads in 44 s, and XOLOTL_ names for every switch (7 Nov)
+
+Loading DeepSeek-V4.1 V4 with an 80 GiB RAM arena took 96 s on the 4090 box. Two things cost most of it, and both are
+fixed by default now:
+
+- **The dense weights are converted once, not on every load.** With a Q6_K dense half, the conversion took ~25 s a
+  load on the CPU. Xolotl now writes the result to `xolotl-cache/` next to the model (~5.5 GB for V4 at Q6_K) and
+  reads it back on later loads. The cache is keyed on the model file's size and date and the dense type, so a new
+  model or setting writes a new one. It is only written when the drive has its size + 2 GiB free.
+  `XOLOTL_DENSE_REQUANT_CACHE=<dir>` puts it somewhere else, `XOLOTL_DENSE_REQUANT_CACHE=0` turns it off.
+- **The RAM arena is pinned while it fills.** Pinning an untouched 80 GiB arena makes the kernel fault and zero every
+  page on one thread. Filling first and pinning in four pieces alongside the fill spreads that work over the readers.
+  `XOLOTL_ARENA_PIN_AFTER=0` goes back to the old order, `XOLOTL_ARENA_PIPE=<n>` sets the pieces (default 4, 0 = one
+  registration after the fill).
+
+Measured on the V4 serve config (4090, 80 GiB arena, second load): **96 s -> 44 s**. The output is unchanged; every
+decode run on 7 Nov used these settings.
+
+**XOLOTL_ names.** Every engine switch documented as `STRATA_<X>` can now also be set as `XOLOTL_<X>`. The engine and
+its launch scripts copy each `XOLOTL_` variable onto the `STRATA_` one at start, and the Xolotl name wins if both are
+set. Nothing that uses the `STRATA_` names changes.
+
 ### RTX 40 (sm_89) speed switches on by default (6 Nov)
 
 The Qwen engine has had a per-card table of speed switches for RTX 30 cards (sm_86) since 0.2.0: switches that give the

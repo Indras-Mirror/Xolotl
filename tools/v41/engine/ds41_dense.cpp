@@ -25,7 +25,11 @@
 #include <map>
 #include <set>
 #include <thread>
+#include <cerrno>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <sys/statvfs.h>
+#endif
 
 #ifdef _WIN32
 #include <string.h>
@@ -516,11 +520,27 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
         // quantizer is CPU-bound; the reads are not the cost - measured with the source in the page cache).  Their
         // output is written once to <dir>/<model>.<key>.dense-rq, in the order this loop converts, and read back on
         // later loads.  The key: the model file's size and mtime, the requant / prediction types and the head switch;
-        // a cache of the wrong total size is ignored (and rewritten).
+        // a cache of the wrong total size is ignored (and rewritten).  On by default since 2026-11-07: unset = the folder
+        // xolotl-cache next to the model (created; ~5.5 GB for V4 at q6_K), STRATA_DENSE_REQUANT_CACHE=0 = off.  A new
+        // cache is only written with its size + 2 GiB free on that drive.
         std::FILE * rq_in = nullptr;
         std::FILE * rq_out = nullptr;
-        std::string rq_path, rq_tmp;
-        if (const char * cd = std::getenv("STRATA_DENSE_REQUANT_CACHE"); cd && *cd && (rq != GGML_TYPE_COUNT || pq != GGML_TYPE_COUNT)) {
+        std::string rq_path, rq_tmp, rq_dir;
+        {
+            const char * ce = std::getenv("STRATA_DENSE_REQUANT_CACHE");
+            if (ce && *ce) rq_dir = std::strcmp(ce, "0") == 0 ? "" : ce;
+            else if (model.size() > 0) {
+                const std::string mp0 = model.shard(0).path();
+                const size_t sl0 = mp0.find_last_of('/');
+                rq_dir = (sl0 == std::string::npos ? std::string(".") : mp0.substr(0, sl0)) + "/xolotl-cache";
+                if (::mkdir(rq_dir.c_str(), 0755) != 0 && errno != EEXIST) {
+                    std::fprintf(stderr, "dense requant cache: cannot create %s (%s) - off (STRATA_DENSE_REQUANT_CACHE=<dir> to choose one)\n",
+                                 rq_dir.c_str(), std::strerror(errno));
+                    rq_dir.clear();
+                }
+            }
+        }
+        if (const char * cd = rq_dir.c_str(); !rq_dir.empty() && (rq != GGML_TYPE_COUNT || pq != GGML_TYPE_COUNT)) {
             size_t want = 0;
             for (size_t s = 0; s < model.size(); ++s)
                 for (const auto & ti : model.shard(s).tensors()) {
@@ -541,9 +561,15 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                 if (::stat(rq_path.c_str(), &cs) == 0 && (size_t) cs.st_size == want) {
                     rq_in = std::fopen(rq_path.c_str(), "rb");
                 } else {
+                    struct statvfs vf {};
+                    const bool room = ::statvfs(cd, &vf) == 0 && (double) vf.f_bavail * (double) vf.f_frsize >= (double) want + 2147483648.0;
                     rq_tmp = rq_path + ".tmp";
-                    rq_out = std::fopen(rq_tmp.c_str(), "wb");
-                    if (!rq_out) std::fprintf(stderr, "dense requant cache: cannot write %s\n", rq_tmp.c_str());
+                    if (!room) std::fprintf(stderr, "dense requant cache: under %.1f GiB free in %s - not written (STRATA_DENSE_REQUANT_CACHE=<dir> elsewhere)\n",
+                                            ((double) want + 2147483648.0) / 1073741824.0, cd);
+                    else {
+                        rq_out = std::fopen(rq_tmp.c_str(), "wb");
+                        if (!rq_out) std::fprintf(stderr, "dense requant cache: cannot write %s\n", rq_tmp.c_str());
+                    }
                 }
             }
         }

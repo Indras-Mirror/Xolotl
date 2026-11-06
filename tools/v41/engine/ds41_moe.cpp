@@ -2330,7 +2330,9 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
     // because THP makes cudaHostRegister slow at load (~0.16 GB/s, ds41-engine.sh's note); the decode question is
     // whether 2 MiB pages cut the TLB cost of the ~10k CPU-lane expert reads per 256 tokens.
     const bool arena_thp = std::getenv("STRATA_ARENA_THP") && std::getenv("STRATA_ARENA_THP")[0] == '1';
-    if (im_->cfg.pin && std::getenv("STRATA_ARENA_PIN_AFTER") && std::getenv("STRATA_ARENA_PIN_AFTER")[0] == '1') {
+    // On by default since 2026-11-07 (load 96 -> 44 s with STRATA_ARENA_PIPE=4 and the dense requant cache, outputs
+    // unchanged); STRATA_ARENA_PIN_AFTER=0 = register first, as before.
+    if (im_->cfg.pin && !(std::getenv("STRATA_ARENA_PIN_AFTER") && std::getenv("STRATA_ARENA_PIN_AFTER")[0] == '0')) {
         void* m = mmap(nullptr, (size_t) gp.arena.bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (m != MAP_FAILED) {
             madvise(m, (size_t) gp.arena.bytes, arena_thp ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
@@ -2408,10 +2410,11 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
     if (const char* ft = std::getenv("STRATA_ARENA_FILL_THREADS"); ft && std::atoi(ft) > 0) nt = std::min(128, std::atoi(ft));
     const double t0 = now_ms();
 #ifndef _WIN32
-    // STRATA_ARENA_PIPE=N (opt-in, with STRATA_ARENA_PIN_AFTER=1): N threads register the arena in pieces while it is
-    // filled (arena_fill_pipelined); STRATA_ARENA_PIPE_MIB the piece (default 1024), STRATA_ARENA_PREFAULT=K threads
-    // populate the pieces ahead of the readers (default 0).  Unset or 0: fill, then one registration, as before.
-    const int pipe_reg = pin_after && std::getenv("STRATA_ARENA_PIPE") ? std::max(0, std::min(64, std::atoi(std::getenv("STRATA_ARENA_PIPE")))) : 0;
+    // STRATA_ARENA_PIPE=N (default 4 since 2026-11-07, with STRATA_ARENA_PIN_AFTER): N threads register the arena in
+    // pieces while it is filled (arena_fill_pipelined); STRATA_ARENA_PIPE_MIB the piece (default 1024),
+    // STRATA_ARENA_PREFAULT=K threads populate the pieces ahead of the readers (default 0).  0: fill, then one
+    // registration, as before.
+    const int pipe_reg = !pin_after ? 0 : std::getenv("STRATA_ARENA_PIPE") ? std::max(0, std::min(64, std::atoi(std::getenv("STRATA_ARENA_PIPE")))) : 4;
     if (pipe_reg > 0) {
         const char* pm = std::getenv("STRATA_ARENA_PIPE_MIB");
         const uint64_t piece = (uint64_t) (pm && std::atoi(pm) > 0 ? std::atoi(pm) : 1024) << 20;

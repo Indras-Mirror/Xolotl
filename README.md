@@ -18,6 +18,10 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 
 Full notes for every item: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
+- **7 Nov - DeepSeek-V4.1 loads in 44 s instead of 96 s**, same output. The converted dense weights are cached on disk
+  after the first load, and the RAM arena is pinned while it fills. On by default. Every switch now also takes an
+  `XOLOTL_` name (`XOLOTL_ARENA_PIN_AFTER=0` = `STRATA_ARENA_PIN_AFTER=0`; the old names keep working).
+  [Details](docs/xolotl/CHANGELOG.md#deepseek-v41-loads-in-44-s-and-xolotl_-names-for-every-switch-7-nov)
 - **6 Nov - +8 % decode on every RTX 40 card**: QFN 45 GB 139 -> 150 tok/s on the 4090, same output. A tuned set of
   bit-exact speed switches for sm_89, on by default (`STRATA_SM89_PERF=0` turns it off).
   [Details](docs/xolotl/CHANGELOG.md#rtx-40-sm_89-speed-switches-on-by-default-6-nov)
