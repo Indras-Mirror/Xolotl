@@ -468,6 +468,8 @@ public:
     /// Decode speculative reads: start O_DIRECT reads of `ids` (a later layer's predicted experts) that are neither
     /// VRAM-resident nor in the arena into a pinned stash; that layer's run takes them from there.  A hint only.
     void spec_read(int64_t layer, const int32_t* ids, int n, bool d3 = false);
+    /// STRATA_LA_ARENA (STRATA_P2P builds): speculative NVMe -> VRAM reads of ARENA experts too (VRAM-resident ones skipped).
+    void spec_read_any(int64_t layer, const int32_t* ids, int n);
 
     /// out[i] = sum_k w6[k] * expert_{ids6[k]}(x)[i], with `x` on the host.  Synchronous.
     bool run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out);

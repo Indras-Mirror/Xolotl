@@ -863,6 +863,40 @@ int main(int argc, char ** argv) {
     double fd_dense = 0, fd_tier = 0, fd_logits = 0;   // prompt wall split (printed with the prompt line)
     std::vector<int> mids;
     std::vector<float> mw;
+    // STRATA_COST_SKIP=<t> (opt-in; CHANGES OUTPUTS - lossy, measure on short34): per pass token, a routed pick that is NOT
+    // the token's top pick, whose normalised weight is below t, and that is NOT resident in VRAM (it would cost a CPU-pool
+    // / PCIe / NVMe trip - the wall) is dropped and the token's other weights are scaled back to their sum.  Every expert
+    // stays reachable (it runs whenever a token gives it >= t, or it is resident).  The dropped entry becomes the token's top
+    // pick at weight 0, so the tier's union folds it away: nothing is fetched for it.  STRATA_COST_SKIP_FILE=1: only
+    // file-tier picks (not resident, not in the RAM arena) are skippable.  Applied on the decode side (verify passes and
+    // the short-prompt passes, so short34 measures it under the real VRAM residency), never in the layer-major batch.
+    // After PROMETHEVS's expert skip (Ryan Flavell, MAGNVS Ltd: a uniform 0.12 on every pick).
+    auto cost_skip = [&](Ds41MoeTier & tr, int l, int * ids, float * wts, int m) {
+        static const float cs_t = std::getenv("STRATA_COST_SKIP") ? (float) std::atof(std::getenv("STRATA_COST_SKIP")) : 0.0f;
+        static const bool cs_file = std::getenv("STRATA_COST_SKIP_FILE") && std::atoi(std::getenv("STRATA_COST_SKIP_FILE")) != 0;
+        static long cs_picks = 0, cs_drop = 0, cs_calls = 0;
+        if (cs_t <= 0.0f || mc.cpu_only) return;
+        for (int t = 0; t < m; ++t) {
+            int * id = ids + (size_t) t * top_k;
+            float * wt = wts + (size_t) t * top_k;
+            float sum = 0.0f;
+            int top = 0;
+            for (int k = 0; k < top_k; ++k) { sum += wt[k]; if (wt[k] > wt[top]) top = k; }
+            if (sum <= 0.0f) continue;
+            float kept = 0.0f;
+            for (int k = 0; k < top_k; ++k) {
+                ++cs_picks;
+                const int e = id[k];
+                const bool cheap = e < 0 || tr.resident(l, e) || (cs_file && tr.in_arena(l, e));
+                if (k != top && !cheap && wt[k] / sum < cs_t) { id[k] = id[top]; wt[k] = 0.0f; ++cs_drop; }
+                kept += wt[k];
+            }
+            if (kept > 0.0f && kept < sum) for (int k = 0; k < top_k; ++k) wt[k] *= sum / kept;
+        }
+        if (++cs_calls % 2560 == 0)
+            std::fprintf(stderr, "[cost-skip] t %.3f%s: %ld of %ld picks dropped (%.2f%%)\n", cs_t, cs_file ? " (file tier only)" : "",
+                         cs_drop, cs_picks, cs_picks ? 100.0 * cs_drop / cs_picks : 0.0);
+    };
     auto pass_m = [&](const int * toks, int m, int pos) -> bool {
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
@@ -874,6 +908,7 @@ int main(int argc, char ** argv) {
             float * rdev = (!mc.cpu_only && !std::getenv("STRATA_DEC_HOSTSUM")) ? d.routed_dev() : nullptr;
             const float * fn = nullptr;
             if (!d.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = d.last_error(); return false; }
+            cost_skip(tr, l, mids.data(), mw.data(), m);
             const double t1 = now_ms();
             fd_dense += t1 - t0;
             t0 = t1;
@@ -983,6 +1018,121 @@ int main(int argc, char ** argv) {
             const float * fn = nullptr;
             if (!d.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = d.last_error(); return false; }
             lap(0);
+            // STRATA_LOOKAHEAD (after Project Maya; ported from c7896e3d9 for STRATA_P2P): attn_router(l) also gave layer
+            // l+1's guessed top 16 per pass token (o_la: l+1's router on l's FFN input, ~96% of the real top-6 inside it on
+            // 25 Oct).  STRATA_PRED_STAT=1 scores the previous layer's guess at THIS layer ([lookahead] line).  =2: layer
+            // l+1's guessed NVMe-tier experts are read now, under this layer's tier call (spec_read - with STRATA_P2P into the
+            // VRAM stash, so a wrong guess costs drive time only).  Budget: guess ranks below STRATA_LA_SPEC_RANK (default 6),
+            // ranked by the union score over the pass tokens, at most STRATA_LA_SPEC per layer (default 2).
+            {
+                static const int la_mode = std::getenv("STRATA_LOOKAHEAD") ? std::atoi(std::getenv("STRATA_LOOKAHEAD")) : 0;
+                static const int la_spec = std::getenv("STRATA_LA_SPEC") ? std::atoi(std::getenv("STRATA_LA_SPEC")) : 2;
+                static const int la_rank = std::getenv("STRATA_LA_SPEC_RANK") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_LA_SPEC_RANK")))) : 6;
+                static std::vector<int> la_prev;
+                static int la_prev_layer = -2, la_prev_m = 0;
+                // STRATA_PRED_STAT coverage: each REAL file-tier pick of this layer, against the previous layer's guess
+                // (any of 16 / within la_rank) and against what was actually sent to spec_read for this layer
+                static std::vector<int32_t> la_sent;   // experts sent for layer la_sent_layer
+                static int la_sent_layer = -2;
+                static long cv_file = 0, cv_g16 = 0, cv_grank = 0, cv_sent = 0, cv_calls = 0, cv_cands = 0, cv_issued = 0, cv_nola = 0;
+                if (la_mode >= 2 && std::getenv("STRATA_PRED_STAT")) {
+                    const bool have = la_prev_layer == l - 1 && la_prev_m == m;
+                    std::vector<int> seen;
+                    for (int t = 0; t < m; ++t)
+                        for (int k = 0; k < top_k; ++k) {
+                            const int e = mids[(size_t) t * top_k + k];
+                            if (e < 0 || tr.resident(l, e) || tr.in_arena(l, e)) continue;
+                            if (std::find(seen.begin(), seen.end(), e) != seen.end()) continue;   // once per expert (the tier reads it once)
+                            seen.push_back(e);
+                            ++cv_file;
+                            if (!have) { ++cv_nola; continue; }
+                            bool g16 = false, gr = false;
+                            for (int u = 0; u < m && !(g16 && gr); ++u)
+                                for (int i = 0; i < 16; ++i)
+                                    if (la_prev[(size_t) u * 16 + i] == e) { g16 = true; if (i < la_rank) gr = true; }
+                            cv_g16 += g16; cv_grank += gr;
+                            if (la_sent_layer == l && std::find(la_sent.begin(), la_sent.end(), e) != la_sent.end()) ++cv_sent;
+                        }
+                    if (++cv_calls % 640 == 0)
+                        std::fprintf(stderr, "[la-cover] %ld layer calls: %ld real file-tier picks (%ld with no guess) | guessed in top 16 %.1f%%, "
+                                     "in top %d %.1f%%, SENT %.1f%% | candidates %ld, sent %ld\n", cv_calls, cv_file, cv_nola,
+                                     cv_file ? 100.0 * cv_g16 / cv_file : 0.0, la_rank, cv_file ? 100.0 * cv_grank / cv_file : 0.0,
+                                     cv_file ? 100.0 * cv_sent / cv_file : 0.0, cv_cands, cv_issued);
+                }
+                if (la_mode > 0 && std::getenv("STRATA_PRED_STAT") && la_prev_layer == l - 1 && la_prev_m == m) {
+                    static double ls_rank[16] = {}, ls_rec[3] = {};
+                    static long ls_tok = 0, ls_calls = 0;
+                    for (int t = 0; t < m; ++t) {
+                        const int * act = mids.data() + (size_t) t * top_k;
+                        const int * pr = la_prev.data() + (size_t) t * 16;
+                        auto in_act = [&](int e) { for (int k = 0; k < top_k; ++k) if (act[k] == e) return true; return false; };
+                        int hit = 0;
+                        for (int r = 0; r < 16; ++r) {
+                            const bool h = in_act(pr[r]);
+                            ls_rank[r] += h; hit += h;
+                            if (r == 5) ls_rec[0] += (double) hit / top_k;
+                            if (r == 7) ls_rec[1] += (double) hit / top_k;
+                        }
+                        ls_rec[2] += (double) hit / top_k;
+                        ++ls_tok;
+                    }
+                    if (++ls_calls % 640 == 0) {
+                        std::fprintf(stderr, "[lookahead] %ld tokens x layers: rank hit %%:", ls_tok);
+                        for (int r = 0; r < 10; ++r) std::fprintf(stderr, " %.0f", 100.0 * ls_rank[r] / ls_tok);
+                        std::fprintf(stderr, " | recall of the real top-%d in guess top-6 %.1f%%, top-8 %.1f%%, top-16 %.1f%%\n", (int) top_k,
+                                     100.0 * ls_rec[0] / ls_tok, 100.0 * ls_rec[1] / ls_tok, 100.0 * ls_rec[2] / ls_tok);
+                    }
+                }
+                if (const int * la = la_mode > 0 ? d.lookahead_ids() : nullptr) {
+                    la_prev.assign(la, la + (size_t) m * 16);
+                    la_prev_layer = l; la_prev_m = m;
+                    if (la_mode >= 2 && la_spec > 0 && l + 1 < stage_end && m <= Ds41MoeTier::kMaxMulti) {
+                        Ds41MoeTier & tn = ds41_tier_for(pipe, l + 1);
+                        std::vector<std::pair<int, int>> sc;   // (expert, union score) of the NVMe-tier guesses
+                        for (int t = 0; t < m; ++t)
+                            for (int i = 0; i < la_rank; ++i) {
+                                const int e = la[(size_t) t * 16 + i];
+                                if (e < 0 || tn.resident(l + 1, e) || tn.in_arena(l + 1, e)) continue;
+                                auto it = std::find_if(sc.begin(), sc.end(), [&](const std::pair<int, int> & q) { return q.first == e; });
+                                if (it == sc.end()) sc.push_back({ e, 16 - i }); else it->second += 16 - i;
+                            }
+                        cv_cands += (long) sc.size();
+                        la_sent.clear();
+                        la_sent_layer = l + 1;
+                        if (!sc.empty()) {
+                            std::stable_sort(sc.begin(), sc.end(), [](const std::pair<int, int> & x, const std::pair<int, int> & y) { return x.second > y.second; });
+                            std::vector<int32_t> rk;
+                            for (const auto & q : sc) rk.push_back(q.first);
+                            const int ns = std::min(la_spec, (int) rk.size());
+                            la_sent.assign(rk.begin(), rk.begin() + ns);
+                            cv_issued += ns;
+                            tn.spec_read(l + 1, rk.data(), ns, true);
+                        }
+                        // STRATA_LA_ARENA=1 (STRATA_P2P): the guessed ARENA experts of layer l+1 too, NVMe -> VRAM, so the tier
+                        // runs them on the card instead of the CPU pool / a PCIe copy (both read the blob over the host RAM
+                        // bus, the wall).  Own budget: STRATA_LA_ARENA_SPEC per layer (default 2), the same guess ranks.
+                        static const bool la_arena = std::getenv("STRATA_LA_ARENA") && std::atoi(std::getenv("STRATA_LA_ARENA")) != 0;
+                        static const int la_arena_spec = std::getenv("STRATA_LA_ARENA_SPEC") ? std::atoi(std::getenv("STRATA_LA_ARENA_SPEC")) : 2;
+                        if (la_arena && la_arena_spec > 0) {
+                            std::vector<std::pair<int, int>> sa;
+                            for (int t = 0; t < m; ++t)
+                                for (int i = 0; i < la_rank; ++i) {
+                                    const int e = la[(size_t) t * 16 + i];
+                                    if (e < 0 || tn.resident(l + 1, e) || !tn.in_arena(l + 1, e)) continue;
+                                    auto it = std::find_if(sa.begin(), sa.end(), [&](const std::pair<int, int> & q) { return q.first == e; });
+                                    if (it == sa.end()) sa.push_back({ e, 16 - i }); else it->second += 16 - i;
+                                }
+                            if (!sa.empty()) {
+                                std::stable_sort(sa.begin(), sa.end(), [](const std::pair<int, int> & x, const std::pair<int, int> & y) { return x.second > y.second; });
+                                std::vector<int32_t> ra;
+                                for (const auto & q : sa) ra.push_back(q.first);
+                                tn.spec_read_any(l + 1, ra.data(), std::min(la_arena_spec, (int) ra.size()));
+                            }
+                        }
+                    }
+                } else la_prev_layer = -2;
+            }
+            cost_skip(tr, l, mids.data(), mw.data(), m);
             if (rdev && !no_tier_batch) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
                 // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (16: a depth-4 pass and a 16-row
