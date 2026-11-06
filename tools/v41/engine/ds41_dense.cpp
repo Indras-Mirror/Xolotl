@@ -136,6 +136,13 @@ int env_rank(const char * k) {
     const char * e = std::getenv(k);
     return e ? std::max(0, std::min(kRK, std::atoi(e))) : 0;
 }
+// STRATA_LOOKAHEAD=1: build_attn also predicts the NEXT layer's experts (o_la) on small passes (decode / verify)
+bool lookahead_on() {
+    static const bool on = env_on("STRATA_LOOKAHEAD", false);
+    return on;
+}
+constexpr int kLaMaxCols = 16;   // o_la is built and read back for passes of at most this many columns
+
 bool smart_router() {
     static const bool on = env_on("STRATA_RB_SMART", false) || env_rank("STRATA_RB_PROTECT") > 0 || env_rank("STRATA_RB_POOL") > 0;
     return on;
@@ -175,6 +182,7 @@ struct Ds41Dense::Impl {
     ggml_tensor * o_fn = nullptr;         // [D, NC]    ffn_norm activation (the routed experts' input)
     ggml_tensor * o_ids = nullptr;        // I32 [NU, NC]
     ggml_tensor * o_wts = nullptr;        // [NU, NC]
+    ggml_tensor * o_la = nullptr;         // I32 [16, NC]  STRATA_LOOKAHEAD: the NEXT layer's top 16, predicted in this layer's graph
     ggml_tensor * o_xids = nullptr;       // I32 [NU, NC]  route meter (smart router): the exact top-NU
     ggml_tensor * o_xwts = nullptr;       // [NU, NC]      ... and their normalized weights
     ggml_tensor * rknob = nullptr;        // F32 [kRK + 1, 2] smart router: protect / pool rank selectors (set_route_select)
@@ -321,6 +329,8 @@ struct Ds41Dense::Impl {
     int64_t idx_tile = 0;
     std::map<std::array<int64_t, 3>, size_t> graph_bytes_memo;   // span_graph_bytes: (cap 1, cap 2, n) -> bytes
     std::vector<float> host_fn, host_wts, host_logits, host_emb;
+    std::vector<int32_t> host_la;         // STRATA_LOOKAHEAD readback (16 per column)
+    bool la_ok = false;                   // the last attn_router read a lookahead
     std::vector<int32_t> host_ids;
     std::vector<int32_t> host_xids;       // route meter: o_xids / o_xwts readbacks, and the counters since route_meter(true)
     std::vector<float> host_xwts;
@@ -1032,6 +1042,13 @@ static bool shexp_late_on() {
     return on;
 }
 
+// STRATA_LOOKAHEAD: layer il+1 is a routed layer whose router can be built (what o_la needs)
+static bool la_next_ok(const Ds41Dense::Impl & im, int il) {
+    const int nl = il + 1;
+    return nl < (int) im.ly.size() && im.ly[(size_t) nl].rbias && im.w.t.count("blk." + std::to_string(nl) + ".ffn_gate_inp.weight") &&
+           im.w.t.count("blk." + std::to_string(nl) + ".exp_probs_b.bias");
+}
+
 static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0,
                                 bool late_shexp = false) {
     using L_t = Ds41Dense::Impl::Layer;
@@ -1347,7 +1364,8 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * f_pre = nullptr, * f_post = nullptr, * f_comb = nullptr;
     b.hc_mixes(h, im.BL(il, "hc_ffn_fn.weight"), im.BL(il, "hc_ffn_scale.weight"), im.BL(il, "hc_ffn_base.weight"),
                &f_pre, &f_post, &f_comb);
-    ggml_tensor * fn = b.rms_w(ggml_dsv4_hc_pre(gc, h, a_pre), im.BL(il, "ffn_norm.weight"));   // [D, n]
+    ggml_tensor * xffn = ggml_dsv4_hc_pre(gc, h, a_pre);                                        // [D, n] before its norm
+    ggml_tensor * fn = b.rms_w(xffn, im.BL(il, "ffn_norm.weight"));                             // [D, n]
 
     // ---- router (model.py Gate): sqrt(softplus), top-k on score + bias, weights from the raw scores
     ggml_tensor * rl = ggml_mul_mat(gc, im.BL(il, "ffn_gate_inp.weight"), fn);
@@ -1460,6 +1478,17 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     cps.emplace_back(fn, b.cols2(im.o_fn, D, n, col0));
     cps.emplace_back(ids, b.cols2(im.o_ids, im.NU, n, col0));
     cps.emplace_back(wts, b.cols2(im.o_wts, im.NU, n, col0));
+    // STRATA_LOOKAHEAD=1 (after Project Maya's ds4 lookahead; ported from c7896e3d9): the NEXT layer's router on THIS
+    // layer's FFN input (its own ffn_norm, score + bias + the selection rbias, as the next layer will select) - a guess
+    // at layer il+1's experts ready a whole layer before they are needed.  A hint only: nothing on the model path reads it.
+    if (im.o_la && n <= kLaMaxCols && col0 == 0 && la_next_ok(im, il)) {
+        const int nl = il + 1;
+        ggml_tensor * rl2 = ggml_mul_mat(gc, im.BLpred(nl), b.rms_w(xffn, im.BL(nl, "ffn_norm.weight")));
+        ggml_mul_mat_set_prec(rl2, GGML_PREC_F32);
+        ggml_tensor * sc2 = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl2)), im.BL(nl, "exp_probs_b.bias")),
+                                     ggml_reshape_2d(gc, im.ly[(size_t) nl].rbias, im.NE, 1));
+        outs.push_back(ggml_cpy(gc, ggml_argsort_top_k(gc, sc2, 16), b.cols2(im.o_la, 16, n, col0)));
+    }
     if (xids) {   // route meter: the exact top-NU and their normalized weights
         ggml_tensor * xw = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), xids), im.NU, n);
         xw = ggml_div(gc, xw, ggml_scale_bias(gc, ggml_sum_rows(gc, xw), 1.0f, 1e-20f));
@@ -1757,6 +1786,7 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.o_fn = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
     im.o_ids = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.NU, NC);
     im.o_wts = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.NU, NC);
+    if (lookahead_on()) im.o_la = ggml_new_tensor_2d(c, GGML_TYPE_I32, 16, NC);
     if (smart_router()) {
         im.o_xids = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.NU, NC);
         im.o_xwts = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.NU, NC);
@@ -2162,6 +2192,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
 #endif
         im.host_ids.resize((size_t) (im.NU * NCM));
         im.host_wts.resize((size_t) (im.NU * NCM));
+        if (lookahead_on()) im.host_la.resize((size_t) (16 * NCM));
         if (smart_router()) {
             im.host_xids.resize((size_t) (im.NU * NCM));
             im.host_xwts.resize((size_t) (im.NU * NCM));
@@ -2910,6 +2941,8 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data(), 0, (size_t) (im.D * n) * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data(), 0, (size_t) (im.NU * n) * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data(), 0, (size_t) (im.NU * n) * 4);
+    im.la_ok = im.o_la && n <= kLaMaxCols && la_next_ok(im, il);
+    if (im.la_ok) ggml_backend_tensor_get_async(im.backend, im.o_la, im.host_la.data(), 0, (size_t) (16 * n) * 4);
     if (im.o_xids) {
         ggml_backend_tensor_get_async(im.backend, im.o_xids, im.host_xids.data(), 0, (size_t) (im.NU * n) * 4);
         ggml_backend_tensor_get_async(im.backend, im.o_xwts, im.host_xwts.data(), 0, (size_t) (im.NU * n) * 4);
@@ -2926,6 +2959,8 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     if (fn_dev) *fn_dev = im.o_fn;
     return true;
 }
+
+const int * Ds41Dense::lookahead_ids() const { return p_->la_ok ? p_->host_la.data() : nullptr; }
 
 bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
     Impl & im = *p_;

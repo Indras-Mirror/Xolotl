@@ -11,6 +11,7 @@
 // implementation.  `tools/ds4/cmake/ds4_moe.cmake` builds both.
 #include "ds41_moe.hpp"
 #include "ds41_transcode.hpp"
+#include "ggml.h"   // ggml_row_size / ggml_type_name / quantize (the expert sidecar, --build-shadow)
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
@@ -32,6 +33,11 @@
 #include <utility>
 
 #include "ds41_sys.hpp"
+#ifdef STRATA_XOLP2P
+#include "xolp2p.h"   // private/xolp2p: direct NVMe -> VRAM (STRATA_P2P=1 at run time)
+#include <unistd.h>
+#include <unordered_map>
+#endif
 
 #include "strata/artifact/ds4_geometry.hpp"
 #include "ds41_geometry.hpp"
@@ -374,6 +380,135 @@ struct RemoteChunk {
     double wait_ms = 0;
 };
 
+#ifdef STRATA_XOLP2P
+/// STRATA_P2P: one blob's three role slices as raw reads - each slice 4 KiB-aligned from the model's raw partition
+/// (rf, a0..a1) into a slot's raw area at raw_off, its bytes at src_off there, n of them, for blob offset at.
+struct P2PPlan {
+    const xolp2p::RawFile* rf[3] = {};
+    uint64_t a0[3] = {}, a1[3] = {};
+    size_t raw_off[3] = {}, src_off[3] = {}, at[3] = {}, n[3] = {};
+    int nr = 0;
+};
+
+/// STRATA_P2P + a speculative read (STRATA_LOOKAHEAD=2 / STRATA_D3_SPEC): the stash lives in the VRAM window instead of
+/// pinned host memory, so a guess the pass does not use costs drive time only - no host RAM traffic (the host stash's
+/// wasted reads crossed the saturated RAM bus twice, which is why the 27 Oct D3_SPEC cut file-blocked 15% for no wall
+/// clock).  Same slot rules as SpecStash: tagged with the gpu_run call (`seq`) that will run its layer, reusable once that
+/// call has passed and the read is done; take() waits for a running read.  Readers: kThreads, 1 MiB requests.
+struct P2PSpec {
+    static constexpr int kThreads = 4;
+    struct Slot { int64_t layer = -1, seq = -1; int32_t e = -1; int left = 0; bool failed = false; P2PPlan plan; };
+    struct Req { int si; const xolp2p::RawFile* rf; uint64_t off, len; uint8_t* dst; };
+    std::vector<Slot> slot;
+    size_t base = 0, stride = 0;   // the stash's offset in the window, bytes per slot
+    uint8_t* dma = nullptr;        // window dma_target()
+    CUdeviceptr dev = 0;           // window dev()
+    int next = 0;
+    long issued = 0, used = 0, failed_n = 0, stale = 0, rej_dup = 0, rej_full = 0, rej_busy = 0;
+    std::mutex mu;
+    std::condition_variable cv_job, cv_done;
+    std::deque<Req> q;
+    std::vector<std::thread> th;
+    bool stop = false;
+
+    void open(int n, size_t at, size_t st, uint8_t* d, CUdeviceptr v) {
+        slot.resize((size_t) n);
+        base = at; stride = st; dma = d; dev = v;
+        for (int i = 0; i < kThreads; ++i)
+            th.emplace_back([this]() {
+                for (;;) {
+                    Req r;
+                    {
+                        std::unique_lock<std::mutex> lk(mu);
+                        cv_job.wait(lk, [&] { return stop || !q.empty(); });
+                        if (stop && q.empty()) return;
+                        r = q.front();
+                        q.pop_front();
+                    }
+                    std::string why;
+                    const bool ok = r.rf->read(r.off, r.len, r.dst, &why);
+                    std::lock_guard<std::mutex> lk(mu);
+                    Slot& x = slot[(size_t) r.si];
+                    if (!ok) x.failed = true;
+                    if (--x.left == 0) cv_done.notify_all();
+                }
+            });
+    }
+    /// Queue (layer, e) for call `seq`; false when it is already stashed, no slot is free, or (max_busy > 0) at least
+    /// max_busy stashed blobs are still being read - back-pressure, so guesses never queue far ahead of demand reads.
+    bool issue(int64_t layer, int32_t e, int64_t seq, int64_t now_seq, const P2PPlan& p, int max_busy = 0) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (max_busy > 0) {
+            int busy = 0;
+            for (const Slot& x : slot) busy += x.left != 0;
+            if (busy >= max_busy) { ++rej_busy; return false; }
+        }
+        for (const Slot& x : slot)
+            if (x.layer == layer && x.e == e && x.seq == seq) { ++rej_dup; return false; }
+        const int ns = (int) slot.size();
+        for (int t = 0; t < ns; ++t) {
+            const int si = (next + t) % ns;
+            Slot& x = slot[(size_t) si];
+            if (x.left != 0 || x.seq > now_seq) continue;   // reading, or waiting for its layer
+            if (x.seq >= 0 && x.e >= 0) ++stale;   // a guess its call never took (take() clears e)
+            x.layer = layer; x.e = e; x.seq = seq; x.failed = false; x.plan = p; x.left = 0;
+            uint8_t* to = dma + base + (size_t) si * stride;
+            for (int r = 0; r < p.nr; ++r)
+                for (uint64_t c = p.a0[r]; c < p.a1[r]; c += (1ull << 20)) {
+                    q.push_back({si, p.rf[r], c, std::min<uint64_t>(1ull << 20, p.a1[r] - c), to + p.raw_off[r] + (c - p.a0[r])});
+                    ++x.left;
+                }
+            cv_job.notify_all();
+            next = (si + 1) % ns;
+            ++issued;
+            return true;
+        }
+        ++rej_full;
+        return false;
+    }
+    /// (layer, e) for call `seq` is stashed (its read may still be running) and has not failed so far.
+    bool has(int64_t layer, int32_t e, int64_t seq) {
+        std::lock_guard<std::mutex> lk(mu);
+        for (const Slot& x : slot)
+            if (x.layer == layer && x.e == e && x.seq == seq) return !x.failed;
+        return false;
+    }
+    /// (layer, e) for call `seq` is stashed AND its read is done (no wait) - the arena lane only switches then.
+    bool ready(int64_t layer, int32_t e, int64_t seq) {
+        std::lock_guard<std::mutex> lk(mu);
+        for (const Slot& x : slot)
+            if (x.layer == layer && x.e == e && x.seq == seq) return x.left == 0 && !x.failed;
+        return false;
+    }
+    /// The finished slot of (layer, e) for call `seq` (waits for a running read), its slice pointers in src[]; false =
+    /// not stashed or its read failed (the host path then reads it).
+    bool take(int64_t layer, int32_t e, int64_t seq, CUdeviceptr src[3], P2PPlan* plan) {
+        std::unique_lock<std::mutex> lk(mu);
+        for (size_t si = 0; si < slot.size(); ++si) {
+            Slot& x = slot[si];
+            if (x.layer != layer || x.e != e || x.seq != seq) continue;
+            cv_done.wait(lk, [&] { return x.left == 0; });
+            x.e = -1;   // taken (never counted stale)
+            if (x.failed) { ++failed_n; return false; }
+            for (int r = 0; r < x.plan.nr; ++r) src[r] = dev + base + si * stride + x.plan.src_off[r];
+            *plan = x.plan;
+            ++used;
+            return true;
+        }
+        return false;
+    }
+    ~P2PSpec() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stop = true;
+            q.clear();
+        }
+        cv_job.notify_all();
+        for (auto& t : th) t.join();
+    }
+};
+#endif
+
 /// All the device state, so the CPU-only flavour has none of it to leak.
 struct Gpu {
     Arena arena;
@@ -396,6 +531,18 @@ struct Gpu {
     void *d_meta = nullptr;            ///< run(): grouped-launch metadata (device side of h_meta)
     uint8_t* h_meta = nullptr;         ///< pinned staging for it
     uint8_t* h_fstage = nullptr;       ///< run(): file-tier misses read here (pinned), then DMA'd (kMaxFg blobs)
+#ifdef STRATA_XOLP2P
+    // STRATA_P2P=1: a VRAM ring the NVMe DMAs file-tier blobs into (xolp2p), STRATA_P2P_SLOTS slots, each = the blob's
+    // three role slices read 4 KiB-aligned (raw area only: the PCIe site assembles them straight into its destination).
+    std::unique_ptr<xolp2p::Window> p2p;
+    bool p2p_tried = false;
+    int p2p_slots = 0;
+    size_t p2p_raw = 0, p2p_slot = 0;  ///< bytes: raw area, whole slot (the same since the asm area went)
+    std::unordered_map<int, std::unique_ptr<xolp2p::RawFile>> p2p_files;   ///< by the shard's (buffered) fd
+    std::unordered_map<int, bool> p2p_nofile;                               ///< shards that cannot be read raw
+    int p2p_spec_slots = 0;                    ///< window slots after the ring's: the P2P spec stash
+    std::unique_ptr<P2PSpec> pspec;            ///< (declared last: its readers use p2p_files, so it goes first)
+#endif
     void *d_x = nullptr, *d_xq = nullptr, *d_parts = nullptr, *d_grp_ptr = nullptr, *d_grp_start = nullptr,
          *d_ngroups = nullptr, *d_ent_dst = nullptr, *d_ent_tok = nullptr, *d_scratch = nullptr, *d_stage = nullptr;
     cudaEvent_t ev[4] = {};
@@ -1783,6 +1930,15 @@ void Ds41GgufBlobs::read(int64_t layer, int64_t expert, uint8_t* dst) const {
     }
 }
 
+bool Ds41GgufBlobs::raw_span(int r, int64_t layer, int64_t expert, int* fd, uint64_t* off, size_t* n) const {
+    if (r < 0 || r > 2 || im_->fd[r].empty() || (size_t) layer >= im_->fd[r].size()) return false;
+    const size_t sz = im_->stride[r][(size_t) layer];
+    const int f = im_->fd[r][(size_t) layer];
+    if (f < 0 || sz == 0) return false;
+    *fd = f; *off = im_->foff[r][(size_t) layer] + (uint64_t) expert * sz; *n = sz;
+    return true;
+}
+
 void Ds41GgufBlobs::read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const {
     if (nparts <= 1) {
         if (part == 0) read(layer, expert, dst);
@@ -2804,6 +2960,116 @@ void Ds41MoeTier::trace_mark(const float* v, int n) {
     std::fflush(im_->trace);
 }
 
+#if defined(DS4_MOE_CUDA) && defined(STRATA_XOLP2P)
+static bool p2p_env(const char* k) { const char* v = std::getenv(k); return v && std::atoi(v) != 0; }
+/// STRATA_P2P: the VRAM window, opened once per tier on first use (a file-tier call or a speculative read): the ring
+/// (STRATA_P2P_SLOTS, default 8) then the spec stash (STRATA_P2P_SPEC_SLOTS; default 8 when STRATA_LOOKAHEAD >= 2 or
+/// STRATA_D3_SPEC asks for speculative reads, else 0).  Slot = one blob's raw area.  False = the host path.
+static bool p2p_ready(Ds41MoeImpl& im, Gpu& gp) {
+    if (gp.p2p_tried) return (bool) gp.p2p && !p2p_env("STRATA_P2P_DRYRUN");
+    if (!p2p_env("STRATA_P2P") || !im.blobs) return false;
+    gp.p2p_tried = true;
+    if (!dynamic_cast<const Ds41FileBlobs*>(im.blobs) && !dynamic_cast<const Ds41GgufBlobs*>(im.blobs)) {
+        std::fprintf(stderr, "ds41: STRATA_P2P unavailable (blob source '%s' has no raw spans) - host path\n", im.blobs->kind());
+        return false;
+    }
+    const char* ss = std::getenv("STRATA_P2P_SPEC_SLOTS");
+    const bool spec_wanted = (std::getenv("STRATA_LOOKAHEAD") && std::atoi(std::getenv("STRATA_LOOKAHEAD")) >= 2) || p2p_env("STRATA_D3_SPEC");
+    gp.p2p_slots = std::getenv("STRATA_P2P_SLOTS") ? std::max(1, std::atoi(std::getenv("STRATA_P2P_SLOTS"))) : 8;
+    gp.p2p_spec_slots = ss ? std::max(0, std::atoi(ss)) : !spec_wanted ? 0 : p2p_env("STRATA_LA_ARENA") ? 16 : 8;
+    gp.p2p_raw = ((size_t) im.blob + 3 * 8192 + 65535) & ~(size_t) 65535;
+    gp.p2p_slot = gp.p2p_raw;   // raw only: assembled into the PCIe site's d_stage / victim slot
+    std::string why;
+    gp.p2p = xolp2p::Window::open((size_t) (gp.p2p_slots + gp.p2p_spec_slots) * gp.p2p_slot, &why);
+    if (!gp.p2p) {
+        std::fprintf(stderr, "ds41: STRATA_P2P unavailable (%s) - file-tier reads stay on the host path\n", why.c_str());
+        return false;
+    }
+    std::fprintf(stderr, "ds41: STRATA_P2P on - NVMe -> VRAM ring, %d slots + %d spec slots x %.1f MiB (%.0f MiB), BAR1 0x%llx%s\n",
+                 gp.p2p_slots, gp.p2p_spec_slots, gp.p2p_slot / 1048576.0, gp.p2p->size() / 1048576.0,
+                 (unsigned long long) gp.p2p->bus(),
+                 p2p_env("STRATA_P2P_VERIFY") ? "; STRATA_P2P_VERIFY: every blob checked against the host read" : "");
+    // STRATA_P2P_DRYRUN=1: the window (ring + spec slots) is opened and held, but no read uses it - the control arm with
+    // the SAME VRAM footprint (free VRAM sizes the prompt prestage and the cache kept across turns, so a control without
+    // the window decodes different text; 2026-11-07 chain6 B).
+    if (p2p_env("STRATA_P2P_DRYRUN")) {
+        std::fprintf(stderr, "ds41: STRATA_P2P_DRYRUN: window held, every read stays on the host path\n");
+        return false;
+    }
+    if (gp.p2p_spec_slots > 0) {
+        gp.pspec = std::make_unique<P2PSpec>();
+        gp.pspec->open(gp.p2p_spec_slots, (size_t) gp.p2p_slots * gp.p2p_slot, gp.p2p_slot, gp.p2p->dma_target(), gp.p2p->dev());
+    }
+    return true;
+}
+/// The raw reader of a shard (by its buffered fd), opened once; null = that shard cannot be read raw (said once).
+static const xolp2p::RawFile* p2p_file(Gpu& gp, int fd) {
+    auto it = gp.p2p_files.find(fd);
+    if (it != gp.p2p_files.end()) return it->second.get();
+    if (gp.p2p_nofile.count(fd)) return nullptr;
+    char lp[64], path[4096];
+    std::snprintf(lp, sizeof lp, "/proc/self/fd/%d", fd);
+    const ssize_t k = ::readlink(lp, path, sizeof path - 1);
+    std::string why = "readlink failed";
+    std::unique_ptr<xolp2p::RawFile> rf;
+    if (k > 0) { path[k] = 0; rf = xolp2p::RawFile::open(path, &why); }
+    if (!rf) {
+        std::fprintf(stderr, "ds41: STRATA_P2P: %s cannot be read raw (%s) - host path for it\n", k > 0 ? path : "?", why.c_str());
+        gp.p2p_nofile[fd] = true;
+        return nullptr;
+    }
+    std::fprintf(stderr, "ds41: STRATA_P2P: %s via %s (%zu extents)\n", path, rf->device().c_str(), rf->extents());
+    return (gp.p2p_files[fd] = std::move(rf)).get();
+}
+/// (layer, e)'s three slices as raw reads into one slot's raw area; false = not this way (the host path reads it).
+static bool p2p_plan(Ds41MoeImpl& im, Gpu& gp, int64_t layer, int64_t e, P2PPlan& p) {
+    const Ds41FileBlobs* fb = dynamic_cast<const Ds41FileBlobs*>(im.blobs);
+    const Ds41GgufBlobs* gg = fb ? nullptr : dynamic_cast<const Ds41GgufBlobs*>(im.blobs);
+    if (!fb && !gg) return false;
+    size_t raw_at = 0, roff = 0;
+    p.nr = 0;
+    for (int r = 0; r < 3; ++r) {
+        int fd; uint64_t off; size_t n;
+        if (!(fb ? fb->raw_span(r, layer, e, &fd, &off, &n) : gg->raw_span(r, layer, e, &fd, &off, &n))) return false;
+        const xolp2p::RawFile* rf = p2p_file(gp, fd);
+        if (!rf) return false;
+        const uint64_t a0 = off & ~4095ull, a1 = (off + n + 4095) & ~4095ull;
+        if (raw_at + (a1 - a0) > gp.p2p_raw) return false;
+        p.rf[p.nr] = rf; p.a0[p.nr] = a0; p.a1[p.nr] = a1;
+        p.raw_off[p.nr] = raw_at; p.src_off[p.nr] = raw_at + (size_t) (off - a0);
+        p.at[p.nr] = roff; p.n[p.nr] = n;
+        ++p.nr;
+        raw_at += a1 - a0;
+        roff += n;
+    }
+    return roff == (size_t) im.bl[(size_t) im.g.cls(layer, e)];
+}
+#endif
+
+void Ds41MoeTier::spec_read_any(int64_t layer, const int32_t* ids, int n) {
+#if defined(DS4_MOE_CUDA) && defined(STRATA_XOLP2P)
+    // STRATA_LA_ARENA: as spec_read's P2P branch, but ARENA experts too (only VRAM-resident ones are skipped) - the
+    // NVMe lane takes them off the host RAM bus.  P2P only: without the VRAM stash this would just add RAM traffic.
+    Ds41MoeImpl& im = *im_;
+    if (!im.inited || !im.gpu || !im.blobs || im.cfg.cpu_only || !ids || n <= 0) return;
+    if (layer <= im.run_layer || layer >= im.g.n_layers || !im.g.routed(layer)) return;
+    Gpu& gp = *im.gpu;
+    if (!p2p_ready(im, gp) || !gp.pspec) return;
+    const int64_t seq = im.run_seq + (layer - im.run_layer);
+    for (int i = 0; i < n; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= im.g.n_experts || resident(layer, e)) continue;
+        // STRATA_LA_ARENA_BUSY (default 2): arena guesses only while fewer stashed blobs than this are still in flight -
+        // they are a bonus; a demand read must never queue behind them (chain7: 2 guesses/layer flooded the SSD)
+        static const int la_busy = std::getenv("STRATA_LA_ARENA_BUSY") ? std::atoi(std::getenv("STRATA_LA_ARENA_BUSY")) : 2;
+        P2PPlan p;
+        if (p2p_plan(im, gp, layer, e, p) && gp.pspec->issue(layer, e, seq, im.run_seq, p, std::max(1, la_busy))) ++im.st.spec_issued;
+    }
+#else
+    (void) layer; (void) ids; (void) n;
+#endif
+}
+
 void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n, bool d3) {
 #if defined(DS4_MOE_CUDA)
     Ds41MoeImpl& im = *im_;
@@ -2812,6 +3078,19 @@ void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n, bool d3) {
     if (!im.inited || !im.gpu || !im.blobs || im.cfg.cpu_only || (im.cfg.arena_adapt && !d3) || !ids || n <= 0) return;
     if (layer <= im.run_layer || layer >= im.g.n_layers || !im.g.routed(layer)) return;
     Gpu& gp = *im.gpu;
+    const int64_t seq0 = im.run_seq + (layer - im.run_layer);   // decode: one gpu_run per layer
+#ifdef STRATA_XOLP2P
+    // STRATA_P2P: the guesses go NVMe -> VRAM (P2PSpec) - a wasted one costs drive time, not host RAM bandwidth
+    if (p2p_ready(im, gp) && gp.pspec) {
+        for (int i = 0; i < n; ++i) {
+            const int32_t e = ids[i];
+            if (e < 0 || e >= im.g.n_experts || resident(layer, e) || in_arena(layer, e)) continue;
+            P2PPlan p;
+            if (p2p_plan(im, gp, layer, e, p) && gp.pspec->issue(layer, e, seq0, im.run_seq, p)) ++im.st.spec_issued;
+        }
+        return;
+    }
+#endif
     if (!gp.spec) {
         gp.spec = std::make_unique<SpecStash>();
         if (!gp.spec->open(im.blobs, im.blob)) { gp.spec.reset(); return; }
@@ -4208,6 +4487,26 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             R.req.store(++gp.remote->n, std::memory_order_release);
         }
     }
+    // ---- STRATA_LA_ARENA=1 (with STRATA_P2P + STRATA_LOOKAHEAD=2): the NVMe lane for ARENA experts.  An arena miss the
+    // lookahead already read NVMe -> VRAM (its spec slot is done - no wait) leaves the CPU pool / PCIe lanes, which both
+    // read the whole blob over the saturated host RAM bus, and runs on the card from the stash like a file-tier blob
+    // (p2p_put; no arena_adapt promotion - it is in the arena already).  Same bytes, other road.
+    int la_u[kMaxFg], nla = 0;
+#ifdef STRATA_XOLP2P
+    static const bool la_arena = std::getenv("STRATA_LA_ARENA") && std::atoi(std::getenv("STRATA_LA_ARENA")) != 0;
+    static long la_arena_seen = 0, la_arena_used = 0, la_arena_fallback = 0;
+    if (la_arena && gp.pspec) {
+        int keep = 0;
+        for (int i = 0; i < nmiss; ++i) {
+            const int u = miss[i];
+            const bool in_ar = gp.arena.ptr(layer, ue[u]) != nullptr;
+            la_arena_seen += in_ar;
+            if (in_ar && nla < kMaxFg && gp.pspec->ready(layer, ue[u], im.run_seq)) { cls[u] = FILEG; la_u[nla++] = u; }
+            else miss[keep++] = u;
+        }
+        nmiss = keep;
+    }
+#endif
     // ---- the PCIe share of the distinct misses (same budget rule as gpu_run) ----
     int np = 0;
     {
@@ -4279,6 +4578,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // (DS41_PROF_X: 1.6 ms of a 2.9 ms call).  STRATA_FILE_GPU=0: the pool computes them (the old path).
     static const bool file_gpu = !(std::getenv("STRATA_FILE_GPU") && std::getenv("STRATA_FILE_GPU")[0] == '0');
     int fg_u[kMaxFg], nfg = 0;
+    bool fg_arena[kMaxFg] = {};   // STRATA_LA_ARENA: an arena expert served from the NVMe lane (its stash slot)
+    for (int i = 0; i < nla; ++i) { fg_arena[nfg] = true; fg_u[nfg++] = la_u[i]; }
     if (file_gpu) {
         for (int u = 0; u < nu; ++u)
             if (cls[u] == CPU && !gp.arena.ptr(layer, ue[u]) && nfg < kMaxFg) { cls[u] = FILEG; fg_u[nfg++] = u; }   // h_fstage: kMaxFg blobs
@@ -4303,11 +4604,72 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // arena_adapt it is copied into its victim slot after the DMAs are queued (fg_copy); the rest are read now
     uint8_t* fg_copy[kMaxFg] = {};
     int fread_b[kMaxFg], nfr = 0;
+    // STRATA_P2P spec slots this call will take, collected only AFTER its own demand reads have started (a slot still
+    // being read used to be waited for here, before the misses were even issued: LA_SPEC 4 lost ~8 ms/pass that way)
+    int fg_pend[kMaxFg], npend = 0;
+    uint8_t* fg_vs[kMaxFg] = {};
+    bool fg_dev[kMaxFg] = {};   // blob b comes from the VRAM window (STRATA_P2P: the ring or the spec stash), via p2p_put
+#ifdef STRATA_XOLP2P
+    static const bool p2p_on = std::getenv("STRATA_P2P") && std::atoi(std::getenv("STRATA_P2P")) != 0;
+    static const bool p2p_verify = std::getenv("STRATA_P2P_VERIFY") && std::atoi(std::getenv("STRATA_P2P_VERIFY")) != 0;
+    struct P2PJob { const xolp2p::RawFile* rf; uint64_t off, len; uint8_t* dst; int a; };
+    struct P2PAsm { int b; uint8_t* vslot; CUdeviceptr src[3]; size_t at[3], n[3]; int nr; };   // at = offset in the blob
+    std::vector<P2PJob> p2p_jobs;
+    P2PAsm p2p_asm[kMaxFg];
+    int p2p_of[kMaxFg];   // fg blob b -> its p2p_asm index, -1 = host path
+    std::fill(p2p_of, p2p_of + kMaxFg, -1);
+    static std::atomic<long> p2p_full{0};   // blobs that found every ring slot taken (host path)
+    static std::atomic<int> p2p_want_max{0};   // most file-tier blobs one call asked for
+    static std::atomic<long> p2p_checked{0}, p2p_bad{0};
+    // STRATA_P2P_PROF=1: where P2P's time goes - the flush per call, the waits on spec slots still being read
+    static const bool p2p_prof = std::getenv("STRATA_P2P_PROF") && std::atoi(std::getenv("STRATA_P2P_PROF")) != 0;
+    static double p2p_flush_ms = 0, p2p_flush_max = 0, p2p_take_ms = 0;
+    static long p2p_flush_n = 0, p2p_take_n = 0;
+    std::atomic<int> p2p_failed[kMaxFg];
+    int n_p2p = 0;
+    // a speculative read (STRATA_LOOKAHEAD=2 / D3_SPEC) that already brought the blob into the VRAM stash
+    auto p2p_take_spec = [&](int b, uint8_t* vslot) {
+        if (!gp.pspec) return false;
+        P2PAsm a; a.b = b; a.vslot = vslot;
+        P2PPlan p;
+        const double tt = p2p_prof ? now_ms() : 0;
+        const bool got = gp.pspec->take(layer, ue[fg_u[b]], im.run_seq, a.src, &p);
+        if (p2p_prof) { p2p_take_ms += now_ms() - tt; ++p2p_take_n; }
+        if (!got) return false;
+        a.nr = p.nr;
+        for (int r = 0; r < p.nr; ++r) { a.at[r] = p.at[r]; a.n[r] = p.n[r]; }
+        p2p_failed[n_p2p].store(0);
+        p2p_of[b] = n_p2p;
+        p2p_asm[n_p2p++] = a;
+        fg_dev[b] = true;
+        fg_src[b] = nullptr;
+        return true;
+    };
+#endif
     for (int b = 0; b < nfg; ++b) {
-        fg_vic[b] = adapt ? arena_victim(im, layer, (uint64_t) BLX(ue[fg_u[b]]), fg_vic, b) : -1;
+        fg_vic[b] = (adapt && !fg_arena[b]) ? arena_victim(im, layer, (uint64_t) BLX(ue[fg_u[b]]), fg_vic, b) : -1;
         uint8_t* vslot = fg_vic[b] >= 0
             ? (uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) gp.arena.slot_of[(size_t) (layer * im.g.n_experts + fg_vic[b])]]
             : nullptr;
+#ifdef STRATA_XOLP2P
+        if (!fg_arena[b] && gp.pspec && gp.pspec->has(layer, ue[fg_u[b]], im.run_seq)) {   // taken after the demand reads start
+            fg_pend[npend++] = b;
+            fg_vs[b] = vslot;
+            fg_src[b] = nullptr;
+            any_vic = any_vic || fg_vic[b] >= 0;
+            continue;
+        }
+        if (p2p_take_spec(b, vslot)) {   // its arena_adapt promotion is p2p_put's D2H (vslot)
+            if (fg_arena[b]) ++la_arena_used; else ++im.st.spec_hits;
+            any_vic = any_vic || fg_vic[b] >= 0;
+            continue;
+        }
+        if (fg_arena[b]) {   // the stash lost it after all: H2D from its own arena slot (pinned), no read
+            fg_src[b] = gp.arena.ptr(layer, ue[fg_u[b]]);
+            ++la_arena_fallback;
+            continue;
+        }
+#endif
         const uint8_t* stashed = gp.spec ? gp.spec->take(layer, ue[fg_u[b]], im.run_seq) : nullptr;
         if (stashed) {
             ++im.st.spec_hits;
@@ -4371,13 +4733,65 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         if (gp.s_dc) ck(cudaStreamSynchronize(gp.s_dc), "d3 arena-adapt dc sync");
         if (gp.s_dn) ck(cudaStreamSynchronize(gp.s_dn), "d3 arena-adapt dn sync");   // idle between calls; cheap
     }
+#ifdef STRATA_XOLP2P
+    // ---- STRATA_P2P=1: file-tier blobs straight from the NVMe into a VRAM ring (xolp2p) - no host RAM at all (the host
+    // path costs four passes over RAM per blob: NVMe -> bounce, bounce -> pinned staging, staging -> PCIe).  Each role
+    // slice is read 4 KiB-aligned from the model's raw partition into a ring slot's raw area, flushed, and p2p_put
+    // assembles it straight into the PCIe site's destination by three device copies.  Same bytes: STRATA_P2P_VERIFY=1
+    // compares every assembled blob with the host read.  Anything that cannot go this way (no window, a shard that is not
+    // raw-readable, more blobs than slots, a failed read) takes the host path unchanged.
+    if (p2p_on && nfr > 0 && p2p_ready(im, gp)) {
+        int keep = 0, n_ring = 0;
+        for (int w = p2p_want_max.load(); nfr > w && !p2p_want_max.compare_exchange_weak(w, nfr);) {}
+        for (int i = 0; i < nfr; ++i) {
+            const int b = fread_b[i];
+            const int64_t e = ue[fg_u[b]];
+            P2PPlan p;
+            bool ok = n_ring < gp.p2p_slots;
+            if (!ok) ++p2p_full;
+            ok = ok && p2p_plan(im, gp, layer, e, p);
+            if (!ok) { fread_b[keep++] = b; continue; }   // this blob: the host path
+            const size_t base = (size_t) n_ring++ * gp.p2p_slot;
+            P2PAsm a; a.b = b; a.nr = p.nr;
+            for (int r = 0; r < p.nr; ++r) {
+                for (uint64_t c = p.a0[r]; c < p.a1[r]; c += (1ull << 20))   // 1 MiB requests, spread over the readers
+                    p2p_jobs.push_back({p.rf[r], c, std::min<uint64_t>(1ull << 20, p.a1[r] - c),
+                                        gp.p2p->dma_target() + base + p.raw_off[r] + (c - p.a0[r]), n_p2p});
+                a.src[r] = gp.p2p->dev() + base + p.src_off[r];
+                a.at[r] = p.at[r];
+                a.n[r] = p.n[r];
+            }
+            a.vslot = fg_vic[b] >= 0 ? (uint8_t*) fg_src[b] : nullptr;   // arena_adapt: promoted by a D2H after the DMA
+            fg_src[b] = nullptr;   // no assembled copy anywhere: p2p_put builds it in the PCIe site's destination
+            fg_dev[b] = true;
+            p2p_failed[n_p2p].store(0);
+            p2p_of[b] = n_p2p;
+            p2p_asm[n_p2p++] = a;
+        }
+        nfr = keep;
+    }
+    const size_t n_pj = p2p_jobs.size();
+#else
+    const size_t n_pj = 0;
+#endif
     const double tfg = nfg > 0 ? now_ms() : 0;
-    if (nfr > 0) {
+    if (nfr > 0 || n_pj > 0) {
         if (!gp.rpool) gp.rpool = std::make_unique<ReadPool>();
         // STRATA_D3_PARTS: a call's read budget in parts (default 32 = the readers, split over its blobs)
         static const int d3_parts = std::getenv("STRATA_D3_PARTS") ? std::max(1, std::atoi(std::getenv("STRATA_D3_PARTS"))) : 32;
-        const int parts = std::max(1, std::min(d3_parts, d3_parts / nfr));
-        gp.rpool->start((size_t) nfr * (size_t) parts, [&, parts](size_t r) {
+        const int parts = std::max(1, std::min(d3_parts, d3_parts / std::max(1, nfr)));
+        const size_t n_host = (size_t) nfr * (size_t) parts;
+        gp.rpool->start(n_host + n_pj, [&, parts, n_host](size_t r) {
+#ifdef STRATA_XOLP2P
+            if (r >= n_host) {   // a P2P request: the NVMe DMAs straight into the VRAM ring
+                const P2PJob& j = p2p_jobs[r - n_host];
+                std::string why;
+                if (!j.rf->read(j.off, j.len, j.dst, &why)) {
+                    if (p2p_failed[j.a].exchange(1) == 0) std::fprintf(stderr, "ds41: STRATA_P2P read failed (%s) - host read for that blob\n", why.c_str());
+                }
+                return;
+            }
+#endif
             const int b = fread_b[r / (size_t) parts];
             im.blobs->read_part(layer, ue[fg_u[b]], (int) (r % (size_t) parts), parts, (uint8_t*) fg_src[b]);
         });
@@ -4527,6 +4941,36 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             bank_read[bank] = true;
         }
     };
+#ifdef STRATA_XOLP2P
+    auto p2p_check = [&](int b, const uint8_t* to, int64_t BL) {   // STRATA_P2P_VERIFY: the assembled blob vs the host read
+        ck(cudaStreamSynchronize(cs), "p2p verify sync");
+        std::vector<uint8_t> got((size_t) BL), want((size_t) BL);
+        const int64_t e = ue[fg_u[b]];
+        ck(cudaMemcpy(got.data(), to, (size_t) BL, cudaMemcpyDeviceToHost), "p2p verify d2h");
+        im.blobs->read(layer, e, want.data());
+        ++p2p_checked;
+        if (std::memcmp(got.data(), want.data(), (size_t) BL) != 0) {
+            size_t k = 0;
+            while (k < (size_t) BL && got[k] == want[k]) ++k;
+            std::fprintf(stderr, "ds41: STRATA_P2P_VERIFY MISMATCH layer %lld expert %lld at byte %zu of %lld\n",
+                         (long long) layer, (long long) e, k, (long long) BL);
+            ++p2p_bad;
+        }
+    };
+#endif
+    // STRATA_P2P: fg blob b's three role slices, ring -> `to` (the PCIe site's d_stage or victim slot) by device copies on
+    // `cs`; then, still ordered before any later wave reuses `to`, the arena_adapt promotion (D2H) and the test-mode check.
+    auto p2p_put = [&](int b, uint8_t* to, int64_t BL) {
+#ifdef STRATA_XOLP2P
+        const P2PAsm& a = p2p_asm[p2p_of[b]];
+        for (int r = 0; r < a.nr; ++r)
+            ck(cudaMemcpyAsync(to + a.at[r], (const void*) (uintptr_t) a.src[r], a.n[r], cudaMemcpyDeviceToDevice, cs), "p2p assemble");
+        if (a.vslot) ck(cudaMemcpyAsync(a.vslot, to, (size_t) BL, cudaMemcpyDeviceToHost, cs), "p2p promote");
+        if (p2p_verify) p2p_check(b, to, BL);
+#else
+        (void) b; (void) to; (void) BL;
+#endif
+    };
     auto launch_site = [&](int want) {
         bool used[kMaxEnt] = {};
         auto in_site = [&](int u) { return cls[u] == want || (want == PCIE && cls[u] == FILEG); };
@@ -4547,10 +4991,12 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                     const int32_t e = ue[u];
                     const int64_t BL = BLX(e);
                     const uint8_t* src = gp.arena.ptr(layer, e);
+                    int p2p_b = -1;
                     if (cls[u] == FILEG) {   // its staging (or arena_adapt victim) slot = its index in fg_u
                         int b = 0;
                         while (fg_u[b] != u) ++b;
                         src = fg_src[b];
+                        if (fg_dev[b]) p2p_b = b;   // STRATA_P2P: its slices are in the VRAM ring, p2p_put assembles them
                     }
                     // LRU admission (arena-held PCIe misses, as gpu_run).  STRATA_FILEG_ADMIT=1 (opt-in): a
                     // FILE-tier miss that RECURS (admit_ok: it also missed within the last kLruWin calls) is
@@ -4578,7 +5024,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                             }
                         }
                         uint8_t* to = (uint8_t*) gp.d_stage + (size_t) (bank * bank_w + si) * (size_t) B;
-                        ck(cudaMemcpyAsync(to, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
+                        if (p2p_b >= 0) p2p_put(p2p_b, to, BL);
+                        else ck(cudaMemcpyAsync(to, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
                         dptr[u] = (unsigned long long) to;
                         ++si;
                     }
@@ -4592,7 +5039,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                                                cudaMemcpyDeviceToHost, cs), "lru demote");
                             ck(cudaMemcpyAsync(vs, (const void*) dptr[u], (size_t) BL, cudaMemcpyDeviceToDevice, cs), "lru stage copy");
                         } else {        // the DMA lands in the victim slot: the kernel reads it there, and it stays
-                            ck(cudaMemcpyAsync(vs, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
+                            if (p2p_b >= 0) p2p_put(p2p_b, vs, BL);
+                            else ck(cudaMemcpyAsync(vs, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
                             dptr[u] = (unsigned long long) vs;
                         }
                         lru_old[n_lru] = v;
@@ -4632,13 +5080,58 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         }
     }
     if (nfg > 0) {   // the file-tier blobs must be home before their DMAs are queued
-        const double tw = nfr > 0 ? now_ms() : 0.0;
-        if (nfr > 0) gp.rpool->wait();
-        if (nfr > 0) im.st.fwait_ms += now_ms() - tw;   // INSTRUMENT: the block on NVMe alone (not the HIT launches)
-        im.st.file_tier += nfg;
+        const bool waited = nfr > 0 || n_pj > 0;
+        const double tw = (waited || npend > 0) ? now_ms() : 0.0;
+        if (waited) gp.rpool->wait();
+#ifdef STRATA_XOLP2P
+        for (int i = 0; i < npend; ++i) {   // the stashed blobs, now that the demand reads ran beside them
+            const int b = fg_pend[i];
+            if (p2p_take_spec(b, fg_vs[b])) { ++im.st.spec_hits; continue; }
+            uint8_t* dst = fg_vs[b] ? fg_vs[b] : gp.h_fstage + (size_t) b * (size_t) B;   // its read failed: host read now
+            im.blobs->read(layer, ue[fg_u[b]], dst);
+            fg_src[b] = dst;
+        }
+#endif
+        if (waited || npend > 0) im.st.fwait_ms += now_ms() - tw;   // INSTRUMENT: the block on NVMe alone (not the HIT launches)
+        im.st.file_tier += nfg - nla;   // (STRATA_LA_ARENA's arena experts are not file-tier reads)
         im.st.file_ms += now_ms() - tfg;
     }
+#ifdef STRATA_XOLP2P
+    if (n_p2p > 0) {
+        static std::atomic<long> p2p_blobs{0}, p2p_fallback{0};
+        for (int i = 0; i < n_p2p; ++i) {
+            if (!p2p_failed[i].load()) continue;
+            P2PAsm& a = p2p_asm[i];   // the raw read failed: read it the host way, now
+            uint8_t* dst = a.vslot ? a.vslot : gp.h_fstage + (size_t) a.b * (size_t) B;
+            im.blobs->read(layer, ue[fg_u[a.b]], dst);
+            fg_src[a.b] = dst; fg_dev[a.b] = false; p2p_of[a.b] = -1; a.nr = 0; a.vslot = nullptr;
+            ++p2p_fallback;
+        }
+        const double tf = p2p_prof ? now_ms() : 0;
+        if (!xolp2p::flush()) { std::fprintf(stderr, "ds41: STRATA_P2P: cuFlushGPUDirectRDMAWrites failed\n"); std::abort(); }
+        if (p2p_prof) { const double d = now_ms() - tf; p2p_flush_ms += d; p2p_flush_max = std::max(p2p_flush_max, d); ++p2p_flush_n; }
+        for (int i = 0; i < n_p2p; ++i) if (p2p_asm[i].nr) ++p2p_blobs;
+        if (p2p_blobs > 0 && (p2p_blobs % 500) < n_p2p)
+            std::fprintf(stderr, "ds41: STRATA_P2P %ld blobs NVMe -> VRAM, %ld host fallbacks, %ld ring-full (host path), most per call %d of %d slots%s\n",
+                         p2p_blobs.load(), p2p_fallback.load(), p2p_full.load(), p2p_want_max.load(), gp.p2p_slots,
+                         p2p_verify ? (", verified " + std::to_string(p2p_checked.load()) + ", MISMATCHES " + std::to_string(p2p_bad.load())).c_str() : "");
+        if (p2p_prof && p2p_blobs > 0 && (p2p_blobs % 500) < n_p2p)
+            std::fprintf(stderr, "ds41: STRATA_P2P_PROF flush %ld calls, %.3f ms avg, %.3f ms max | spec take %ld calls, %.3f ms total\n",
+                         p2p_flush_n, p2p_flush_n ? p2p_flush_ms / p2p_flush_n : 0.0, p2p_flush_max, p2p_take_n, p2p_take_ms);
+        if (gp.pspec && p2p_blobs > 0 && (p2p_blobs % 500) < n_p2p) {
+            std::lock_guard<std::mutex> lk(gp.pspec->mu);
+            std::fprintf(stderr, "ds41: STRATA_P2P spec stash: %ld guesses read, %ld used, %ld never taken, %ld failed, rejected %ld dup / %ld no slot / %ld drive busy (%d slots)\n",
+                         gp.pspec->issued, gp.pspec->used, gp.pspec->stale, gp.pspec->failed_n, gp.pspec->rej_dup, gp.pspec->rej_full, gp.pspec->rej_busy, gp.p2p_spec_slots);
+            if (la_arena)
+                std::fprintf(stderr, "ds41: STRATA_LA_ARENA: %ld of %ld arena misses (%.1f%%) ran from the NVMe lane instead of the CPU pool / PCIe, %ld fallbacks\n",
+                             la_arena_used, la_arena_seen, la_arena_seen ? 100.0 * la_arena_used / la_arena_seen : 0.0, la_arena_fallback);
+        }
+    }
+#endif
     launch_site(PCIE);
+#ifdef STRATA_XOLP2P
+    // (the arena_adapt promotion of a P2P blob is p2p_put's, right after its assembly)
+#endif
     if (dn) {   // belt and braces: `s` has waited on every PCIe-site copy, so the sync that ends this call covers s_dn
         ck(cudaEventRecord(gp.dn_ev[1], gp.s_dn), "d3 dn tail record");
         ck(cudaStreamWaitEvent(gp.s, gp.dn_ev[1], 0), "d3 dn tail wait");
@@ -4908,6 +5401,36 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     }
     st.prefetched_useful = npf;
     st.wall_ms = now_ms() - t0;
+    // STRATA_TYPE_TALLY=1 (measurement only): on decode-sized calls (nt <= 8), every distinct expert's blob bytes by lane
+    // (VRAM hit | PCIe site incl. file->GPU | CPU pool on an arena copy | CPU from the file) and by blob size (one size
+    // per format in V4: MXFP4 / Q3_K / Q2_0 / PTQ1_0) - how many bytes of each type cross the slow lanes per pass
+    // (the upside of a smaller shadow copy of a type).  Printed every 2560 calls as MB per 40 calls (~one pass).
+    {
+        static const bool tally = std::getenv("STRATA_TYPE_TALLY") && std::atoi(std::getenv("STRATA_TYPE_TALLY")) != 0;
+        static std::mutex tl_mu;
+        static long tl_calls = 0;
+        static std::vector<std::pair<int64_t, std::array<double, 4>>> tl;   // (blob bytes, bytes per lane)
+        if (tally && nt <= 8) {
+            std::lock_guard<std::mutex> lk(tl_mu);
+            for (int u = 0; u < nu; ++u) {
+                const int64_t bb = BLX(ue[u]);
+                const int c = cls[u];
+                const int lane = c == HIT ? 0 : (c == PCIE || c == FILEG || c == DEFER) ? 1 : c == CPU && gp.arena.ptr(layer, ue[u]) ? 2 : 3;
+                size_t k = 0;
+                while (k < tl.size() && tl[k].first != bb) ++k;
+                if (k == tl.size()) tl.push_back({bb, {0, 0, 0, 0}});
+                tl[k].second[(size_t) lane] += (double) bb;
+            }
+            if (++tl_calls % 2560 == 0) {
+                const double per = 40.0 / (double) tl_calls / 1e6;
+                std::fprintf(stderr, "[type-tally] %ld calls, MB per 40 calls (vram | pcie+file->gpu | cpu arena | cpu file):", tl_calls);
+                for (const auto& t : tl)
+                    std::fprintf(stderr, " [%.2f MB blob] %.0f | %.0f | %.0f | %.0f;", t.first / 1e6, t.second[0] * per,
+                                 t.second[1] * per, t.second[2] * per, t.second[3] * per);
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
     if (xprof) {
         xmark(6);
         ++xp_n; xp_nu += nu;
@@ -7029,6 +7552,103 @@ void Ds41FileBlobs::give_bounce(uint8_t* p) const {
     bfree_.push_back(p);
 }
 
+// ---- the expert sidecar (STRATA_SHADOW / XOLOTL_SHADOW=<file>[:<file>...], opt-in) ----
+// A sidecar redefines some experts: their format (one gate=up type and one down type per file) and where their bytes
+// live.  Written by `ds41_generate --build-shadow`; the model file is never written.  Use 1: a smaller copy of the
+// biggest experts (a 2-bit SHADOW of the MXFP4 / Q3_K ones - lossy, judged on short34).  Use 2: experts the model file
+// does not hold at full precision (the parent's native FP4).  All or nothing: one bad file = no sidecar at all.
+//   file: a 4096-byte-aligned header, then the blobs, each [gate | up | down] in the file's types, padded to 4096.
+//   header: "X41SHAD1", u64 model file size, u64 n, u64 data start, i32 gate/up type, i32 down type; then
+//           n x {i32 layer, i32 expert, u64 offset}
+namespace {
+struct ShadowHead { char magic[8]; uint64_t src_size, n, data; int32_t gu_type, d_type; };
+struct ShadowEnt { int32_t l, e; uint64_t off; };
+struct ShadowFile { std::string path; int fd = -1, dfd = -1; int32_t gu = -1, d = -1; std::vector<ShadowEnt> ent; };
+// row bytes through the engine's block table (it knows Xolotl's own types, e.g. PTQ1_0 = 143, which ggml's does not);
+// 0 = unknown type or a row the block does not divide
+uint64_t shadow_rb(int t, int64_t n) {
+    int be = 0, bb = 0;
+    if (t < 0 || !block_geometry((uint32_t) t, be, bb) || be <= 0 || n % be) return 0;
+    return (uint64_t) (n / be) * (uint64_t) bb;
+}
+uint64_t shadow_blob(int gt, int dt, int64_t D, int64_t FF) {
+    return 2 * shadow_rb(gt, D) * (uint64_t) FF + shadow_rb(dt, FF) * (uint64_t) D;
+}
+// A searched Q2_0 encoder for --build-shadow.  ggml's quantize_row_q2_0_ref sets the scale to the block's max |w|,
+// so levels {-1, 0, +1, +2} x max: +2 is never used and everything under max/2 rounds to 0 (relative error ~0.72 on
+// V4's experts).  Here, per 64-value block: both signs of d (a negative d puts the 2x level on the negative side) x 12
+// scale ratios, nearest level, then d refitted by least squares for that assignment; the lowest squared error wins.
+// Same block_q2_0 bytes (fp16 d, 2-bit codes q = level + 1, 4 per byte, low bits first) - ggml's dequantizer reads it.
+void shadow_q2_0_row(const float* x, uint8_t* out, int64_t n) {
+    constexpr int QK = 64;
+    for (int64_t b = 0; b < n / QK; ++b) {
+        const float* v = x + b * QK;
+        float amax = 0;
+        for (int j = 0; j < QK; ++j) amax = std::max(amax, std::fabs(v[j]));
+        float best_d = 0, best_e = 0;
+        for (int j = 0; j < QK; ++j) best_e += v[j] * v[j];   // d = 0: everything 0
+        uint8_t q[QK], bq[QK];
+        std::fill(bq, bq + QK, (uint8_t) 1);
+        if (amax > 0) {
+            for (int sg = -1; sg <= 1; sg += 2)
+                for (int r = 0; r < 12; ++r) {
+                    const float d0 = sg * amax * (0.30f + 0.06f * (float) r);   // the 2x level at 0.6 .. 1.92 x max
+                    const float id = 1.0f / d0;
+                    float sxq = 0, sqq = 0;
+                    for (int j = 0; j < QK; ++j) {
+                        int l = (int) std::lround(v[j] * id);
+                        l = std::min(2, std::max(-1, l));
+                        q[j] = (uint8_t) (l + 1);
+                        sxq += v[j] * (float) l;
+                        sqq += (float) (l * l);
+                    }
+                    if (sqq <= 0) continue;
+                    const float d = sxq / sqq;   // least squares for this assignment
+                    float e = 0;
+                    for (int j = 0; j < QK; ++j) { const float t = v[j] - d * (float) ((int) q[j] - 1); e += t * t; }
+                    if (e < best_e) { best_e = e; best_d = d; std::memcpy(bq, q, QK); }
+                }
+        }
+        const ggml_fp16_t h = ggml_fp32_to_fp16(best_d);
+        uint8_t* o = out + b * (int64_t) (sizeof(ggml_fp16_t) + QK / 4);
+        std::memcpy(o, &h, sizeof h);
+        uint8_t* qs = o + sizeof h;
+        std::fill(qs, qs + QK / 4, (uint8_t) 0);
+        for (int j = 0; j < QK; ++j) qs[j / 4] |= (uint8_t) (bq[j] << ((j % 4) * 2));
+    }
+}
+
+std::string shadow_tname(int t) {
+    return t >= 0 && t < GGML_TYPE_COUNT ? std::string(ggml_type_name((ggml_type) t)) : t == 143 ? std::string("ptq1_0") : "type " + std::to_string(t);
+}
+bool shadow_read(ShadowFile& sf, uint64_t src_size, int64_t NL, int64_t NE, int64_t D, int64_t FF, std::string& why) {
+    sf.fd = ds41_sys::open(sf.path.c_str(), O_RDONLY);
+    if (sf.fd < 0) { why = "cannot open " + sf.path; return false; }
+    ds41_sys::Stat st{};
+    if (ds41_sys::fstat(sf.fd, &st) != 0) { why = "fstat " + sf.path; return false; }
+    ShadowHead H{};
+    if (ds41_sys::pread(sf.fd, &H, sizeof H, 0) != (ssize_t) sizeof H) { why = "short header in " + sf.path; return false; }
+    if (std::memcmp(H.magic, "X41SHAD1", 8) != 0) { why = "bad magic in " + sf.path; return false; }
+    if (H.src_size != src_size) { why = sf.path + " was built from a different model file (size)"; return false; }
+    if (H.n == 0 || H.n > (uint64_t) (NL * NE) || H.data < sizeof H + H.n * sizeof(ShadowEnt) || (H.data & 4095)) { why = "bad header in " + sf.path; return false; }
+    if (shadow_rb(H.gu_type, D) == 0 || shadow_rb(H.d_type, FF) == 0) { why = "unusable types in " + sf.path; return false; }
+    sf.gu = H.gu_type;
+    sf.d = H.d_type;
+    sf.ent.resize((size_t) H.n);
+    const size_t ib = (size_t) H.n * sizeof(ShadowEnt);
+    if (ds41_sys::pread(sf.fd, sf.ent.data(), ib, (int64_t) sizeof H) != (ssize_t) ib) { why = "short index in " + sf.path; return false; }
+    const uint64_t b = shadow_blob(sf.gu, sf.d, D, FF);
+    std::vector<uint8_t> seen((size_t) (NL * NE), 0);
+    for (const ShadowEnt& x : sf.ent) {
+        if (x.l < 0 || x.l >= NL || x.e < 0 || x.e >= NE || (x.off & 4095) || x.off < H.data || x.off + b > (uint64_t) st.st_size ||
+            seen[(size_t) (x.l * NE + x.e)]++) { why = "bad index entry in " + sf.path; return false; }
+    }
+    sf.dfd = ds41_sys::open(sf.path.c_str(), O_RDONLY | O_DIRECT);   // -1 = this filesystem refuses O_DIRECT
+    ds41_sys::posix_fadvise(sf.fd, 0, 0, POSIX_FADV_RANDOM);
+    return true;
+}
+}  // namespace
+
 bool Ds41FileBlobs::open(std::string& err) {
     if (fd_ >= 0) return true;
     std::unique_ptr<GgufModel> m;
@@ -7047,11 +7667,55 @@ bool Ds41FileBlobs::open(std::string& err) {
     g_.n_experts = NE;
     g_.top_k = G.n_used;
     g_.swiglu_limit = G.swiglu_limit > 0 ? (float) G.swiglu_limit : std::numeric_limits<float>::infinity();
+    // the sidecars (STRATA_SHADOW): validated and opened here, before any offset is computed - a bad one leaves the model
+    // file's experts exactly as they are
+    std::vector<ShadowFile> shf;
+    std::vector<int16_t> sh_of;   // per (layer, expert): its sidecar, -1 = the model file
+    std::vector<uint64_t> sh_at;
+    if (const char* sv = std::getenv("STRATA_SHADOW"); sv && *sv) {
+        ds41_sys::Stat ms{};
+        const std::string mp0 = m->shard(0).path();
+        const int mf = ds41_sys::open(mp0.c_str(), O_RDONLY);
+        const bool ms_ok = mf >= 0 && ds41_sys::fstat(mf, &ms) == 0;
+        if (mf >= 0) ds41_sys::close(mf);
+        std::string list(sv), why;
+        for (size_t a = 0; a <= list.size();) {
+            const size_t b = std::min(list.find(':', a), list.size());
+            if (b > a) { shf.emplace_back(); shf.back().path = list.substr(a, b - a); }
+            a = b + 1;
+        }
+        bool ok = ms_ok && !shf.empty() && m->size() + shf.size() < ((size_t) 1 << (64 - kShardShift));
+        if (!ms_ok) why = "cannot stat the model file";
+        for (ShadowFile& f : shf) ok = ok && shadow_read(f, (uint64_t) ms.st_size, NL, NE, D, FF, why);
+        if (ok) {
+            sh_of.assign((size_t) (NL * NE), -1);
+            sh_at.assign((size_t) (NL * NE), 0);
+            for (size_t f = 0; f < shf.size(); ++f)   // a later file wins an expert two files hold
+                for (const ShadowEnt& x : shf[f].ent) {
+                    sh_of[(size_t) (x.l * NE + x.e)] = (int16_t) f;
+                    sh_at[(size_t) (x.l * NE + x.e)] = x.off;
+                }
+        } else {
+            std::fprintf(stderr, "shadow: NOT used (%s) - every expert from the model file\n", why.empty() ? "no file" : why.c_str());
+            for (ShadowFile& f : shf) {
+                if (f.fd >= 0) ds41_sys::close(f.fd);
+                if (f.dfd >= 0) ds41_sys::close(f.dfd);
+            }
+            shf.clear();
+        }
+    }
+    auto ex_types = [&](int64_t l, int64_t e) -> std::pair<int, int> {
+        if (!sh_of.empty() && sh_of[(size_t) (l * NE + e)] >= 0) {
+            const ShadowFile& f = shf[(size_t) sh_of[(size_t) (l * NE + e)]];
+            return {f.gu, f.d};
+        }
+        return {G.experts[(size_t) l].gu_type[(size_t) e], G.experts[(size_t) l].d_type[(size_t) e]};
+    };
     g_.eclass.assign((size_t) (NL * NE), 0);
     std::map<std::pair<int, int>, int> cid;
     for (int64_t l = 0; l < NL; ++l)
         for (int64_t e = 0; e < NE; ++e) {
-            const std::pair<int, int> k{G.experts[(size_t) l].gu_type[(size_t) e], G.experts[(size_t) l].d_type[(size_t) e]};
+            const std::pair<int, int> k = ex_types(l, e);
             auto it = cid.find(k);
             if (it == cid.end()) {
                 it = cid.emplace(k, (int) g_.cls_gu.size()).first;
@@ -7083,6 +7747,16 @@ bool Ds41FileBlobs::open(std::string& err) {
     for (int64_t l = 0; l < NL; ++l) {
         const Ds41ExpertMap& X = G.experts[(size_t) l];
         for (int64_t e = 0; e < NE; ++e) {
+            if (!sh_of.empty() && sh_of[(size_t) (l * NE + e)] >= 0) {   // a sidecar expert: its own file (shard tag after the model's)
+                const ShadowFile& f = shf[(size_t) sh_of[(size_t) (l * NE + e)]];
+                const uint64_t tag = (uint64_t) (m->size() + (size_t) sh_of[(size_t) (l * NE + e)]) << kShardShift;
+                const uint64_t gb = rb(f.gu, D) * (uint64_t) FF;
+                const size_t i = (size_t) (l * NE + e);
+                gate_off_[i] = tag + sh_at[i];
+                up_off_[i] = gate_off_[i] + gb;
+                down_off_[i] = up_off_[i] + gb;
+                continue;
+            }
             const int gt = X.gu_type[(size_t) e], dt = X.d_type[(size_t) e];
             const TensorInfo *tg = nullptr, *tu = nullptr, *td = nullptr;
             const uint64_t bg = locate(X.gate_t.at(gt), tg), bu = locate(X.up_t.at(gt), tu), bd = locate(X.down_t.at(dt), td);
@@ -7109,6 +7783,28 @@ bool Ds41FileBlobs::open(std::string& err) {
         sfd_.push_back(f);
         sdfd_.push_back(direct_ok_ ? ds41_sys::open(sp.c_str(), O_RDONLY | O_DIRECT) : -1);
         direct_ok_ = direct_ok_ && sdfd_.back() >= 0;
+    }
+    if (!shf.empty()) {   // the sidecars' fds as the shards after the model's (their offsets carry those tags)
+        uint64_t nb = 0, was = 0;
+        for (ShadowFile& f : shf) {
+            sfd_.push_back(f.fd);
+            sdfd_.push_back(f.dfd);
+            direct_ok_ = direct_ok_ && f.dfd >= 0;
+        }
+        std::vector<int> per((size_t) shf.size(), 0);
+        for (int64_t l = 0; l < NL; ++l)
+            for (int64_t e = 0; e < NE; ++e) {
+                const int16_t f = sh_of[(size_t) (l * NE + e)];
+                if (f < 0) continue;
+                ++per[(size_t) f];
+                nb += shadow_blob(shf[(size_t) f].gu, shf[(size_t) f].d, D, FF);
+                was += shadow_blob(G.experts[(size_t) l].gu_type[(size_t) e], G.experts[(size_t) l].d_type[(size_t) e], D, FF);
+            }
+        for (size_t f = 0; f < shf.size(); ++f)
+            std::fprintf(stderr, "shadow: %d experts from %s as %s / %s%s\n", per[f], shf[f].path.c_str(), shadow_tname(shf[f].gu).c_str(),
+                         shadow_tname(shf[f].d).c_str(), shf[f].dfd >= 0 ? "" : " (no O_DIRECT: buffered reads)");
+        std::fprintf(stderr, "shadow: those experts %.2f GB (in the model file %.2f GB) - CHANGES OUTPUTS unless the sidecar is exact\n",
+                     nb / 1e9, was / 1e9);
     }
     fd_ = sfd_[0];
     dfd_ = direct_ok_ ? sdfd_[0] : -1;
@@ -7393,6 +8089,153 @@ void Ds41FileBlobs::advise(int64_t layer, int64_t expert) const {
         if (x.bytes) ds41_sys::posix_fadvise(sfd(x.off), (int64_t) sloc(x.off), (int64_t) x.bytes, POSIX_FADV_WILLNEED);
 }
 
+bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>& from, int to_gu, int to_d, int threads,
+                                 std::string& err) const {
+    // Per expert and ROLE: a role whose type is in `from` is re-quantized to the target (gate/up -> to_gu, down -> to_d),
+    // any other role is copied byte for byte.  Experts with no role in `from` are not in the sidecar.  The resulting
+    // (gate/up, down) pairs each get their own file: `out` for (to_gu, to_d), `out.g<gu>d<d>` for the others; `out.list`
+    // holds the colon list to set STRATA_SHADOW / XOLOTL_SHADOW to.
+    if (fd_ < 0) { err = "source not open"; return false; }
+    if (sfd_.size() > 1) { err = "build from the plain model (a split GGUF or an active STRATA_SHADOW is not supported)"; return false; }
+    const int64_t NL = g_.n_layers, NE = g_.n_experts, D = g_.n_embd, FF = g_.n_ff;
+    if (to_gu < 0 || to_gu >= GGML_TYPE_COUNT || to_d < 0 || to_d >= GGML_TYPE_COUNT || !ggml_get_type_traits((ggml_type) to_gu)->to_float ||
+        !ggml_get_type_traits((ggml_type) to_d)->to_float || shadow_rb(to_gu, D) == 0 || shadow_rb(to_d, FF) == 0) {
+        err = "the target types must be ggml types that divide the expert rows"; return false;
+    }
+    for (int t : from)
+        if (t < 0 || t >= GGML_TYPE_COUNT || !ggml_get_type_traits((ggml_type) t)->to_float) { err = "source type " + std::to_string(t) + " has no ggml dequantizer"; return false; }
+    auto in_from = [&](int t) { return std::find(from.begin(), from.end(), t) != from.end(); };
+    ds41_sys::Stat ss{};
+    ds41_sys::fstat(fd_, &ss);
+    struct Grp { int gu, d; std::string path; uint64_t stride = 0, data = 0; int fd = -1; std::vector<ShadowEnt> ent; };
+    std::vector<Grp> grp;
+    struct Job { int32_t l, e; int g; size_t k; };
+    std::vector<Job> jobs;
+    for (int64_t l = 0; l < NL; ++l)
+        for (int64_t e = 0; e < NE; ++e) {
+            const int c = g_.cls(l, e), sg = g_.cls_gu[(size_t) c], sd = g_.cls_d[(size_t) c];
+            if (!in_from(sg) && !in_from(sd)) continue;
+            const int rg = in_from(sg) ? to_gu : sg, rd = in_from(sd) ? to_d : sd;
+            size_t gi = 0;
+            while (gi < grp.size() && !(grp[gi].gu == rg && grp[gi].d == rd)) ++gi;
+            if (gi == grp.size()) {
+                Grp G;
+                G.gu = rg; G.d = rd;
+                G.path = (rg == to_gu && rd == to_d) ? out : out + ".g" + std::to_string(rg) + "d" + std::to_string(rd);
+                if (shadow_blob(rg, rd, D, FF) == 0) { err = "a resulting pair has an unknown row size"; return false; }
+                G.stride = (shadow_blob(rg, rd, D, FF) + 4095) & ~(uint64_t) 4095;
+                grp.push_back(G);
+            }
+            jobs.push_back({(int32_t) l, (int32_t) e, (int) gi, grp[gi].ent.size()});
+            grp[gi].ent.push_back({(int32_t) l, (int32_t) e, 0});
+        }
+    if (jobs.empty()) { err = "no expert has a role of those types"; return false; }
+    auto wr = [](int fd, const uint8_t* p, uint64_t n, uint64_t off) {
+        while (n) {
+            const ssize_t k = ds41_sys::pwrite(fd, p, (size_t) std::min<uint64_t>(n, 1u << 30), (int64_t) off);
+            if (k <= 0) return false;
+            p += k; off += (uint64_t) k; n -= (uint64_t) k;
+        }
+        return true;
+    };
+    auto cleanup = [&] {
+        for (Grp& G : grp) {
+            if (G.fd >= 0) ds41_sys::close(G.fd);
+            G.fd = -1;
+            std::remove((G.path + ".tmp").c_str());
+        }
+    };
+    for (Grp& G : grp) {
+        G.data = (sizeof(ShadowHead) + G.ent.size() * sizeof(ShadowEnt) + 4095) & ~(uint64_t) 4095;
+        for (size_t i = 0; i < G.ent.size(); ++i) G.ent[i].off = G.data + i * G.stride;
+        G.fd = ds41_sys::open((G.path + ".tmp").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (G.fd < 0) { cleanup(); err = "cannot create " + G.path + ".tmp"; return false; }
+        std::vector<uint8_t> h((size_t) G.data, 0);
+        ShadowHead H{};
+        std::memcpy(H.magic, "X41SHAD1", 8);
+        H.src_size = (uint64_t) ss.st_size;
+        H.n = G.ent.size();
+        H.data = G.data;
+        H.gu_type = G.gu;
+        H.d_type = G.d;
+        std::memcpy(h.data(), &H, sizeof H);
+        std::memcpy(h.data() + sizeof H, G.ent.data(), G.ent.size() * sizeof(ShadowEnt));
+        if (!wr(G.fd, h.data(), G.data, 0)) { cleanup(); err = "header write failed"; return false; }
+    }
+    std::mutex smu;
+    std::map<int, std::array<double, 3>> stat;   // converted role source type -> {sum sq err, sum sq value, roles}
+    std::atomic<size_t> nx{0}, done{0};
+    std::atomic<bool> bad{false};
+    const double t0 = now_ms();
+    uint64_t smax = 0;
+    for (const Grp& G : grp) smax = std::max(smax, G.stride);
+    auto work = [&] {
+        std::vector<uint8_t> src(max_), dst((size_t) smax, 0);
+        std::vector<float> f((size_t) std::max(D, FF)), b((size_t) std::max(D, FF));
+        for (size_t i; !bad && (i = nx++) < jobs.size();) {
+            const Job& J = jobs[i];
+            const Grp& G = grp[(size_t) J.g];
+            const int c = g_.cls(J.l, J.e), sg = g_.cls_gu[(size_t) c], sd = g_.cls_d[(size_t) c];
+            read(J.l, J.e, src.data());
+            std::fill(dst.begin(), dst.begin() + (ptrdiff_t) G.stride, 0);
+            std::map<int, std::array<double, 3>> local;
+            // one role: `rows` rows of `cols`, source type st -> type dt (converted) or copied when st == dt
+            auto role = [&](const uint8_t* s0, uint8_t* d0, int64_t rows, int64_t cols, int st, int dt) {
+                const uint64_t srb = shadow_rb(st, cols), drb = shadow_rb(dt, cols);
+                if (st == dt) { std::memcpy(d0, s0, (size_t) (srb * (uint64_t) rows)); return; }
+                const auto* tsrc = ggml_get_type_traits((ggml_type) st);
+                const auto* tdst = ggml_get_type_traits((ggml_type) dt);
+                double se = 0, sv = 0;
+                for (int64_t r = 0; r < rows; ++r) {
+                    tsrc->to_float(s0 + (size_t) r * srb, f.data(), cols);
+                    if (dt == GGML_TYPE_Q2_0) shadow_q2_0_row(f.data(), d0 + (size_t) r * drb, cols);   // searched scales (above)
+                    else ggml_quantize_chunk((ggml_type) dt, f.data(), d0 + (size_t) r * drb, 0, 1, cols, nullptr);
+                    tdst->to_float(d0 + (size_t) r * drb, b.data(), cols);
+                    for (int64_t k = 0; k < cols; ++k) { const double v = f[(size_t) k], q = v - b[(size_t) k]; se += q * q; sv += v * v; }
+                }
+                auto& x = local[st];
+                x[0] += se; x[1] += sv; x[2] += 1;
+            };
+            const uint64_t sgb = shadow_rb(sg, D) * (uint64_t) FF, dgb = shadow_rb(G.gu, D) * (uint64_t) FF;
+            role(src.data(), dst.data(), FF, D, sg, G.gu);                       // gate
+            role(src.data() + sgb, dst.data() + dgb, FF, D, sg, G.gu);           // up
+            role(src.data() + 2 * sgb, dst.data() + 2 * dgb, D, FF, sd, G.d);    // down
+            if (!wr(G.fd, dst.data(), G.stride, G.ent[J.k].off)) { bad = true; break; }
+            {
+                std::lock_guard<std::mutex> lk(smu);
+                for (const auto& [t, x] : local) { auto& y = stat[t]; y[0] += x[0]; y[1] += x[1]; y[2] += x[2]; }
+            }
+            const size_t d = ++done;
+            if (d % 256 == 0 || d == jobs.size())
+                std::fprintf(stderr, "build-shadow: %zu / %zu experts (%.0f s)\n", d, jobs.size(), (now_ms() - t0) / 1000.0);
+        }
+    };
+    std::vector<std::thread> th;
+    for (int t = 0; t < std::max(1, threads); ++t) th.emplace_back(work);
+    for (auto& x : th) x.join();
+    bool ok = !bad;
+    for (Grp& G : grp) ok = ok && ::fsync(G.fd) == 0;
+    if (!ok) { cleanup(); err = "write failed (disk full?)"; return false; }
+    std::string list;
+    for (Grp& G : grp) {
+        ds41_sys::close(G.fd);
+        G.fd = -1;
+        if (std::rename((G.path + ".tmp").c_str(), G.path.c_str()) != 0) { err = "cannot rename " + G.path + ".tmp"; return false; }
+        list += (list.empty() ? "" : ":") + G.path;
+        std::fprintf(stderr, "build-shadow: %s: %zu experts as %s / %s (%.2f GB)\n", G.path.c_str(), G.ent.size(), shadow_tname(G.gu).c_str(),
+                     shadow_tname(G.d).c_str(), (double) (G.data + G.ent.size() * G.stride) / 1e9);
+    }
+    for (const auto& [t, x] : stat)
+        std::fprintf(stderr, "build-shadow: %.0f %s roles -> %s / %s: relative error %.4f\n", x[2], shadow_tname(t).c_str(),
+                     shadow_tname(to_gu).c_str(), shadow_tname(to_d).c_str(), x[1] > 0 ? std::sqrt(x[0] / x[1]) : 0.0);
+    {
+        std::FILE* lf = std::fopen((out + ".list").c_str(), "w");
+        if (!lf || std::fprintf(lf, "%s\n", list.c_str()) < 0 || std::fclose(lf) != 0) { err = "cannot write " + out + ".list"; return false; }
+    }
+    std::fprintf(stderr, "build-shadow: done in %.0f s - XOLOTL_SHADOW=%s\n", (now_ms() - t0) / 1000.0, list.c_str());
+    return true;
+}
+
 size_t Ds41FileBlobs::expert_bytes(int64_t l, int64_t e) const {
     const int c = g_.cls(l, e);
     return (size_t) (2 * (uint64_t) gu_rb_[(size_t) c] * (uint64_t) g_.n_ff + (uint64_t) d_rb_[(size_t) c] * (uint64_t) g_.n_embd);
@@ -7435,6 +8278,15 @@ void Ds41FileBlobs::read(int64_t layer, int64_t expert, uint8_t* dst) const {
         pread_all(sfd(x.off), dst + at, sloc(x.off), x.bytes);
         at += x.bytes;
     }
+}
+
+bool Ds41FileBlobs::raw_span(int r, int64_t layer, int64_t expert, int* fd, uint64_t* off, size_t* n) const {
+    if (r < 0 || r > 2) return false;
+    Span s[3];
+    spans(layer, expert, s);
+    if (!s[r].bytes) return false;
+    *fd = sfd(s[r].off); *off = sloc(s[r].off); *n = (size_t) s[r].bytes;
+    return *fd >= 0;
 }
 
 void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const {

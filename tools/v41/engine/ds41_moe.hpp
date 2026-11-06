@@ -175,6 +175,9 @@ public:
     size_t blob_bytes(int64_t l) const override;
     void read(int64_t layer, int64_t expert, uint8_t* dst) const override;
     void read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const override;
+    /// Role r's slice of (layer, expert) in the file: the shard's (buffered) fd, its file offset and length.  false when
+    /// the slice is not file-backed.  Non-virtual on purpose (no vtable change): STRATA_P2P's raw NVMe -> VRAM reads.
+    bool raw_span(int r, int64_t layer, int64_t expert, int* fd, uint64_t* off, size_t* n) const;
 
 private:
     /// Bytes [lo, hi) of role r's slice of (layer, expert) into dst (O_DIRECT, pread, then the mmap as fallbacks).
@@ -226,6 +229,9 @@ public:
     const Ds41MoeGeom& geom() const { return g_; }
     /// bytes of expert e of layer l (its class's blob)
     size_t expert_bytes(int64_t l, int64_t e) const;
+    /// Role r's span of (layer, expert): its shard's (buffered) fd, the plain file offset and length.  Non-virtual (no
+    /// vtable change): STRATA_P2P's raw NVMe -> VRAM reads.  Ignores the mirror (those reads all go to the model drive).
+    bool raw_span(int r, int64_t layer, int64_t expert, int* fd, uint64_t* off, size_t* n) const;
     /// The mirror (STRATA_BLOB_MIRROR=<file>, written by `ds41_generate --build-mirror`): packed copies of the coldest
     /// experts on a SECOND drive.  read_part then reads a share of each mirrored blob's parts from it
     /// (STRATA_BLOB_MIRROR_SHARE, default 0.28), so both drives serve one blob at once.  Experts mirrored, 0 = none.
@@ -235,6 +241,11 @@ public:
     int64_t mirrored() const { return mirrored_; }
     /// Writes the mirror: `order` coldest first, until `budget` bytes.  Returns false with `err` on failure.
     bool build_mirror(const std::string& out, const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget,
+                      std::string& err) const;
+    /// Writes an expert sidecar (STRATA_SHADOW): every expert whose gate/up type is in `from_gu`, re-quantized to
+    /// `to_gu` / `to_d` (row by row through float), into `out` (via out.tmp, renamed when complete).  The model file is only
+    /// read.  `threads` workers.  Prints the relative error per source type.  False with `err` on failure.
+    bool build_shadow(const std::string& out, const std::vector<int>& from_gu, int to_gu, int to_d, int threads,
                       std::string& err) const;
 
 private:
@@ -462,6 +473,8 @@ public:
     /// Decode speculative reads: start O_DIRECT reads of `ids` (a later layer's predicted experts) that are neither
     /// VRAM-resident nor in the arena into a pinned stash; that layer's run takes them from there.  A hint only.
     void spec_read(int64_t layer, const int32_t* ids, int n, bool d3 = false);
+    /// STRATA_LA_ARENA (STRATA_P2P builds): speculative NVMe -> VRAM reads of ARENA experts too (VRAM-resident ones skipped).
+    void spec_read_any(int64_t layer, const int32_t* ids, int n);
 
     /// out[i] = sum_k w6[k] * expert_{ids6[k]}(x)[i], with `x` on the host.  Synchronous.
     bool run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out);

@@ -1,0 +1,4 @@
+# Xolotl Direct devices: readable/writable by group "disk" (which can already read raw disks, so this grants no new
+# privilege).  Copy to /etc/udev/rules.d/ and run `sudo udevadm control --reload`.  The modules are loaded by hand.
+KERNEL=="p2pgate", SUBSYSTEM=="misc", GROUP="disk", MODE="0660"
+KERNEL=="xolp2p",  SUBSYSTEM=="misc", GROUP="disk", MODE="0660"
