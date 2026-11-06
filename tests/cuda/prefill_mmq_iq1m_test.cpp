@@ -48,8 +48,8 @@ std::vector<uint8_t> make_matrix(ggml_type t, int64_t rows, int64_t cols, int ex
     for (size_t blk = 0; blk < out.size() / 56; ++blk) {
         uint16_t sc[4];
         std::memcpy(sc, out.data() + blk * 56 + 48, 8);
-        // d in [~0.004, ~0.03]: fp16 exponent 0x18-0x1B with a random mantissa
-        const uint16_t d = (uint16_t) (((0x18 + next() % 4) << 10) | (next() & 0x3ff));
+        // d in [2^-8, 2^-4): fp16 biased exponent 7-10 with a random mantissa
+        const uint16_t d = (uint16_t) (((0x07 + next() % 4) << 10) | (next() & 0x3ff));
         sc[0] = (uint16_t) ((sc[0] & 0x0fff) | ((d & 0x000f) << 12));
         sc[1] = (uint16_t) ((sc[1] & 0x0fff) | ((d & 0x00f0) << 8));
         sc[2] = (uint16_t) ((sc[2] & 0x0fff) | ((d & 0x0f00) << 4));
