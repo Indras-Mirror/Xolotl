@@ -1365,6 +1365,7 @@ that one compute capability. The identity gate (10 prompts plus exact_pp 4K/20K,
 | Architecture | On by default | Off switch |
 | --- | --- | --- |
 | sm_86 (RTX 3050-3090, RTX A2000-A6000) | `STRATA_ADAPT_NOWAIT=1`, `STRATA_ADAPT_LAG=2`, `STRATA_CPU_IQ_ALL_EXACT1=1`, `STRATA_SIDE_MIXER=2`, `STRATA_ATTN_DAILY=1`, `STRATA_GR_UP75=1`, `STRATA_GU_SWIGLU=1`, `STRATA_QSA_ROWS=1`, `STRATA_B6_MMVQ_ROWS=1` | `STRATA_SM86_PERF=0` |
+| sm_89 (RTX 4060-4090, RTX Ada, L4, L40S), since 6 Nov 2026 | the sm_86 set (measured as one stack on an RTX 4090: QFN 45 GB decode +8.1 %, output the same) | `STRATA_SM89_PERF=0` |
 | sm_60 (Tesla P100) | `STRATA_ADAPT_NOWAIT=1`, `STRATA_ADAPT_LAG=2`, `STRATA_SIDE_MIXER=2`, `STRATA_FUSE_WAIT=2`, `STRATA_B6_MMVQ_ROWS=1`, `STRATA_FUSE_DECODE=1`, `STRATA_GR_UP75=1` | `STRATA_SM60_PERF=0` |
 | sm_120 (RTX 50 and RTX PRO Blackwell) | `STRATA_SIDE_MIXER=2`, `STRATA_ATTN_DAILY=1`, `STRATA_GR_UP75=1`, `STRATA_GR_DOWN_TG=1`, `STRATA_GU_SWIGLU=1` | `STRATA_SM120_PERF=0` |
 

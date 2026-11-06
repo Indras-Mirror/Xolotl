@@ -38,6 +38,23 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_QSA_ROWS", "1"},            // -0.5, -1.2
             {"STRATA_B6_MMVQ_ROWS", "1"},        // A4000 0, 3060 -1.7
         };
+    } else if (mj == 8 && mn == 9) {
+        if (off("STRATA_SM89_PERF")) return t;
+        t = {
+            // 2026-11-06, RTX 4090 (Ada), Qwen3.8-Flash-Next XQ 45 GB (QFN45), 16K prompt + 1,024 tokens, every arm emitting the
+            // same text (--spec-follow): sm_86's whole table as one arm, decode 138.96 -> 150.21 tok/s (+8.1 %, 3 interleaved
+            // runs, 149-151 against 138-140; base vs base -0.2 %), time per verify window -6.4 %, prompt unchanged, output the
+            // same.  Taken as the stack it was measured as (no drop-one on this card yet); the same bit-exact switches as sm_86.
+            {"STRATA_ADAPT_NOWAIT", "1"},
+            {"STRATA_ADAPT_LAG", "2"},
+            {"STRATA_CPU_IQ_ALL_EXACT1", "1"},
+            {"STRATA_SIDE_MIXER", "2"},
+            {"STRATA_ATTN_DAILY", "1"},
+            {"STRATA_GR_UP75", "1"},
+            {"STRATA_GU_SWIGLU", "1"},
+            {"STRATA_QSA_ROWS", "1"},
+            {"STRATA_B6_MMVQ_ROWS", "1"},
+        };
     } else if (mj == 6 && mn == 0) {
         if (off("STRATA_SM60_PERF")) return t;
         t = {
@@ -92,13 +109,15 @@ std::vector<std::string> apply_nv_defaults(int major, int minor) {
         set.push_back(kv.first);
     }
     if (!set.empty()) {
-        const bool sm86 = mj == 8;
+        const bool sm86 = mj == 8 && mn == 6;
+        const bool sm89 = mj == 8 && mn == 9;
         const bool sm121 = mj == 12 && mn == 1;
-        // sm_86 / sm_60: bit-exact switches.  sm_121: the fused prompt path and the FP4-activation NVFP4 prompt round differently from the
+        // sm_86 / sm_89 / sm_60: bit-exact switches.  sm_121: the fused prompt path and the FP4-activation NVFP4 prompt round differently from the
         // paths they replace (24 of 24 greedy answers were identical on the Spark; no KL run), so the line does not say "exact".
         std::fprintf(stderr, "strata: %s: %zu %sspeed switches on by default (%s=0 turns them off%s; a switch you set is kept): ",
-                     sm86 ? "sm_86 (Ampere)" : sm121 ? "sm_121 (GB10)" : "sm_60 (Pascal)", set.size(), sm121 ? "" : "exact ",
-                     sm86 ? "STRATA_SM86_PERF" : sm121 ? "STRATA_SM121_PERF" : "STRATA_SM60_PERF",
+                     sm86 ? "sm_86 (Ampere)" : sm89 ? "sm_89 (Ada)" : sm121 ? "sm_121 (GB10)" : "sm_60 (Pascal)", set.size(),
+                     sm121 ? "" : "exact ",
+                     sm86 ? "STRATA_SM86_PERF" : sm89 ? "STRATA_SM89_PERF" : sm121 ? "STRATA_SM121_PERF" : "STRATA_SM60_PERF",
                      sm121 ? ", as does STRATA_DEFAULTS=026" : "");
         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
         std::fprintf(stderr, "\n");

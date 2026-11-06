@@ -7,6 +7,8 @@
 // on a card (STRATA_EXCHANGE_ROTATE, STRATA_PCIE_BALANCE, STRATA_QSA_WARP, ...) are not in any table.
 //
 //   STRATA_SM86_PERF=0   turns the sm_86 table off (cards of compute capability 8.6: RTX 3050-3090, RTX A2000-A6000)
+//   STRATA_SM89_PERF=0   turns the sm_89 table off (compute capability 8.9: RTX 4060-4090, RTX 2000-6000 Ada, L4, L40S): sm_86's
+//                        table, measured on an RTX 4090 as one stack (2026-11-06, QFN45 decode +8.1 %, output the same)
 //   STRATA_SM60_PERF=0   turns the sm_60 table off (Pascal GP100: Tesla P100)
 //   STRATA_SM121_PERF=0  turns the sm_121 table off (GB10: NVIDIA DGX Spark; new in 0.2.7.1, also off under STRATA_DEFAULTS=026).  Its
 //                        switches are measured speed settings, not bit-exact ones: the fused prompt kernels and the FP4-activation NVFP4

@@ -8,6 +8,23 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### RTX 40 (sm_89) speed switches on by default (6 Nov)
+
+The Qwen engine has had a per-card table of speed switches for RTX 30 cards (sm_86) since 0.2.0: switches that give the
+same tokens bit for bit and were faster on that card. RTX 40 cards (sm_89) had none, so they ran the plain defaults.
+Measured on the 4090 tonight, the sm_86 set as one stack makes decode faster here too, so sm_89 now gets the same
+table: `STRATA_ADAPT_NOWAIT=1`, `STRATA_ADAPT_LAG=2`, `STRATA_CPU_IQ_ALL_EXACT1=1`, `STRATA_SIDE_MIXER=2`,
+`STRATA_ATTN_DAILY=1`, `STRATA_GR_UP75=1`, `STRATA_GU_SWIGLU=1`, `STRATA_QSA_ROWS=1`, `STRATA_B6_MMVQ_ROWS=1`.
+`STRATA_SM89_PERF=0` turns it off, and a switch you set yourself is kept.
+
+- QFN 45 GB, 16,383-token prompt + 1,024 tokens, every arm emitting the same text: decode **138.96 -> 150.21 tok/s
+  (+8.1 %)**, 3 interleaved runs (149-151 against 138-140), base against base -0.2 %; time per verify window -6.4 %;
+  prefill unchanged. Recheck on the public build, defaults against `STRATA_SM89_PERF=0`, 2 runs: 149.5 against 138.9.
+- Output the same in every arm. Measured as a stack on one card (no drop-one per switch on sm_89 yet).
+- Also screened tonight and left out (inside the run noise on the 4090): the prompt-side GDN and dedupe switches, the
+  adapt overlap, fused waits, PLE / verify dedupe, Q/L fusion, the down-projection group cap, embeddings in VRAM, the
+  cost-aware MTP window, and the 31 Oct prompt picks (`STRATA_PF_GROUP_SCRATCH`, `STRATA_PREFILL_ROUTED_STREAM`).
+
 ### DeepSeek-V4.1: Engram read-ahead and the late shared expert (6 Nov)
 
 Two changes to the DeepSeek-V4.1 engine (`tools/v41/engine/ds41_dense.cpp`), both on by default and both computing

@@ -18,6 +18,9 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 
 Full notes for every item: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
+- **6 Nov - +8 % decode on every RTX 40 card**: QFN 45 GB 139 -> 150 tok/s on the 4090, same output. A tuned set of
+  bit-exact speed switches for sm_89, on by default (`STRATA_SM89_PERF=0` turns it off).
+  [Details](docs/xolotl/CHANGELOG.md#rtx-40-sm_89-speed-switches-on-by-default-6-nov)
 - **6 Nov - DeepSeek-V4.1: +11 % long-prompt prefill, +2.7 % decode**, same output bit for bit. The next prompt
   chunk's Engram reads start a chunk early, and the shared expert runs while the routed experts load. Both on by
   default, ideas from Basalt. [Details](docs/xolotl/CHANGELOG.md#deepseek-v41-engram-read-ahead-and-the-late-shared-expert-6-nov)
@@ -84,6 +87,7 @@ tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speec
 
 | Date | Change | Model | Prefill before | Prefill after | Decode |
 | --- | --- | --- | ---: | ---: | --- |
+| 6 Nov | RTX 40 (sm_89) speed switches (default on) | [Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored), 16K prompt | 4,054 tok/s | 4,069 tok/s (same) | **139 -> 150 tok/s (+8 %)** |
 | 6 Nov | Engram read-ahead + late shared expert (default on) | [DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored), 26.6K prompt / 8K decode | 456 tok/s | **506 tok/s (+11 %)** | **25.7 -> 26.5 tok/s (+2.7 %)** |
 | 6 Nov | IQ1_M experts on MMQ for prompts (default on) | [Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored), 16K prompt | 3,239-3,430 tok/s | **3,796-3,890 tok/s (+13-17 %)** | within noise |
 

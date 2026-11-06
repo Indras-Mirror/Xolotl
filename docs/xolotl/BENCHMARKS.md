@@ -64,6 +64,7 @@ build as the noise control.
 
 | Date | Change | Model | Test | Before | After | Control (old build again) | Quality |
 | --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| 6 Nov | RTX 40 (sm_89) speed switches (`STRATA_SM89_PERF`, default on) | Qwen3.8-Flash-Next XQ 45 GB | 16,383-token prompt + 1,024 tokens, 3 runs | decode 138.96 tok/s | **decode 150.21 tok/s (+8.1 %)** | 138.72 tok/s (-0.2 %) | bit-exact switches; the same text in every arm |
 | 6 Nov | Engram read-ahead + late shared expert (`STRATA_DS41_ENGRAM_AHEAD`, `STRATA_DS41_SHEXP_LATE`, default on) | DeepSeek-V4.1-Flash-1017 V4 XQ, dense Q8_0 | 26,622-token prompt, 3 interleaved rounds | prefill 456 tok/s | **prefill 506 tok/s (+11.1 %)** | | identical: NLL 0.5152 / top-1 86.11 % vs the DeepSeek API both ways, logits bit-identical |
 | 6 Nov | the same | the same | 8K prompt + 512 tokens, 3 interleaved rounds | decode 25.74 tok/s | **decode 26.45 tok/s (+2.7 %)** | | the same text and expert counts in round 1 |
 | 6 Nov | IQ1_M experts on MMQ for prompts (`STRATA_MMQ_IQ1M`, default on) | Qwen3.8-Flash-Next XQ 45 GB | 16,383-token prompt + 1,024 tokens, 3 runs | prefill 3,239 tok/s | **prefill 3,796 tok/s (+17.2 %)** | 3,281 tok/s (+1.3 %) | closer to Q8_0: prompt KL 0.224 -> 0.184 (20 prompts), top-1 90 % both |
