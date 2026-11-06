@@ -7561,8 +7561,18 @@ namespace {
 struct ShadowHead { char magic[8]; uint64_t src_size, n, data; int32_t gu_type, d_type; };
 struct ShadowEnt { int32_t l, e; uint64_t off; };
 struct ShadowFile { std::string path; int fd = -1, dfd = -1; int32_t gu = -1, d = -1; std::vector<ShadowEnt> ent; };
+// row bytes through the engine's block table (it knows Xolotl's own types, e.g. PTQ1_0 = 143, which ggml's does not);
+// 0 = unknown type or a row the block does not divide
+uint64_t shadow_rb(int t, int64_t n) {
+    int be = 0, bb = 0;
+    if (t < 0 || !block_geometry((uint32_t) t, be, bb) || be <= 0 || n % be) return 0;
+    return (uint64_t) (n / be) * (uint64_t) bb;
+}
 uint64_t shadow_blob(int gt, int dt, int64_t D, int64_t FF) {
-    return 2 * (uint64_t) ggml_row_size((ggml_type) gt, D) * (uint64_t) FF + (uint64_t) ggml_row_size((ggml_type) dt, FF) * (uint64_t) D;
+    return 2 * shadow_rb(gt, D) * (uint64_t) FF + shadow_rb(dt, FF) * (uint64_t) D;
+}
+std::string shadow_tname(int t) {
+    return t >= 0 && t < GGML_TYPE_COUNT ? std::string(ggml_type_name((ggml_type) t)) : t == 143 ? std::string("ptq1_0") : "type " + std::to_string(t);
 }
 bool shadow_read(ShadowFile& sf, uint64_t src_size, int64_t NL, int64_t NE, int64_t D, int64_t FF, std::string& why) {
     sf.fd = ds41_sys::open(sf.path.c_str(), O_RDONLY);
@@ -7574,10 +7584,7 @@ bool shadow_read(ShadowFile& sf, uint64_t src_size, int64_t NL, int64_t NE, int6
     if (std::memcmp(H.magic, "X41SHAD1", 8) != 0) { why = "bad magic in " + sf.path; return false; }
     if (H.src_size != src_size) { why = sf.path + " was built from a different model file (size)"; return false; }
     if (H.n == 0 || H.n > (uint64_t) (NL * NE) || H.data < sizeof H + H.n * sizeof(ShadowEnt) || (H.data & 4095)) { why = "bad header in " + sf.path; return false; }
-    if (H.gu_type < 0 || H.gu_type >= GGML_TYPE_COUNT || H.d_type < 0 || H.d_type >= GGML_TYPE_COUNT ||
-        ggml_blck_size((ggml_type) H.gu_type) <= 0 || D % ggml_blck_size((ggml_type) H.gu_type) || FF % ggml_blck_size((ggml_type) H.d_type)) {
-        why = "unusable types in " + sf.path; return false;
-    }
+    if (shadow_rb(H.gu_type, D) == 0 || shadow_rb(H.d_type, FF) == 0) { why = "unusable types in " + sf.path; return false; }
     sf.gu = H.gu_type;
     sf.d = H.d_type;
     sf.ent.resize((size_t) H.n);
@@ -7747,8 +7754,8 @@ bool Ds41FileBlobs::open(std::string& err) {
                 was += shadow_blob(G.experts[(size_t) l].gu_type[(size_t) e], G.experts[(size_t) l].d_type[(size_t) e], D, FF);
             }
         for (size_t f = 0; f < shf.size(); ++f)
-            std::fprintf(stderr, "shadow: %d experts from %s as %s / %s%s\n", per[f], shf[f].path.c_str(), ggml_type_name((ggml_type) shf[f].gu),
-                         ggml_type_name((ggml_type) shf[f].d), shf[f].dfd >= 0 ? "" : " (no O_DIRECT: buffered reads)");
+            std::fprintf(stderr, "shadow: %d experts from %s as %s / %s%s\n", per[f], shf[f].path.c_str(), shadow_tname(shf[f].gu).c_str(),
+                         shadow_tname(shf[f].d).c_str(), shf[f].dfd >= 0 ? "" : " (no O_DIRECT: buffered reads)");
         std::fprintf(stderr, "shadow: those experts %.2f GB (in the model file %.2f GB) - CHANGES OUTPUTS unless the sidecar is exact\n",
                      nb / 1e9, was / 1e9);
     }
@@ -8035,29 +8042,48 @@ void Ds41FileBlobs::advise(int64_t layer, int64_t expert) const {
         if (x.bytes) ds41_sys::posix_fadvise(sfd(x.off), (int64_t) sloc(x.off), (int64_t) x.bytes, POSIX_FADV_WILLNEED);
 }
 
-bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>& from_gu, int to_gu, int to_d, int threads,
+bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>& from, int to_gu, int to_d, int threads,
                                  std::string& err) const {
+    // Per expert and ROLE: a role whose type is in `from` is re-quantized to the target (gate/up -> to_gu, down -> to_d),
+    // any other role is copied byte for byte.  Experts with no role in `from` are not in the sidecar.  The resulting
+    // (gate/up, down) pairs each get their own file: `out` for (to_gu, to_d), `out.g<gu>d<d>` for the others; `out.list`
+    // holds the colon list to set STRATA_SHADOW / XOLOTL_SHADOW to.
     if (fd_ < 0) { err = "source not open"; return false; }
     if (sfd_.size() > 1) { err = "build from the plain model (a split GGUF or an active STRATA_SHADOW is not supported)"; return false; }
     const int64_t NL = g_.n_layers, NE = g_.n_experts, D = g_.n_embd, FF = g_.n_ff;
-    const ggml_type tg = (ggml_type) to_gu, td = (ggml_type) to_d;
-    if (D % ggml_blck_size(tg) || FF % ggml_blck_size(td)) { err = "the target types do not divide the expert rows"; return false; }
+    if (to_gu < 0 || to_gu >= GGML_TYPE_COUNT || to_d < 0 || to_d >= GGML_TYPE_COUNT || !ggml_get_type_traits((ggml_type) to_gu)->to_float ||
+        !ggml_get_type_traits((ggml_type) to_d)->to_float || shadow_rb(to_gu, D) == 0 || shadow_rb(to_d, FF) == 0) {
+        err = "the target types must be ggml types that divide the expert rows"; return false;
+    }
+    for (int t : from)
+        if (t < 0 || t >= GGML_TYPE_COUNT || !ggml_get_type_traits((ggml_type) t)->to_float) { err = "source type " + std::to_string(t) + " has no ggml dequantizer"; return false; }
+    auto in_from = [&](int t) { return std::find(from.begin(), from.end(), t) != from.end(); };
     ds41_sys::Stat ss{};
     ds41_sys::fstat(fd_, &ss);
-    std::vector<ShadowEnt> ent;
+    struct Grp { int gu, d; std::string path; uint64_t stride = 0, data = 0; int fd = -1; std::vector<ShadowEnt> ent; };
+    std::vector<Grp> grp;
+    struct Job { int32_t l, e; int g; size_t k; };
+    std::vector<Job> jobs;
     for (int64_t l = 0; l < NL; ++l)
         for (int64_t e = 0; e < NE; ++e) {
-            const int c = g_.cls(l, e);
-            if (std::find(from_gu.begin(), from_gu.end(), g_.cls_gu[(size_t) c]) != from_gu.end()) ent.push_back({(int32_t) l, (int32_t) e, 0});
+            const int c = g_.cls(l, e), sg = g_.cls_gu[(size_t) c], sd = g_.cls_d[(size_t) c];
+            if (!in_from(sg) && !in_from(sd)) continue;
+            const int rg = in_from(sg) ? to_gu : sg, rd = in_from(sd) ? to_d : sd;
+            size_t gi = 0;
+            while (gi < grp.size() && !(grp[gi].gu == rg && grp[gi].d == rd)) ++gi;
+            if (gi == grp.size()) {
+                Grp G;
+                G.gu = rg; G.d = rd;
+                G.path = (rg == to_gu && rd == to_d) ? out : out + ".g" + std::to_string(rg) + "d" + std::to_string(rd);
+                if (shadow_blob(rg, rd, D, FF) == 0) { err = "a resulting pair has an unknown row size"; return false; }
+                G.stride = (shadow_blob(rg, rd, D, FF) + 4095) & ~(uint64_t) 4095;
+                grp.push_back(G);
+            }
+            jobs.push_back({(int32_t) l, (int32_t) e, (int) gi, grp[gi].ent.size()});
+            grp[gi].ent.push_back({(int32_t) l, (int32_t) e, 0});
         }
-    if (ent.empty()) { err = "no expert has one of those gate/up types"; return false; }
-    const uint64_t ob = shadow_blob(to_gu, to_d, D, FF), ostride = (ob + 4095) & ~(uint64_t) 4095;
-    const uint64_t data = (sizeof(ShadowHead) + ent.size() * sizeof(ShadowEnt) + 4095) & ~(uint64_t) 4095;
-    for (size_t i = 0; i < ent.size(); ++i) ent[i].off = data + i * ostride;
-    const std::string tmp = out + ".tmp";
-    const int fd = ds41_sys::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) { err = "cannot create " + tmp; return false; }
-    auto wr = [&](const uint8_t* p, uint64_t n, uint64_t off) {
+    if (jobs.empty()) { err = "no expert has a role of those types"; return false; }
+    auto wr = [](int fd, const uint8_t* p, uint64_t n, uint64_t off) {
         while (n) {
             const ssize_t k = ds41_sys::pwrite(fd, p, (size_t) std::min<uint64_t>(n, 1u << 30), (int64_t) off);
             if (k <= 0) return false;
@@ -8065,74 +8091,100 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
         }
         return true;
     };
-    {
-        std::vector<uint8_t> h((size_t) data, 0);
+    auto cleanup = [&] {
+        for (Grp& G : grp) {
+            if (G.fd >= 0) ds41_sys::close(G.fd);
+            G.fd = -1;
+            std::remove((G.path + ".tmp").c_str());
+        }
+    };
+    for (Grp& G : grp) {
+        G.data = (sizeof(ShadowHead) + G.ent.size() * sizeof(ShadowEnt) + 4095) & ~(uint64_t) 4095;
+        for (size_t i = 0; i < G.ent.size(); ++i) G.ent[i].off = G.data + i * G.stride;
+        G.fd = ds41_sys::open((G.path + ".tmp").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (G.fd < 0) { cleanup(); err = "cannot create " + G.path + ".tmp"; return false; }
+        std::vector<uint8_t> h((size_t) G.data, 0);
         ShadowHead H{};
         std::memcpy(H.magic, "X41SHAD1", 8);
         H.src_size = (uint64_t) ss.st_size;
-        H.n = ent.size();
-        H.data = data;
-        H.gu_type = to_gu;
-        H.d_type = to_d;
+        H.n = G.ent.size();
+        H.data = G.data;
+        H.gu_type = G.gu;
+        H.d_type = G.d;
         std::memcpy(h.data(), &H, sizeof H);
-        std::memcpy(h.data() + sizeof H, ent.data(), ent.size() * sizeof(ShadowEnt));
-        if (!wr(h.data(), data, 0)) { ds41_sys::close(fd); std::remove(tmp.c_str()); err = "header write failed"; return false; }
+        std::memcpy(h.data() + sizeof H, G.ent.data(), G.ent.size() * sizeof(ShadowEnt));
+        if (!wr(G.fd, h.data(), G.data, 0)) { cleanup(); err = "header write failed"; return false; }
     }
-    // per source gate/up type: sum of squared error and of squared value (relative error = sqrt(se / sv))
     std::mutex smu;
-    std::map<int, std::array<double, 3>> stat;   // type -> {se, sv, experts}
+    std::map<int, std::array<double, 3>> stat;   // converted role source type -> {sum sq err, sum sq value, roles}
     std::atomic<size_t> nx{0}, done{0};
     std::atomic<bool> bad{false};
     const double t0 = now_ms();
+    uint64_t smax = 0;
+    for (const Grp& G : grp) smax = std::max(smax, G.stride);
     auto work = [&] {
-        std::vector<uint8_t> src(max_), dst((size_t) ostride, 0);
+        std::vector<uint8_t> src(max_), dst((size_t) smax, 0);
         std::vector<float> f((size_t) std::max(D, FF)), b((size_t) std::max(D, FF));
-        for (size_t i; !bad && (i = nx++) < ent.size();) {
-            const int64_t l = ent[i].l, e = ent[i].e;
-            const int c = g_.cls(l, e);
-            const ggml_type sg = (ggml_type) g_.cls_gu[(size_t) c], sd = (ggml_type) g_.cls_d[(size_t) c];
-            read(l, e, src.data());
-            double se = 0, sv = 0;
-            // role r: rows n_rows of n_cols, from type st (row bytes srb) to type dt (row bytes drb)
-            auto conv = [&](const uint8_t* s0, uint8_t* d0, int64_t rows, int64_t cols, ggml_type st, ggml_type dt) {
-                const size_t srb = ggml_row_size(st, cols), drb = ggml_row_size(dt, cols);
-                const auto* tsrc = ggml_get_type_traits(st);
-                const auto* tdst = ggml_get_type_traits(dt);
+        for (size_t i; !bad && (i = nx++) < jobs.size();) {
+            const Job& J = jobs[i];
+            const Grp& G = grp[(size_t) J.g];
+            const int c = g_.cls(J.l, J.e), sg = g_.cls_gu[(size_t) c], sd = g_.cls_d[(size_t) c];
+            read(J.l, J.e, src.data());
+            std::fill(dst.begin(), dst.begin() + (ptrdiff_t) G.stride, 0);
+            std::map<int, std::array<double, 3>> local;
+            // one role: `rows` rows of `cols`, source type st -> type dt (converted) or copied when st == dt
+            auto role = [&](const uint8_t* s0, uint8_t* d0, int64_t rows, int64_t cols, int st, int dt) {
+                const uint64_t srb = shadow_rb(st, cols), drb = shadow_rb(dt, cols);
+                if (st == dt) { std::memcpy(d0, s0, (size_t) (srb * (uint64_t) rows)); return; }
+                const auto* tsrc = ggml_get_type_traits((ggml_type) st);
+                const auto* tdst = ggml_get_type_traits((ggml_type) dt);
+                double se = 0, sv = 0;
                 for (int64_t r = 0; r < rows; ++r) {
-                    if (st == GGML_TYPE_F32) std::memcpy(f.data(), s0 + (size_t) r * srb, (size_t) cols * 4);
-                    else tsrc->to_float(s0 + (size_t) r * srb, f.data(), cols);
-                    ggml_quantize_chunk(dt, f.data(), d0 + (size_t) r * drb, 0, 1, cols, nullptr);
+                    tsrc->to_float(s0 + (size_t) r * srb, f.data(), cols);
+                    ggml_quantize_chunk((ggml_type) dt, f.data(), d0 + (size_t) r * drb, 0, 1, cols, nullptr);
                     tdst->to_float(d0 + (size_t) r * drb, b.data(), cols);
                     for (int64_t k = 0; k < cols; ++k) { const double v = f[(size_t) k], q = v - b[(size_t) k]; se += q * q; sv += v * v; }
                 }
+                auto& x = local[st];
+                x[0] += se; x[1] += sv; x[2] += 1;
             };
-            const size_t sgb = ggml_row_size(sg, D) * (size_t) FF, dgb = ggml_row_size(tg, D) * (size_t) FF;
-            conv(src.data(), dst.data(), FF, D, sg, tg);                       // gate
-            conv(src.data() + sgb, dst.data() + dgb, FF, D, sg, tg);           // up
-            conv(src.data() + 2 * sgb, dst.data() + 2 * dgb, D, FF, sd, td);   // down
-            if (!wr(dst.data(), ostride, ent[i].off)) { bad = true; break; }
+            const uint64_t sgb = shadow_rb(sg, D) * (uint64_t) FF, dgb = shadow_rb(G.gu, D) * (uint64_t) FF;
+            role(src.data(), dst.data(), FF, D, sg, G.gu);                       // gate
+            role(src.data() + sgb, dst.data() + dgb, FF, D, sg, G.gu);           // up
+            role(src.data() + 2 * sgb, dst.data() + 2 * dgb, D, FF, sd, G.d);    // down
+            if (!wr(G.fd, dst.data(), G.stride, G.ent[J.k].off)) { bad = true; break; }
             {
                 std::lock_guard<std::mutex> lk(smu);
-                auto& s = stat[(int) sg];
-                s[0] += se; s[1] += sv; s[2] += 1;
+                for (const auto& [t, x] : local) { auto& y = stat[t]; y[0] += x[0]; y[1] += x[1]; y[2] += x[2]; }
             }
             const size_t d = ++done;
-            if (d % 256 == 0 || d == ent.size())
-                std::fprintf(stderr, "build-shadow: %zu / %zu experts (%.0f s)\n", d, ent.size(), (now_ms() - t0) / 1000.0);
+            if (d % 256 == 0 || d == jobs.size())
+                std::fprintf(stderr, "build-shadow: %zu / %zu experts (%.0f s)\n", d, jobs.size(), (now_ms() - t0) / 1000.0);
         }
     };
     std::vector<std::thread> th;
     for (int t = 0; t < std::max(1, threads); ++t) th.emplace_back(work);
     for (auto& x : th) x.join();
-    const bool synced = !bad && ::fsync(fd) == 0;
-    ds41_sys::close(fd);
-    if (!synced) { std::remove(tmp.c_str()); err = "write failed (disk full?)"; return false; }
-    if (std::rename(tmp.c_str(), out.c_str()) != 0) { err = "cannot rename " + tmp; return false; }
-    for (const auto& [t, s] : stat)
-        std::fprintf(stderr, "build-shadow: %.0f experts from %s -> %s / %s: relative error %.4f\n", s[2], ggml_type_name((ggml_type) t),
-                     ggml_type_name(tg), ggml_type_name(td), s[1] > 0 ? std::sqrt(s[0] / s[1]) : 0.0);
-    std::fprintf(stderr, "build-shadow: wrote %s (%zu experts, %.2f GB) in %.0f s\n", out.c_str(), ent.size(),
-                 (double) (data + ent.size() * ostride) / 1e9, (now_ms() - t0) / 1000.0);
+    bool ok = !bad;
+    for (Grp& G : grp) ok = ok && ::fsync(G.fd) == 0;
+    if (!ok) { cleanup(); err = "write failed (disk full?)"; return false; }
+    std::string list;
+    for (Grp& G : grp) {
+        ds41_sys::close(G.fd);
+        G.fd = -1;
+        if (std::rename((G.path + ".tmp").c_str(), G.path.c_str()) != 0) { err = "cannot rename " + G.path + ".tmp"; return false; }
+        list += (list.empty() ? "" : ":") + G.path;
+        std::fprintf(stderr, "build-shadow: %s: %zu experts as %s / %s (%.2f GB)\n", G.path.c_str(), G.ent.size(), shadow_tname(G.gu).c_str(),
+                     shadow_tname(G.d).c_str(), (double) (G.data + G.ent.size() * G.stride) / 1e9);
+    }
+    for (const auto& [t, x] : stat)
+        std::fprintf(stderr, "build-shadow: %.0f %s roles -> %s / %s: relative error %.4f\n", x[2], shadow_tname(t).c_str(),
+                     shadow_tname(to_gu).c_str(), shadow_tname(to_d).c_str(), x[1] > 0 ? std::sqrt(x[0] / x[1]) : 0.0);
+    {
+        std::FILE* lf = std::fopen((out + ".list").c_str(), "w");
+        if (!lf || std::fprintf(lf, "%s\n", list.c_str()) < 0 || std::fclose(lf) != 0) { err = "cannot write " + out + ".list"; return false; }
+    }
+    std::fprintf(stderr, "build-shadow: done in %.0f s - XOLOTL_SHADOW=%s\n", (now_ms() - t0) / 1000.0, list.c_str());
     return true;
 }
 
