@@ -337,7 +337,7 @@ struct Ds41Dense::Impl {
     // attn_router: the whole pass's rows are read from disk while the embeddings, the init graph and the layers below
     // the first Engram layer (1) run.  Null once uploaded (or when Engram is off) - see engram_ready().
     std::shared_ptr<Ds41Engram::Batch> eng_batch;
-    // STRATA_DS41_ENGRAM_AHEAD=1: the NEXT prompt chunk's reads (engram_next), started into eng_rows once this pass's
+    // STRATA_DS41_ENGRAM_AHEAD (default on): the NEXT prompt chunk's reads (engram_next), started into eng_rows once this pass's
     // rows are on the card (engram_ready), so they run beside this chunk's layers 1.. instead of only layer 0
     std::shared_ptr<Ds41Engram::Batch> eng_ahead;
     int64_t eng_ahead_pos0 = -1;
@@ -995,13 +995,14 @@ static ggml_cgraph * build_shexp_late(Ds41Dense::Impl & im, ggml_context * gc, i
     return gf;
 }
 
-// STRATA_DS41_SHEXP_LATE=1 (opt-in; Basalt 6220768cf's idea, re-derived for this engine): the decode / verify graph
+// STRATA_DS41_SHEXP_LATE (default on, =0 off; Basalt 6220768cf's idea, re-derived for this engine): the decode / verify graph
 // (attn_router) stops at the router and the state copies, and the shared expert runs as its own graph queued right
 // after the router's readback (build_shexp_late), so the host classifies the routed experts and starts their reads
 // while the card computes it.  Same ops on the same fn values (o_fn is fn's copy); the finish graph reads shexp
-// behind it on the same stream.
+// behind it on the same stream.  2026-11-06, 4090, V4 1017 XQ, Q8_0 dense: decode +2.7 % at 8K (3 rounds), short34
+// logits bit-identical to the old path at an equal VRAM seed.
 static bool shexp_late_on() {
-    static const bool on = [] { const char * e = std::getenv("STRATA_DS41_SHEXP_LATE"); return e && e[0] == '1'; }();
+    static const bool on = [] { const char * e = std::getenv("STRATA_DS41_SHEXP_LATE"); return !e || e[0] != '0'; }();
     return on;
 }
 
@@ -2254,8 +2255,9 @@ size_t Ds41Dense::span_graph_bytes(int pos_end, int n) {
 // no-op once done (eng_batch is null), so it is safe to call at every layer - but the caller gates it on L.eslot >= 0
 // so the layers BELOW the first Engram layer run while the disk is still reading.  The whole pass's rows (both Engram
 // slots, all n columns) go up in one shot, so the second Engram layer (14) is a plain read of the same tensor.
+// STRATA_DS41_ENGRAM_AHEAD (default on, =0 off): see eng_ahead.  2026-11-06, 4090: prefill of a 26.6K prompt +11 %.
 static bool engram_ahead_on() {
-    static const bool on = [] { const char * e = std::getenv("STRATA_DS41_ENGRAM_AHEAD"); return e && e[0] == '1'; }();
+    static const bool on = [] { const char * e = std::getenv("STRATA_DS41_ENGRAM_AHEAD"); return !e || e[0] != '0'; }();
     return on;
 }
 

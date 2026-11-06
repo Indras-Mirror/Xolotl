@@ -8,6 +8,33 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### DeepSeek-V4.1: Engram read-ahead and the late shared expert (6 Nov)
+
+Two changes to the DeepSeek-V4.1 engine (`tools/v41/engine/ds41_dense.cpp`), both on by default and both computing
+exactly what the old path did. The ideas come from Basalt (jesdga95: 9e95f399f, 6220768cf), re-derived for this engine.
+
+- **Engram read-ahead** (`STRATA_DS41_ENGRAM_AHEAD`, `=0` off). A long prompt goes through the model in chunks, and each
+  chunk needs its rows from the Engram tables on disk. Before, the next chunk's reads only overlapped the current chunk's
+  first layer. Now they start as soon as the current chunk reaches its first Engram layer, so the disk works beside
+  almost the whole chunk. Prompts of one chunk (up to ~6-9K tokens on a 24 GB card) are unchanged.
+- **Late shared expert** (`STRATA_DS41_SHEXP_LATE`, `=0` off). Each decode step's router and shared expert used to be
+  one GPU job, and the host waited for both before it could start loading the routed experts. Now the router's answer
+  comes back first, the host starts the expert reads, and the card computes the shared expert at the same time.
+- **Measured** on the RTX 4090 box (110 GB RAM), DeepSeek-V4.1-Flash-1017 V4 XQ with the dense half at Q8_0, through the
+  server, both on vs both off, 3 interleaved rounds:
+
+  | Test | Off | On | Change |
+  | --- | ---: | ---: | ---: |
+  | Prefill, 26,622-token prompt | 469 / 448 / 449 tok/s | 507 / 507 / 504 tok/s | **+11.1 %** |
+  | Decode, 8K prompt, 512 tokens | 25.51 / 26.02 / 25.70 tok/s | 26.10 / 26.61 / 26.63 tok/s | **+2.7 %** |
+  | Prefill, 6,382-token prompt (one chunk) | 318 / 317 / 320 tok/s | 313 / 320 / 317 tok/s | same |
+
+- **Quality: identical.** Scored against DeepSeek's own API outputs (34 cases): NLL 0.5152, top-1 86.11 % with both
+  on and with both off, and the logits are bit-identical at the same VRAM seed. The first 8K decode round gave the same
+  text, the same expert counts and the same hash on both.
+- Tried and dropped: a speculative-decode window of 3 instead of 4 (Basalt 1a01349f1) was 5 % slower here, and a 25 % /
+  40 % soft-prune list on top of the route bias cost 3-5 % NLL with no decode gain.
+
 ### IQ1_M prompts on MMQ (6 Nov)
 
 - **IQ1_M experts take llama.cpp's MMQ kernels for prompts** (on by default, `STRATA_MMQ_IQ1M=0` restores the old path; port of

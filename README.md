@@ -18,6 +18,9 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 
 Full notes for every item: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
+- **6 Nov - DeepSeek-V4.1: +11 % long-prompt prefill, +2.7 % decode**, same output bit for bit. The next prompt
+  chunk's Engram reads start a chunk early, and the shared expert runs while the routed experts load. Both on by
+  default, ideas from Basalt. [Details](docs/xolotl/CHANGELOG.md#deepseek-v41-engram-read-ahead-and-the-late-shared-expert-6-nov)
 - **6 Nov - +13-17 % prefill on IQ1_M layers** (QFN 45 GB: up to 3,890 tok/s at 16K on the 4090), and closer to
   the Q8_0 parent than before. On by default (`STRATA_MMQ_IQ1M=0` turns it off), port of Basalt.
   [Details](docs/xolotl/CHANGELOG.md#iq1_m-prompts-on-mmq-6-nov)
@@ -81,7 +84,20 @@ tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speec
 
 | Date | Change | Model | Prefill before | Prefill after | Decode |
 | --- | --- | --- | ---: | ---: | --- |
+| 6 Nov | Engram read-ahead + late shared expert (default on) | [DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored), 26.6K prompt / 8K decode | 456 tok/s | **506 tok/s (+11 %)** | **25.7 -> 26.5 tok/s (+2.7 %)** |
 | 6 Nov | IQ1_M experts on MMQ for prompts (default on) | [Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored), 16K prompt | 3,239-3,430 tok/s | **3,796-3,890 tok/s (+13-17 %)** | within noise |
+
+**Smaller cards (12-16 GB).** The engine fits the work to the card, and the experts that don't fit live in RAM and on
+the SSD, so system RAM matters as much as VRAM. Community runs:
+
+| Card | RAM | Model | Prefill | Decode | Run |
+| --- | --- | --- | ---: | ---: | --- |
+| RTX 3060 12 GB | 64 GB | Qwen3.8-Flash-Next Q2_0 | 882 tok/s (4K), 981 (32K), 934 (128K) | 39-45 tok/s | [2026-10-09](bench/results/2026-10-09-community-rtx-3060-0141/README.md) |
+| RTX 4070 12 GB | 32 GB | Qwen3.8-Flash-Next IQ2_XS | | 48 tok/s | [2026-10-08](bench/results/2026-10-08-community-rtx4070-iq2-xs/README.md) (Hcl192088) |
+| RTX 3060 12 GB | 46 GB | DeepSeek-V4.1-Flash | 149 tok/s (8K) | 8-10 tok/s | [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md) |
+| RTX 5070 12 GB | 64 GB | DeepSeek-V4.1-Flash | 121-231 tok/s (4-8K) | 4.7 tok/s | [docs/DEEPSEEK41.md](docs/DEEPSEEK41.md) |
+
+More cards, AMD and Intel included: [docs/COMMUNITY_BENCHMARKS.md](docs/COMMUNITY_BENCHMARKS.md).
 
 **What that means in practice:**
 
@@ -189,7 +205,8 @@ numbers), [kelheor](https://github.com/kelheor) (the vision `pread` fix, #51; th
 (the thread-local CUDA stream leak, #57), [penink-WH](https://github.com/penink-WH) (AC922 rig), [cpacsm75](https://github.com/cpacsm75) (192 GB
 arena tuning on Windows, #77; the RTX 5090 arena and `--kv-q8` numbers at 256K/512K, #114) and
 [jesdga95](https://github.com/jesdga95/basalt) (Basalt: the priced stream-all prefill chunk, quoted tool calls in string
-values, union/nullable tool parameters, IQ code bytes by shift, IQ1_M on MMQ).
+values, union/nullable tool parameters, IQ code bytes by shift, IQ1_M on MMQ, and the ideas behind the
+DeepSeek-V4.1 Engram read-ahead and late shared expert).
 
 *Xolotl* is Quetzalcoatl's dark twin, who carries the dead up from the underworld - as the engine carries experts up
 from RAM and NVMe. Research code from one developer, measured on one PC; reports from other hardware welcome. MIT.
