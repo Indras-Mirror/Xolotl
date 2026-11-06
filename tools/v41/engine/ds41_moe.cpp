@@ -7571,6 +7571,50 @@ uint64_t shadow_rb(int t, int64_t n) {
 uint64_t shadow_blob(int gt, int dt, int64_t D, int64_t FF) {
     return 2 * shadow_rb(gt, D) * (uint64_t) FF + shadow_rb(dt, FF) * (uint64_t) D;
 }
+// A searched Q2_0 encoder for --build-shadow.  ggml's quantize_row_q2_0_ref sets the scale to the block's max |w|,
+// so levels {-1, 0, +1, +2} x max: +2 is never used and everything under max/2 rounds to 0 (relative error ~0.72 on
+// V4's experts).  Here, per 64-value block: both signs of d (a negative d puts the 2x level on the negative side) x 12
+// scale ratios, nearest level, then d refitted by least squares for that assignment; the lowest squared error wins.
+// Same block_q2_0 bytes (fp16 d, 2-bit codes q = level + 1, 4 per byte, low bits first) - ggml's dequantizer reads it.
+void shadow_q2_0_row(const float* x, uint8_t* out, int64_t n) {
+    constexpr int QK = 64;
+    for (int64_t b = 0; b < n / QK; ++b) {
+        const float* v = x + b * QK;
+        float amax = 0;
+        for (int j = 0; j < QK; ++j) amax = std::max(amax, std::fabs(v[j]));
+        float best_d = 0, best_e = 0;
+        for (int j = 0; j < QK; ++j) best_e += v[j] * v[j];   // d = 0: everything 0
+        uint8_t q[QK], bq[QK];
+        std::fill(bq, bq + QK, (uint8_t) 1);
+        if (amax > 0) {
+            for (int sg = -1; sg <= 1; sg += 2)
+                for (int r = 0; r < 12; ++r) {
+                    const float d0 = sg * amax * (0.30f + 0.06f * (float) r);   // the 2x level at 0.6 .. 1.92 x max
+                    const float id = 1.0f / d0;
+                    float sxq = 0, sqq = 0;
+                    for (int j = 0; j < QK; ++j) {
+                        int l = (int) std::lround(v[j] * id);
+                        l = std::min(2, std::max(-1, l));
+                        q[j] = (uint8_t) (l + 1);
+                        sxq += v[j] * (float) l;
+                        sqq += (float) (l * l);
+                    }
+                    if (sqq <= 0) continue;
+                    const float d = sxq / sqq;   // least squares for this assignment
+                    float e = 0;
+                    for (int j = 0; j < QK; ++j) { const float t = v[j] - d * (float) ((int) q[j] - 1); e += t * t; }
+                    if (e < best_e) { best_e = e; best_d = d; std::memcpy(bq, q, QK); }
+                }
+        }
+        const ggml_fp16_t h = ggml_fp32_to_fp16(best_d);
+        uint8_t* o = out + b * (int64_t) (sizeof(ggml_fp16_t) + QK / 4);
+        std::memcpy(o, &h, sizeof h);
+        uint8_t* qs = o + sizeof h;
+        std::fill(qs, qs + QK / 4, (uint8_t) 0);
+        for (int j = 0; j < QK; ++j) qs[j / 4] |= (uint8_t) (bq[j] << ((j % 4) * 2));
+    }
+}
+
 std::string shadow_tname(int t) {
     return t >= 0 && t < GGML_TYPE_COUNT ? std::string(ggml_type_name((ggml_type) t)) : t == 143 ? std::string("ptq1_0") : "type " + std::to_string(t);
 }
@@ -8141,7 +8185,8 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
                 double se = 0, sv = 0;
                 for (int64_t r = 0; r < rows; ++r) {
                     tsrc->to_float(s0 + (size_t) r * srb, f.data(), cols);
-                    ggml_quantize_chunk((ggml_type) dt, f.data(), d0 + (size_t) r * drb, 0, 1, cols, nullptr);
+                    if (dt == GGML_TYPE_Q2_0) shadow_q2_0_row(f.data(), d0 + (size_t) r * drb, cols);   // searched scales (above)
+                    else ggml_quantize_chunk((ggml_type) dt, f.data(), d0 + (size_t) r * drb, 0, 1, cols, nullptr);
                     tdst->to_float(d0 + (size_t) r * drb, b.data(), cols);
                     for (int64_t k = 0; k < cols; ++k) { const double v = f[(size_t) k], q = v - b[(size_t) k]; se += q * q; sv += v * v; }
                 }
