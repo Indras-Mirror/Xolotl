@@ -93,6 +93,7 @@ namespace {
 struct Args {
     std::string model, ids_csv, ids_file, rank, dump_logits, dump_last;
     std::string build_mirror;      // --build-mirror F [--mirror-gib N]: write the blob mirror (coldest experts by --rank) and exit
+    std::string build_shadow;      // --build-shadow F: write an expert sidecar (STRATA_SHADOW) and exit - STRATA_SHADOW_FROM=<gate/up type ids,> (default 39,11 = MXFP4, Q3_K), STRATA_SHADOW_TYPE=<ggml type id> (default 42 = Q2_0), STRATA_SHADOW_THREADS (default 16)
     double mirror_gib = 85.0;
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
     float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
@@ -234,6 +235,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
         else if (k == "--rank") a.rank = next();
         else if (k == "--build-mirror") a.build_mirror = next();
+        else if (k == "--build-shadow") a.build_shadow = next();
         else if (k == "--check-mirror") { a.build_mirror = next(); a.mirror_gib = -1; }
         else if (k == "--mirror-gib") a.mirror_gib = std::atof(next().c_str());
         else if (k == "--vram-lru") a.vram_lru = true;
@@ -319,7 +321,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--pcie-frac") a.pcie = std::atof(next().c_str());
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
-    return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty());
+    return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty() || !a.build_shadow.empty());
 }
 
 double now_ms() {
@@ -345,6 +347,17 @@ int main(int argc, char ** argv) {
         return 2;
     }
     ds41_apply_mmq_cc_policy(a.backend == "cuda", a.chunk_mmq);
+    if (!a.build_shadow.empty()) {   // an expert sidecar (STRATA_SHADOW / XOLOTL_SHADOW); the model file is only read
+        std::string err;
+        if (std::getenv("STRATA_SHADOW")) { std::fprintf(stderr, "ds41_generate: unset STRATA_SHADOW / XOLOTL_SHADOW to build one\n"); return 2; }
+        Ds41FileBlobs src(a.model);
+        if (!src.open(err)) { std::fprintf(stderr, "ds41_generate: experts: %s\n", err.c_str()); return 1; }
+        std::vector<int> from = parse_csv(std::getenv("STRATA_SHADOW_FROM") ? std::getenv("STRATA_SHADOW_FROM") : "39,11");
+        const int to = std::getenv("STRATA_SHADOW_TYPE") ? std::atoi(std::getenv("STRATA_SHADOW_TYPE")) : 42;
+        const int th = std::getenv("STRATA_SHADOW_THREADS") ? std::max(1, std::atoi(std::getenv("STRATA_SHADOW_THREADS"))) : 16;
+        if (!src.build_shadow(a.build_shadow, from, to, to, th, err)) { std::fprintf(stderr, "ds41_generate: build-shadow: %s\n", err.c_str()); return 1; }
+        return 0;
+    }
     if (!a.build_mirror.empty()) {   // the second-drive blob mirror (STRATA_BLOB_MIRROR): coldest experts first
         std::string err;
         if (a.mirror_gib < 0) {   // --check-mirror F: open it with every blob compared against the model file
@@ -3545,6 +3558,36 @@ int main(int argc, char ** argv) {
                     if (tn < 0) { finish = tn == -2 ? "nonfinite" : "grammar"; break; }
                     const double tq2 = now_ms();
                     ++rq_pass; rq_acc += acc;
+                    // STRATA_MARGIN_LOG=1|<file> (measurement only, outputs unchanged): the top-1 - top-2 logit gap of every
+                    // verify row whose token is emitted (rows r0 .. r0+acc) - how many tokens a margin gate (PROMETHEVS,
+                    // Ryan Flavell / MAGNVS: exact recompute below 0.45) would flag.  stderr histogram every 256 passes;
+                    // a file path also gets one "pass row margin top1 top2" line per row.
+                    {
+                        static const char * mg_env = std::getenv("STRATA_MARGIN_LOG");
+                        static FILE * mg_f = mg_env && std::strcmp(mg_env, "1") != 0 ? std::fopen(mg_env, "w") : nullptr;
+                        static const float mg_cut[6] = { 0.1f, 0.25f, 0.45f, 0.75f, 1.0f, 2.0f };
+                        static long mg_rows = 0, mg_below[6] = {}, mg_pass = 0;
+                        if (mg_env) {
+                            for (int i = 0; i <= acc; ++i) {
+                                const float * row = vlog.data() + (size_t) (r0 + i) * nv;
+                                int b1 = 0, b2 = -1;
+                                for (int v = 1; v < nv; ++v) {
+                                    if (row[v] > row[b1]) { b2 = b1; b1 = v; }
+                                    else if (b2 < 0 || row[v] > row[b2]) b2 = v;
+                                }
+                                const float gap = row[b1] - row[b2];
+                                ++mg_rows;
+                                for (int c = 0; c < 6; ++c) mg_below[c] += gap < mg_cut[c];
+                                if (mg_f) std::fprintf(mg_f, "%ld %d %.4f %d %d\n", mg_pass, i, gap, b1, b2);
+                            }
+                            if (++mg_pass % 256 == 0) {
+                                if (mg_f) std::fflush(mg_f);
+                                std::fprintf(stderr, "[margin] %ld rows: gap <0.1 %.2f%% <0.25 %.2f%% <0.45 %.2f%% <0.75 %.2f%% <1 %.2f%% <2 %.2f%%\n",
+                                             mg_rows, 100.0 * mg_below[0] / mg_rows, 100.0 * mg_below[1] / mg_rows, 100.0 * mg_below[2] / mg_rows,
+                                             100.0 * mg_below[3] / mg_rows, 100.0 * mg_below[4] / mg_rows, 100.0 * mg_below[5] / mg_rows);
+                            }
+                        }
+                    }
                     // STRATA_BIAS_REFRESH=N (default 1, 0 = the old per-request snapshot; changes outputs like any residency change): the route bias + file penalty
                     // are a snapshot of the VRAM set taken when the request's decode starts, while the vram_lru admissions
                     // and arena rebalance keep changing that set - so a long decode biases toward evicted experts and away

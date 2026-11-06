@@ -11,6 +11,7 @@
 // implementation.  `tools/ds4/cmake/ds4_moe.cmake` builds both.
 #include "ds41_moe.hpp"
 #include "ds41_transcode.hpp"
+#include "ggml.h"   // ggml_row_size / ggml_type_name / quantize (the expert sidecar, --build-shadow)
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
@@ -5397,6 +5398,36 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     }
     st.prefetched_useful = npf;
     st.wall_ms = now_ms() - t0;
+    // STRATA_TYPE_TALLY=1 (measurement only): on decode-sized calls (nt <= 8), every distinct expert's blob bytes by lane
+    // (VRAM hit | PCIe site incl. file->GPU | CPU pool on an arena copy | CPU from the file) and by blob size (one size
+    // per format in V4: MXFP4 / Q3_K / Q2_0 / PTQ1_0) - how many bytes of each type cross the slow lanes per pass
+    // (the upside of a smaller shadow copy of a type).  Printed every 2560 calls as MB per 40 calls (~one pass).
+    {
+        static const bool tally = std::getenv("STRATA_TYPE_TALLY") && std::atoi(std::getenv("STRATA_TYPE_TALLY")) != 0;
+        static std::mutex tl_mu;
+        static long tl_calls = 0;
+        static std::vector<std::pair<int64_t, std::array<double, 4>>> tl;   // (blob bytes, bytes per lane)
+        if (tally && nt <= 8) {
+            std::lock_guard<std::mutex> lk(tl_mu);
+            for (int u = 0; u < nu; ++u) {
+                const int64_t bb = BLX(ue[u]);
+                const int c = cls[u];
+                const int lane = c == HIT ? 0 : (c == PCIE || c == FILEG || c == DEFER) ? 1 : c == CPU && gp.arena.ptr(layer, ue[u]) ? 2 : 3;
+                size_t k = 0;
+                while (k < tl.size() && tl[k].first != bb) ++k;
+                if (k == tl.size()) tl.push_back({bb, {0, 0, 0, 0}});
+                tl[k].second[(size_t) lane] += (double) bb;
+            }
+            if (++tl_calls % 2560 == 0) {
+                const double per = 40.0 / (double) tl_calls / 1e6;
+                std::fprintf(stderr, "[type-tally] %ld calls, MB per 40 calls (vram | pcie+file->gpu | cpu arena | cpu file):", tl_calls);
+                for (const auto& t : tl)
+                    std::fprintf(stderr, " [%.2f MB blob] %.0f | %.0f | %.0f | %.0f;", t.first / 1e6, t.second[0] * per,
+                                 t.second[1] * per, t.second[2] * per, t.second[3] * per);
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
     if (xprof) {
         xmark(6);
         ++xp_n; xp_nu += nu;
@@ -7518,6 +7549,52 @@ void Ds41FileBlobs::give_bounce(uint8_t* p) const {
     bfree_.push_back(p);
 }
 
+// ---- the expert sidecar (STRATA_SHADOW / XOLOTL_SHADOW=<file>[:<file>...], opt-in) ----
+// A sidecar redefines some experts: their format (one gate=up type and one down type per file) and where their bytes
+// live.  Written by `ds41_generate --build-shadow`; the model file is never written.  Use 1: a smaller copy of the
+// biggest experts (a 2-bit SHADOW of the MXFP4 / Q3_K ones - lossy, judged on short34).  Use 2: experts the model file
+// does not hold at full precision (the parent's native FP4).  All or nothing: one bad file = no sidecar at all.
+//   file: a 4096-byte-aligned header, then the blobs, each [gate | up | down] in the file's types, padded to 4096.
+//   header: "X41SHAD1", u64 model file size, u64 n, u64 data start, i32 gate/up type, i32 down type; then
+//           n x {i32 layer, i32 expert, u64 offset}
+namespace {
+struct ShadowHead { char magic[8]; uint64_t src_size, n, data; int32_t gu_type, d_type; };
+struct ShadowEnt { int32_t l, e; uint64_t off; };
+struct ShadowFile { std::string path; int fd = -1, dfd = -1; int32_t gu = -1, d = -1; std::vector<ShadowEnt> ent; };
+uint64_t shadow_blob(int gt, int dt, int64_t D, int64_t FF) {
+    return 2 * (uint64_t) ggml_row_size((ggml_type) gt, D) * (uint64_t) FF + (uint64_t) ggml_row_size((ggml_type) dt, FF) * (uint64_t) D;
+}
+bool shadow_read(ShadowFile& sf, uint64_t src_size, int64_t NL, int64_t NE, int64_t D, int64_t FF, std::string& why) {
+    sf.fd = ds41_sys::open(sf.path.c_str(), O_RDONLY);
+    if (sf.fd < 0) { why = "cannot open " + sf.path; return false; }
+    ds41_sys::Stat st{};
+    if (ds41_sys::fstat(sf.fd, &st) != 0) { why = "fstat " + sf.path; return false; }
+    ShadowHead H{};
+    if (ds41_sys::pread(sf.fd, &H, sizeof H, 0) != (ssize_t) sizeof H) { why = "short header in " + sf.path; return false; }
+    if (std::memcmp(H.magic, "X41SHAD1", 8) != 0) { why = "bad magic in " + sf.path; return false; }
+    if (H.src_size != src_size) { why = sf.path + " was built from a different model file (size)"; return false; }
+    if (H.n == 0 || H.n > (uint64_t) (NL * NE) || H.data < sizeof H + H.n * sizeof(ShadowEnt) || (H.data & 4095)) { why = "bad header in " + sf.path; return false; }
+    if (H.gu_type < 0 || H.gu_type >= GGML_TYPE_COUNT || H.d_type < 0 || H.d_type >= GGML_TYPE_COUNT ||
+        ggml_blck_size((ggml_type) H.gu_type) <= 0 || D % ggml_blck_size((ggml_type) H.gu_type) || FF % ggml_blck_size((ggml_type) H.d_type)) {
+        why = "unusable types in " + sf.path; return false;
+    }
+    sf.gu = H.gu_type;
+    sf.d = H.d_type;
+    sf.ent.resize((size_t) H.n);
+    const size_t ib = (size_t) H.n * sizeof(ShadowEnt);
+    if (ds41_sys::pread(sf.fd, sf.ent.data(), ib, (int64_t) sizeof H) != (ssize_t) ib) { why = "short index in " + sf.path; return false; }
+    const uint64_t b = shadow_blob(sf.gu, sf.d, D, FF);
+    std::vector<uint8_t> seen((size_t) (NL * NE), 0);
+    for (const ShadowEnt& x : sf.ent) {
+        if (x.l < 0 || x.l >= NL || x.e < 0 || x.e >= NE || (x.off & 4095) || x.off < H.data || x.off + b > (uint64_t) st.st_size ||
+            seen[(size_t) (x.l * NE + x.e)]++) { why = "bad index entry in " + sf.path; return false; }
+    }
+    sf.dfd = ds41_sys::open(sf.path.c_str(), O_RDONLY | O_DIRECT);   // -1 = this filesystem refuses O_DIRECT
+    ds41_sys::posix_fadvise(sf.fd, 0, 0, POSIX_FADV_RANDOM);
+    return true;
+}
+}  // namespace
+
 bool Ds41FileBlobs::open(std::string& err) {
     if (fd_ >= 0) return true;
     std::unique_ptr<GgufModel> m;
@@ -7536,11 +7613,55 @@ bool Ds41FileBlobs::open(std::string& err) {
     g_.n_experts = NE;
     g_.top_k = G.n_used;
     g_.swiglu_limit = G.swiglu_limit > 0 ? (float) G.swiglu_limit : std::numeric_limits<float>::infinity();
+    // the sidecars (STRATA_SHADOW): validated and opened here, before any offset is computed - a bad one leaves the model
+    // file's experts exactly as they are
+    std::vector<ShadowFile> shf;
+    std::vector<int16_t> sh_of;   // per (layer, expert): its sidecar, -1 = the model file
+    std::vector<uint64_t> sh_at;
+    if (const char* sv = std::getenv("STRATA_SHADOW"); sv && *sv) {
+        ds41_sys::Stat ms{};
+        const std::string mp0 = m->shard(0).path();
+        const int mf = ds41_sys::open(mp0.c_str(), O_RDONLY);
+        const bool ms_ok = mf >= 0 && ds41_sys::fstat(mf, &ms) == 0;
+        if (mf >= 0) ds41_sys::close(mf);
+        std::string list(sv), why;
+        for (size_t a = 0; a <= list.size();) {
+            const size_t b = std::min(list.find(':', a), list.size());
+            if (b > a) { shf.emplace_back(); shf.back().path = list.substr(a, b - a); }
+            a = b + 1;
+        }
+        bool ok = ms_ok && !shf.empty() && m->size() + shf.size() < ((size_t) 1 << (64 - kShardShift));
+        if (!ms_ok) why = "cannot stat the model file";
+        for (ShadowFile& f : shf) ok = ok && shadow_read(f, (uint64_t) ms.st_size, NL, NE, D, FF, why);
+        if (ok) {
+            sh_of.assign((size_t) (NL * NE), -1);
+            sh_at.assign((size_t) (NL * NE), 0);
+            for (size_t f = 0; f < shf.size(); ++f)   // a later file wins an expert two files hold
+                for (const ShadowEnt& x : shf[f].ent) {
+                    sh_of[(size_t) (x.l * NE + x.e)] = (int16_t) f;
+                    sh_at[(size_t) (x.l * NE + x.e)] = x.off;
+                }
+        } else {
+            std::fprintf(stderr, "shadow: NOT used (%s) - every expert from the model file\n", why.empty() ? "no file" : why.c_str());
+            for (ShadowFile& f : shf) {
+                if (f.fd >= 0) ds41_sys::close(f.fd);
+                if (f.dfd >= 0) ds41_sys::close(f.dfd);
+            }
+            shf.clear();
+        }
+    }
+    auto ex_types = [&](int64_t l, int64_t e) -> std::pair<int, int> {
+        if (!sh_of.empty() && sh_of[(size_t) (l * NE + e)] >= 0) {
+            const ShadowFile& f = shf[(size_t) sh_of[(size_t) (l * NE + e)]];
+            return {f.gu, f.d};
+        }
+        return {G.experts[(size_t) l].gu_type[(size_t) e], G.experts[(size_t) l].d_type[(size_t) e]};
+    };
     g_.eclass.assign((size_t) (NL * NE), 0);
     std::map<std::pair<int, int>, int> cid;
     for (int64_t l = 0; l < NL; ++l)
         for (int64_t e = 0; e < NE; ++e) {
-            const std::pair<int, int> k{G.experts[(size_t) l].gu_type[(size_t) e], G.experts[(size_t) l].d_type[(size_t) e]};
+            const std::pair<int, int> k = ex_types(l, e);
             auto it = cid.find(k);
             if (it == cid.end()) {
                 it = cid.emplace(k, (int) g_.cls_gu.size()).first;
@@ -7572,6 +7693,16 @@ bool Ds41FileBlobs::open(std::string& err) {
     for (int64_t l = 0; l < NL; ++l) {
         const Ds41ExpertMap& X = G.experts[(size_t) l];
         for (int64_t e = 0; e < NE; ++e) {
+            if (!sh_of.empty() && sh_of[(size_t) (l * NE + e)] >= 0) {   // a sidecar expert: its own file (shard tag after the model's)
+                const ShadowFile& f = shf[(size_t) sh_of[(size_t) (l * NE + e)]];
+                const uint64_t tag = (uint64_t) (m->size() + (size_t) sh_of[(size_t) (l * NE + e)]) << kShardShift;
+                const uint64_t gb = rb(f.gu, D) * (uint64_t) FF;
+                const size_t i = (size_t) (l * NE + e);
+                gate_off_[i] = tag + sh_at[i];
+                up_off_[i] = gate_off_[i] + gb;
+                down_off_[i] = up_off_[i] + gb;
+                continue;
+            }
             const int gt = X.gu_type[(size_t) e], dt = X.d_type[(size_t) e];
             const TensorInfo *tg = nullptr, *tu = nullptr, *td = nullptr;
             const uint64_t bg = locate(X.gate_t.at(gt), tg), bu = locate(X.up_t.at(gt), tu), bd = locate(X.down_t.at(dt), td);
@@ -7598,6 +7729,28 @@ bool Ds41FileBlobs::open(std::string& err) {
         sfd_.push_back(f);
         sdfd_.push_back(direct_ok_ ? ds41_sys::open(sp.c_str(), O_RDONLY | O_DIRECT) : -1);
         direct_ok_ = direct_ok_ && sdfd_.back() >= 0;
+    }
+    if (!shf.empty()) {   // the sidecars' fds as the shards after the model's (their offsets carry those tags)
+        uint64_t nb = 0, was = 0;
+        for (ShadowFile& f : shf) {
+            sfd_.push_back(f.fd);
+            sdfd_.push_back(f.dfd);
+            direct_ok_ = direct_ok_ && f.dfd >= 0;
+        }
+        std::vector<int> per((size_t) shf.size(), 0);
+        for (int64_t l = 0; l < NL; ++l)
+            for (int64_t e = 0; e < NE; ++e) {
+                const int16_t f = sh_of[(size_t) (l * NE + e)];
+                if (f < 0) continue;
+                ++per[(size_t) f];
+                nb += shadow_blob(shf[(size_t) f].gu, shf[(size_t) f].d, D, FF);
+                was += shadow_blob(G.experts[(size_t) l].gu_type[(size_t) e], G.experts[(size_t) l].d_type[(size_t) e], D, FF);
+            }
+        for (size_t f = 0; f < shf.size(); ++f)
+            std::fprintf(stderr, "shadow: %d experts from %s as %s / %s%s\n", per[f], shf[f].path.c_str(), ggml_type_name((ggml_type) shf[f].gu),
+                         ggml_type_name((ggml_type) shf[f].d), shf[f].dfd >= 0 ? "" : " (no O_DIRECT: buffered reads)");
+        std::fprintf(stderr, "shadow: those experts %.2f GB (in the model file %.2f GB) - CHANGES OUTPUTS unless the sidecar is exact\n",
+                     nb / 1e9, was / 1e9);
     }
     fd_ = sfd_[0];
     dfd_ = direct_ok_ ? sdfd_[0] : -1;
@@ -7880,6 +8033,107 @@ void Ds41FileBlobs::advise(int64_t layer, int64_t expert) const {
     spans(layer, expert, s);
     for (const Span& x : s)
         if (x.bytes) ds41_sys::posix_fadvise(sfd(x.off), (int64_t) sloc(x.off), (int64_t) x.bytes, POSIX_FADV_WILLNEED);
+}
+
+bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>& from_gu, int to_gu, int to_d, int threads,
+                                 std::string& err) const {
+    if (fd_ < 0) { err = "source not open"; return false; }
+    if (sfd_.size() > 1) { err = "build from the plain model (a split GGUF or an active STRATA_SHADOW is not supported)"; return false; }
+    const int64_t NL = g_.n_layers, NE = g_.n_experts, D = g_.n_embd, FF = g_.n_ff;
+    const ggml_type tg = (ggml_type) to_gu, td = (ggml_type) to_d;
+    if (D % ggml_blck_size(tg) || FF % ggml_blck_size(td)) { err = "the target types do not divide the expert rows"; return false; }
+    ds41_sys::Stat ss{};
+    ds41_sys::fstat(fd_, &ss);
+    std::vector<ShadowEnt> ent;
+    for (int64_t l = 0; l < NL; ++l)
+        for (int64_t e = 0; e < NE; ++e) {
+            const int c = g_.cls(l, e);
+            if (std::find(from_gu.begin(), from_gu.end(), g_.cls_gu[(size_t) c]) != from_gu.end()) ent.push_back({(int32_t) l, (int32_t) e, 0});
+        }
+    if (ent.empty()) { err = "no expert has one of those gate/up types"; return false; }
+    const uint64_t ob = shadow_blob(to_gu, to_d, D, FF), ostride = (ob + 4095) & ~(uint64_t) 4095;
+    const uint64_t data = (sizeof(ShadowHead) + ent.size() * sizeof(ShadowEnt) + 4095) & ~(uint64_t) 4095;
+    for (size_t i = 0; i < ent.size(); ++i) ent[i].off = data + i * ostride;
+    const std::string tmp = out + ".tmp";
+    const int fd = ds41_sys::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { err = "cannot create " + tmp; return false; }
+    auto wr = [&](const uint8_t* p, uint64_t n, uint64_t off) {
+        while (n) {
+            const ssize_t k = ds41_sys::pwrite(fd, p, (size_t) std::min<uint64_t>(n, 1u << 30), (int64_t) off);
+            if (k <= 0) return false;
+            p += k; off += (uint64_t) k; n -= (uint64_t) k;
+        }
+        return true;
+    };
+    {
+        std::vector<uint8_t> h((size_t) data, 0);
+        ShadowHead H{};
+        std::memcpy(H.magic, "X41SHAD1", 8);
+        H.src_size = (uint64_t) ss.st_size;
+        H.n = ent.size();
+        H.data = data;
+        H.gu_type = to_gu;
+        H.d_type = to_d;
+        std::memcpy(h.data(), &H, sizeof H);
+        std::memcpy(h.data() + sizeof H, ent.data(), ent.size() * sizeof(ShadowEnt));
+        if (!wr(h.data(), data, 0)) { ds41_sys::close(fd); std::remove(tmp.c_str()); err = "header write failed"; return false; }
+    }
+    // per source gate/up type: sum of squared error and of squared value (relative error = sqrt(se / sv))
+    std::mutex smu;
+    std::map<int, std::array<double, 3>> stat;   // type -> {se, sv, experts}
+    std::atomic<size_t> nx{0}, done{0};
+    std::atomic<bool> bad{false};
+    const double t0 = now_ms();
+    auto work = [&] {
+        std::vector<uint8_t> src(max_), dst((size_t) ostride, 0);
+        std::vector<float> f((size_t) std::max(D, FF)), b((size_t) std::max(D, FF));
+        for (size_t i; !bad && (i = nx++) < ent.size();) {
+            const int64_t l = ent[i].l, e = ent[i].e;
+            const int c = g_.cls(l, e);
+            const ggml_type sg = (ggml_type) g_.cls_gu[(size_t) c], sd = (ggml_type) g_.cls_d[(size_t) c];
+            read(l, e, src.data());
+            double se = 0, sv = 0;
+            // role r: rows n_rows of n_cols, from type st (row bytes srb) to type dt (row bytes drb)
+            auto conv = [&](const uint8_t* s0, uint8_t* d0, int64_t rows, int64_t cols, ggml_type st, ggml_type dt) {
+                const size_t srb = ggml_row_size(st, cols), drb = ggml_row_size(dt, cols);
+                const auto* tsrc = ggml_get_type_traits(st);
+                const auto* tdst = ggml_get_type_traits(dt);
+                for (int64_t r = 0; r < rows; ++r) {
+                    if (st == GGML_TYPE_F32) std::memcpy(f.data(), s0 + (size_t) r * srb, (size_t) cols * 4);
+                    else tsrc->to_float(s0 + (size_t) r * srb, f.data(), cols);
+                    ggml_quantize_chunk(dt, f.data(), d0 + (size_t) r * drb, 0, 1, cols, nullptr);
+                    tdst->to_float(d0 + (size_t) r * drb, b.data(), cols);
+                    for (int64_t k = 0; k < cols; ++k) { const double v = f[(size_t) k], q = v - b[(size_t) k]; se += q * q; sv += v * v; }
+                }
+            };
+            const size_t sgb = ggml_row_size(sg, D) * (size_t) FF, dgb = ggml_row_size(tg, D) * (size_t) FF;
+            conv(src.data(), dst.data(), FF, D, sg, tg);                       // gate
+            conv(src.data() + sgb, dst.data() + dgb, FF, D, sg, tg);           // up
+            conv(src.data() + 2 * sgb, dst.data() + 2 * dgb, D, FF, sd, td);   // down
+            if (!wr(dst.data(), ostride, ent[i].off)) { bad = true; break; }
+            {
+                std::lock_guard<std::mutex> lk(smu);
+                auto& s = stat[(int) sg];
+                s[0] += se; s[1] += sv; s[2] += 1;
+            }
+            const size_t d = ++done;
+            if (d % 256 == 0 || d == ent.size())
+                std::fprintf(stderr, "build-shadow: %zu / %zu experts (%.0f s)\n", d, ent.size(), (now_ms() - t0) / 1000.0);
+        }
+    };
+    std::vector<std::thread> th;
+    for (int t = 0; t < std::max(1, threads); ++t) th.emplace_back(work);
+    for (auto& x : th) x.join();
+    const bool synced = !bad && ::fsync(fd) == 0;
+    ds41_sys::close(fd);
+    if (!synced) { std::remove(tmp.c_str()); err = "write failed (disk full?)"; return false; }
+    if (std::rename(tmp.c_str(), out.c_str()) != 0) { err = "cannot rename " + tmp; return false; }
+    for (const auto& [t, s] : stat)
+        std::fprintf(stderr, "build-shadow: %.0f experts from %s -> %s / %s: relative error %.4f\n", s[2], ggml_type_name((ggml_type) t),
+                     ggml_type_name(tg), ggml_type_name(td), s[1] > 0 ? std::sqrt(s[0] / s[1]) : 0.0);
+    std::fprintf(stderr, "build-shadow: wrote %s (%zu experts, %.2f GB) in %.0f s\n", out.c_str(), ent.size(),
+                 (double) (data + ent.size() * ostride) / 1e9, (now_ms() - t0) / 1000.0);
+    return true;
 }
 
 size_t Ds41FileBlobs::expert_bytes(int64_t l, int64_t e) const {

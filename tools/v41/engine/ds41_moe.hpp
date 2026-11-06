@@ -242,6 +242,11 @@ public:
     /// Writes the mirror: `order` coldest first, until `budget` bytes.  Returns false with `err` on failure.
     bool build_mirror(const std::string& out, const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget,
                       std::string& err) const;
+    /// Writes an expert sidecar (STRATA_SHADOW): every expert whose gate/up type is in `from_gu`, re-quantized to
+    /// `to_gu` / `to_d` (row by row through float), into `out` (via out.tmp, renamed when complete).  The model file is only
+    /// read.  `threads` workers.  Prints the relative error per source type.  False with `err` on failure.
+    bool build_shadow(const std::string& out, const std::vector<int>& from_gu, int to_gu, int to_d, int threads,
+                      std::string& err) const;
 
 private:
     struct Span { uint64_t off = 0, bytes = 0; };
