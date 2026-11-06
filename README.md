@@ -18,6 +18,10 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 
 Full notes for every item: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
+- **7 Nov - Xolotl Direct (Linux, experimental, opt-in): NVMe straight into VRAM on a GeForce card.** Experts read
+  from the drive skip system RAM: one expert 11 -> 3.1 ms, zero RAM-bus traffic, the same output. With the
+  layer-ahead VRAM stash: +3 % decode on DeepSeek-V4.1. Needs Resizable BAR and two small kernel modules.
+  [Setup](docs/XOLOTL_DIRECT.md)
 - **7 Nov - DeepSeek-V4.1 loads in 44 s instead of 96 s**, same output. The converted dense weights are cached on disk
   after the first load, and the RAM arena is pinned while it fills. On by default. Every switch now also takes an
   `XOLOTL_` name (`XOLOTL_ARENA_PIN_AFTER=0` = `STRATA_ARENA_PIN_AFTER=0`; the old names keep working).

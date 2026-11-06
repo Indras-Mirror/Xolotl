@@ -8,6 +8,25 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Xolotl Direct: NVMe straight into VRAM (7 Nov, experimental)
+
+When DeepSeek-V4.1 decodes, the experts that are in neither VRAM nor the RAM arena are read from the NVMe drive. Until
+now those bytes went NVMe -> RAM bounce -> pinned staging -> PCIe -> VRAM: four trips over the RAM bus, which is the
+wall on a DDR4 box. Xolotl Direct has the drive write them straight into the card's memory, on the normal NVIDIA
+driver and a GeForce card (no driver patch, no datacenter card). It is opt-in at build time (`-DXOLOTL_DIRECT=ON`) and
+at run time (`XOLOTL_P2P=1`), Linux only, and needs Resizable BAR plus two small GPL kernel modules
+(`kernel/xolotl-direct/`). Setup: [docs/XOLOTL_DIRECT.md](../XOLOTL_DIRECT.md).
+
+- One 18 MiB expert NVMe -> VRAM: **3.1 ms** against ~11 ms on the normal path; 64 MiB at **6.31 GB/s** (the drive's
+  limit) against 4.61; no system-RAM traffic. Every direct read checked against a normal read: 0 differences.
+- Decode, V4, 4090, 8K prompt / 512 tokens, two rounds with identical VRAM: normal 116.5 ms/pass 25.36 tok/s |
+  direct 116.0 / 25.48 | direct + file lookahead (`XOLOTL_LOOKAHEAD=2 XOLOTL_LA_SPEC=2`) **113.0 / 26.14 (+3.1 %)**.
+  On its own the direct path saves ~1.7 ms of file waiting per pass but barely moves the pass (those reads already
+  overlap other work); the gain comes from the VRAM stash it makes possible, filled a layer early.
+- The same output: P2P on and off decode the same text.
+- Tested on one machine so far (RTX 4090, Linux 7.0, driver 595.91, Samsung PM9A1). Reports from other cards and
+  drives welcome.
+
 ### DeepSeek-V4.1 loads in 44 s, and XOLOTL_ names for every switch (7 Nov)
 
 Loading DeepSeek-V4.1 V4 with an 80 GiB RAM arena took 96 s on the 4090 box. Two things cost most of it, and both are
