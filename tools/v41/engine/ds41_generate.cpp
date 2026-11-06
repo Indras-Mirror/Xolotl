@@ -1251,7 +1251,10 @@ int main(int argc, char ** argv) {
                         }
                         return false;
                     }
-                    if (batch_dense.begin_batch(ids + c0, B, pos0 + c0)) break;
+                    if (batch_dense.begin_batch(ids + c0, B, pos0 + c0)) {
+                        if (c0 + B < n) batch_dense.engram_next(ids + c0 + B, std::min(B, n - c0 - B), pos0 + c0 + B);
+                        break;
+                    }
                     if (B > SB) {
                         std::fprintf(stderr, "ds41_generate: batch of %d did not fit (%s) - retrying at %d\n",
                                      B, dense.last_error().c_str(), std::max(SB, B / 2));
@@ -1373,6 +1376,7 @@ int main(int argc, char ** argv) {
                 const int m = std::min(NP, n - c0);
                 double t0 = now_ms();
                 if (!pipe.dense(0).begin(ids + c0, m, pos0 + c0)) { ferr = pipe.dense(0).last_error(); return false; }
+                if (c0 + m < n) pipe.dense(0).engram_next(ids + c0 + m, std::min(NP, n - c0 - m), pos0 + c0 + m);
                 Ds41Dense * cur_dense = &pipe.dense(0);
                 Ds41MoeTier * cur_tier = &pipe.tier(0);
                 int cur_st = 0;

@@ -190,6 +190,10 @@ public:
     /// ids / wts: n * n_used (token-major); *fn_host: n * n_embd floats (the routed experts' input, valid until the
     /// next call).  `fn_dev` (optional): the same activations on the backend.
     bool attn_router(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev = nullptr);
+    /// STRATA_DS41_ENGRAM_AHEAD=1: the next prompt chunk (tokens tids[0..n) at pos0), given right after this chunk's
+    /// begin() / begin_batch(): its Engram reads start once this chunk's rows are uploaded (its first Engram layer) and
+    /// become that chunk's batch if it is exactly (pos0, n); otherwise they are drained.  A no-op when off.
+    void engram_next(const int * tids, int n, int pos0);
     /// Prefetch hint for layer il of a one-token pass (call before attn_router(il)): the layer's router applied to
     /// rms_norm(hc_pre(state, pre)) * ffn_norm.weight, + the selection bias, ranked; top_ids gets n_top (<= 16).
     /// A hint only: the result does not depend on it.
