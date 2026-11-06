@@ -160,6 +160,11 @@ constexpr size_t kSlotGuard = 256;
 /// expert's rows get the same bits in any such launch, whatever its group-mates and max_rows (STRATA_MMQ_GROUP_SORT).
 /// 160 or 320 tiles per column tile on 82 SMs: yes; 108 or 128 SMs: no (stream-k splits the few-tile launches).
 bool whole_tiles(int ggml_type, int64_t w_rows, int n_experts);
+/// Whether `Context::run` on the current device would split a product's K across blocks with llama.cpp's stream-k
+/// decomposition (its fixup adds the partial sums in another order), for `n_experts` experts of [w_rows, *] weights of
+/// `ggml_type` and at most `max_rows` rows an expert: the tile width mul_mat_q_switch_J picks, the config's stream_k
+/// flag, and launch_mul_mat_q's tile-efficiency test.  False for a type MMQ does not cover.  (STRATA_IQ4_W4A8.)
+bool launch_splits_k(int ggml_type, int64_t w_rows, int64_t max_rows, int n_experts);
 /// STRATA_MMQ_DIRECT, read once: 0 (default) today's gather; 1 the guard layout and resident experts read in
 /// place; 2 the guard layout with today's gather (the bitwise A/B reference).  0 whenever !tab_built().
 int direct_mode();

@@ -2307,7 +2307,7 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     # #136: the Q2_0 pack's prompt experts on Strata's own int8 kernels (moe_fused.cu, opt-in STRATA_PF_FUSED=1; CUDA
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
-    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
+    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_iq4_w4a8.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
                 src/prefill/mmq_nvfp4_w4a8.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_quantize_cu})
     if(STRATA_EXPERIMENTAL_SM60 AND NOT STRATA_HIP_GFX906)
@@ -2558,6 +2558,14 @@ if(STRATA_NATIVE_EXPERTS)
         add_test(NAME prefill_ws_parity_test COMMAND prefill_ws_parity_test)
         set_tests_properties(prefill_ws_parity_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
       endif()
+    endif()
+    if(STRATA_BUILD_TESTS AND NOT STRATA_HIP_GFX906)
+      # STRATA_IQ4_W4A8: the IQ4 W4A8 expert kernel against MMQ, bit for bit, on the group buffers and (with
+      # STRATA_MMQ_TAB) the pointer table (exit 77 without a card or off sm_80..sm_88; gfx906: a stub, no test)
+      add_executable(prefill_iq4_w4a8_test tests/cuda/prefill_iq4_w4a8_test.cu)
+      target_link_libraries(prefill_iq4_w4a8_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME prefill_iq4_w4a8_test COMMAND prefill_iq4_w4a8_test)
+      set_tests_properties(prefill_iq4_w4a8_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     endif()
     if(STRATA_BUILD_TESTS AND _strata_mmq_tab_on)
       # STRATA_MMQ_DIRECT: the pointer-table MMQ bit for bit against the gathered MMQ (exit 77 below sm_80)
