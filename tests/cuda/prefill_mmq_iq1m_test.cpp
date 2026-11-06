@@ -3,7 +3,7 @@
 // ggml's dequantized weights.  MMQ rounds the activations to q8_1 by design, so this is a screen for the loader (grid,
 // shift, scales), layout, stride, expert-bound and row-id errors, not a bit-exactness test (Basalt: rel RMS 5.3e-3 against
 // a double reference).  Several experts per product, permuted rows, an all-zero row, and a row count that is not a
-// multiple of 128 (the fallback configs).  Run with STRATA_MMQ_IQ1M=1 (the type is opt-in at run time).
+// multiple of 128 (the fallback configs).  STRATA_MMQ_IQ1M=0 would turn the type off, so ctest sets it to 1.
 #include "strata/prefill/moe_mmq.hpp"
 
 #include "ggml.h"

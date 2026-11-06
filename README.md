@@ -18,6 +18,9 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 
 Full notes for every item: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
+- **6 Nov - +13-17 % prefill on IQ1_M layers** (QFN 45 GB: up to 3,890 tok/s at 16K on the 4090), and closer to
+  the Q8_0 parent than before. On by default (`STRATA_MMQ_IQ1M=0` turns it off), port of Basalt.
+  [Details](docs/xolotl/CHANGELOG.md#iq1_m-prompts-on-mmq-6-nov)
 - **4 Nov - faster short requests with the disk prefix cache** (#115): 9.0 s -> 0.32 s for a short request after a
   47K-token prompt, opt-in. Also the MiniMax replay fix (#116), the Basalt ports and RTX 5090 `--kv-q8` numbers (#114).
   [Details](docs/xolotl/CHANGELOG.md#prefix-cache-latency-minimax-replay-and-the-basalt-ports-4-nov)
@@ -45,7 +48,7 @@ Full notes for every item: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
 ## What one PC can do
 
-**One RTX 4090 (24 GB) · Ryzen 7 5700X · 90 GB DDR4 · one NVMe drive** (128 GB RAM since 1 Nov; the numbers below
+**One RTX 4090 (24 GB) · Ryzen 7 5700X · 90 GB DDR4 · one NVMe drive** (110 GB RAM since 1 Nov; the numbers below
 are from the 90 GB runs unless marked). Every number is measured on that machine,
 through the real server, while it solved real tasks (21 HumanEval problems, 10 tool-call tasks, 3 agentic bug-fix
 loops), greedy, thinking on with a 32K-token thinking budget.
@@ -72,6 +75,13 @@ prefill 289-297 / 395-409 tok/s at 6.1K / 16.5K; full HumanEval (164) 162/164. H
 LFM3-Omni-2B (2 Nov, `xolotl-lfm3`, alone on the card): a non-reasoning model, so thinking off; prefill 32,796 / 26,049
 tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speech out at 12x real time) - see
 [docs/LFM3.md](docs/LFM3.md). Its agentic 0/3 is the 2B model calling a tool the agent does not have.</sub>
+
+**Speed-ups since those runs** (same 4090 box; before/after on the same prompt and settings; full log in
+[docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md#speed-log)):
+
+| Date | Change | Model | Prefill before | Prefill after | Decode |
+| --- | --- | --- | ---: | ---: | --- |
+| 6 Nov | IQ1_M experts on MMQ for prompts (default on) | [Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored), 16K prompt | 3,239-3,430 tok/s | **3,796-3,890 tok/s (+13-17 %)** | within noise |
 
 **What that means in practice:**
 
@@ -179,7 +189,7 @@ numbers), [kelheor](https://github.com/kelheor) (the vision `pread` fix, #51; th
 (the thread-local CUDA stream leak, #57), [penink-WH](https://github.com/penink-WH) (AC922 rig), [cpacsm75](https://github.com/cpacsm75) (192 GB
 arena tuning on Windows, #77; the RTX 5090 arena and `--kv-q8` numbers at 256K/512K, #114) and
 [jesdga95](https://github.com/jesdga95/basalt) (Basalt: the priced stream-all prefill chunk, quoted tool calls in string
-values, union/nullable tool parameters, IQ code bytes by shift).
+values, union/nullable tool parameters, IQ code bytes by shift, IQ1_M on MMQ).
 
 *Xolotl* is Quetzalcoatl's dark twin, who carries the dead up from the underworld - as the engine carries experts up
 from RAM and NVMe. Research code from one developer, measured on one PC; reports from other hardware welcome. MIT.

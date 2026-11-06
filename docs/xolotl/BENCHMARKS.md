@@ -56,6 +56,22 @@ lowers it further (10 GiB free: 190 tok/s at 16.5K). Its decode here follows a 6
 26.8 tok/s of the short HumanEval contexts. The Qwen3.8-Flash-Next row is a freshly started server; after an hour of agent work
 (the expert cache warm) the same probe gives 3,139 tok/s at 6K and 3,903 tok/s at 16.4K.
 
+## Speed log
+
+Engine speed-ups, newest first, each measured before/after on the same box (RTX 4090, Ryzen 7 5700X, 110 GB RAM), the
+same prompt and the same settings, one change at a time. "Runs" = repeats per arm, with a second run of the old
+build as the noise control.
+
+| Date | Change | Model | Test | Before | After | Control (old build again) | Quality |
+| --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| 6 Nov | IQ1_M experts on MMQ for prompts (`STRATA_MMQ_IQ1M`, default on) | Qwen3.8-Flash-Next XQ 45 GB | 16,383-token prompt + 1,024 tokens, 3 runs | prefill 3,239 tok/s | **prefill 3,796 tok/s (+17.2 %)** | 3,281 tok/s (+1.3 %) | closer to Q8_0: prompt KL 0.224 -> 0.184 (20 prompts), top-1 90 % both |
+| 6 Nov | the same, recheck on the public build (default on vs `STRATA_MMQ_IQ1M=0`) | Qwen3.8-Flash-Next XQ 45 GB | the same, 2 runs | prefill 3,430 tok/s | **prefill 3,890 tok/s (+13.4 %)** | | |
+
+Decode for the IQ1_M rows: 130.8 / 124.5 / 127.1 tok/s (before / after / control), then 135.9 / 132.9 (before /
+after). The time per verify window was 3-4 % higher with it in both A/Bs, while a rerun of the old build alone moved 3 %:
+inside the noise of these runs, and the decode kernels are not the ones this change touches. Details:
+[CHANGELOG](CHANGELOG.md#iq1_m-prompts-on-mmq-6-nov).
+
 ## DeepSeek-V4.1 quant vs the DeepSeek API
 
 The same tasks, the same prompts, temperature 0. API = DeepSeek's `deepseek-flash` endpoint (full precision, default

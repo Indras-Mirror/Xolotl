@@ -343,12 +343,13 @@ Nvfp4Mode nvfp4_mode() {
 }
 
 #if defined(STRATA_MMQ_IQ1M)
-// STRATA_MMQ_IQ1M=1 (opt-in; Basalt 86b1e97f4, the overlay in cmake/strata_ggml_iq1m_overlay.cmake): IQ1_M experts take
-// MMQ for prompts.  The int8 tile holds the weights exactly; the activations are rounded to q8_1 as on every MMQ layer,
+// IQ1_M experts take MMQ for prompts (default on; STRATA_MMQ_IQ1M=0 restores the FP16 path / pf_wmma; Basalt 86b1e97f4,
+// the overlay in cmake/strata_ggml_iq1m_overlay.cmake).  The int8 tile holds the weights exactly; the activations are rounded to q8_1 as on every MMQ layer,
 // so the prompt's numerics on those layers change against the FP16 path / pf_wmma they ran on (Basalt: last-row KL
-// 0.00005-0.0018, top-1 the same).  Decode is unchanged.
+// 0.00005-0.0018, top-1 the same).  On QFN45 against its Q8_0 parent it lands closer than the FP16 path (prompt-path KL
+// mean 0.224 -> 0.184, 20 prompts) and prefills 17 % faster on the 4090.  Decode is unchanged.
 static bool iq1m_on() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_MMQ_IQ1M"); return e != nullptr && e[0] == '1'; }();
+    static const bool on = [] { const char* e = std::getenv("STRATA_MMQ_IQ1M"); return e == nullptr || e[0] != '0'; }();
     return on;
 }
 #endif

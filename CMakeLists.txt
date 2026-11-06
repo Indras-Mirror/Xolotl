@@ -127,7 +127,7 @@ endif()
 # HIP a code object loads on first use, so they cost other models nothing there (R9700: the same slots).  Used at run
 # time with STRATA_MMQ_KQ=1 (opt-in: it changes the prompt's rounding against the FP16 path).
 option(STRATA_MMQ_TQ_OVERLAY "Gyro trellis MMQ prompt kernels on an upstream llama.cpp: an overlay of its ggml-cuda headers written at configure time (cmake/strata_ggml_tq_overlay.cmake).  Xolotl: OFF - our pinned ggml carries its own mmq changes the overlay does not match, and no Xolotl model uses the trellis types" OFF)
-option(STRATA_MMQ_IQ1M "MMQ prompt kernels for IQ1_M experts (QFN45's gate/up in 27 of 48 layers; Basalt 86b1e97f4): an overlay of the pinned ggml-cuda headers written at configure time (cmake/strata_ggml_iq1m_overlay.cmake).  Used at run time only with STRATA_MMQ_IQ1M=1 (it changes the prompt's rounding on those layers against the FP16 path / pf_wmma)" ON)
+option(STRATA_MMQ_IQ1M "MMQ prompt kernels for IQ1_M experts (QFN45's gate/up in 27 of 48 layers; Basalt 86b1e97f4): an overlay of the pinned ggml-cuda headers written at configure time (cmake/strata_ggml_iq1m_overlay.cmake).  On at run time; STRATA_MMQ_IQ1M=0 restores the FP16 path / pf_wmma (q8_1 activations change the prompt's rounding on those layers)" ON)
 option(STRATA_MMQ_KQUANTS "Build the MMQ prompt kernels for Q4_K / Q5_K / Q5_1 / Q6_K: the experts of Unsloth's K-quant files, and on HIP the dense GGUF projections (STRATA_DENSE_MMQ)" ON)
 # Q6_K gate/up in the grouped expert kernels (Unsloth's UD-Q6_K_XL, and layer 2 of UD-Q5_K_XL; docs/QUANTS.md).  On by
 # default since MODEL-UPDATE Phase 1: one more instance per grouped kernel in iq_kernels.cu, +19 KB of sm_60 code,
@@ -2291,7 +2291,7 @@ if(STRATA_NATIVE_EXPERTS)
       if(STRATA_IQ1M_OVERLAY_OK)
         set(_strata_mmq_iq1m ON)
         set(_strata_quantize_cu ${_strata_iq1m_overlay_dir}/quantize.cu)
-        message(STATUS "IQ1_M MMQ (prompt experts, run-time opt-in STRATA_MMQ_IQ1M=1): overlay in ${_strata_iq1m_overlay_dir}")
+        message(STATUS "IQ1_M MMQ (prompt experts; STRATA_MMQ_IQ1M=0 turns it off): overlay in ${_strata_iq1m_overlay_dir}")
       endif()
     endif()
     # #136: the Q2_0 pack's prompt experts on Strata's own int8 kernels (moe_fused.cu, opt-in STRATA_PF_FUSED=1; CUDA

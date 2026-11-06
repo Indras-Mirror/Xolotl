@@ -8,6 +8,25 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### IQ1_M prompts on MMQ (6 Nov)
+
+- **IQ1_M experts take llama.cpp's MMQ kernels for prompts** (on by default, `STRATA_MMQ_IQ1M=0` restores the old path; port of
+  Basalt 86b1e97f4 by jesdga95). Upstream MMQ has IQ1_S but not IQ1_M, so the 27 IQ1_M layers of
+  [QFN 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored) ran their prompt experts
+  on the FP16 path, while its other 21 layers already took MMQ. The MMQ tile holds an IQ1_M weight exactly as int8 with
+  one scale per 16 values (IQ2_XS's tile layout), with its own loader (`src/prefill/mmq_iq1m_tiles.cuh`). The type is
+  added by a configure-time overlay of the pinned ggml-cuda headers in the build tree
+  (`cmake/strata_ggml_iq1m_overlay.cmake`); the shared llama.cpp tree is not touched, and any anchor mismatch turns the
+  overlay off. CMake option `STRATA_MMQ_IQ1M` (ON) builds it. Test: `tests/cuda/prefill_mmq_iq1m_test.cpp` (random
+  IQ1_M blocks against a double product, 0.23 % relative error).
+- **Measured on the RTX 4090**, QFN 45 GB, 16,383-token prompt + 1,024 tokens, 3 runs per arm, every arm emitting the
+  same text: prefill **3,239 -> 3,796 tok/s (+17.2 %)**; a second run of the old path gave +1.3 %. A recheck on the public build
+  (default on vs `STRATA_MMQ_IQ1M=0`, 2 runs): 3,430 -> 3,890 tok/s (+13.4 %). Decode stays within the run-to-run noise
+  (the time per verify window 3-4 % higher in both A/Bs; a rerun of the old build moved 3 %).
+- **Quality: closer to Q8_0.** Prompt-path logits on 20 prompts against the Q8_0 parent model: the old path KL mean
+  0.224 / median 0.0096 / max 1.60, IQ1_M on MMQ 0.184 / 0.0077 / 1.08, top-1 90 % on both. MMQ rounds the activations
+  to q8_1, as QFN's other 21 layers already did.
+
 ### Prefix-cache latency, MiniMax replay and the Basalt ports (4 Nov)
 
 - **Faster short requests with the disk prefix cache on** (#115, NektoDron). Opt-ins:
