@@ -123,7 +123,9 @@ def _local_texts():
                 "~/AI/QuetzaCodetl/src/**/*.ts", "~/AI/Odin/mcp-server/*.js"]:
         for p in sorted(glob.glob(os.path.expanduser(pat), recursive=True)):
             add(code, p)
-    for p in sorted(glob.glob(os.path.expanduser("~/AI/*/*.md")) + glob.glob(os.path.expanduser("~/AI/*/docs/*.md"))
+    # (the upstream README translations live in data/multilingual/ since 8 Nov 2026)
+    for p in sorted(glob.glob(os.path.expanduser("~/AI/*/*.md")) + glob.glob(os.path.expanduser("~/AI/*/data/multilingual/*.md"))
+                    + glob.glob(os.path.expanduser("~/AI/*/docs/*.md"))
                     + glob.glob(os.path.expanduser("~/AI/*/docs/**/*.md"), recursive=True)):
         if os.path.getsize(p) < 3000 or "node_modules" in p:
             continue

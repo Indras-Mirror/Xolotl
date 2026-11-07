@@ -19,15 +19,15 @@ import numpy as np  # noqa: E402
 MODEL = "/media/mal/NVME1TB/Models/DeepSeek-V4-Flash-Q2-0731.gguf"
 N = 1200
 CAL = [("cpp", "src/core/expert_cache.cpp", 0), ("py", "setup.py", 0), ("prose", "docs/ds4/ENGINE_MOE.md", 0),
-       ("json", "tests/ds4/tokenizer_golden.json", 0), ("de", "README.de.md", 0), ("zh", "README.zh-CN.md", 0),
-       ("es", "README.es.md", 0)]
+       ("json", "tests/ds4/tokenizer_golden.json", 0), ("de", "data/multilingual/README.de.md", 0), ("zh", "data/multilingual/README.zh-CN.md", 0),
+       ("es", "data/multilingual/README.es.md", 0)]
 # English + Chinese + code only (Mal's question: do non-en/zh languages own prunable experts?)
 CAL_ENZH = [("cpp", "src/core/expert_cache.cpp", 0), ("py", "setup.py", 0), ("prose", "docs/ds4/ENGINE_MOE.md", 0),
             ("json", "tests/ds4/tokenizer_golden.json", 0), ("prose2", "docs/ds4/ENGINE_DENSE.md", 0),
-            ("zh", "README.zh-CN.md", 0), ("prose3", "docs/ds4/PORT_PLAN.md", 0)]
+            ("zh", "data/multilingual/README.zh-CN.md", 0), ("prose3", "docs/ds4/PORT_PLAN.md", 0)]
 EVAL = [("cpp", "tools/ds4/ds4_moe.cpp", 0), ("py", "serve/responses.py", 0), ("prose", "docs/ds4/DSV4_ARCH_SPEC.md", 0),
-        ("de", "README.de.md", N), ("zh", "README.zh-CN.md", N), ("fr*", "README.fr.md", N), ("ja*", "README.ja.md", N),
-        ("pt*", "README.pt-BR.md", N)]
+        ("de", "data/multilingual/README.de.md", N), ("zh", "data/multilingual/README.zh-CN.md", N), ("fr*", "data/multilingual/README.fr.md", N), ("ja*", "data/multilingual/README.ja.md", N),
+        ("pt*", "data/multilingual/README.pt-BR.md", N)]
 
 
 def build(tok, spec, bos):

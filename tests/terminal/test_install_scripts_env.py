@@ -13,7 +13,7 @@ SH = ROOT / "packaging" / "install.sh"
 
 class Text(unittest.TestCase):
     def test_the_readme_one_liner_cannot_succeed_on_a_failed_download(self):
-        for name in ("README.md", "README.de.md", "docs/INSTALL.md", "docs/TERMINAL_LAUNCH.md"):
+        for name in ("README.md", "docs/INSTALL.md", "docs/TERMINAL_LAUNCH.md"):
             text = (ROOT / name).read_text(encoding="utf-8")
             self.assertNotIn("install.sh | sh", text, name)                    # `curl ... | sh` runs nothing and exits 0 when curl fails
             self.assertIn("install.sh -o install.sh && sh install.sh", text, name)
