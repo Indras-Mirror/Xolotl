@@ -18,8 +18,8 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 
 Full notes for every item: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
-- **7 Nov - DeepSeek-V4.1 fast mode (opt-in): +27 % decode for under a point of quality** (26 -> 33 tok/s on the 4090,
-  short34 top-1 86.2 % vs 87.0 %, Gauntlet 8/12 in both modes). A 2-bit (Q2_K) copy of the biggest experts in a sidecar file.
+- **7 Nov - DeepSeek-V4.1 fast mode (opt-in): 41 tok/s decode on real agent tasks, against 32.6 normally** (+26 %, the
+  Gauntlet on the 4090), solving the same tasks (8/12 in both modes); short34 top-1 86.2 % vs 87.0 %. A 2-bit (Q2_K) copy of the biggest experts in a sidecar file.
   [Fast mode](#fast-mode-deepseek-v41)
 - **7 Nov - Xolotl Direct (Linux, experimental, opt-in): NVMe straight into VRAM on a GeForce card.** Experts read
   from the drive skip system RAM: one expert 11 -> 3.1 ms, zero RAM-bus traffic, the same output. With the
@@ -69,10 +69,16 @@ DeepSeek-V4.1's decode speed is set by how many expert bytes cross the RAM bus a
 keeps a 2-bit (Q2_K) copy of the two biggest expert formats (the MXFP4 and Q3_K experts, about half of those bytes)
 in a sidecar file and reads that instead. The model file is not changed, and turning it off is unsetting one variable.
 
+**On real agent work it decodes at 41.1 tok/s against 32.6 in normal mode (+26 %), and solves the same tasks.** Both
+numbers are decode during the Gauntlet's coding tasks below (speculative drafts land more often on code); on a fixed
+8K-prompt probe it is 33.0 vs 26.1 tok/s.
+
 | RTX 4090, V4, 8K prompt | decode | short34 top-1 | short34 NLL |
 |---|---|---|---|
 | normal | 26.1 tok/s | 87.01 % | 0.512 |
 | **fast** | **33.0 tok/s (+27 %)** | **86.16 %** | **0.540** |
+
+<sub>Decode here = the 8K-prompt probe; short34 = agreement with the full model's next token over our 34-text set.</sub>
 
 ```bash
 build-xolotl/ds41_generate -m V41-XQ-1017-v4.gguf --build-shadow /nvme/V4.fast.x41s   # once, ~30 min CPU, ~40 GB
@@ -129,7 +135,7 @@ tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speec
 
 | Date | Change | Model | Prefill before | Prefill after | Decode |
 | --- | --- | --- | ---: | ---: | --- |
-| 7 Nov | [Fast mode](#fast-mode-deepseek-v41): 2-bit (Q2_K) copy of the biggest experts (**opt-in, lossy**: short34 top-1 87.0 -> 86.2 %) | [DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored), 8K prompt | | | **26.1 -> 33.0 tok/s (+27 %)** |
+| 7 Nov | [Fast mode](#fast-mode-deepseek-v41): 2-bit (Q2_K) copy of the biggest experts (**opt-in, lossy**: short34 top-1 87.0 -> 86.2 %) | [DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored), agent tasks / 8K prompt | | | **32.6 -> 41.1 tok/s on agent tasks (+26 %)**; 26.1 -> 33.0 on the 8K probe |
 | 6 Nov | RTX 40 (sm_89) speed switches (default on) | [Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored), 16K prompt | 4,054 tok/s | 4,069 tok/s (same) | **139 -> 150 tok/s (+8 %)** |
 | 6 Nov | Engram read-ahead + late shared expert (default on) | [DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored), 26.6K prompt / 8K decode | 456 tok/s | **506 tok/s (+11 %)** | **25.7 -> 26.5 tok/s (+2.7 %)** |
 | 6 Nov | IQ1_M experts on MMQ for prompts (default on) | [Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored), 16K prompt | 3,239-3,430 tok/s | **3,796-3,890 tok/s (+13-17 %)** | within noise |
@@ -154,7 +160,8 @@ More cards, AMD and Intel included: [docs/COMMUNITY_BENCHMARKS.md](docs/COMMUNIT
   carries up the experts each token needs.
 - **Fast where it counts.** The Qwen models run at 100-200 tok/s; an agent's small follow-up turn on DeepSeek-V4.1
   costs ~8 s on a 6K-16K context, and the engine learns the conversation's experts between turns. When speed matters
-  more than the last bit of quality, DeepSeek-V4.1's [fast mode](#fast-mode-deepseek-v41) decodes ~27 % faster.
+  more than the last bit of quality, DeepSeek-V4.1's [fast mode](#fast-mode-deepseek-v41) decodes at 41 tok/s on agent tasks
+  (32.6 normally).
 
 ## Quick start
 
