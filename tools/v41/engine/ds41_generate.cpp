@@ -336,6 +336,61 @@ double log_softmax_at(const float * lg, int nv, int tok) {
     return (double) lg[tok] - mx - std::log(z);
 }
 
+// STRATA_IMATRIX_OUT accumulator (see the tap in pass_m).  File scope because the serve loop leaves through std::_Exit
+// (static destructors never run): save() is called explicitly before it.
+struct ImatAcc {
+    std::string path; int nl = 0, ne = 0, nd = 0; bool init = false, off = false;
+    std::vector<std::vector<float>> s; std::vector<double> c;
+    bool on() {
+        if (off) return false;
+        if (!init) {
+            const char * e = std::getenv("STRATA_IMATRIX_OUT");
+            if (!e || !*e) { off = true; return false; }
+            path = e;
+        }
+        return true;
+    }
+    template <class Geom> void add(int64_t l, int m, int top_k, int64_t n_embd, const float * fn, const int * ids, const Geom & TG) {
+        if (!init) {
+            nl = (int) TG.n_layers; ne = (int) TG.n_experts; nd = (int) n_embd;
+            s.resize((size_t) nl * ne); c.assign((size_t) nl * ne, 0.0); init = true;
+            std::fprintf(stderr, "imatrix: collecting per-expert input x^2 -> %s (written at exit)\n", path.c_str());
+        }
+        for (int t = 0; t < m; ++t) {
+            const float * x = fn + (size_t) t * n_embd;
+            for (int k = 0; k < top_k; ++k) {
+                const int e = ids[(size_t) t * top_k + k];
+                if (l < 0 || l >= nl || e < 0 || e >= ne) continue;
+                auto & sv = s[(size_t) l * ne + e];
+                if (sv.empty()) sv.assign((size_t) nd, 0.0f);
+                for (int64_t q = 0; q < nd; ++q) sv[(size_t) q] += x[q] * x[q];
+                c[(size_t) l * ne + e] += 1.0;
+            }
+        }
+    }
+    void save() {
+        if (!init || path.empty()) return;
+        std::FILE * f = std::fopen((path + ".tmp").c_str(), "wb");
+        if (!f) { std::fprintf(stderr, "imatrix: cannot write %s.tmp\n", path.c_str()); return; }
+        std::fwrite("X41IMAT1", 1, 8, f);
+        const int32_t h[3] = { nl, ne, nd };
+        std::fwrite(h, 4, 3, f);
+        long n = 0;
+        for (int i = 0; i < nl * ne; ++i) {
+            if (c[(size_t) i] <= 0) continue;
+            const int32_t le[2] = { i / ne, i % ne };
+            std::fwrite(le, 4, 2, f);
+            std::fwrite(&c[(size_t) i], 8, 1, f);
+            std::fwrite(s[(size_t) i].data(), 4, (size_t) nd, f);
+            ++n;
+        }
+        const bool ok = std::fclose(f) == 0 && std::rename((path + ".tmp").c_str(), path.c_str()) == 0;
+        std::fprintf(stderr, "imatrix: %ld experts %s %s\n", n, ok ? "written to" : "FAILED to write", path.c_str());
+        init = false;   // once
+    }
+};
+ImatAcc g_imat;
+
 // Xolotl names for the engine's switches: every XOLOTL_<X> in the environment is copied onto STRATA_<X> before anything
 // reads it (the Xolotl name wins when both are set), so XOLOTL_ARENA_PIN_AFTER=0 == STRATA_ARENA_PIN_AFTER=0.  The
 // STRATA_* names keep working unchanged; the code reads only STRATA_* (upstream Strata syncs stay conflict-free).
@@ -1151,51 +1206,7 @@ int main(int argc, char ** argv) {
             // importance matrix --build-shadow can weight its scale search with (STRATA_SHADOW_IMATRIX).  Decode-side passes
             // only (verify + prompts <= 768 tokens).  Written at exit: "X41IMAT1", i32 n_layers, n_experts, n_embd, then per
             // (layer, expert) with a count: i32 layer, i32 expert, f64 count, f32[n_embd] sums.
-            {
-                static const char * im_out = std::getenv("STRATA_IMATRIX_OUT");
-                struct IMat {
-                    std::string path; int nl = 0, ne = 0, nd = 0;
-                    std::vector<std::vector<float>> s; std::vector<double> c;
-                    ~IMat() {
-                        if (path.empty()) return;
-                        std::FILE * f = std::fopen(path.c_str(), "wb");
-                        if (!f) { std::fprintf(stderr, "imatrix: cannot write %s\n", path.c_str()); return; }
-                        std::fwrite("X41IMAT1", 1, 8, f);
-                        const int32_t h[3] = { nl, ne, nd };
-                        std::fwrite(h, 4, 3, f);
-                        long n = 0;
-                        for (int i = 0; i < nl * ne; ++i) {
-                            if (c[(size_t) i] <= 0) continue;
-                            const int32_t le[2] = { i / ne, i % ne };
-                            std::fwrite(le, 4, 2, f);
-                            std::fwrite(&c[(size_t) i], 8, 1, f);
-                            std::fwrite(s[(size_t) i].data(), 4, (size_t) nd, f);
-                            ++n;
-                        }
-                        std::fclose(f);
-                        std::fprintf(stderr, "imatrix: %ld experts written to %s\n", n, path.c_str());
-                    }
-                };
-                static IMat im;
-                if (im_out && *im_out) {
-                    if (im.path.empty()) {
-                        im.path = im_out; im.nl = (int) TG.n_layers; im.ne = (int) TG.n_experts; im.nd = (int) n_embd;
-                        im.s.resize((size_t) im.nl * im.ne);
-                        im.c.assign((size_t) im.nl * im.ne, 0.0);
-                    }
-                    for (int t = 0; t < m; ++t) {
-                        const float * x = fn + (size_t) t * n_embd;
-                        for (int k = 0; k < top_k; ++k) {
-                            const int e = mids[(size_t) t * top_k + k];
-                            if (l < 0 || l >= im.nl || e < 0 || e >= im.ne) continue;
-                            auto & sv = im.s[(size_t) l * im.ne + e];
-                            if (sv.empty()) sv.assign((size_t) n_embd, 0.0f);
-                            for (int64_t c = 0; c < n_embd; ++c) sv[(size_t) c] += x[c] * x[c];
-                            im.c[(size_t) l * im.ne + e] += 1.0;
-                        }
-                    }
-                }
-            }
+            if (g_imat.on()) g_imat.add(l, m, top_k, n_embd, fn, mids.data(), TG);
             if (rdev && !no_tier_batch) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
                 // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (16: a depth-4 pass and a 16-row
@@ -3816,6 +3827,7 @@ int main(int argc, char ** argv) {
         // on it until the client closes the pipe - leave without the static destructors
         std::fflush(stdout);
         std::fflush(stderr);
+        g_imat.save();   // STRATA_IMATRIX_OUT (static destructors do not run past _Exit)
         std::_Exit(0);
     }
 
