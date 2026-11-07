@@ -241,6 +241,19 @@ UD-Q2_K_XL is closer to the model on this text and slower, as its 39 GiB more ex
 and RAM. One text and one run each, not a benchmark; Unsloth's own KLD for UD-Q2_K_XL is on their
 [model page](https://unsloth.ai/docs/models/deepseek-v4.1-flash).
 
+### Fast mode (opt-in, lossy, 7 Nov)
+
+For the 1017 V4 build: a sidecar file with a 2-bit (Q2_K) copy of every MXFP4 and Q3_K expert, about half the bytes
+that cross the RAM bus and the NVMe drive per token. The engine reads that copy instead; the model file is not
+changed. RTX 4090, 8K prompt: decode **26.1 -> 33.0 tok/s (+27 %)**, short34 top-1 87.01 -> 86.16 %, NLL 0.512 -> 0.540.
+
+```bash
+build-xolotl/ds41_generate -m V41-XQ-1017-v4.gguf --build-shadow /nvme/V4.fast.x41s   # once: ~30 min CPU, ~40 GB
+XOLOTL_SHADOW=$(cat /nvme/V4.fast.x41s.list)  <your usual serve command>             # unset it to turn it off
+```
+
+Build, switches, the importance matrix and what else was tried: [docs/XOLOTL_FAST.md](XOLOTL_FAST.md).
+
 ### Serving it (OpenAI + Anthropic API, tool calls)
 
 ```bash

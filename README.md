@@ -119,6 +119,7 @@ tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speec
 
 | Date | Change | Model | Prefill before | Prefill after | Decode |
 | --- | --- | --- | ---: | ---: | --- |
+| 7 Nov | [Fast mode](#fast-mode-deepseek-v41): 2-bit (Q2_K) copy of the biggest experts (**opt-in, lossy**: short34 top-1 87.0 -> 86.2 %) | [DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored), 8K prompt | | | **26.1 -> 33.0 tok/s (+27 %)** |
 | 6 Nov | RTX 40 (sm_89) speed switches (default on) | [Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored), 16K prompt | 4,054 tok/s | 4,069 tok/s (same) | **139 -> 150 tok/s (+8 %)** |
 | 6 Nov | Engram read-ahead + late shared expert (default on) | [DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored), 26.6K prompt / 8K decode | 456 tok/s | **506 tok/s (+11 %)** | **25.7 -> 26.5 tok/s (+2.7 %)** |
 | 6 Nov | IQ1_M experts on MMQ for prompts (default on) | [Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored), 16K prompt | 3,239-3,430 tok/s | **3,796-3,890 tok/s (+13-17 %)** | within noise |
@@ -142,7 +143,8 @@ More cards, AMD and Intel included: [docs/COMMUNITY_BENCHMARKS.md](docs/COMMUNIT
 - **No server farm.** The weights (152 GiB for DeepSeek-V4.1) live across VRAM, pinned RAM and NVMe; the engine
   carries up the experts each token needs.
 - **Fast where it counts.** The Qwen models run at 100-200 tok/s; an agent's small follow-up turn on DeepSeek-V4.1
-  costs ~8 s on a 6K-16K context, and the engine learns the conversation's experts between turns.
+  costs ~8 s on a 6K-16K context, and the engine learns the conversation's experts between turns. When speed matters
+  more than the last bit of quality, DeepSeek-V4.1's [fast mode](#fast-mode-deepseek-v41) decodes ~27 % faster.
 
 ## Quick start
 
@@ -162,7 +164,8 @@ Get a model:
 - **DeepSeek-V4.1-Flash:** the **[1017 builds](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)**
   of the October checkpoint (V4 recommended, with `v4/rank-1017-v4.bin`), or the earlier
   [GSQ build](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored) (152 GiB, mixed ternary /
-  2-bit / 3-bit). Both cards have the download and Engram steps.
+  2-bit / 3-bit). Both cards have the download and Engram steps. Optional for V4: the
+  [fast-mode](#fast-mode-deepseek-v41) sidecar (~40 GB), built once with `ds41_generate --build-shadow`.
 - **Qwen3.8-Flash-Next:** **[XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored)**
   (the two `.gguf` shards plus `pack-qfn45/`).
 
@@ -170,6 +173,7 @@ Then serve it (edit the model paths in the DeepSeek and GLM configs first):
 
 ```bash
 python3 tools/v41/serve/serve_ds41.py --engine strata --config tools/v41/serve/strata-ds41.json --port 8150           # DeepSeek-V4.1-Flash
+XOLOTL_SHADOW=$(cat /nvme/V4.fast.x41s.list) python3 tools/v41/serve/serve_ds41.py ...                                # the same in fast mode (V4)
 python3 tools/glm/serve/serve_glm.py  --engine strata --config tools/glm/serve/strata-glm-maya-abl-512k.json --port 8144  # GLM-5.3-Flash
 ./scripts/xol-qfn.sh --serve-only --model <shard 1 .gguf> --pack <pack-qfn45>                                       # Qwen3.8-Flash-Next (port 8099)
 python3 -m serve.server --engine strata --config <your-27b.json> --port 8090                                          # Qwen3.8-27B (exe: build-xolotl/strata-dense)
@@ -191,7 +195,8 @@ What I've measured is one setup: **RTX 4090 (24 GB), 90 GB DDR4, Linux, NVMe**. 
   prefill will be slower. Below 16 GB won't work.
 - **RAM:** 90 GB here, with a 64 GB expert cache in RAM. Less RAM means a smaller cache, so more experts come off the
   NVMe each token and decode is slower. More RAM helps: around 256 GB holds every expert.
-- **Disks:** about 152 GiB for the quant plus ~200 GB for the Engram tables. Both want a fast NVMe on ext4 or NTFS.
+- **Disks:** about 152 GiB for the quant plus ~200 GB for the Engram tables, and ~40 GB more for the optional fast
+  mode. All of it wants a fast NVMe on ext4 or NTFS.
   **Not exFAT** (Linux's exFAT driver serialises parallel reads; expert reads were 5x slower here) and not a hard
   drive (the Engram lookups are ~48 small random reads per token).
 
@@ -201,7 +206,8 @@ A mixture-of-experts model only uses a few experts per token. Xolotl keeps every
 VRAM, tens of GiB in a pinned RAM arena the GPU reads by DMA, the rest on NVMe read at the drive's ceiling - and
 moves the ones each token's router asks for, a layer ahead. Each model adds its own tricks: DeepSeek-V4.1 gets a
 calibrated mixed-precision quantisation, speculative decoding with exact sampling, a bit-exact 4-bit KV cache for 512K
-context and an arena that adapts to the conversation; GLM-5.3-Flash gets its abliteration LoRA on every path and soft
+context, an arena that adapts to the conversation, an opt-in fast mode that reads a 2-bit copy of its biggest experts,
+and Xolotl Direct, which lets the NVMe drive write experts straight into VRAM; GLM-5.3-Flash gets its abliteration LoRA on every path and soft
 pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up](docs/xolotl/HOW_IT_WORKS.md).**
 
 ## Read more
@@ -212,6 +218,7 @@ pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up
 | [Benchmarks](docs/xolotl/BENCHMARKS.md) | every measured number, exactness checks, how to measure your own PC |
 | [Changelog](docs/xolotl/CHANGELOG.md) | everything that landed, newest first, with the PR numbers and who did it |
 | [DeepSeek-V4.1-Flash engine](docs/DEEPSEEK_V41.md) | GSQ quantisation, DSpark, the fp4 KV cache, Engram |
+| [DeepSeek-V4.1 fast mode](docs/XOLOTL_FAST.md) | the 2-bit expert sidecar: build, serve, switches, what it costs and what we tried |
 | [DeepSeek-V4.1 on Windows](docs/WINDOWS.md) | native MSVC + CUDA build, configs, RTX 50 notes |
 | [GLM-5.3-Flash engine](docs/glm) | KDA + MLA attention, the LoRA on routed experts, soft pruning |
 | [LFM3-Omni engine](docs/LFM3.md) | pictures, audio, video and speech on a 2B model, park/unpark beside a big one |
