@@ -1,6 +1,6 @@
 # tools/xolotl/apparmor/xolotl-engines - the Xolotl engines get no internet sockets (AppArmor 4, Linux).
 #
-# The engines (strata, xolotl-dense, ds41_generate, glm_generate, xolotl-lfm3, strata-vision) talk to the server only
+# The engines (strata, xolotl-dense, ds41_generate, glm_generate, strata-vision) talk to the server only
 # through stdin / stdout and link no network library, so this changes nothing they do. It is defence in depth: if a
 # crafted model file ever exploited a parser bug, the process still could not open a connection anywhere. The Python
 # server (serve/) is not confined: it has to listen on 127.0.0.1 for your apps.
@@ -11,12 +11,13 @@
 # Check: start any model, then   cat /proc/$(pgrep -x xolotl-dense)/attr/current   -> "xolotl-engine (enforce)"
 # Remove: sudo apparmor_parser -R /etc/apparmor.d/xolotl-engines && sudo rm /etc/apparmor.d/xolotl-engines
 #
-# The attachment matches the engine names in any checkout's build-xolotl/ or build-vision/bin/.
+# The attachment matches the engine names in any checkout's build-xolotl/ or build-vision/bin/. xolotl-lfm3 is left
+# out: next to another model it calls that server's /v1/vram on localhost (park / unpark), which needs a TCP socket.
 
 abi <abi/4.0>,
 include <tunables/global>
 
-profile xolotl-engine /**/build-{xolotl,vision/bin}/{strata,xolotl-dense,strata-dense,ds41_generate,glm_generate,ds4_generate,xolotl-lfm3,strata-vision} {
+profile xolotl-engine /**/build-{xolotl,vision/bin}/{strata,xolotl-dense,strata-dense,ds41_generate,glm_generate,ds4_generate,strata-vision} {
   # everything an engine does: files (model, packs, caches, logs), /dev/nvidia*, raw block reads of Engram, pinned
   # memory, threads, signals, CUDA's IPC (MPS) over unix sockets
   file,

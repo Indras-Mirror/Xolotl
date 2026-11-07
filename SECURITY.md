@@ -20,10 +20,12 @@ protections apply.
 A model file (GGUF) is weights and metadata: Xolotl's C++ engines read it as data, and nothing in it runs as code.
 Checked on 8 Nov 2026:
 
-- **The engines have no network code.** `strata`, `xolotl-dense`, `ds41_generate`, `glm_generate` and `xolotl-lfm3`
-  link no network library (no curl, no TLS) and open no internet socket: they talk to the server only through
-  stdin / stdout. Watched while the 27B worked through agent tasks: zero inet sockets.
-  `tools/xolotl/apparmor/xolotl-engines` makes that a rule the kernel enforces (one `sudo` to install).
+- **The engines have no network code.** `strata`, `xolotl-dense`, `ds41_generate` and `glm_generate` link no network
+  library (no curl, no TLS) and open no internet socket: they talk to the server only through stdin / stdout. Watched
+  while the 27B worked through agent tasks: zero inet sockets. `tools/xolotl/apparmor/xolotl-engines` makes that a
+  rule the kernel enforces (one `sudo` to install). The one exception is `xolotl-lfm3`: next to another model
+  (`--peer-vram`) it runs `curl` to that server's `/v1/vram` on localhost to share the GPU, so it is left out of the
+  profile.
 - **The server listens on `127.0.0.1`** unless you pass `--host`. It connects out only to what you configure (MCP
   servers in the run config, a voice backend) and to an image URL that a client request contains. Remote JSON-schema
   `$ref`s are never fetched. Chat templates from model files render in Jinja's immutable sandbox. Nothing loads
