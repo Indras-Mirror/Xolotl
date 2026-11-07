@@ -564,10 +564,9 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
     dense_positions_i32(pos_dev, n * HK, HK, pos0, s);
     native_rope_apply(kcur, kcur, n * HK, D, c.n_rot, rope, pos_dev, s);
     dense_kv_append_rows_fmt(kc, vc, kfmt, vfmt, kcur, vcur, n, pos0, HK, D, (int) max_context, s);
-    for (int j = 0; j < n; ++j) {
-        dense_attn_decode_fmt(qcur + (size_t) j * H * D, kc, vc, kfmt, vfmt, attn + (size_t) j * H * D, attn_scratch,
-                              H, HK, D, pos0 + j + 1, (int) max_context, scale, s);
-    }
+    // xolotl: every column in one launch (the cache is read once per window, not once per column); a column gets the
+    // same bits alone as inside a window, so single steps and verified columns agree
+    dense_attn_decode_multi_fmt(qcur, kc, vc, kfmt, vfmt, attn, attn_scratch, H, HK, D, pos0 + 1, n, (int) max_context, scale, s);
     dense_gate_apply(attn, q_full, attn32, n * H, H, D, s);
     }
     quantize(attn32, H * D, n, s);
@@ -888,9 +887,11 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                                       (uint64_t) C * (cfg_.ssm_d_conv - 1) * 4;     // one snapshot of one GDN layer
             const uint64_t tap_bytes = opt.taps.empty() ? 0 :
                 (uint64_t) (NC + DenseModel::kTapRing) * opt.taps.size() * (uint64_t) cfg_.n_embd * 4;
+            // the decode attention's partials: one region per column of a window (the extra NC - 1, ~19 MB each at 200K)
+            const uint64_t scratch_extra = (uint64_t) (NC - 1) * dense_attn_scratch_bytes(cfg_.n_head, cfg_.head_dim, (int) max_context);
             auto reserved_for = [&](bool mtp) {
                 return (uint64_t) (n_attn + (mtp ? 1 : 0)) * kv_per_layer +
-                       ((mtp || opt.spec_snapshots) ? (uint64_t) n_gdn * snap_one * (uint64_t) draft_max : 0) + tap_bytes;
+                       ((mtp || opt.spec_snapshots) ? (uint64_t) n_gdn * snap_one * (uint64_t) draft_max : 0) + tap_bytes + scratch_extra;
             };
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
@@ -1081,7 +1082,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                   I.alloc(&I.attn, K * H * D * f, err, "attn") && I.alloc(&I.attn32, K * H * D * f, err, "attn32") &&
                   I.alloc(&I.ffn_g, K * cfg_.n_ff * f, err, "ffn_g") && I.alloc(&I.ffn_u, K * cfg_.n_ff * f, err, "ffn_u") &&
                   I.alloc(&I.ffn_h, K * cfg_.n_ff * f, err, "ffn_h") && I.alloc(&I.logits, K * cfg_.n_vocab * f, err, "logits") &&
-                  I.alloc(&I.attn_scratch, dense_attn_scratch_bytes(H, D, (int) max_context), err, "attention scratch") &&
+                  I.alloc(&I.attn_scratch, (uint64_t) NC * dense_attn_scratch_bytes(H, D, (int) max_context), err, "attention scratch") &&
                   // one position per row of a full NC-column pass: the attention's RoPE is batched over the columns
                   I.alloc(&I.pos_dev, K * (uint64_t) std::max(H, HK) * 4, err, "positions") &&
                   I.alloc(&I.hid, K * E * f, err, "hidden") && I.alloc(&I.h_last, (uint64_t) E * f, err, "last hidden") &&

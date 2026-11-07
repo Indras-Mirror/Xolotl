@@ -69,6 +69,13 @@ void dense_attn_decode_fmt(const float* q, const void* k_cache, const void* v_ca
                            float* scratch, int n_head, int n_kv, int head_dim, int n_ctx, int max_ctx, float scale,
                            void* stream);
 
+/// xolotl: dense_attn_decode_fmt for the n (1..8) columns of a verify window in one launch: q / out are
+/// [n][n_head][head_dim], column c attends over cells [0, n_ctx0 + c).  The scratch must hold n times
+/// dense_attn_scratch_bytes(...).  A column's result does not depend on n (single steps match window columns).
+void dense_attn_decode_multi_fmt(const float* q, const void* k_cache, const void* v_cache, int k_fmt, int v_fmt,
+                                 float* out, float* scratch, int n_head, int n_kv, int head_dim, int n_ctx0, int n,
+                                 int max_ctx, float scale, void* stream);
+
 /// Bytes of scratch dense_attn_decode needs for a cache of `max_ctx` cells.
 uint64_t dense_attn_scratch_bytes(int n_head, int head_dim, int max_ctx);
 
