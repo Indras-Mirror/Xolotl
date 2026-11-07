@@ -245,8 +245,10 @@ public:
     /// Writes an expert sidecar (STRATA_SHADOW): every expert whose gate/up type is in `from_gu`, re-quantized to
     /// `to_gu` / `to_d` (row by row through float), into `out` (via out.tmp, renamed when complete).  The model file is only
     /// read.  `threads` workers.  Prints the relative error per source type.  False with `err` on failure.
+    /// `skip` (optional, n_layers x n_experts): experts that stay exact (not in the sidecar) - e.g. the top of the rank,
+    /// the set the VRAM cache holds (STRATA_SHADOW_SKIP_TOP).
     bool build_shadow(const std::string& out, const std::vector<int>& from_gu, int to_gu, int to_d, int threads,
-                      std::string& err) const;
+                      std::string& err, const std::vector<char>* skip = nullptr) const;
 
 private:
     struct Span { uint64_t off = 0, bytes = 0; };

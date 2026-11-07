@@ -8094,7 +8094,7 @@ void Ds41FileBlobs::advise(int64_t layer, int64_t expert) const {
 }
 
 bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>& from, int to_gu, int to_d, int threads,
-                                 std::string& err) const {
+                                 std::string& err, const std::vector<char>* skip) const {
     // Per expert and ROLE: a role whose type is in `from` is re-quantized to the target (gate/up -> to_gu, down -> to_d),
     // any other role is copied byte for byte.  Experts with no role in `from` are not in the sidecar.  The resulting
     // (gate/up, down) pairs each get their own file: `out` for (to_gu, to_d), `out.g<gu>d<d>` for the others; `out.list`
@@ -8119,6 +8119,7 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
         for (int64_t e = 0; e < NE; ++e) {
             const int c = g_.cls(l, e), sg = g_.cls_gu[(size_t) c], sd = g_.cls_d[(size_t) c];
             if (!in_from(sg) && !in_from(sd)) continue;
+            if (skip && (size_t) (l * NE + e) < skip->size() && (*skip)[(size_t) (l * NE + e)]) continue;   // stays exact
             const int rg = in_from(sg) ? to_gu : sg, rd = in_from(sd) ? to_d : sd;
             size_t gi = 0;
             while (gi < grp.size() && !(grp[gi].gu == rg && grp[gi].d == rd)) ++gi;

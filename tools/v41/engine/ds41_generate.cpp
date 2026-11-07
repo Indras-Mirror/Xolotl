@@ -373,7 +373,25 @@ int main(int argc, char ** argv) {
         std::vector<int> from = parse_csv(std::getenv("STRATA_SHADOW_FROM") ? std::getenv("STRATA_SHADOW_FROM") : "39,11");
         const int to = std::getenv("STRATA_SHADOW_TYPE") ? std::atoi(std::getenv("STRATA_SHADOW_TYPE")) : 42;
         const int th = std::getenv("STRATA_SHADOW_THREADS") ? std::max(1, std::atoi(std::getenv("STRATA_SHADOW_THREADS"))) : 16;
-        if (!src.build_shadow(a.build_shadow, from, to, to, th, err)) { std::fprintf(stderr, "ds41_generate: build-shadow: %s\n", err.c_str()); return 1; }
+        // STRATA_SHADOW_SKIP_TOP=<n> (with --rank): the n best-ranked experts stay exact - the hot set the VRAM cache holds,
+        // so the shadow only replaces experts served from the RAM arena / the NVMe file tier (the slow lanes)
+        std::vector<char> skip;
+        if (const char * st = std::getenv("STRATA_SHADOW_SKIP_TOP"); st && std::atoi(st) > 0) {
+            if (a.rank.empty()) { std::fprintf(stderr, "ds41_generate: STRATA_SHADOW_SKIP_TOP needs --rank\n"); return 2; }
+            const std::vector<std::pair<int32_t, int32_t>> rk = ds41_read_ranked(a.rank, err);
+            if (rk.empty()) { std::fprintf(stderr, "ds41_generate: --rank: %s\n", err.c_str()); return 1; }
+            const Ds41MoeGeom & sg = src.geom();
+            skip.assign((size_t) (sg.n_layers * sg.n_experts), 0);
+            int n = 0;
+            for (const auto & le : rk) {
+                if (n >= std::atoi(st)) break;
+                if (le.first < 0 || le.first >= sg.n_layers || le.second < 0 || le.second >= sg.n_experts) continue;
+                char & k = skip[(size_t) (le.first * sg.n_experts + le.second)];
+                if (!k) { k = 1; ++n; }
+            }
+            std::fprintf(stderr, "build-shadow: the %d best-ranked experts stay exact (%s)\n", n, a.rank.c_str());
+        }
+        if (!src.build_shadow(a.build_shadow, from, to, to, th, err, skip.empty() ? nullptr : &skip)) { std::fprintf(stderr, "ds41_generate: build-shadow: %s\n", err.c_str()); return 1; }
         return 0;
     }
     if (!a.build_mirror.empty()) {   // the second-drive blob mirror (STRATA_BLOB_MIRROR): coldest experts first
