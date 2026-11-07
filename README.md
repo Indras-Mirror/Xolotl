@@ -58,7 +58,7 @@ served. Decode is the generation speed during those tasks.
 | ----------------------------------------------------------------------------------------------------------------- | --------- | :----------: | :------------: | :-------------: | :-----: | :-------: |
 | **[DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)**     | 552B MoE  |     4.99     |      32.6      |     289-409     |   512K  |    4.49   |
 | **DeepSeek-V4.1 V4, [fast mode](#fast-mode-deepseek-v41)**                                                        | 552B MoE  |     4.99     |      41.1      |    measuring    |   512K  |     -     |
-| **GLM-5.3-Flash**                                                                                                 | 320B MoE  |   running    |    running     |     312-450     |   512K  |    5.87   |
+| **GLM-5.3-Flash**                                                                                                 | 320B MoE  |   to come    |    to come     |     312-450     |   512K  |    5.87   |
 | **[Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored)** | 125B MoE  |     4.49     |      157       |   3,800-4,070   |   200K  |    3.90   |
 | **Qwen3.8-27B**                                                                                                   | 27B dense |     4.47     |       89       |   1,240-1,390   |   200K  |    4.47   |
 
