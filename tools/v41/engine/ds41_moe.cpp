@@ -7579,14 +7579,18 @@ uint64_t shadow_blob(int gt, int dt, int64_t D, int64_t FF) {
 // V4's experts).  Here, per 64-value block: both signs of d (a negative d puts the 2x level on the negative side) x 12
 // scale ratios, nearest level, then d refitted by least squares for that assignment; the lowest squared error wins.
 // Same block_q2_0 bytes (fp16 d, 2-bit codes q = level + 1, 4 per byte, low bits first) - ggml's dequantizer reads it.
-void shadow_q2_0_row(const float* x, uint8_t* out, int64_t n) {
+void shadow_q2_0_row(const float* x, uint8_t* out, int64_t n, const float* wt = nullptr) {
+    // wt (optional, n values): per-column importance (the imatrix: mean x^2 of that input channel) - the error is
+    // sum_j wt_j (x_j - d q_j)^2, so the channels the expert's inputs actually use are fitted closer
     constexpr int QK = 64;
     for (int64_t b = 0; b < n / QK; ++b) {
         const float* v = x + b * QK;
+        float wv[QK];
+        for (int j = 0; j < QK; ++j) wv[j] = wt ? wt[b * QK + j] : 1.0f;
         float amax = 0;
         for (int j = 0; j < QK; ++j) amax = std::max(amax, std::fabs(v[j]));
         float best_d = 0, best_e = 0;
-        for (int j = 0; j < QK; ++j) best_e += v[j] * v[j];   // d = 0: everything 0
+        for (int j = 0; j < QK; ++j) best_e += wv[j] * v[j] * v[j];   // d = 0: everything 0
         uint8_t q[QK], bq[QK];
         std::fill(bq, bq + QK, (uint8_t) 1);
         if (amax > 0) {
@@ -7599,13 +7603,13 @@ void shadow_q2_0_row(const float* x, uint8_t* out, int64_t n) {
                         int l = (int) std::lround(v[j] * id);
                         l = std::min(2, std::max(-1, l));
                         q[j] = (uint8_t) (l + 1);
-                        sxq += v[j] * (float) l;
-                        sqq += (float) (l * l);
+                        sxq += wv[j] * v[j] * (float) l;
+                        sqq += wv[j] * (float) (l * l);
                     }
                     if (sqq <= 0) continue;
-                    const float d = sxq / sqq;   // least squares for this assignment
+                    const float d = sxq / sqq;   // (weighted) least squares for this assignment
                     float e = 0;
-                    for (int j = 0; j < QK; ++j) { const float t = v[j] - d * (float) ((int) q[j] - 1); e += t * t; }
+                    for (int j = 0; j < QK; ++j) { const float t = v[j] - d * (float) ((int) q[j] - 1); e += wv[j] * t * t; }
                     if (e < best_e) { best_e = e; best_d = d; std::memcpy(bq, q, QK); }
                 }
         }
@@ -8162,6 +8166,52 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
         std::memcpy(h.data() + sizeof H, G.ent.data(), G.ent.size() * sizeof(ShadowEnt));
         if (!wr(G.fd, h.data(), G.data, 0)) { cleanup(); err = "header write failed"; return false; }
     }
+    // STRATA_SHADOW_IMATRIX=<file> (X41IMAT1 from STRATA_IMATRIX_OUT): per (layer, expert) gate/up input-channel weights
+    // (mean x^2, + 1e-3 x the expert's mean so no column weighs 0); experts without samples take their layer's average.
+    // Down rows stay unweighted (their input is the SwiGLU output, not tapped).
+    std::vector<std::vector<float>> imw((size_t) (NL * NE));
+    if (const char* ip = std::getenv("STRATA_SHADOW_IMATRIX"); ip && *ip) {
+        std::FILE* f = std::fopen(ip, "rb");
+        char mg[8] = {};
+        int32_t h[3] = {};
+        if (!f || std::fread(mg, 1, 8, f) != 8 || std::memcmp(mg, "X41IMAT1", 8) != 0 || std::fread(h, 4, 3, f) != 3 ||
+            h[0] != NL || h[1] != NE || h[2] != D) {
+            if (f) std::fclose(f);
+            err = std::string("bad imatrix ") + ip + " (not X41IMAT1 of this geometry)";
+            return false;
+        }
+        int32_t le[2];
+        double cnt = 0;
+        std::vector<float> sv((size_t) D);
+        long nexp = 0;
+        std::vector<std::vector<double>> lay((size_t) NL);
+        std::vector<double> lay_n((size_t) NL, 0.0);
+        while (std::fread(le, 4, 2, f) == 2 && std::fread(&cnt, 8, 1, f) == 1 && std::fread(sv.data(), 4, (size_t) D, f) == (size_t) D) {
+            if (le[0] < 0 || le[0] >= NL || le[1] < 0 || le[1] >= NE || cnt <= 0) continue;
+            auto& w = imw[(size_t) (le[0] * NE + le[1])];
+            w.resize((size_t) D);
+            double mean = 0;
+            for (int64_t c = 0; c < D; ++c) { w[(size_t) c] = (float) (sv[(size_t) c] / cnt); mean += w[(size_t) c]; }
+            mean /= (double) D;
+            for (int64_t c = 0; c < D; ++c) w[(size_t) c] += (float) (1e-3 * mean);
+            auto& la = lay[(size_t) le[0]];
+            if (la.empty()) la.assign((size_t) D, 0.0);
+            for (int64_t c = 0; c < D; ++c) la[(size_t) c] += w[(size_t) c];
+            lay_n[(size_t) le[0]] += 1;
+            ++nexp;
+        }
+        std::fclose(f);
+        long filled = 0;
+        for (int64_t l = 0; l < NL; ++l)
+            for (int64_t e = 0; e < NE; ++e) {
+                auto& w = imw[(size_t) (l * NE + e)];
+                if (!w.empty() || lay_n[(size_t) l] <= 0) continue;
+                w.resize((size_t) D);
+                for (int64_t c = 0; c < D; ++c) w[(size_t) c] = (float) (lay[(size_t) l][(size_t) c] / lay_n[(size_t) l]);
+                ++filled;
+            }
+        std::fprintf(stderr, "build-shadow: imatrix %s - %ld experts sampled, %ld from their layer's average\n", ip, nexp, filled);
+    }
     std::mutex smu;
     std::map<int, std::array<double, 3>> stat;   // converted role source type -> {sum sq err, sum sq value, roles}
     std::atomic<size_t> nx{0}, done{0};
@@ -8180,7 +8230,8 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
             std::fill(dst.begin(), dst.begin() + (ptrdiff_t) G.stride, 0);
             std::map<int, std::array<double, 3>> local;
             // one role: `rows` rows of `cols`, source type st -> type dt (converted) or copied when st == dt
-            auto role = [&](const uint8_t* s0, uint8_t* d0, int64_t rows, int64_t cols, int st, int dt) {
+            const float* wgu = imw[(size_t) (J.l * NE + J.e)].empty() ? nullptr : imw[(size_t) (J.l * NE + J.e)].data();
+            auto role = [&](const uint8_t* s0, uint8_t* d0, int64_t rows, int64_t cols, int st, int dt, const float* wt) {
                 const uint64_t srb = shadow_rb(st, cols), drb = shadow_rb(dt, cols);
                 if (st == dt) { std::memcpy(d0, s0, (size_t) (srb * (uint64_t) rows)); return; }
                 const auto* tsrc = ggml_get_type_traits((ggml_type) st);
@@ -8188,7 +8239,7 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
                 double se = 0, sv = 0;
                 for (int64_t r = 0; r < rows; ++r) {
                     tsrc->to_float(s0 + (size_t) r * srb, f.data(), cols);
-                    if (dt == GGML_TYPE_Q2_0) shadow_q2_0_row(f.data(), d0 + (size_t) r * drb, cols);   // searched scales (above)
+                    if (dt == GGML_TYPE_Q2_0) shadow_q2_0_row(f.data(), d0 + (size_t) r * drb, cols, wt);   // searched scales (above)
                     else ggml_quantize_chunk((ggml_type) dt, f.data(), d0 + (size_t) r * drb, 0, 1, cols, nullptr);
                     tdst->to_float(d0 + (size_t) r * drb, b.data(), cols);
                     for (int64_t k = 0; k < cols; ++k) { const double v = f[(size_t) k], q = v - b[(size_t) k]; se += q * q; sv += v * v; }
@@ -8197,9 +8248,9 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
                 x[0] += se; x[1] += sv; x[2] += 1;
             };
             const uint64_t sgb = shadow_rb(sg, D) * (uint64_t) FF, dgb = shadow_rb(G.gu, D) * (uint64_t) FF;
-            role(src.data(), dst.data(), FF, D, sg, G.gu);                       // gate
-            role(src.data() + sgb, dst.data() + dgb, FF, D, sg, G.gu);           // up
-            role(src.data() + 2 * sgb, dst.data() + 2 * dgb, D, FF, sd, G.d);    // down
+            role(src.data(), dst.data(), FF, D, sg, G.gu, wgu);                         // gate (columns = input channels)
+            role(src.data() + sgb, dst.data() + dgb, FF, D, sg, G.gu, wgu);             // up
+            role(src.data() + 2 * sgb, dst.data() + 2 * dgb, D, FF, sd, G.d, nullptr);  // down (unweighted)
             if (!wr(G.fd, dst.data(), G.stride, G.ent[J.k].off)) { bad = true; break; }
             {
                 std::lock_guard<std::mutex> lk(smu);
