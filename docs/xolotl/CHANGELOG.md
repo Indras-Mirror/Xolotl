@@ -30,6 +30,9 @@ card (170-200 tok/s), ported into `xolotl-dense`:
 | Write new code, `--ngram-chain` | 127.0 | **140.4** |
 | Prose, `--ngram-chain` | 88.9 | 90.4 |
 
+On real agent work (Gauntlet v3-small, one run, as served with all of the above): **score 5.50, 5 of 6 solved, decode
+104.6 tok/s** (before: 4.47 twice at 89 tok/s). Fresh-prompt prefill 1,634 / 1,419 tok/s at 6K / 16K.
+
 Greedy answers with and without MTP, and with and without the chain, are word for word the same. The voice setup (27B at
 200K next to LFM3) still fits with the chain's 7 rollback snapshots: MTP stays on, 22.8 of 24.5 GB.
 

@@ -62,12 +62,13 @@ served. Decode is the generation speed during those tasks.
 | **DeepSeek-V4.1 V4, [fast mode](#fast-mode-deepseek-v41)**                                                        | 552B MoE  |     4.99     |      41.1      |     258-439     |   512K  |     -     |
 | **GLM-5.3-Flash**                                                                                                 | 320B MoE  |   to come    |       23       |     312-450     |   512K  |    5.87   |
 | **[Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored)** | 125B MoE  |     4.49     |      157       |   3,800-4,070   |   200K  |    3.90   |
-| **Qwen3.8-27B**                                                                                                   | 27B dense |     4.47     |       89       |   1,240-1,390   |   200K  |    4.47   |
+| **Qwen3.8-27B**                                                                                                   | 27B dense |     5.50     |      105       |   1,420-1,630   |   200K  |    4.47   |
 
 <sub>Score (of 6) = each task's progress summed (1 per solve, partial credit from the hidden tests), averaged over the runs.
 API score = each model's own full-precision API through OpenRouter (DeepSeek-V4.1-Flash-1017, GLM-5.3-Flash, Qwen3.8-Flash,
 Qwen3.8-27B), the same tasks and turns, reasoning on (8 Nov).
-GLM-5.3-Flash's decode is from the first task of its run (38,500 tokens; the run is parked, its score is to come).
+Qwen3.8-27B: one run on 8 Nov after that day's decode fixes (MTP with thinking off, one-pass verify attention,
+`--ngram-chain`); before them it scored 4.47 twice at 89 tok/s. GLM-5.3-Flash's decode is from the first task of its run (38,500 tokens; the run is parked, its score is to come).
 Prefill = a fresh 6K-17K-token prompt (`tools/throughput.py`), DeepSeek-V4.1's with its dense half at Q8_0. In the
 Gauntlet DeepSeek-V4.1 runs with its dense half at Q6_K, as it is served. More numbers, the Q8_0 references, the speed log and the older HumanEval table (every model 19-21/21
 there, so it no longer separates them): [docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md).</sub>
