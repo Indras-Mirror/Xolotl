@@ -14,11 +14,11 @@ file tier shrinks.
 V4, RTX 4090, Q6_K dense, 80 GiB RAM arena, 8K prompt, 512 tokens; short34 = agreement with the full model's next
 token over our 34-text quality set:
 
-| | decode tok/s | short34 top-1 | short34 NLL |
-|---|---|---|---|
-| normal | 26.1 | 87.01 % | 0.512 |
-| **fast (Q2_K shadow, default)** | **33.0 (+27 %)** | **86.16 %** | **0.540** |
-| fast, first version (Q2_0 shadow) | 34.1 - 36.7 (+29 to +43 %) | 84.46 % | 0.566 |
+|                                   | decode tok/s               | short34 top-1 | short34 NLL |
+| --------------------------------- | -------------------------- | ------------- | ----------- |
+| normal                            | 26.1                       | 87.01 %       | 0.512       |
+| **fast (Q2_K shadow, default)**   | **33.0 (+27 %)**           | **86.16 %**   | **0.540**   |
+| fast, first version (Q2_0 shadow) | 34.1 - 36.7 (+29 to +43 %) | 84.46 %       | 0.566       |
 
 - The quality cost is under a point of top-1 agreement with the full model (the first Q2_0 version lost 2.5). Use it
   when speed matters more than the last bit of quality (long agent runs, drafts, chat); keep the normal mode for work
@@ -34,10 +34,10 @@ token over our 34-text quality set:
 Agentic coding, the [Gauntlet](../tools/gauntlet/README.md) v3-small (6 hard tasks graded by hidden tests, 10 turns,
 thinking on, served settings, 2 runs each):
 
-| | solved | score | decode during the tasks |
-|---|---|---|---|
-| normal | 8 / 12 | 4.99 | 32.6 tok/s |
-| **fast** | **8 / 12** | **4.99** | **41.1 tok/s (+26 %)** |
+|          | solved     | score    | decode during the tasks |
+| -------- | ---------- | -------- | ----------------------- |
+| normal   | 8 / 12     | 4.99     | 32.6 tok/s              |
+| **fast** | **8 / 12** | **4.99** | **41.1 tok/s (+26 %)**  |
 
 The same tasks solved and missed in both modes (each missed 04 once; 03 stays half-done in every run).
 
@@ -68,13 +68,13 @@ The same tasks solved and missed in both modes (each missed 04 once; 03 stays ha
    this exact model file; if it was not (or a file is damaged), it says `shadow: NOT used (...)` and serves the normal
    experts.
 
-| switch | what |
-|---|---|
-| `XOLOTL_SHADOW=<file>[:<file>...]` | the sidecar files (the `.list`) |
-| `XOLOTL_SHADOW_FROM=39,11` | when building: which expert types get a 2-bit copy (39 = MXFP4, 11 = Q3_K) |
-| `XOLOTL_SHADOW_TYPE=10` | when building: the 2-bit format (10 = Q2_K, the default; 42 = Q2_0, the first version) |
-| `XOLOTL_SHADOW_IMATRIX=<file>` | when building: weight the 2-bit fit by an importance matrix |
-| `XOLOTL_IMATRIX_OUT=<file>` | when serving: record that importance matrix (measurement only, output unchanged) |
-| `XOLOTL_SHADOW_THREADS=16` | when building: CPU threads |
+| switch                             | what                                                                                   |
+| ---------------------------------- | -------------------------------------------------------------------------------------- |
+| `XOLOTL_SHADOW=<file>[:<file>...]` | the sidecar files (the `.list`)                                                        |
+| `XOLOTL_SHADOW_FROM=39,11`         | when building: which expert types get a 2-bit copy (39 = MXFP4, 11 = Q3_K)             |
+| `XOLOTL_SHADOW_TYPE=10`            | when building: the 2-bit format (10 = Q2_K, the default; 42 = Q2_0, the first version) |
+| `XOLOTL_SHADOW_IMATRIX=<file>`     | when building: weight the 2-bit fit by an importance matrix                            |
+| `XOLOTL_IMATRIX_OUT=<file>`        | when serving: record that importance matrix (measurement only, output unchanged)       |
+| `XOLOTL_SHADOW_THREADS=16`         | when building: CPU threads                                                             |
 
 **Turn it off:** unset `XOLOTL_SHADOW`.

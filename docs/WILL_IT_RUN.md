@@ -19,3 +19,17 @@ What I've measured is one setup: **RTX 4090 (24 GB), 110 GB DDR4 (90 GB until 1 
   mode. All of it wants a fast NVMe on ext4 or NTFS.
   **Not exFAT** (Linux's exFAT driver serialises parallel reads; expert reads were 5x slower here) and not a hard
   drive (the Engram lookups are ~48 small random reads per token).
+
+## Community runs on smaller cards
+
+The engine fits the work to the card, and the experts that don't fit live in RAM and on the SSD, so system RAM
+matters as much as VRAM.
+
+| Card           | RAM   | Model                     |                               Prefill |      Decode | Run                                                                                      |
+| -------------- | ----- | ------------------------- | ------------------------------------: | ----------: | ---------------------------------------------------------------------------------------- |
+| RTX 3060 12 GB | 64 GB | Qwen3.8-Flash-Next Q2_0   | 882 tok/s (4K), 981 (32K), 934 (128K) | 39-45 tok/s | [2026-10-09](../bench/results/2026-10-09-community-rtx-3060-0141/README.md)              |
+| RTX 4070 12 GB | 32 GB | Qwen3.8-Flash-Next IQ2_XS |                                     - |    48 tok/s | [2026-10-08](../bench/results/2026-10-08-community-rtx4070-iq2-xs/README.md) (Hcl192088) |
+| RTX 3060 12 GB | 46 GB | DeepSeek-V4.1-Flash       |                        149 tok/s (8K) |  8-10 tok/s | [DEEPSEEK41.md](DEEPSEEK41.md)                                                           |
+| RTX 5070 12 GB | 64 GB | DeepSeek-V4.1-Flash       |                  121-231 tok/s (4-8K) |   4.7 tok/s | [DEEPSEEK41.md](DEEPSEEK41.md)                                                           |
+
+More cards, AMD and Intel included: [COMMUNITY_BENCHMARKS.md](COMMUNITY_BENCHMARKS.md).
