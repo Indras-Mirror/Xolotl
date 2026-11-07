@@ -911,6 +911,7 @@ int main(int argc, char ** argv) {
                     }
                 }
             }
+            if (g_imat.on()) g_imat.add(l, 1, top_k, n_embd, fn, ids1.data(), TG);   // STRATA_IMATRIX_OUT
             const bool tok_ok = rdev ? t.run_to_dev(l, ids1.data(), w1.data(), fn, rdev)
                                      : t.run(l, ids1.data(), w1.data(), fn, routed1.data());
             if (!tok_ok) { ferr = "tier.run failed"; return false; }
@@ -981,6 +982,7 @@ int main(int argc, char ** argv) {
             const double t1 = now_ms();
             fd_dense += t1 - t0;
             t0 = t1;
+            if (g_imat.on()) g_imat.add(l, m, top_k, n_embd, fn, mids.data(), TG);   // STRATA_IMATRIX_OUT
             for (int ti = 0; ti < m; ++ti) {
                 const bool ok = rdev ? tr.run_to_dev(l, mids.data() + (size_t) ti * top_k, mw.data() + (size_t) ti * top_k,
                                                      fn + (size_t) ti * n_embd, rdev + (size_t) ti * n_embd)
