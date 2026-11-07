@@ -20,6 +20,10 @@
 - **Ryan Flavell** ([PROMETHEVS](https://github.com/Magnvs7/Promethevs), MAGNVS Ltd): compress-then-correct, the idea
   behind fast mode's 2-bit expert shadow and the decode margin log.
 
+- **[NInfer](https://github.com/JGamboa/ninfer-4090-windows)** (JGamboa's RTX 4090 fork): the one-pass verify attention
+  and the n-gram draft chain in `xolotl-dense`, after its `--ngram chain`; z-lab's
+  [Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab) drafter for `--dflash2`.
+
 ## Contributors, with thanks
 
 - **[NektoDron](https://github.com/NektoDron)**

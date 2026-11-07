@@ -8,6 +8,35 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Qwen3.8-27B: one-pass verify attention and an n-gram draft chain (8 Nov)
+
+Two ideas from [NInfer](https://github.com/JGamboa/ninfer-4090-windows), the fastest 27B engine we have measured on this
+card (170-200 tok/s), ported into `xolotl-dense`:
+
+- **Verify attention in one launch.** The decode attention ran once per column of a verify window, so a 4-token window
+  read the KV cache 4 times. It now takes every column in one launch: each K/V cell is loaded once and updates every
+  column that sees it. Per column it is the same split-K arithmetic, with explicit fma / mul, so a column gives the same
+  bits alone as inside a window (`--selftest`: 0 bits off over an 8-column window crossing a split boundary). With it,
+  RMS norm uses 1,024 threads holding the row in registers (it was one 256-thread block per row, 8 us a call).
+- **`--ngram-chain`** (in the style of llama.cpp's ngram-mod): a pool maps a hash of the last 8 tokens to the token
+  that last followed them, over the whole conversation. After MTP's drafts the proposal continues from the pool, up to
+  7 drafts, and a round only uses the wider window when the pool adds at least 3. Verification is unchanged.
+
+| Qwen3.8-27B, MTP 3, greedy, thinking off | Before (tok/s) | After (tok/s) |
+| --- | ---: | ---: |
+| Synthetic code prompt, 2K context (2 rounds) | 134.0 / 133.1 | **144.0 / 142.3** |
+| The same at 30K context (2 rounds) | 89.4 / 89.2 | **98.2 / 98.2** |
+| Rewrite a 140-line file with one change, `--ngram-chain` (7.0 tokens a cycle) | 137.3 | **173.0** |
+| Write new code, `--ngram-chain` | 127.0 | **140.4** |
+| Prose, `--ngram-chain` | 88.9 | 90.4 |
+
+Greedy answers with and without MTP, and with and without the chain, are word for word the same. The voice setup (27B at
+200K next to LFM3) still fits with the chain's 7 rollback snapshots: MTP stays on, 22.8 of 24.5 GB.
+
+**DFlash2 for the 27B** (`--dflash2 <pack>`, z-lab's Qwen3.8-27B-DFlash2 drafter, opt-in) runs and gives the same greedy
+text, but no speed-up yet: it drafts 7 and gets 40-53 % accepted (about 3.8 tokens a cycle, MTP 3's figure), while an
+8-column check costs more. It stays opt-in until the verify pass gets cheaper.
+
 ### Qwen3.8-27B: MTP stays on with thinking off, decode 52 -> 111 tok/s (8 Nov)
 
 `xolotl-dense` switched speculative decoding off whenever a repetition or presence penalty was set. Every thinking-off

@@ -93,6 +93,10 @@ build as the noise control.
 
 | Date | Change | Model | Test | Before | After | Control (old build again) | Quality |
 | --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| 8 Nov | `--ngram-chain`: MTP proposal + n-gram continuation (up to 7 drafts) | Qwen3.8-27B IQ3_S + MTP, 200K k8v4 | rewrite a 140-line file, greedy, thinking off | decode 137.3 tok/s | **decode 173.0 tok/s (+26 %)** | | same text |
+| 8 Nov | the same | the same | new code / prose | 127.0 / 88.9 tok/s | **140.4 / 90.4 tok/s** | | same text |
+| 8 Nov | Verify attention over all columns in one launch + register RMS norm (default on) | Qwen3.8-27B IQ3_S + MTP 3 | synthetic 2K / 30K prompt + 256 tokens, 2 rounds each | decode 134.0 / 89.4 tok/s | **decode 144.0 / 98.2 tok/s (+7 / +10 %)** | 133.1 / 89.2 tok/s | MTP == plain text; selftest 0 bits off |
+| 8 Nov | MTP kept on with a presence / repetition penalty (thinking-off requests) | Qwen3.8-27B IQ3_S + MTP 3 | fresh 2K / 6K / 16K prompts, thinking off | decode 52.3 / 52.0 / 47.8 tok/s | **decode 105.3 / 110.7 / 102.7 tok/s** | 52.5 / 52.0 / 47.9 tok/s | same greedy text |
 | 7 Nov | Fast mode: 2-bit (Q2_K + imatrix) copy of the MXFP4 and Q3_K experts (`XOLOTL_SHADOW`, **opt-in, lossy**) | DeepSeek-V4.1-Flash-1017 V4 XQ, dense Q6_K | Gauntlet v3-small, 2 runs each / 8K prompt + 512 tokens | decode 32.6 tok/s on the tasks / 26.1 on the probe | **41.1 tok/s (+26 %) / 33.0 (+27 %)** | | short34 top-1 87.01 -> 86.16 %; Gauntlet 8/12 in both modes ([XOLOTL_FAST](../XOLOTL_FAST.md)) |
 | 6 Nov | RTX 40 (sm_89) speed switches (`STRATA_SM89_PERF`, default on) | Qwen3.8-Flash-Next XQ 45 GB | 16,383-token prompt + 1,024 tokens, 3 runs | decode 138.96 tok/s | **decode 150.21 tok/s (+8.1 %)** | 138.72 tok/s (-0.2 %) | bit-exact switches; the same text in every arm |
 | 6 Nov | Engram read-ahead + late shared expert (`STRATA_DS41_ENGRAM_AHEAD`, `STRATA_DS41_SHEXP_LATE`, default on) | DeepSeek-V4.1-Flash-1017 V4 XQ, dense Q8_0 | 26,622-token prompt, 3 interleaved rounds | prefill 456 tok/s | **prefill 506 tok/s (+11.1 %)** | | identical: NLL 0.5152 / top-1 86.11 % vs the DeepSeek API both ways, logits bit-identical |

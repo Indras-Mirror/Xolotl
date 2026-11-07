@@ -12,6 +12,8 @@
 
 ## Latest
 
+- **8 Nov** - Qwen3.8-27B decode: MTP now stays on with thinking off (52 -> 111 tok/s), one-pass verify attention
+  (+7-10 %) and an n-gram draft chain (`--ngram-chain`: 137 -> 173 tok/s when rewriting a file). Same text, bit for bit.
 - **8 Nov** - [Gauntlet v3](#what-one-pc-can-do) is the main table: every model on the same 6 hard agentic tasks. Our DeepSeek-V4.1 and Qwen3.8-Flash-Next builds score at or above their own full-precision APIs on it.
 - **8 Nov** - The Qwen3.8-27B dense engine is `xolotl-dense` now (built on Mirko Perrone's dense port); `strata-dense`
   stays as a symlink, so nothing breaks.
