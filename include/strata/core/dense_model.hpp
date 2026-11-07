@@ -78,6 +78,12 @@ namespace strata::core
         /// xolotl: layers whose output rows run() and prefill() copy for an external drafter (DFlash2: its
         /// target_layer_ids, e.g. 5,19,33,47,61); empty = off.  See run_taps() / ring_taps().
         std::vector<int> taps;
+        /// xolotl: MTP drafts score only these token ids (a frequency shortlist, NInfer's --lm-head-draft): the
+        /// head rows are copied once into a smaller matrix, so each draft step reads a fraction of the 248K-row head.
+        /// Verification keeps the full head, so the output is unchanged; a draft outside the list is just rejected.
+        /// Empty = drafts use the full head.
+        std::vector<int32_t> draft_vocab;
+        int draft_vocab_extra = 16384;  ///< rows kept free after the shortlist for draft_vocab_extend()
     };
 
     class DenseModel
@@ -178,6 +184,10 @@ namespace strata::core
         /// block's own output (llama.cpp does the same for a single head).  Drafting stops early at the first token
         /// whose probability is below `p_min` (that token is not returned).  Greedy.  *n_out receives the count.
         bool mtp_draft(int32_t token, int pos, int max_n, float p_min, int32_t *out, int *n_out, std::string &err);
+        /// xolotl: adds the tokens of `tokens` (a request's prompt) that the --draft-vocab shortlist lacks to the
+        /// drafts' head, newest first, up to DenseOptions::draft_vocab_extra rows; replaces the previous request's.
+        /// No-op without a shortlist.  Drafts only: verification is untouched.
+        void draft_vocab_extend(const int32_t *tokens, int64_t n);
         /// Makes column `col` of the last run() the "last hidden" (used after a rollback).
         void set_last_hidden(int col);
 

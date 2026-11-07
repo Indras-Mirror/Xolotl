@@ -101,6 +101,8 @@ void usage() {
                  "       xolotl-dense --selftest | --check <model.gguf> [--mtp] [--kv fp16|int8|q4_0|k8v4]\n"
                  "  a dense qwen35 GGUF (Qwen3.8-27B) behind Strata's server protocol; the server runs it with\n"
                  "  `serve/server.py --engine strata --config <run config>` whose `exe` is this program.\n"
+                 "  --draft-vocab FILE: MTP drafts score only these token ids (int32 LE, a frequency shortlist such as\n"
+                 "                  data/packs/qwen3.8-27b/draft-vocab-65536.i32); verification keeps the full head (same output).\n"
                  "  --prompt-chunk N feeds the prompt N tokens at a time through MMQ instead of 8 at a time through\n"
                  "  the GEMVs (0 is the default; --no-prefill forces the old path).  The chunked path reads the KV\n"
                  "  cache in whatever format --kv picked.\n"
@@ -869,6 +871,7 @@ int main(int argc, char** argv) {
     long long prompt_chunk = 0;
     int n_ckpt = 4;                                    // conversation checkpoints (pinned host RAM, ~154 MiB each); 0 = off
     std::string df2_pack;                              // xolotl: --dflash2 <pack>, the DFlash2 block drafter instead of MTP
+    std::string draft_vocab;                           // xolotl: --draft-vocab <file of int32 token ids>, MTP shortlist head
     bool draft_max_set = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -883,6 +886,7 @@ int main(int argc, char** argv) {
         else if (a == "--draft-max" || a == "--spec-draft-n-max") { draft_max = std::atoi(next("--draft-max")); draft_max_set = true; }
         else if (a == "--dflash2") df2_pack = next("--dflash2");
         else if (a == "--ngram-chain") ngram_on = true;
+        else if (a == "--draft-vocab") draft_vocab = next("--draft-vocab");
         else if (a == "--ngram-n") ngram_n = std::atoi(next("--ngram-n"));
         else if (a == "--ngram-max") ngram_max = std::atoi(next("--ngram-max"));
         else if (a == "--ngram-min") ngram_min = std::atoi(next("--ngram-min"));
@@ -937,6 +941,18 @@ int main(int argc, char** argv) {
     opt.draft_max = ngram_on ? ngram_max : draft_max;   // rollback snapshots for the widest window
     opt.kv = kv_type;
     if (use_df2) { opt.spec_snapshots = true; opt.taps = df2.tap_layers(); }
+    if (!draft_vocab.empty() && want_mtp) {
+        FILE* fv = std::fopen(draft_vocab.c_str(), "rb");
+        if (fv) {
+            int32_t id;
+            while (std::fread(&id, 4, 1, fv) == 1) opt.draft_vocab.push_back(id);
+            std::fclose(fv);
+        }
+        if (opt.draft_vocab.empty()) {
+            std::fprintf(stderr, "xolotl-dense: --draft-vocab %s: unreadable or empty (int32 token ids expected)\n", draft_vocab.c_str());
+            return 2;
+        }
+    }
     if (!model.load(gguf, context, err, opt)) {
         std::fprintf(stderr, "xolotl-dense: %s\n", err.c_str());
         std::printf("ERR %s\n", err.c_str());
@@ -1147,6 +1163,7 @@ int main(int argc, char** argv) {
         int64_t since_pp = 0;
         const bool use_pf = model.prefill_ready();
         const int64_t pf_step = model.prefill_chunk();      // STOP is checked between steps
+        model.draft_vocab_extend(ids.data(), (int64_t) ids.size());   // --draft-vocab: the prompt's own rare tokens
         // Where to save checkpoints.  A prompt that diverges from the one already read diverges in its tail - the
         // client re-renders or trims the last turns - but "the tail" is not the last 64 tokens: over the 24 diverges
         // logged by a 72k-token chat (strata-qwen3.8-27b.log) the divergence sat 143, 171, 226, 466, 1515 and 2738

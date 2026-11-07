@@ -21,7 +21,10 @@
   behind fast mode's 2-bit expert shadow and the decode margin log.
 
 - **[NInfer](https://github.com/JGamboa/ninfer-4090-windows)** (JGamboa's RTX 4090 fork): the one-pass verify attention
-  and the n-gram draft chain in `xolotl-dense`, after its `--ngram chain`; z-lab's
+  and the n-gram draft chain in `xolotl-dense`, after its `--ngram chain`; the MTP draft shortlist head
+  (`--draft-vocab`, after its `--lm-head-draft`), whose token list `data/packs/qwen3.8-27b/draft-vocab-131072.i32` is
+  the top 131,072 of NInfer's frequency ranking (`tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64`,
+  Apache-2.0) plus the 33 control tokens; z-lab's
   [Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab) drafter for `--dflash2`.
 
 ## Contributors, with thanks

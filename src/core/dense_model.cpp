@@ -332,6 +332,14 @@ struct DenseModel::Impl {
     float* mtp_h = nullptr;                         // the MTP block's own output hidden (chains the next draft step)
     int* d_tok = nullptr;
     float* d_prob = nullptr;
+    QMat draft_head;                                // the MTP drafts' shortlist head (DenseOptions::draft_vocab), or empty
+    std::vector<int32_t> draft_ids;                 // draft_head row -> token id
+    int draft_base = 0, draft_cap = 0;              // shortlist rows, and the free rows after them for the prompt's tokens
+    std::vector<uint8_t> draft_in;                  // per token id: 1 = in the shortlist
+    const uint8_t* draft_src = nullptr;             // the head's rows in the file
+    uint64_t draft_row = 0;                         // bytes per head row
+    std::vector<int32_t> draft_extra;               // the prompt tokens currently appended
+    std::vector<uint8_t> draft_stage;
 
     // ---- helpers
     template <class T> bool alloc(T** out, uint64_t bytes, std::string& err, const char* what) {
@@ -711,7 +719,7 @@ bool DenseModel::Impl::mtp_block(const DenseConfig& c, int n, int pos0, bool wan
         dense_rms_norm(x + (size_t) (n - 1) * E, M.head_norm, xn, 1, E, c.rms_eps, s);
         cudaMemcpyAsync(mtp_h, xn, (size_t) E * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) s);
         quantize(xn, E, 1, s);
-        gemv(M.head, mtp_logits, 1, s);
+        gemv(draft_head.dev ? draft_head : M.head, mtp_logits, 1, s);
     }
     return true;
 }
@@ -832,6 +840,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         const int E = cfg_.n_embd;
         const int mtp_block_idx = cfg_.n_layer;           // the MTP block follows the trunk
         const std::string mp = "blk." + std::to_string(mtp_block_idx) + ".";
+        uint64_t draft_bytes = 0;                         // the --draft-vocab head, 0 = none (section 4 decides)
         if (with_mtp && (cfg_.n_nextn < 1 || !I.find(mp + "nextn.eh_proj.weight"))) {
             err = "dense model: this GGUF has no MTP block (nextn_predict_layers = " + std::to_string(cfg_.n_nextn) +
                   "); start without --mtp";
@@ -913,6 +922,12 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             else if (tok) trunk_bytes += native_mmvq_supported((int) tok->tensor->type)
                     ? native_mmvq_weight_bytes((int) tok->tensor->type, E, cfg_.n_vocab) : 0;
             mtp_bytes = bytes_of_prefix(mp);
+            if (with_mtp && !opt.draft_vocab.empty()) {     // the shortlist head is a second, smaller copy of head rows
+                const Found* h = I.find("output.weight") ? I.find("output.weight") : tok;
+                if (h && native_mmvq_supported((int) h->tensor->type))
+                    draft_bytes = native_mmvq_weight_bytes((int) h->tensor->type, E,
+                                                           (int) opt.draft_vocab.size() + std::max(0, opt.draft_vocab_extra));
+            }
             const bool user_cap = std::getenv("STRATA_DENSE_GPU_MIB") != nullptr;
             if (with_mtp && !user_cap && !opt.mtp_force && budget_for(true) < (int64_t) (trunk_bytes + mtp_bytes)) {
                 // the longest context at which everything, MTP included, stays in VRAM
@@ -932,12 +947,19 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                                  (long long) fit_ctx);
                 with_mtp = false;
             }
+            // the shortlist head only if it fits next to everything else: without the room it is left out, MTP stays on
+            if (draft_bytes && (!with_mtp || (!user_cap && budget_for(true) < (int64_t) (trunk_bytes + mtp_bytes + draft_bytes)))) {
+                if (with_mtp)
+                    std::fprintf(stderr, "xolotl-dense: --draft-vocab left out: no VRAM for its %.0f MiB (MTP stays on, drafts use the full head)\n",
+                                 draft_bytes / 1048576.0);
+                draft_bytes = 0;
+            }
             const uint64_t reserved = reserved_for(with_mtp);
             const uint64_t kv_need = (uint64_t) (n_attn + (with_mtp ? 1 : 0)) * kv_per_layer;
             if (user_cap) {                                                  // explicit cap for the weights, in MiB
                 I.budget = (uint64_t) std::atoll(std::getenv("STRATA_DENSE_GPU_MIB")) << 20;
             } else if ((int64_t) free_b > (int64_t) (reserved + margin)) {
-                I.budget = (uint64_t) budget_for(with_mtp);
+                I.budget = (uint64_t) budget_for(with_mtp) - draft_bytes;   // the weights leave the shortlist head its room
             } else {
                 err = "dense model: the KV cache for a context of " + std::to_string(max_context) + " needs " +
                       std::to_string(kv_need >> 20) + " MiB, but only " + std::to_string(free_b >> 20) +
@@ -1060,6 +1082,42 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                           I.head, total, err))
             return false;
         if (with_mtp && !I.mtp.head.dev) I.mtp.head = I.head;    // the MTP block shares the trunk's head
+        if (with_mtp && !opt.draft_vocab.empty() && I.mtp.head.dev != I.head.dev)
+            std::fprintf(stderr, "xolotl-dense: --draft-vocab ignored: this MTP block has its own head\n");
+        else if (with_mtp && draft_bytes) {
+            // Copy the shortlist's rows of the head (rows are whole blocks, contiguous) into one smaller matrix.
+            const QMat& src = I.mtp.head;
+            const Found* hf = I.find("output.weight") ? I.find("output.weight") : tok;
+            const int n = (int) opt.draft_vocab.size(), cap = std::max(0, opt.draft_vocab_extra);
+            const uint64_t row = native_mmvq_weight_bytes(src.type, E, 1);
+            const uint8_t* base = (const uint8_t*) hf->file->tensor_data(*hf->tensor);
+            std::vector<uint8_t> rows((size_t) row * (n + cap));
+            for (int i = 0; i < n; ++i) {
+                const int32_t id = opt.draft_vocab[i];
+                if (id < 0 || id >= cfg_.n_vocab) { err = "dense model: --draft-vocab id " + std::to_string(id) + " is outside the vocabulary"; return false; }
+                std::memcpy(rows.data() + (size_t) row * i, base + (size_t) row * id, row);
+            }
+            void* dev = nullptr;
+            if (cudaMalloc(&dev, rows.size()) != cudaSuccess || cudaMemcpy(dev, rows.data(), rows.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+                if (dev) cudaFree(dev);
+                cudaGetLastError();
+                std::fprintf(stderr, "xolotl-dense: --draft-vocab: no VRAM for the %.0f MiB shortlist head, drafts use the full head\n",
+                             rows.size() / 1048576.0);
+            } else {
+                I.allocations.push_back(dev);
+                total += rows.size();
+                I.draft_head = QMat{dev, src.type, E, n};
+                I.draft_ids = opt.draft_vocab;
+                I.draft_base = n;
+                I.draft_cap = cap;
+                I.draft_in.assign((size_t) cfg_.n_vocab, 0);
+                for (int32_t id : opt.draft_vocab) I.draft_in[(size_t) id] = 1;
+                I.draft_src = base;
+                I.draft_row = row;
+                std::fprintf(stderr, "xolotl-dense: MTP drafts score a %d-token shortlist + up to %d of each prompt's own tokens "
+                             "(%.0f MiB; verification keeps all %d)\n", n, cap, rows.size() / 1048576.0, cfg_.n_vocab);
+            }
+        }
         weight_bytes_ = total;
         host_bytes_ = I.host_bytes;
         if (I.host_tensors)
@@ -1511,6 +1569,34 @@ bool DenseModel::mtp_ingest(const int32_t* tokens, int n, int pos0, int start, s
     }
 }
 
+void DenseModel::draft_vocab_extend(const int32_t* tokens, int64_t n) {
+    Impl& I = *impl_;
+    if (!I.draft_head.dev || I.draft_cap == 0) return;
+    std::vector<int32_t> extra;
+    std::vector<uint8_t> seen = I.draft_in;
+    for (int64_t i = n - 1; i >= 0 && (int) extra.size() < I.draft_cap; --i) {     // newest first
+        const int32_t t = tokens[i];
+        if (t < 0 || t >= cfg_.n_vocab || seen[(size_t) t]) continue;
+        seen[(size_t) t] = 1;
+        extra.push_back(t);
+    }
+    // pad to a multiple of 64 rows with copies of a shortlist token (a duplicate row has the same logit, so the
+    // argmax maps to the same id) - the GEMV launchers then see the same row-count shapes as the shortlist itself
+    while (!extra.empty() && (I.draft_base + extra.size()) % 64 && (int) extra.size() < I.draft_cap) extra.push_back(I.draft_ids[0]);
+    if (extra == I.draft_extra) return;             // the same conversation: the rows are already there
+    I.draft_stage.resize((size_t) I.draft_row * extra.size());
+    for (size_t k = 0; k < extra.size(); ++k)
+        std::memcpy(I.draft_stage.data() + I.draft_row * k, I.draft_src + I.draft_row * (size_t) extra[k], I.draft_row);
+    if (!extra.empty())
+        cudaMemcpyAsync((uint8_t*) I.draft_head.dev + I.draft_row * (size_t) I.draft_base, I.draft_stage.data(),
+                        I.draft_stage.size(), cudaMemcpyHostToDevice, (cudaStream_t) I.stream);
+    cudaStreamSynchronize((cudaStream_t) I.stream);
+    I.draft_ids.resize((size_t) I.draft_base);
+    I.draft_ids.insert(I.draft_ids.end(), extra.begin(), extra.end());
+    I.draft_head.n_out = I.draft_base + (int) extra.size();
+    I.draft_extra = std::move(extra);
+}
+
 bool DenseModel::mtp_draft(int32_t token, int pos, int max_n, float p_min, int32_t* out, int* n_out, std::string& err) {
     Impl& I = *impl_;
     *n_out = 0;
@@ -1526,13 +1612,14 @@ bool DenseModel::mtp_draft(int32_t token, int pos, int max_n, float p_min, int32
             dense_rms_norm(I.m_e, I.mtp.enorm, I.cat, 1, E, cfg_.rms_eps, s);
             dense_rms_norm(i == 0 ? I.h_last : I.mtp_h, I.mtp.hnorm, I.cat + E, 1, E, cfg_.rms_eps, s);
             I.mtp_block(cfg_, 1, pos + i, true, s);
-            dense_argmax_prob(I.mtp_logits, cfg_.n_vocab, I.d_tok, I.d_prob, s);
+            dense_argmax_prob(I.mtp_logits, I.draft_head.dev ? I.draft_head.n_out : cfg_.n_vocab, I.d_tok, I.d_prob, s);
             int id = -1;
             float prob = 0.0f;
             cudaMemcpyAsync(&id, I.d_tok, sizeof(int), cudaMemcpyDeviceToHost, (cudaStream_t) s);
             cudaMemcpyAsync(&prob, I.d_prob, sizeof(float), cudaMemcpyDeviceToHost, (cudaStream_t) s);
             if (!sync(err)) return false;
             if (prob < p_min) break;                    // not sure enough: this token is not offered
+            if (I.draft_head.dev) id = I.draft_ids[id]; // shortlist row -> token id (prob is over the shortlist)
             out[(*n_out)++] = id;
             tok = id;
         }
