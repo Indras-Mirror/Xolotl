@@ -8,6 +8,21 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Qwen3.8-27B: a shortlist head for the MTP drafts (8 Nov)
+
+**`--draft-vocab <file>`** (after NInfer's `--lm-head-draft`): each MTP draft step read the whole 248,320-row output
+head (1.1 ms, three times a cycle). Drafts now score a copy of the rows of the 131,072 most frequent tokens (NInfer's
+frequency ranking) plus the prompt's own tokens that the list lacks (so a file rewrite keeps its identifiers).
+Verification still uses the full head, so the output does not change. Drafting takes 4.0 ms a cycle instead of 6.0,
+and costs 591 MiB of VRAM. If that room isn't there, the shortlist is skipped and MTP stays on. Served by
+`xol-dense-quetza` and `xol-dense-voice` (27B + LFM3 at 200K: 23.9 of 24.6 GB).
+
+| Qwen3.8-27B, MTP 3 + `--ngram-chain`, greedy, thinking off (mean of 2 runs) | Before (tok/s) | After (tok/s) |
+| --- | ---: | ---: |
+| Rewrite a 140-line file with one change | 174.7 | **182.8** |
+| Write new code | 141.8 | **144.7** |
+| Prose | 91.9 | **97.4** |
+
 ### Qwen3.8-27B: one-pass verify attention and an n-gram draft chain (8 Nov)
 
 Two ideas from [NInfer](https://github.com/JGamboa/ninfer-4090-windows), the fastest 27B engine we have measured on this
