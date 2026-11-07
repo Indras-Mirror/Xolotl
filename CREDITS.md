@@ -42,7 +42,7 @@
   accounting (#83); IQ3_S expert downs for Unsloth's UD-Q2_K_XL (#85)
 - **[paul123637-lab](https://github.com/paul123637-lab)**: the DSpark seed fixes (#54, #56); RTX 5080 and 5060 Ti helper
   numbers
-- **[kelheor](https://github.com/kelheor)**: the vision `pread` fix (#51); the Windows ds41 build fix (#94)
+- **[kelheor](https://github.com/kelheor)**: the vision `pread` fix (#51); the Windows ds41 build fixes (#94, #118: portable mkdir / 64-bit stat / free space for the dense cache and --build-shadow)
 - **[exye137](https://github.com/exye137)**: the thread-local CUDA stream leak (#57)
 - **[penink-WH](https://github.com/penink-WH)**: the AC922 rig
 - **[cpacsm75](https://github.com/cpacsm75)**: 192 GB arena tuning on Windows (#77); the RTX 5090 arena and `--kv-q8`

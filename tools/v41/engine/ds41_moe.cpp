@@ -8266,7 +8266,7 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
     for (int t = 0; t < std::max(1, threads); ++t) th.emplace_back(work);
     for (auto& x : th) x.join();
     bool ok = !bad;
-    for (Grp& G : grp) ok = ok && ::fsync(G.fd) == 0;
+    for (Grp& G : grp) ok = ok && ds41_sys::fsync(G.fd) == 0;
     if (!ok) { cleanup(); err = "write failed (disk full?)"; return false; }
     std::string list;
     for (Grp& G : grp) {

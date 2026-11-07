@@ -30,8 +30,10 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+#  include <direct.h>   // _wmkdir
 #  include <io.h>
 #  include <fcntl.h>
+#  include <sys/stat.h> // _wstat64
 #  include <malloc.h>   // alloca
 #  include <cerrno>
 using ssize_t = std::ptrdiff_t;
@@ -51,6 +53,7 @@ using ssize_t = std::ptrdiff_t;
 #else
 #  include <fcntl.h>
 #  include <sys/stat.h>
+#  include <sys/statvfs.h>
 #  include <unistd.h>
 #  include <alloca.h>
 #endif
@@ -154,6 +157,29 @@ inline int fstat(int fd, Stat* st) {
 
 inline int fsync(int fd) { return FlushFileBuffers(handle_of(fd)) ? 0 : -1; }
 
+/// One directory (parents are not created); 0 on success, -1 with errno set (EEXIST when it already exists).
+inline int mkdir(const char* path, int /*mode*/ = 0755) { return _wmkdir(widen(path).c_str()); }
+
+/// Size and modification time of a file, 64-bit on both platforms (MSVC's struct stat st_size is 32-bit).
+struct FileStat {
+    uint64_t size = 0;
+    int64_t  mtime = 0;
+};
+inline bool stat_file(const char* path, FileStat* st) {
+    struct _stat64 s;
+    if (_wstat64(widen(path).c_str(), &s) != 0) return false;
+    st->size = (uint64_t) s.st_size;
+    st->mtime = (int64_t) s.st_mtime;
+    return true;
+}
+
+/// Bytes a user can still write on the volume that holds `path`; 0 when that cannot be read.
+inline uint64_t free_bytes(const char* path) {
+    ULARGE_INTEGER avail{};
+    if (!GetDiskFreeSpaceExW(widen(path).c_str(), &avail, nullptr, nullptr)) return 0;
+    return (uint64_t) avail.QuadPart;
+}
+
 inline int posix_fadvise(int, int64_t, int64_t, int) { return 0; }
 
 inline int posix_memalign(void** p, size_t align, size_t n) {
@@ -195,6 +221,25 @@ inline int fstat(int fd, Stat* st) {
     return 0;
 }
 inline int fsync(int fd) { return ::fsync(fd); }
+
+inline int mkdir(const char* path, int mode = 0755) { return ::mkdir(path, (mode_t) mode); }
+
+struct FileStat {
+    uint64_t size = 0;
+    int64_t  mtime = 0;
+};
+inline bool stat_file(const char* path, FileStat* st) {
+    struct stat s;
+    if (::stat(path, &s) != 0) return false;
+    st->size = (uint64_t) s.st_size;
+    st->mtime = (int64_t) s.st_mtime;
+    return true;
+}
+
+inline uint64_t free_bytes(const char* path) {
+    struct statvfs vf {};
+    return ::statvfs(path, &vf) == 0 ? (uint64_t) vf.f_bavail * (uint64_t) vf.f_frsize : 0;
+}
 inline int posix_fadvise(int fd, int64_t off, int64_t len, int advice) {
     return ::posix_fadvise(fd, (off_t) off, (off_t) len, advice);
 }

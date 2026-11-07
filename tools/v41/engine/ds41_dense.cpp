@@ -4,6 +4,7 @@
 
 #include "ds41_engram.hpp"
 #include "ds41_ops.hpp"
+#include "ds41_sys.hpp"
 
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
@@ -26,10 +27,6 @@
 #include <set>
 #include <thread>
 #include <cerrno>
-#include <sys/stat.h>
-#ifndef _WIN32
-#include <sys/statvfs.h>
-#endif
 
 #ifdef _WIN32
 #include <string.h>
@@ -543,7 +540,7 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                 const std::string mp0 = model.shard(0).path();
                 const size_t sl0 = mp0.find_last_of('/');
                 rq_dir = (sl0 == std::string::npos ? std::string(".") : mp0.substr(0, sl0)) + "/xolotl-cache";
-                if (::mkdir(rq_dir.c_str(), 0755) != 0 && errno != EEXIST) {
+                if (ds41_sys::mkdir(rq_dir.c_str()) != 0 && errno != EEXIST) {
                     std::fprintf(stderr, "dense requant cache: cannot create %s (%s) - off (STRATA_DENSE_REQUANT_CACHE=<dir> to choose one)\n",
                                  rq_dir.c_str(), std::strerror(errno));
                     rq_dir.clear();
@@ -558,21 +555,20 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                     if (const std::string pn = pred_name(ti); !pn.empty()) want += ggml_nbytes(w.t[pn]);
                     if ((int) w.t[canon(ti)]->type != (int) ti.type) want += ggml_nbytes(w.t[canon(ti)]);
                 }
-            struct stat st {};
+            ds41_sys::FileStat st;
             const std::string mp = model.shard(0).path();
-            if (want > 0 && ::stat(mp.c_str(), &st) == 0) {
+            if (want > 0 && ds41_sys::stat_file(mp.c_str(), &st)) {
                 const size_t sl = mp.find_last_of('/');
                 char key[160];
-                std::snprintf(key, sizeof key, ".%llx.%llx.%s.%s.h%d.dense-rq", (unsigned long long) st.st_size,
-                              (unsigned long long) st.st_mtime, rq != GGML_TYPE_COUNT ? ggml_type_name(rq) : "none",
+                std::snprintf(key, sizeof key, ".%llx.%llx.%s.%s.h%d.dense-rq", (unsigned long long) st.size,
+                              (unsigned long long) st.mtime, rq != GGML_TYPE_COUNT ? ggml_type_name(rq) : "none",
                               pq != GGML_TYPE_COUNT ? ggml_type_name(pq) : "none", rq_head ? 1 : 0);
                 rq_path = std::string(cd) + "/" + (sl == std::string::npos ? mp : mp.substr(sl + 1)) + key;
-                struct stat cs {};
-                if (::stat(rq_path.c_str(), &cs) == 0 && (size_t) cs.st_size == want) {
+                ds41_sys::FileStat cs;
+                if (ds41_sys::stat_file(rq_path.c_str(), &cs) && (size_t) cs.size == want) {
                     rq_in = std::fopen(rq_path.c_str(), "rb");
                 } else {
-                    struct statvfs vf {};
-                    const bool room = ::statvfs(cd, &vf) == 0 && (double) vf.f_bavail * (double) vf.f_frsize >= (double) want + 2147483648.0;
+                    const bool room = (double) ds41_sys::free_bytes(cd) >= (double) want + 2147483648.0;
                     rq_tmp = rq_path + ".tmp";
                     if (!room) std::fprintf(stderr, "dense requant cache: under %.1f GiB free in %s - not written (STRATA_DENSE_REQUANT_CACHE=<dir> elsewhere)\n",
                                             ((double) want + 2147483648.0) / 1073741824.0, cd);
