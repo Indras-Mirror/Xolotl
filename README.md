@@ -160,3 +160,5 @@ from RAM and NVMe. Research code from one developer, measured on one PC; reports
 
 If Xolotl's been useful to you and you want to help support what I do, you can shout me a coffee on
 [Ko-fi](https://ko-fi.com/indrasmirror). Every bit helps keep this going :)
+
+Write-ups, benchmarks and news about Xolotl: **[indrasmirror.au](https://indrasmirror.au/blog-xolotl-frontier-models-one-gaming-pc)**.
