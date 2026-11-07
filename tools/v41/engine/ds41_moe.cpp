@@ -8241,7 +8241,7 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
                 for (int64_t r = 0; r < rows; ++r) {
                     tsrc->to_float(s0 + (size_t) r * srb, f.data(), cols);
                     if (dt == GGML_TYPE_Q2_0) shadow_q2_0_row(f.data(), d0 + (size_t) r * drb, cols, wt);   // searched scales (above)
-                    else ggml_quantize_chunk((ggml_type) dt, f.data(), d0 + (size_t) r * drb, 0, 1, cols, nullptr);
+                    else ggml_quantize_chunk((ggml_type) dt, f.data(), d0 + (size_t) r * drb, 0, 1, cols, wt);   // k-quants use the imatrix
                     tdst->to_float(d0 + (size_t) r * drb, b.data(), cols);
                     for (int64_t k = 0; k < cols; ++k) { const double v = f[(size_t) k], q = v - b[(size_t) k]; se += q * q; sv += v * v; }
                 }
