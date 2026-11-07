@@ -8,6 +8,13 @@ vulnerability reporting: the repository's **Security** tab, **Report a vulnerabi
 (the request, the config keys involved, the Xolotl commit), and what an attacker gains. We answer there, fix it in
 a release, and credit you in the advisory unless you ask us not to.
 
+Ordinary hardening ideas and findings that are safe to discuss in public are welcome as an
+[issue](https://github.com/Indras-Mirror/Xolotl/issues) (upstream Strata's audit findings are collected in [Strata #544](https://github.com/Niko1221/Strata/issues/544)) or as a pull request, which we
+review like our own code.
+
+Supported: the latest commit on `main` (Xolotl has no releases). The server code below is Strata's, so the same
+protections apply.
+
 ## Local models and your network
 
 A model file (GGUF) is weights and metadata: Xolotl's C++ engines read it as data, and nothing in it runs as code.
@@ -24,13 +31,6 @@ Checked on 8 Nov 2026:
 - **The real risk is tools.** A model can only act on the world through the tools an agent gives it. In QuetzaCodetl,
   shell commands, the JS REPL, web search and web fetch (outside a short list of documentation sites) all ask before
   they run, unless you allow them.
-
-Ordinary hardening ideas and findings that are safe to discuss in public are welcome as an
-[issue](https://github.com/Indras-Mirror/Xolotl/issues) (upstream Strata's audit findings are collected in [Strata #544](https://github.com/Niko1221/Strata/issues/544)) or as a pull request, which we
-review like our own code.
-
-Supported: the latest commit on `main` (Xolotl has no releases). The server code below is Strata's, so the same
-protections apply.
 
 ## What the server exposes
 
