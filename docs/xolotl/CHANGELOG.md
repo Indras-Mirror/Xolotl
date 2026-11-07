@@ -8,6 +8,15 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Gauntlet v3 is the main table, with each model's own API beside it (8 Nov)
+
+The README now leads with the [Gauntlet](../../tools/gauntlet/README.md) v3-small (6 hard agentic coding tasks graded by
+hidden tests, 10 turns, thinking on, each model as served) instead of the HumanEval / tool-call / agentic screen, on
+which every model scored 19-21/21, 10/10, 3/3. The same tasks ran on each model's full-precision API through OpenRouter
+(reasoning on): DeepSeek-V4.1-Flash-1017 4.49 against our V4's 4.99, Qwen3.8-Flash 3.90 against our 45 GB build's 4.49,
+Qwen3.8-27B 4.47 against 4.47, GLM-5.3-Flash 5.87 (our local GLM run is still to come). Fresh-prompt prefill on
+GLM-5.3-Flash re-measured: 312 tok/s at 6K, 450 at 16K. The old table is in [BENCHMARKS.md](BENCHMARKS.md).
+
 ### The dense engine is `xolotl-dense` now (8 Nov)
 
 The Qwen3.8-27B dense engine builds as `build-xolotl/xolotl-dense` (log lines `xolotl-dense: ...`). The port it
