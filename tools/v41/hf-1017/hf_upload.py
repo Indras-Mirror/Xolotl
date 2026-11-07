@@ -27,10 +27,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = "/media/mal/SSD NVME/AI/V41-GSQ-1017"
 GGUF = os.path.join(SRC_DIR, "V41-GSQ-1017.gguf")
 SMALL = [os.path.join(SRC_DIR, "rank-1017-085.bin"), os.path.join(SRC_DIR, "V41-GSQ-1017.gguf.experts.json")]
-TOKENIZER = "/media/mal/SSD NVME/AI/V41-GSQ/tokenizer"
+TOKENIZER = "/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/tokenizer"
 SIDECARS = [
-    "/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision-1017.gguf",
-    "/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision-1017.Q2_K.gguf",
+    "/media/mal/NVME1TB/Xolotl/deepseek-v4.1/sidecar/V41-MTP-Vision-1017.gguf",
+    "/media/mal/NVME1TB/Xolotl/deepseek-v4.1/sidecar/V41-MTP-Vision-1017.Q2_K.gguf",
 ]
 STAGE = "/media/mal/NVME1TB/hf-staging-1017"
 WORK = os.path.expanduser("~/AI/Strata-Backup/v41-dev/hf-1017")

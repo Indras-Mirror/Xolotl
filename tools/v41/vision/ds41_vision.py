@@ -74,7 +74,7 @@ SVE1 = 0x31455653
 F32, F16, Q8_0, BF16 = 0, 1, 8, 30
 BYTES_PER_ELEM = {F32: 4, F16: 2, BF16: 2}
 
-DEFAULT_SIDECAR = "/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.gguf"
+DEFAULT_SIDECAR = "/media/mal/NVME1TB/Xolotl/deepseek-v4.1/sidecar/V41-MTP-Vision.gguf"
 DEFAULT_REFERENCE = os.environ.get("DS41_REFERENCE", os.path.expanduser("~/AI/gsq-rco/dsv41-inference"))
 VISION_PREFIXES = ("vision.", "aligner.", "image_")
 

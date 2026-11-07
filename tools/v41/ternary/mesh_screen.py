@@ -33,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 
-GGUF = "/media/mal/SSD NVME/AI/V41-GSQ/V41-GSQ.gguf"
+GGUF = "/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/V41-GSQ.gguf"
 TYPE_NAME = {143: "ptq1", 42: "q2_0", 11: "q3_k"}
 BPW = {143: 1.75, 42: 2.25, 11: 3.4375}
 

@@ -2,7 +2,7 @@
   "exe": "/home/mal/AI/Xolotl/tools/glm/serve/glm-engine.sh",
   "args": [
     "-m",
-    "/media/mal/NVME1TB/Models/GLM-5.3-Flash-Maya-S-v2/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf",
+    "/media/mal/NVME1TB/Xolotl/glm-5.3/GLM-5.3-Flash-Maya-S-v2/GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf",
     "--backend",
     "cuda",
     "--experts",
@@ -40,11 +40,11 @@
     "--stop",
     "154820,154827,154829",
     "--lora",
-    "/media/Crucial1TB/models/GLM-5.3-Flash-RCO/lora/gcsa-abliterix/GLM-5.3-Flash-Ablitered2-LoRA-v2.gguf",
+    "/media/Crucial1TB/Xolotl/glm-5.3/GLM-5.3-Flash-RCO/lora/gcsa-abliterix/GLM-5.3-Flash-Ablitered2-LoRA-v2.gguf",
     "--lora-exps"
   ],
   "cwd": "/home/mal/AI/Xolotl",
-  "tokenizer": "/media/Crucial1TB/models/GLM-5.3-Flash-RCO/tokenizer",
+  "tokenizer": "/media/Crucial1TB/Xolotl/glm-5.3/GLM-5.3-Flash-RCO/tokenizer",
   "model_name": "glm-5.3-flash-maya-ablated-512k",
   "log": "/tmp/strata-glm-maya-abl-512k.log",
   "port": 8144,

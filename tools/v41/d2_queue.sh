@@ -9,10 +9,10 @@
 # Cancel between runs: touch ~/AI/Xolotl/private/v41-dev/d2/queue.CANCEL
 set -u
 DS=$HOME/AI/Xolotl
-G="/media/mal/SSD NVME/AI/V41-GSQ/V41-GSQ.gguf"
+G="/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/V41-GSQ.gguf"
 EN="/media/Crucial1TB/V41-Engram:/media/mal/SSD NVME/AI/V41-Engram"
-R="/media/mal/SSD NVME/AI/V41-GSQ/rank.bin"
-SC="/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.gguf"
+R="/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/rank.bin"
+SC="/media/mal/NVME1TB/Xolotl/deepseek-v4.1/sidecar/V41-MTP-Vision.gguf"
 W="$HOME/AI/Xolotl/private/v41-dev/d2"; mkdir -p "$W"; cd "$DS" || exit 1
 CANCEL="$W/queue.CANCEL"
 rm -f "$CANCEL"

@@ -20,9 +20,9 @@ if kill -0 "$P" 2>/dev/null && [ "${FORCE:-0}" != 1 ]; then
 fi
 
 MODEL="/media/mal/SSD NVME/AI/V41-GSQ-1017-v3.gguf"
-ENGRAM="/media/Crucial1TB/V41-1017-Engram:/media/mal/SSD NVME/AI/V41-1017-Engram"
-RANK=/media/mal/NVME1TB/Models/rank-1017-v3.bin
-SIDECAR=/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision-1017.Q2_K.gguf   # -1017 is part of the name
+ENGRAM="/media/Crucial1TB/Xolotl/deepseek-v4.1/V41-1017-Engram:/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-1017-Engram"
+RANK=/media/mal/NVME1TB/Xolotl/deepseek-v4.1/rank-1017-v3.bin
+SIDECAR=/media/mal/NVME1TB/Xolotl/deepseek-v4.1/sidecar/V41-MTP-Vision-1017.Q2_K.gguf   # -1017 is part of the name
 IDS=/home/mal/AI/Xolotl/private/v41-dev/sweep-1127/p256.i32
 ARGS=(-m "$MODEL" --ids-file "$IDS" --backend cuda --experts gpu --engram "$ENGRAM" --rank "$RANK"
       --ctx 32768 --arena-adapt --kv-fp4 --route-bias 0.5 --route-bias-file 0.3 --arena-gib 64

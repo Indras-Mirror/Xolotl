@@ -1,7 +1,7 @@
 #!/bin/bash
 DS=$HOME/AI/Xolotl
-G="/media/mal/SSD NVME/AI/V41-GSQ/V41-GSQ.gguf"; EN="/media/Crucial1TB/V41-Engram:/media/mal/SSD NVME/AI/V41-Engram"; R="/media/mal/SSD NVME/AI/V41-GSQ/rank.bin"
-SC=/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.gguf
+G="/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/V41-GSQ.gguf"; EN="/media/Crucial1TB/V41-Engram:/media/mal/SSD NVME/AI/V41-Engram"; R="/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/rank.bin"
+SC=/media/mal/NVME1TB/Xolotl/deepseek-v4.1/sidecar/V41-MTP-Vision.gguf
 W=$HOME/AI/Xolotl/private/v41-dev/d2; mkdir -p $W; cd $DS
 run() { tag=$1; shift
   until [ $(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo) -ge 75 ]; do sleep 5; done

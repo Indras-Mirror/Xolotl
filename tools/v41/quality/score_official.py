@@ -16,9 +16,9 @@ import numpy as np
 
 NV = 129280
 DS = os.path.expanduser('~/AI/Xolotl')
-BASE_ARGS = ['-m', '/media/mal/SSD NVME/AI/V41-GSQ/V41-GSQ.gguf', '--backend', 'cuda', '--experts', 'gpu',
+BASE_ARGS = ['-m', '/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/V41-GSQ.gguf', '--backend', 'cuda', '--experts', 'gpu',
              '--engram', '/media/Crucial1TB/V41-Engram:/media/mal/SSD NVME/AI/V41-Engram',
-             '--rank', '/media/mal/SSD NVME/AI/V41-GSQ/rank.bin', '--ctx', '32768', '--stop', '1', '--serve']
+             '--rank', '/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/rank.bin', '--ctx', '32768', '--stop', '1', '--serve']
 
 
 def load_cases(path):

@@ -6,7 +6,7 @@
 #   3. end to end: ppl + prompt/decode speed on held-out code  ds41_generate --ppl (2048 tokens, chunk 512)
 set -u
 cd $HOME/AI/Xolotl
-GGUF="${GGUF:-/media/mal/SSD NVME/AI/V41-GSQ/V41-GSQ.gguf}"
+GGUF="${GGUF:-/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/V41-GSQ.gguf}"
 OUT="${OUT:-$HOME/AI/Strata-Backup/v41-dev/gpu-$(date +%m%d-%H%M)}"
 ENGRAM="/media/mal/NVME1TB/Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8:/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8:/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8:/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"
 mkdir -p "$OUT"

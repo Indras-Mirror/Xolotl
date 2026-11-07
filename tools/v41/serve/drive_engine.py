@@ -17,9 +17,9 @@ import time
 import numpy as np
 
 DS = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-G = "/media/mal/SSD NVME/AI/V41-GSQ/V41-GSQ.gguf"
+G = "/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/V41-GSQ.gguf"
 EN = "/media/Crucial1TB/V41-Engram:/media/mal/SSD NVME/AI/V41-Engram"
-R = "/media/mal/SSD NVME/AI/V41-GSQ/rank.bin"
+R = "/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/rank.bin"
 
 out_json, log, ctx = sys.argv[1], sys.argv[2], sys.argv[3]
 reqs = json.load(open(sys.argv[4]))

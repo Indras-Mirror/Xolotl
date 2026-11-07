@@ -1,6 +1,6 @@
 # Smaller DSpark expert weights, measured by acceptance (v41-dspark-shrink)
 
-The DSpark sidecar `/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.gguf` is 8.42 GB, of which the nine routed-expert
+The DSpark sidecar `/media/mal/NVME1TB/Xolotl/deepseek-v4.1/sidecar/V41-MTP-Vision.gguf` is 8.42 GB, of which the nine routed-expert
 tensors `mtp.{0,1,2}.ffn.experts.{w1,w2,w3}.weight` ([in,ff,128] each, 802 MB, MXFP4) are 7.22 GB.  A drafter's precision
 cannot change output quality - every draft is verified by the trunk - so it can be compressed hard, and only the
 acceptance rate moves.  This measures that trade.

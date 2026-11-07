@@ -2,7 +2,7 @@
   "exe": "/home/mal/AI/Xolotl/tools/glm/serve/glm-engine.sh",
   "args": [
     "-m",
-    "/media/Crucial1TB/models/GLM-5.3-Flash-RCO/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf",
+    "/media/Crucial1TB/Xolotl/glm-5.3/GLM-5.3-Flash-RCO/GLM-5.3-Flash-GSQ-RCO-3.0bit-q4kattn.gguf",
     "--backend",
     "cuda",
     "--experts",
@@ -33,10 +33,10 @@
     "--stop",
     "154820,154827,154829",
     "--lora",
-    "/media/Crucial1TB/models/GLM-5.3-Flash-RCO/lora/gcsa-abliterix/GLM-5.3-Flash-Ablitered2-LoRA-v2.gguf"
+    "/media/Crucial1TB/Xolotl/glm-5.3/GLM-5.3-Flash-RCO/lora/gcsa-abliterix/GLM-5.3-Flash-Ablitered2-LoRA-v2.gguf"
   ],
   "cwd": "/home/mal/AI/Xolotl",
-  "tokenizer": "/media/Crucial1TB/models/GLM-5.3-Flash-RCO/tokenizer",
+  "tokenizer": "/media/Crucial1TB/Xolotl/glm-5.3/GLM-5.3-Flash-RCO/tokenizer",
   "model_name": "glm-5.3-flash-strata-abliterated-fast",
   "log": "/tmp/strata-glm-unc-fast.log",
   "port": 8140,

@@ -2,10 +2,10 @@
 # correctness gate, decode biases OFF (routing then matches the prefill's): D3 (nb_a) vs per-token (nb_b), -n 96,
 # each dumps its verify rows; then an independent prefill of each stream (arb_nb_*).
 DS=$HOME/AI/Xolotl
-G="/media/mal/SSD NVME/AI/V41-GSQ/V41-GSQ.gguf"
+G="/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/V41-GSQ.gguf"
 EN="/media/Crucial1TB/V41-Engram:/media/mal/SSD NVME/AI/V41-Engram"
-R="/media/mal/SSD NVME/AI/V41-GSQ/rank.bin"
-SC=/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.gguf
+R="/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/rank.bin"
+SC=/media/mal/NVME1TB/Xolotl/deepseek-v4.1/sidecar/V41-MTP-Vision.gguf
 W=$HOME/AI/Xolotl/private/v41-dev/d2; cd "$DS" || exit 1
 run() { tag=$1; shift
   until [ "$(awk '/MemAvailable/{printf "%d",$2/1048576}' /proc/meminfo)" -ge 75 ]; do sleep 5; done

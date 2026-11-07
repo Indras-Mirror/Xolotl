@@ -10,7 +10,7 @@ EV=${LUCEBOX_EVAL:-/home/mal/v41-work/eval/lucebox-1017}
 X=/home/mal/AI/Xolotl; cd "$X" || exit 1; mkdir -p "$OUT"
 P=$(cat /home/mal/v41-work/quant-1017-v4/pass.pid 2>/dev/null)
 if kill -0 "$P" 2>/dev/null && [ "${FORCE:-0}" != 1 ]; then echo "quant pass $P is running" >&2; exit 1; fi
-ENGRAM=${ENGRAM:-"/media/Crucial1TB/V41-1017-Engram:/media/mal/SSD NVME/AI/V41-1017-Engram"}
+ENGRAM=${ENGRAM:-"/media/Crucial1TB/Xolotl/deepseek-v4.1/V41-1017-Engram:/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-1017-Engram"}
 TMP=${LOGIT_TMP:-/media/mal/NVME1TB/lucebox-logits}; mkdir -p "$TMP"
 for s in $SEQS; do
     python3 -c "import numpy as np; np.load('$EV/heldout_8x1024.npy')[$s].astype(np.int32).tofile('$OUT/seq$s.i32')"

@@ -33,7 +33,7 @@ import v41_formats as F  # noqa: E402
 import v41_gptq as G  # noqa: E402
 import v41_quant as VQ  # noqa: E402
 
-GGUF = os.environ.get("V41_GSQ_GGUF", "/media/mal/SSD NVME/AI/V41-GSQ/V41-GSQ.gguf")   # the GSQ file whose experts are read
+GGUF = os.environ.get("V41_GSQ_GGUF", "/media/mal/SSD NVME/Xolotl/deepseek-v4.1/V41-GSQ/V41-GSQ.gguf")   # the GSQ file whose experts are read
 CALIB = "/media/Crucial1TB/v41-calib"
 FF = 2304
 
