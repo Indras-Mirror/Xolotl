@@ -400,7 +400,9 @@ void launch(bool xs, const Tab16& tab, const Product& p, int64_t row_bytes, cuda
 
 // the compute capabilities the kernel's bits were checked against MMQ's on (prefill_iq4_w4a8_test): Ampere (8.0-8.8) and
 // Blackwell 12.0; Ada (8.9) has no card to test on, so it keeps MMQ
-static bool arch_ok(int cc) { return (cc >= 80 && cc < 89) || cc == 120; }
+// xolotl: sm_89 (RTX 40) joins: the same mma.sync int8 path as sm_86; the path is opt-in, and prefill_iq4_w4a8_test must
+// show 0 differing words against MMQ on the card before it is used there (checked on the 4090 before any default)
+static bool arch_ok(int cc) { return (cc >= 80 && cc <= 89) || cc == 120; }
 
 void report_counts();
 int iq4_w4a8_mode() {
