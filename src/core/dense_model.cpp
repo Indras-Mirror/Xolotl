@@ -220,7 +220,7 @@ struct Prof {
             for (int i = 0; i < NB; ++i) known += ms[i];
             const double P = (double) passes;
             std::fprintf(stderr,
-                         "strata-dense prof: %.1f cols/pass, GPU %.1f ms/pass = gemv Q4_K %.1f + Q6_K %.1f + Q8_0 %.1f + other %.1f"
+                         "xolotl-dense prof: %.1f cols/pass, GPU %.1f ms/pass = gemv Q4_K %.1f + Q6_K %.1f + Q8_0 %.1f + other %.1f"
                          " | quantize %.1f | gdn token loop %.1f | attn token loop %.1f | rest %.1f ; host enqueue %.1f ms/pass\n",
                          (double) cols / P, total_ms / P, ms[GEMV_Q4K] / P, ms[GEMV_Q6K] / P, ms[GEMV_Q80] / P, ms[GEMV_OTHER] / P,
                          ms[QUANT] / P, ms[GDN_LOOP] / P, ms[ATTN_LOOP] / P, (total_ms - known) / P, host_ms / P);
@@ -752,7 +752,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             return false;
         }
         if (g0.get(a + "expert_count") && g0.get(a + "expert_count")->u > 0) {
-            err = "dense model: this GGUF is a MoE model; run it with `strata`, not `strata-dense`";
+            err = "dense model: this GGUF is a MoE model; run it with `strata`, not `xolotl-dense`";
             return false;
         }
         int64_t v = 0;
@@ -827,7 +827,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (cs != cudaSuccess) { err = std::string("dense model: CUDA setup: ") + cudaGetErrorString(cs); return false; }
         if (const char* e = std::getenv("STRATA_DENSE_PROF")) I.prof.enabled = e[0] && e[0] != '0';
         if (const char* e = std::getenv("STRATA_DENSE_MMVQ_FAST"))      // the multi-column layout that is faster but not bitwise equal to 1 column
-            if (e[0] && e[0] != '0') { native_mmvq_set_multi_exact(false); std::fprintf(stderr, "strata-dense: multi-column GEMV: upstream layout\n"); }
+            if (e[0] && e[0] != '0') { native_mmvq_set_multi_exact(false); std::fprintf(stderr, "xolotl-dense: multi-column GEMV: upstream layout\n"); }
         if (const char* e = std::getenv("STRATA_DENSE_DEBUG")) {
             long long a0 = 0, b0 = 0;
             if (std::sscanf(e, "%lld:%lld", &a0, &b0) == 2) { I.dbg_from = a0; I.dbg_to = b0; }
@@ -899,13 +899,13 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                                      (int64_t) ((uint64_t) n_gdn * snap_one * (uint64_t) draft_max);
                 const int64_t fit_ctx = room > 0 ? (room / per_token) / 1024 * 1024 : 0;
                 std::fprintf(stderr,
-                             "strata-dense: MTP is OFF: the weights (%.2f GiB with the MTP block), the KV cache for %lld tokens and "
+                             "xolotl-dense: MTP is OFF: the weights (%.2f GiB with the MTP block), the KV cache for %lld tokens and "
                              "the %d rollback snapshot(s) do not all fit in VRAM, so some weights would be read over PCIe on every "
                              "token - slower, not faster.%s\n",
                              (trunk_bytes + mtp_bytes) / 1073741824.0, (long long) max_context, draft_max,
                              fit_ctx >= 2048 ? "" : " Even a short context would not fit: use a smaller quant.");
                 if (fit_ctx >= 2048)
-                    std::fprintf(stderr, "strata-dense:   with MTP on, a --context up to about %lld tokens fits in this GPU "
+                    std::fprintf(stderr, "xolotl-dense:   with MTP on, a --context up to about %lld tokens fits in this GPU "
                                  "(or use --draft-max 1); --mtp-force keeps MTP at the current context anyway.\n",
                                  (long long) fit_ctx);
                 with_mtp = false;
@@ -922,7 +922,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                       " MiB of VRAM are free (1 GiB is kept as margin). Use a shorter --context.";
                 return false;
             }
-            std::fprintf(stderr, "strata-dense: VRAM %zu MiB free of %zu; KV cache %llu MiB (%s, context %lld)%s; "
+            std::fprintf(stderr, "xolotl-dense: VRAM %zu MiB free of %zu; KV cache %llu MiB (%s, context %lld)%s; "
                          "%llu MiB of weights may go to the GPU (the model needs %.0f MiB), the rest stays in host memory\n",
                          free_b >> 20, total_b >> 20, (unsigned long long) (kv_need >> 20), kv_name_.c_str(), (long long) max_context,
                          with_mtp ? " + MTP snapshots" : "", (unsigned long long) (I.budget >> 20),
@@ -1041,7 +1041,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         weight_bytes_ = total;
         host_bytes_ = I.host_bytes;
         if (I.host_tensors)
-            std::fprintf(stderr, "strata-dense: %d tensors (%.2f GiB of %.2f) live in host memory and are read over PCIe "
+            std::fprintf(stderr, "xolotl-dense: %d tensors (%.2f GiB of %.2f) live in host memory and are read over PCIe "
                          "on every token - a shorter --context or a smaller quant puts more on the GPU\n",
                          I.host_tensors, I.host_bytes / 1073741824.0, total / 1073741824.0);
 
@@ -1347,13 +1347,13 @@ bool DenseModel::prefill_setup(int64_t chunk, std::string& err) {
     for (;;) {
         if (size_scratch(chunk)) break;
         if (chunk <= NC) return false;
-        std::fprintf(stderr, "strata-dense: the prefill scratch for %lld tokens does not fit; trying %lld\n",
+        std::fprintf(stderr, "xolotl-dense: the prefill scratch for %lld tokens does not fit; trying %lld\n",
                      (long long) chunk, (long long) (chunk / 2));
         chunk /= 2;
     }
     pf_chunk_ = chunk;
     pf_ready_ = true;
-    std::fprintf(stderr, "strata-dense: prompt prefill through MMQ, %lld tokens at a time\n", (long long) chunk);
+    std::fprintf(stderr, "xolotl-dense: prompt prefill through MMQ, %lld tokens at a time\n", (long long) chunk);
     return true;
 #else
     (void) chunk;

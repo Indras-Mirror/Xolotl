@@ -340,7 +340,7 @@ Il profilo è solo lo **stato iniziale**: l'adaptive tier scambia poi gli expert
 ```bash
 cmake -B build-dense -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON \
       -DSTRATA_BUILD_TESTS=OFF
-cmake --build build-dense --target strata-dense -j
+cmake --build build-dense --target xolotl-dense -j
 ```
 
 Scorciatoia che fa tutto (download GGUF, tokenizer, build, config):

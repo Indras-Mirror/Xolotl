@@ -340,7 +340,7 @@ The profile is only the **initial state**: the adaptive tier then swaps experts 
 ```bash
 cmake -B build-dense -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON \
       -DSTRATA_BUILD_TESTS=OFF
-cmake --build build-dense --target strata-dense -j
+cmake --build build-dense --target xolotl-dense -j
 ```
 
 Shortcut that does everything (GGUF download, tokenizer, build, config):

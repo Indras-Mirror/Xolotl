@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/dense_bench.py - measure `strata-dense` without the HTTP server.
+"""tools/dense_bench.py - measure `xolotl-dense` without the HTTP server.
 
 WHY.  Tuning the dense decode needs a number that comes back the same way every time.  Going through
 serve/server.py adds the chat template, the sampler defaults and a websocket, and it can only be run by whoever
@@ -31,7 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 
-EXE = "strata-dense.exe" if os.name == "nt" else "strata-dense"
+EXE = "xolotl-dense.exe" if os.name == "nt" else "xolotl-dense"
 
 # A prompt with real structure: the model has to read it, and its length is easy to control.  Repeated with
 # variation so the prompt is not one giant n-gram the drafter could memorize.

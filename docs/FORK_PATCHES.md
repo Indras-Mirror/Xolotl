@@ -32,7 +32,7 @@ in the tree and opt-in, worth an A/B on our models.
 ## Accepting a merge
 
 1. `tools/lost_lines.py <merge-base> public HEAD` - every listed line must be a rewrite that keeps the behaviour.
-2. Build `strata`, `ds41_generate`, `glm_generate`, `strata-dense` with build-xolotl's options.
+2. Build `strata`, `ds41_generate`, `glm_generate`, `xolotl-dense` with build-xolotl's options.
 3. The gates in UPSTREAM_SYNC.md, plus the Flash-Next check: `tools/quant_quality.py run` on the served quant must
    match the previous build's TSV (same top-1 / KL to the old build) and `tools/throughput.py` must not regress.
 4. Fast-forward `public`, rebuild `build-xolotl`, keep the previous binaries until the next day's use is clean.

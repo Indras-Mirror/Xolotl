@@ -4,12 +4,12 @@
     python tools/dense_setup.py --gguf /path/Qwen3.8-27B-UD-Q4_K_M.gguf --build --arch 86 --context 32768
     python tools/dense_setup.py --download UD-Q4_K_M --build --arch 86
 
-No pack step: `strata-dense` reads the GGUF blocks as they are (every type the native GEMVs take, IQ3_S included),
+No pack step: `xolotl-dense` reads the GGUF blocks as they are (every type the native GEMVs take, IQ3_S included),
 so there is nothing to convert.  What this does:
 
   1. (--download) fetches the GGUF from huggingface.co/unsloth/Qwen3.8-27B-GGUF
   2. exports the tokenizer + chat template from the GGUF (tools/strata_tokenizer.py) into data/packs/<name>/tokenizer
-  3. (--build) builds the `strata-dense` target with CUDA
+  3. (--build) builds the `xolotl-dense` target with CUDA
   4. writes strata-qwen3.8-27b.json, the run config serve/server.py (and START-HERE) reads
 
 Then:   python serve/server.py --engine strata --config strata-qwen3.8-27b.json
@@ -28,7 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 WIN = os.name == "nt"
 REPO = "unsloth/Qwen3.8-27B-GGUF"
-EXE = "strata-dense.exe" if WIN else "strata-dense"
+EXE = "xolotl-dense.exe" if WIN else "xolotl-dense"
 
 
 def say(msg: str) -> None:
@@ -70,7 +70,7 @@ def build(arch: str, build_dir: Path) -> Path:
     gen = ["-G", "Ninja"] if shutil.which("ninja") else []
     run([cmake, *gen, "-S", ROOT, "-B", build_dir, "-DCMAKE_BUILD_TYPE=Release", "-DSTRATA_ENABLE_CUDA=ON",
          f"-DCMAKE_CUDA_ARCHITECTURES={arch}"])
-    run([cmake, "--build", build_dir, "--target", "strata-dense", "-j", str(max(2, (os.cpu_count() or 4) // 2))])
+    run([cmake, "--build", build_dir, "--target", "xolotl-dense", "-j", str(max(2, (os.cpu_count() or 4) // 2))])
     for cand in (build_dir / EXE, build_dir / "Release" / EXE):
         if cand.exists():
             return cand
@@ -84,7 +84,7 @@ def main() -> int:
     src.add_argument("--download", metavar="QUANT", help="fetch Qwen3.8-27B-<QUANT>.gguf, e.g. UD-Q4_K_M")
     ap.add_argument("--models-dir", default=str(ROOT / "data" / "models"))
     ap.add_argument("--context", type=int, default=32768)
-    ap.add_argument("--build", action="store_true", help="build strata-dense (CUDA)")
+    ap.add_argument("--build", action="store_true", help="build xolotl-dense (CUDA)")
     ap.add_argument("--arch", default="native", help="CMAKE_CUDA_ARCHITECTURES, e.g. 86 (RTX 30), 89 (RTX 40), 120 (RTX 50)")
     ap.add_argument("--kv", choices=["fp16", "int8", "q4_0", "k8v4"], default="fp16",
                     help="KV cache storage, the same option as strata's setup: fp16 (default), int8 (~53%% of the memory), "
@@ -102,7 +102,7 @@ def main() -> int:
     ap.add_argument("--mtp-force", action="store_true",
                     help="MTP: keep it on even when the weights do not all fit in VRAM (by default it switches itself off)")
     ap.add_argument("--port", type=int, default=8080)
-    ap.add_argument("--exe", help="use this strata-dense instead of building")
+    ap.add_argument("--exe", help="use this xolotl-dense instead of building")
     a = ap.parse_args()
     if not 1 <= a.draft_max <= 7:
         sys.exit("--draft-max must be 1..7")

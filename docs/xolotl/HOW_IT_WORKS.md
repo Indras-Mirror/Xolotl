@@ -27,7 +27,7 @@ On top of that, per model:
   reachable), an elastic expert cache that lends its VRAM to long prompts. Details: [docs/glm](../glm).
 - **Qwen3.8-Flash-Next** - upstream Strata 0.1.44: MTP speculative decoding, int8 KV, image input with an encoder that
   starts on the first picture and gives its VRAM back when idle. Details: [README.strata.md](../../README.strata.md).
-- **Qwen3.8-27B** - native GGUF dense engine (`strata-dense`): MMQ prompt prefill, MTP speculative decoding (draft 3),
+- **Qwen3.8-27B** - native GGUF dense engine (`xolotl-dense`, built on Mirko Perrone's dense port): MMQ prompt prefill, MTP speculative decoding (draft 3),
   int8-K / int4-V cache (`k8v4`) for 200K context.
 
 Every model is served by the same Python server with each model's own chat template and tool-call format (Qwen

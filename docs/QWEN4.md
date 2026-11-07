@@ -35,7 +35,7 @@ the MoE and the PLE table.
 it's a fair bet), the `strata` engine runs it today: hyper-connections, GDN, QSA, the routed experts and PLE are all
 there. Day one should mostly be checking the converter output and the metadata, then quants.
 
-**Qwen4-27B dense** goes into `strata-dense` (the engine behind the Qwen3.8-27B dense port). What it needs:
+**Qwen4-27B dense** goes into `xolotl-dense` (formerly `strata-dense`, the engine behind the Qwen3.8-27B dense port). What it needs:
 
 1. **The hyper-connection residual** around every GDN / QSA / FFN block and the final mixer. The generic HC kernels
    (`gr_read` / `gr_write`) already take the geometry at runtime, so hidden 5120 / rank 640 works on them as is. The

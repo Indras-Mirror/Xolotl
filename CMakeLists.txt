@@ -171,10 +171,10 @@ option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 # #2027: defined here, before the GPU section reads it to register the native-expert tests (it was defined at the
 # native-experts section far below, so a first configure registered four tests fewer than the second)
 option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
-# xolotl: the Qwen3.8-27B dense engine `strata-dense` (src/program/dense_main.cpp).  The dense lineage committed its
+# xolotl: the Qwen3.8-27B dense engine `xolotl-dense`, formerly `strata-dense` (src/program/dense_main.cpp).  The dense lineage committed its
 # sources but never its CMake target - the production binary was built from an uncommitted CMakeLists in
 # /tmp/strata-dense-eval (gone).  Reconstructed from that build dir's link line and flags (~/AI/strata-dense-build).
-option(STRATA_DENSE "Build strata-dense, the Qwen3.8-27B dense GGUF engine (CUDA)" ON)
+option(STRATA_DENSE "Build xolotl-dense (strata-dense), the Qwen3.8-27B dense GGUF engine (CUDA)" ON)
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()
@@ -962,16 +962,27 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_options(strata PRIVATE "LINKER:/DELAYLOAD:hipblas.dll" "LINKER:/DELAYLOAD:libhipblaslt.dll" "LINKER:/DELAYLOAD:rocblas.dll")
   endif()
 
-  # xolotl: strata-dense (see option STRATA_DENSE).  Same shape as the production build: dense_model.cpp in
+  # xolotl: xolotl-dense (see option STRATA_DENSE).  Same shape as the production build: dense_model.cpp in
   # strata_engine with STRATA_DENSE_MMQ=1 (its MMQ prompt path; set on that one file only, it is the only reader),
   # dense_kernels.cu in strata_kernels, the binary linked against strata_engine + strata_mmq.
   if(STRATA_DENSE AND STRATA_ENABLE_CUDA AND STRATA_NATIVE_EXPERTS)
     target_sources(strata_engine PRIVATE src/core/dense_model.cpp)
     set_source_files_properties(src/core/dense_model.cpp PROPERTIES COMPILE_DEFINITIONS STRATA_DENSE_MMQ=1)
     target_sources(strata_kernels PRIVATE src/kernels/cuda/dense_kernels.cu)
-    add_executable(strata-dense src/program/dense_main.cpp)
-    target_include_directories(strata-dense PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(strata-dense PRIVATE strata_engine strata_mmq ${_strata_gpu_runtime_target})
+    add_executable(xolotl-dense src/program/dense_main.cpp)
+    target_include_directories(xolotl-dense PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(xolotl-dense PRIVATE strata_engine strata_mmq ${_strata_gpu_runtime_target})
+    # 2026-11-08: renamed from strata-dense (the Xolotl name; the port is Mirko Perrone's, see CREDITS.md).  The old
+    # name stays next to it - a symlink on Linux / macOS, a copy on Windows - so existing configs and scripts keep
+    # working.
+    if(WIN32)
+      add_custom_command(TARGET xolotl-dense POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:xolotl-dense> $<TARGET_FILE_DIR:xolotl-dense>/strata-dense${CMAKE_EXECUTABLE_SUFFIX})
+    else()
+      add_custom_command(TARGET xolotl-dense POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rm -f $<TARGET_FILE_DIR:xolotl-dense>/strata-dense
+        COMMAND ${CMAKE_COMMAND} -E create_symlink xolotl-dense $<TARGET_FILE_DIR:xolotl-dense>/strata-dense)
+    endif()
   endif()
   # NEW-MODELS-PLAN.md T1: Qwen3.6-35B-A3B's reference path (one GPU, the model resident, plain kernels), checked
   # against llama.cpp by tools/qwen35/; the engine itself does not run the family yet

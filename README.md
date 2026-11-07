@@ -80,7 +80,7 @@ bash tools/xolotl/fetch-llama.sh   # llama.cpp at the pinned commit + tools/xolo
 cmake -S . -B build-xolotl -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON \
   -DSTRATA_MMQ_KQUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp -DSTRATA_DSV41_FQ_OP=ON \
   -DSTRATA_DSV41_HC_MIX=ON
-ninja -C build-xolotl      # strata, strata-dense, glm_generate, ds41_generate, ds4_generate
+ninja -C build-xolotl      # strata, xolotl-dense, glm_generate, ds41_generate, ds4_generate
 ```
 
 Get a model:
@@ -100,7 +100,7 @@ python3 tools/v41/serve/serve_ds41.py --engine strata --config tools/v41/serve/s
 XOLOTL_SHADOW=$(cat /nvme/V4.fast.x41s.list) python3 tools/v41/serve/serve_ds41.py ...                                # the same in fast mode (V4)
 python3 tools/glm/serve/serve_glm.py  --engine strata --config tools/glm/serve/strata-glm-maya-abl-512k.json --port 8144  # GLM-5.3-Flash
 ./scripts/xol-qfn.sh --serve-only --model <shard 1 .gguf> --pack <pack-qfn45>                                       # Qwen3.8-Flash-Next (port 8099)
-python3 -m serve.server --engine strata --config <your-27b.json> --port 8090                                          # Qwen3.8-27B (exe: build-xolotl/strata-dense)
+python3 -m serve.server --engine strata --config <your-27b.json> --port 8090                                          # Qwen3.8-27B (exe: build-xolotl/xolotl-dense)
 ```
 
 Then point any OpenAI- or Anthropic-compatible client at `http://127.0.0.1:<port>/v1`.

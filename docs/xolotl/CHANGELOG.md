@@ -8,6 +8,14 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### The dense engine is `xolotl-dense` now (8 Nov)
+
+The Qwen3.8-27B dense engine builds as `build-xolotl/xolotl-dense` (log lines `xolotl-dense: ...`). The port it
+grew from is Mirko Perrone's ([perronemirko/Strata](https://github.com/perronemirko/Strata)); the Xolotl tree unified
+and extended it. `strata-dense` stays next to it (a symlink, a copy on Windows), so existing configs, wrappers and
+scripts keep working unchanged. Internals keep their names (`STRATA_DENSE`, `dense_model.cpp`, the `STRATA_*`
+switches). The same weights give the same output on both names.
+
 ### DeepSeek-V4.1 fast mode now uses Q2_K: under a point of quality for +27 % decode (7 Nov)
 
 The fast-mode sidecar is now built as **Q2_K** (llama.cpp's 2-bit k-quant, a scale and a minimum per 16 weights)

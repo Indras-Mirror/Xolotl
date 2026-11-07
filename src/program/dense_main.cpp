@@ -1,4 +1,4 @@
-// src/program/dense_main.cpp - `strata-dense --serve --native <model.gguf> --context N`
+// src/program/dense_main.cpp - `xolotl-dense --serve --native <model.gguf> --context N`
 //
 // The prompt is read in chunks: through llama.cpp's MMQ int8 tensor-core kernels when the build has them
 // (--prompt-chunk N, the default path), otherwise NC tokens at a time through the FP32 GEMVs (--no-prefill).
@@ -94,9 +94,9 @@ bool parse_ids(const char* p, std::vector<int32_t>& ids) {
 
 void usage() {
     std::fprintf(stderr,
-                 "usage: strata-dense --serve --native <model.gguf> [--context N] [--kv fp16|int8|q4_0|k8v4] [--mtp [--draft-max N] [--draft-min N] [--draft-p-min P] [--mtp-force]]\n"
+                 "usage: xolotl-dense --serve --native <model.gguf> [--context N] [--kv fp16|int8|q4_0|k8v4] [--mtp [--draft-max N] [--draft-min N] [--draft-p-min P] [--mtp-force]]\n"
                  "                  [--prompt-chunk N | --no-prefill]\n"
-                 "       strata-dense --selftest | --check <model.gguf> [--mtp] [--kv fp16|int8|q4_0|k8v4]\n"
+                 "       xolotl-dense --selftest | --check <model.gguf> [--mtp] [--kv fp16|int8|q4_0|k8v4]\n"
                  "  a dense qwen35 GGUF (Qwen3.8-27B) behind Strata's server protocol; the server runs it with\n"
                  "  `serve/server.py --engine strata --config <run config>` whose `exe` is this program.\n"
                  "  --prompt-chunk N feeds the prompt N tokens at a time through MMQ instead of 8 at a time through\n"
@@ -109,7 +109,7 @@ void usage() {
                  "                  before it, so N=6 also covers a divergence 32768 tokens back.\n");
 }
 
-// ---- `strata-dense --selftest`: the new CUDA kernels against a CPU reference, no model needed.
+// ---- `xolotl-dense --selftest`: the new CUDA kernels against a CPU reference, no model needed.
 uint16_t f32_to_f16_bits(float f) {          // round to nearest even; the test inputs stay well inside the range
     uint32_t x;
     std::memcpy(&x, &f, 4);
@@ -614,7 +614,7 @@ int selftest() {
 }
 
 
-// ---- `strata-dense --check <model.gguf> [--mtp]`: the model against ITSELF - the columns, the snapshot and the
+// ---- `xolotl-dense --check <model.gguf> [--mtp]`: the model against ITSELF - the columns, the snapshot and the
 // rollback must reproduce feeding the tokens one at a time.  Needs the GPU and the model, no reference engine.
 double max_abs_diff(const std::vector<float>& a, const std::vector<float>& b, bool* same) {
     double d = 0;
@@ -798,7 +798,7 @@ int main(int argc, char** argv) {
                 else if (a == "--kv" && j + 1 < argc) kv = argv[++j];
                 else if (a != "--check" && a.rfind("--", 0) != 0) path = a;
             }
-            if (path.empty()) { std::fprintf(stderr, "usage: strata-dense --check <model.gguf> [--mtp] [--kv fp16|int8|q4_0|k8v4]\n"); return 2; }
+            if (path.empty()) { std::fprintf(stderr, "usage: xolotl-dense --check <model.gguf> [--mtp] [--kv fp16|int8|q4_0|k8v4]\n"); return 2; }
             return check_model(path, mtp, kv);
         }
     }
@@ -814,7 +814,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
-            if (i + 1 >= argc) { std::fprintf(stderr, "strata-dense: %s needs a value\n", what); std::exit(2); }
+            if (i + 1 >= argc) { std::fprintf(stderr, "xolotl-dense: %s needs a value\n", what); std::exit(2); }
             return argv[++i];
         };
         if (a == "--serve") serve = true;
@@ -834,25 +834,25 @@ int main(int argc, char** argv) {
     }
     if (!serve || gguf.empty()) { usage(); return 2; }
     if (draft_max < 1 || draft_max > strata::core::DenseModel::kMaxCols - 1) {
-        std::fprintf(stderr, "strata-dense: --draft-max must be 1..%d\n", strata::core::DenseModel::kMaxCols - 1);
+        std::fprintf(stderr, "xolotl-dense: --draft-max must be 1..%d\n", strata::core::DenseModel::kMaxCols - 1);
         return 2;
     }
     if (draft_min < 1 || draft_min > draft_max) {
-        std::fprintf(stderr, "strata-dense: --draft-min must be 1..--draft-max (%d)\n", draft_max);
+        std::fprintf(stderr, "xolotl-dense: --draft-min must be 1..--draft-max (%d)\n", draft_max);
         return 2;
     }
-    if (!(draft_p_min >= 0.0f && draft_p_min <= 1.0f)) { std::fprintf(stderr, "strata-dense: --draft-p-min must be 0..1\n"); return 2; }
+    if (!(draft_p_min >= 0.0f && draft_p_min <= 1.0f)) { std::fprintf(stderr, "xolotl-dense: --draft-p-min must be 0..1\n"); return 2; }
 
     strata::core::DenseModel model;
     std::string err;
-    std::fprintf(stderr, "strata-dense: loading %s%s ...\n", gguf.c_str(), want_mtp ? " (with the MTP head)" : "");
+    std::fprintf(stderr, "xolotl-dense: loading %s%s ...\n", gguf.c_str(), want_mtp ? " (with the MTP head)" : "");
     strata::core::DenseOptions opt;
     opt.mtp = want_mtp;
     opt.mtp_force = mtp_force;
     opt.draft_max = draft_max;
     opt.kv = kv_type;
     if (!model.load(gguf, context, err, opt)) {
-        std::fprintf(stderr, "strata-dense: %s\n", err.c_str());
+        std::fprintf(stderr, "xolotl-dense: %s\n", err.c_str());
         std::printf("ERR %s\n", err.c_str());
         return 1;
     }
@@ -867,12 +867,12 @@ int main(int argc, char** argv) {
     if (prompt_chunk >= 0) {
         std::string perr;
         if (!model.prefill_setup(prompt_chunk, perr))
-            std::fprintf(stderr, "strata-dense: prompt prefill off - %s\n", perr.c_str());
+            std::fprintf(stderr, "xolotl-dense: prompt prefill off - %s\n", perr.c_str());
     }
     {
         std::string cerr;
-        if (!model.ckpt_init(n_ckpt, cerr)) std::fprintf(stderr, "strata-dense: checkpoints off - %s\n", cerr.c_str());
-        else if (model.ckpt_slots()) std::fprintf(stderr, "strata-dense: %d conversation checkpoints\n", model.ckpt_slots());
+        if (!model.ckpt_init(n_ckpt, cerr)) std::fprintf(stderr, "xolotl-dense: checkpoints off - %s\n", cerr.c_str());
+        else if (model.ckpt_slots()) std::fprintf(stderr, "xolotl-dense: %d conversation checkpoints\n", model.ckpt_slots());
     }
     // the ids that end an answer, from the model's own vocabulary
     std::vector<int32_t> stop_ids;
@@ -902,7 +902,7 @@ int main(int argc, char** argv) {
                 model.has_mtp() ? draft_min : 0, (double) draft_p_min);
     std::printf("READY %lld stop\n", (long long) model.max_context());
     std::fflush(stdout);
-    std::fprintf(stderr, "strata-dense: ready - %.2f GiB of weights, %.2f GiB of KV cache (%s), context %lld%s\n",
+    std::fprintf(stderr, "xolotl-dense: ready - %.2f GiB of weights, %.2f GiB of KV cache (%s), context %lld%s\n",
                  model.weight_bytes() / 1073741824.0, model.kv_bytes() / 1073741824.0, model.kv_type().c_str(), (long long) model.max_context(),
                  model.has_mtp() ? ", MTP speculative decoding on" : (want_mtp ? ", MTP requested but OFF (see above)" : ""));
 
@@ -995,14 +995,14 @@ int main(int argc, char** argv) {
                         if (held != "none") held += ",";
                         held += std::to_string(model.ckpt_pos(k));
                     }
-                std::fprintf(stderr, "strata-dense: previous %zu tokens are not a prefix of the new %zu - they first differ at token %zu, checkpoints hold %s%s\n",
+                std::fprintf(stderr, "xolotl-dense: previous %zu tokens are not a prefix of the new %zu - they first differ at token %zu, checkpoints hold %s%s\n",
                              fed.size(), ids.size(), common, held.c_str(),
                              best >= 0 ? " (restoring one)" : " (none at or before that token: re-reading from 0)");
             }
             if (best >= 0 && model.ckpt_restore(best, err)) {
                 resume = (size_t) model.position();
                 fed.resize(resume);
-                std::fprintf(stderr, "strata-dense: checkpoint restored at token %zu, reading %zu\n", resume, ids.size() - resume);
+                std::fprintf(stderr, "xolotl-dense: checkpoint restored at token %zu, reading %zu\n", resume, ids.size() - resume);
             } else {
                 model.reset();
                 fed.clear();
@@ -1057,7 +1057,7 @@ int main(int argc, char** argv) {
             }
             if (slot < 0) slot = lo;
             std::string cerr;
-            if (!model.ckpt_save(slot, cerr)) std::fprintf(stderr, "strata-dense: checkpoint: %s\n", cerr.c_str());
+            if (!model.ckpt_save(slot, cerr)) std::fprintf(stderr, "xolotl-dense: checkpoint: %s\n", cerr.c_str());
         };
         for (int64_t i = (int64_t) resume; i < n && !failed;) {
             int64_t step = std::min<int64_t>(use_pf ? pf_step : (int64_t) NC, n - i);
@@ -1231,14 +1231,14 @@ int main(int argc, char** argv) {
         std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld\n", produced, (long long) n, prompt_ms, decode_ms, finish,
                     drafts_accepted, drafts_offered, (long long) resume);
         std::fflush(stdout);
-        std::fprintf(stderr, "strata-dense: prompt %lld tokens = %zu reused + %lld read in %.0f ms, %lld generated in %.0f ms (%.1f tok/s)%s",
+        std::fprintf(stderr, "xolotl-dense: prompt %lld tokens = %zu reused + %lld read in %.0f ms, %lld generated in %.0f ms (%.1f tok/s)%s",
                      (long long) n, resume, (long long) (n - (long long) resume), prompt_ms, produced, decode_ms,
                      decode_ms > 0 ? 1000.0 * produced / decode_ms : 0.0, cancelled ? " (cancelled)" : "");
         if (drafts_offered) std::fprintf(stderr, ", MTP drafts accepted %lld of %lld (%.0f%%)", drafts_accepted, drafts_offered,
                                          100.0 * (double) drafts_accepted / (double) drafts_offered);
         std::fprintf(stderr, "\n");
         if (cycles + plain_steps > 0 && model.has_mtp())    // where the decode time went, per step
-            std::fprintf(stderr, "strata-dense:   %lld speculative cycles (%.2f tokens each): draft %.1f ms, verify %.1f ms, "
+            std::fprintf(stderr, "xolotl-dense:   %lld speculative cycles (%.2f tokens each): draft %.1f ms, verify %.1f ms, "
                          "ingest %.1f ms per cycle; %lld plain steps at %.1f ms\n", cycles,
                          cycles ? (double) emitted_spec / (double) cycles : 0.0, cycles ? t_draft / (double) cycles : 0.0,
                          cycles ? t_verify / (double) cycles : 0.0, cycles ? t_ingest / (double) cycles : 0.0, plain_steps,

@@ -67,6 +67,6 @@ The 1-token gain is the part that matters for the CPU expert tier, because that 
 | Mac (Apple Silicon) | Q2_0, IQ3_XXS, IQ3_S, UD-Q4_K_XL | everything is ggml NEON: the phone kernel's direct case |
 | Strix Halo | IQ4_XS, UD-Q4_K_XL, IQ3_* | unified memory, high bandwidth: likely compute-bound |
 | Windows / AMD HIP / Intel Arc / older GPUs | same formats as above, same CPU code | AVX1 builds (older CPUs) have the most per-row overhead |
-| Qwen3.8-27B dense (`strata-dense`) | none (CUDA only, no CPU tier) | n/a |
+| Qwen3.8-27B dense (`xolotl-dense`) | none (CUDA only, no CPU tier) | n/a |
 
 Source of the ARM numbers: `~/AI/Xolotl-Mobile` (bench/xm_bench.cpp, docs/PLAN.md).
