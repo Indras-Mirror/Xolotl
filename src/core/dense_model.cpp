@@ -248,6 +248,11 @@ struct DenseModel::Impl {
     std::map<std::string, Found> index;
     std::vector<Layer> layers;
     Mtp mtp;
+    // xolotl: an external drafter's inputs (DenseOptions::taps): tap_slot[l] = this layer's place in a tap row, -1 none
+    std::vector<int> tap_slot;
+    int n_taps = 0;
+    float* taps_run = nullptr;                      // [NC][n_taps * n_embd]: the last run()'s columns
+    float* taps_ring = nullptr;                     // [kTapRing][n_taps * n_embd]: prefill rows at position % kTapRing
     std::vector<void*> allocations;                 // everything cudaMalloc'ed here, freed in the destructor
     std::vector<void*> host_allocs;                 // weights that did not fit in VRAM: mapped pinned host memory
     uint64_t budget = UINT64_MAX;                   // bytes of weights that may go to VRAM
@@ -729,6 +734,19 @@ DenseModel::~DenseModel() {
 }
 
 float* DenseModel::logits_col(int j) const { return impl_->logits + (size_t) j * cfg_.n_vocab; }
+int DenseModel::n_taps() const { return impl_->n_taps; }
+const float* DenseModel::run_taps() const { return impl_->taps_run; }
+const float* DenseModel::ring_taps() const { return impl_->taps_ring; }
+const void* DenseModel::head_weights() const { return impl_->head.dev; }
+int DenseModel::head_type() const { return impl_->head.type; }
+int64_t DenseModel::head_rows() const { return impl_->head.n_out; }
+bool DenseModel::embed_host(int32_t token, float* out, std::string& err) const {
+    const Impl& I = *impl_;
+    if (token < 0 || token >= cfg_.n_vocab) { err = "dense model: token id outside the vocabulary"; return false; }
+    const uint8_t* row = I.embd.f.file->tensor_data(*I.embd.f.tensor) + (size_t) token * I.embd.row_bytes;
+    if (!dequant_row(I.embd.type, row, cfg_.n_embd, out)) { err = "dense model: embedding dequantization"; return false; }
+    return true;
+}
 void* DenseModel::stream() const { return impl_->stream; }
 
 bool DenseModel::load(const std::string& path, int64_t max_context, std::string& err, const DenseOptions& opt) {
@@ -868,8 +886,11 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             const uint64_t kv_per_layer = (uint64_t) HK * (uint64_t) max_context * (kcell + vcell);
             const uint64_t snap_one = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4 +
                                       (uint64_t) C * (cfg_.ssm_d_conv - 1) * 4;     // one snapshot of one GDN layer
+            const uint64_t tap_bytes = opt.taps.empty() ? 0 :
+                (uint64_t) (NC + DenseModel::kTapRing) * opt.taps.size() * (uint64_t) cfg_.n_embd * 4;
             auto reserved_for = [&](bool mtp) {
-                return (uint64_t) (n_attn + (mtp ? 1 : 0)) * kv_per_layer + (mtp ? (uint64_t) n_gdn * snap_one * (uint64_t) draft_max : 0);
+                return (uint64_t) (n_attn + (mtp ? 1 : 0)) * kv_per_layer +
+                       ((mtp || opt.spec_snapshots) ? (uint64_t) n_gdn * snap_one * (uint64_t) draft_max : 0) + tap_bytes;
             };
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
@@ -1007,7 +1028,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                 const uint64_t sbytes = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4;
                 const uint64_t cbytes = (uint64_t) C * (cfg_.ssm_d_conv - 1) * 4;
                 if (!I.alloc(&L.state, sbytes, err, "GDN state") || !I.alloc(&L.conv_state, cbytes, err, "conv state")) return false;
-                if (with_mtp) {
+                if (with_mtp || opt.spec_snapshots) {
                     L.st_slots.assign((size_t) draft_max, nullptr);
                     L.cv_slots.assign((size_t) draft_max, nullptr);
                     for (int j = 0; j < draft_max; ++j)
@@ -1069,11 +1090,27 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             ok = I.alloc(&I.m_e, K * E * f, err, "MTP embeddings") && I.alloc(&I.hin, K * E * f, err, "MTP hidden input") &&
                  I.alloc(&I.cat, K * 2 * E * f, err, "MTP concat") && I.alloc(&I.mtp_logits, (uint64_t) cfg_.n_vocab * f, err, "MTP logits") &&
                  I.alloc(&I.mtp_h, (uint64_t) E * f, err, "MTP output hidden");
+        if (ok && !opt.taps.empty()) {
+            I.tap_slot.assign((size_t) cfg_.n_layer, -1);
+            for (size_t t = 0; t < opt.taps.size(); ++t) {
+                const int l = opt.taps[t];
+                if (l < 0 || l >= cfg_.n_layer || I.tap_slot[(size_t) l] >= 0) {
+                    err = "dense model: tap layer " + std::to_string(l) + " is outside the model's " + std::to_string(cfg_.n_layer) +
+                          " layers or repeated";
+                    return false;
+                }
+                I.tap_slot[(size_t) l] = (int) t;
+            }
+            I.n_taps = (int) opt.taps.size();
+            const uint64_t row = (uint64_t) I.n_taps * E * f;
+            ok = I.alloc(&I.taps_run, (uint64_t) NC * row, err, "drafter taps") &&
+                 I.alloc(&I.taps_ring, (uint64_t) DenseModel::kTapRing * row, err, "drafter tap ring");
+        }
         if (!ok) return false;
 
         native_gdn_set_enabled(true);
         has_mtp_ = with_mtp;
-        draft_max_ = with_mtp ? draft_max : 0;
+        draft_max_ = (with_mtp || opt.spec_snapshots) ? draft_max : 0;
         reset();
         std::string serr;
         if (!sync(serr)) { err = serr; return false; }
@@ -1192,7 +1229,7 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
     Impl& I = *impl_;
     if (n < 1 || n > NC) { err = "dense model: run() takes 1 to " + std::to_string(NC) + " tokens"; return false; }
     if (pos_ + n > max_context_) { err = "dense model: the context is full"; return false; }
-    if (snapshot && (!has_mtp_ || n - 1 > draft_max_)) { err = "dense model: bad snapshot request (more columns than --draft-max + 1, or no MTP)"; return false; }
+    if (snapshot && (draft_max_ == 0 || n - 1 > draft_max_)) { err = "dense model: bad snapshot request (more columns than --draft-max + 1, or no drafter)"; return false; }
     void* s = I.stream;
     const int E = cfg_.n_embd;
     const int64_t pos0 = pos_;
@@ -1209,6 +1246,9 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
             else I.attn_block(cfg_, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, n, (int) pos0, s);
             add_inplace(I.x, I.mix, (int64_t) n * E, s);
             I.ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, s);
+            if (I.n_taps && I.tap_slot[(size_t) l] >= 0)   // this layer's output rows for the drafter
+                cudaMemcpy2DAsync(I.taps_run + (size_t) I.tap_slot[(size_t) l] * E, (size_t) I.n_taps * E * 4, I.x, (size_t) E * 4,
+                                  (size_t) E * 4, (size_t) n, cudaMemcpyDeviceToDevice, (cudaStream_t) s);
             if (dbg) trace_vec("x", pos0, l, L.attn ? "attn" : "gdn", I.x, n * E, s);
         }
         pos_ += n;
@@ -1395,6 +1435,16 @@ bool DenseModel::prefill(const int32_t* tokens, int64_t n, Logits lg, std::strin
                 else I.pf_attn_block(cfg_, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, T, (int) pos0, s);
                 add_inplace(P.x, P.mix, T * E, s);
                 I.pf_ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, T, s);
+                if (I.n_taps && I.tap_slot[(size_t) l] >= 0) {   // the drafter's rows: the chunk's last kTapRing, at position % ring
+                    const int64_t R = DenseModel::kTapRing;
+                    for (int64_t r = std::max<int64_t>(0, T - R); r < T;) {
+                        const int64_t slot = (pos0 + r) % R, len = std::min<int64_t>(T - r, R - slot);
+                        cudaMemcpy2DAsync(I.taps_ring + ((size_t) slot * I.n_taps + I.tap_slot[(size_t) l]) * E, (size_t) I.n_taps * E * 4,
+                                          P.x + (size_t) r * E, (size_t) E * 4, (size_t) E * 4, (size_t) len,
+                                          cudaMemcpyDeviceToDevice, (cudaStream_t) s);
+                        r += len;
+                    }
+                }
             }
             // The MTP block is fed in kMaxCols groups, exactly as the prompt loop does after a run(): each group's
             // column 0 pairs with the previous group's last hidden (h_last, which mtp_ingest leaves behind).

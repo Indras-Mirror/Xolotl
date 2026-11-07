@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack the incoai DFlash2 drafter for Qwen3.8-Flash-Next (safetensors) into the engine's runtime file.
+"""Pack a DFlash2 drafter (incoai's for Qwen3.8-Flash-Next, z-lab's for Qwen3.8-27B; safetensors) into the engine's runtime file.
 
     python tools/dflash2_pack.py model.safetensors config.json out.pack [--bf16]
 
@@ -12,6 +12,7 @@ The matrices' quantization matches ggml's quantize_row_q8_0 (d = amax / 127, q =
 (tools/dflash2/q8test.py) measured no acceptance loss from it.
 """
 import json
+import os
 import struct
 import sys
 
@@ -125,7 +126,7 @@ def pack(st_path, cfg_path, out_path, say=print):
         "head_dim": cfg["head_dim"], "inter": cfg["intermediate_size"], "window": cfg["sliding_window"], "rope_theta": cfg["rope_parameters"]["rope_theta"],
         "eps": cfg["rms_norm_eps"], "block": dc["block_size"], "conv_group": dc["conv_group_size"], "conv_kernel": dc["conv_kernel_size"],
         "mask_token": dc["mask_token_id"], "rank": dc["selector_rank"], "top_k": dc["selector_top_k"], "taps": dc["target_layer_ids"],
-        "vocab": cfg["vocab_size"], "source": "incoai/Qwen3.8-Flash-Next-DFlash2 a22a1744",
+        "vocab": cfg["vocab_size"], "source": os.environ.get("DF2_SOURCE", "incoai/Qwen3.8-Flash-Next-DFlash2 a22a1744"),
     }
     # offsets: relative to the end of the (padded) index; 256-byte aligned
     off = 0

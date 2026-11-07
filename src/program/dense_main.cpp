@@ -26,6 +26,7 @@
 // be checked against llama.cpp; a batched prefill is the next optimisation, not a prerequisite.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/dense_model.hpp"
+#include "strata/core/dflash2.hpp"
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/dense_kernels.hpp"
 #include "strata/kernels/native_gdn.hpp"
@@ -811,6 +812,8 @@ int main(int argc, char** argv) {
     // 0: the default prompt chunk; >0: ask for that chunk; <0 (--no-prefill): feed the prompt through run()
     long long prompt_chunk = 0;
     int n_ckpt = 4;                                    // conversation checkpoints (pinned host RAM, ~154 MiB each); 0 = off
+    std::string df2_pack;                              // xolotl: --dflash2 <pack>, the DFlash2 block drafter instead of MTP
+    bool draft_max_set = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -821,7 +824,8 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") want_mtp = true;
         else if (a == "--kv") kv_type = next("--kv");
         else if (a == "--mtp-force") mtp_force = true;
-        else if (a == "--draft-max" || a == "--spec-draft-n-max") draft_max = std::atoi(next("--draft-max"));
+        else if (a == "--draft-max" || a == "--spec-draft-n-max") { draft_max = std::atoi(next("--draft-max")); draft_max_set = true; }
+        else if (a == "--dflash2") df2_pack = next("--dflash2");
         else if (a == "--draft-min" || a == "--spec-draft-n-min") draft_min = std::atoi(next("--draft-min"));
         else if (a == "--draft-p-min" || a == "--spec-draft-p-min") draft_p_min = std::strtof(next("--draft-p-min"), nullptr);
         else if (a == "--native" || a == "--model" || a == "--gguf") gguf = next("--native");
@@ -833,6 +837,10 @@ int main(int argc, char** argv) {
         // the flags setup passes to `strata` (--gpu-layers, --cache, ...) mean nothing here and are not an error
     }
     if (!serve || gguf.empty()) { usage(); return 2; }
+    if (!df2_pack.empty()) {
+        want_mtp = false;                              // the block drafter replaces MTP (one drafter, and the VRAM for it)
+        if (!draft_max_set) draft_max = strata::core::Dflash2Drafter::kDrafts;
+    }
     if (draft_max < 1 || draft_max > strata::core::DenseModel::kMaxCols - 1) {
         std::fprintf(stderr, "xolotl-dense: --draft-max must be 1..%d\n", strata::core::DenseModel::kMaxCols - 1);
         return 2;
@@ -845,12 +853,26 @@ int main(int argc, char** argv) {
 
     strata::core::DenseModel model;
     std::string err;
+    // xolotl: the DFlash2 drafter loads first, so the model's VRAM budget sees what it took
+    strata::core::Dflash2Drafter df2;
+    const bool use_df2 = !df2_pack.empty();
+    if (use_df2) {
+        if (!df2.load(df2_pack, 0, err)) {
+            std::fprintf(stderr, "xolotl-dense: %s\n", err.c_str());
+            std::printf("ERR %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "xolotl-dense: DFlash2 drafter %s (%.0f MiB of VRAM, taps after layers", df2_pack.c_str(), df2.vram_bytes() / 1048576.0);
+        for (int l : df2.tap_layers()) std::fprintf(stderr, " %d", l);
+        std::fprintf(stderr, ")\n");
+    }
     std::fprintf(stderr, "xolotl-dense: loading %s%s ...\n", gguf.c_str(), want_mtp ? " (with the MTP head)" : "");
     strata::core::DenseOptions opt;
     opt.mtp = want_mtp;
     opt.mtp_force = mtp_force;
     opt.draft_max = draft_max;
     opt.kv = kv_type;
+    if (use_df2) { opt.spec_snapshots = true; opt.taps = df2.tap_layers(); }
     if (!model.load(gguf, context, err, opt)) {
         std::fprintf(stderr, "xolotl-dense: %s\n", err.c_str());
         std::printf("ERR %s\n", err.c_str());
@@ -859,6 +881,31 @@ int main(int argc, char** argv) {
     const auto& cfg = model.config();
     const int n_vocab = cfg.n_vocab;
     constexpr int NC = strata::core::DenseModel::kMaxCols;
+    // the drafter shares the model's embedding (its block rows: the anchor's row, then the mask token's 7 times, staged
+    // in pinned memory the drafter's graphs copy from) and its output head
+    float* df2_stage = nullptr;
+    if (use_df2) {
+        const int E = cfg.n_embd;
+        if (df2.n_embd() != E || (int) df2.tap_layers().size() * E != model.n_taps() * E) {
+            std::printf("ERR the DFlash2 pack (width %d) is not for this model (width %d)\n", df2.n_embd(), E);
+            return 1;
+        }
+        if (cudaHostAlloc((void**) &df2_stage, (size_t) NC * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+            std::printf("ERR cannot allocate the drafter's embedding stage\n");
+            return 1;
+        }
+        for (int r = 1; r < NC; ++r)
+            if (!model.embed_host(df2.mask_token(), df2_stage + (size_t) r * E, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+        auto embed = [df2_stage, E](const int32_t*, int n, float* out, cudaStream_t cs) {
+            cudaMemcpyAsync(out, df2_stage, (size_t) n * E * sizeof(float), cudaMemcpyHostToDevice, cs);
+        };
+        if (!df2.bind_raw(embed, model.head_weights(), model.head_type(), model.head_rows(), {}, err) ||
+            !df2.prepare(model.run_taps(), err)) {
+            std::fprintf(stderr, "xolotl-dense: %s\n", err.c_str());
+            std::printf("ERR %s\n", err.c_str());
+            return 1;
+        }
+    }
     using strata::core::Logits;
 
     // Batched prompt processing: the prompt goes through MMQ in chunks instead of NC-token run() groups.  If the
@@ -895,16 +942,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("INFO engine=dense-0.2 model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld kv=%s mtp=%d draft_max=%d draft_min=%d draft_p_min=%.2f\n",
+    std::printf("INFO engine=dense-0.2 model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld kv=%s mtp=%d dflash2=%d draft_max=%d draft_min=%d draft_p_min=%.2f\n",
                 cfg.arch.c_str(), cfg.n_layer, cfg.n_embd, (unsigned long long) (model.weight_bytes() >> 20),
                 (unsigned long long) (model.host_weight_bytes() >> 20), (unsigned long long) (model.kv_bytes() >> 20),
-                (long long) model.max_context(), model.kv_type().c_str(), model.has_mtp() ? 1 : 0, model.has_mtp() ? draft_max : 0,
-                model.has_mtp() ? draft_min : 0, (double) draft_p_min);
+                (long long) model.max_context(), model.kv_type().c_str(), model.has_mtp() ? 1 : 0, use_df2 ? 1 : 0,
+                (model.has_mtp() || use_df2) ? draft_max : 0, (model.has_mtp() || use_df2) ? draft_min : 0, (double) draft_p_min);
     std::printf("READY %lld stop\n", (long long) model.max_context());
     std::fflush(stdout);
     std::fprintf(stderr, "xolotl-dense: ready - %.2f GiB of weights, %.2f GiB of KV cache (%s), context %lld%s\n",
                  model.weight_bytes() / 1073741824.0, model.kv_bytes() / 1073741824.0, model.kv_type().c_str(), (long long) model.max_context(),
-                 model.has_mtp() ? ", MTP speculative decoding on" : (want_mtp ? ", MTP requested but OFF (see above)" : ""));
+                 use_df2 ? ", DFlash2 speculative decoding on" : model.has_mtp() ? ", MTP speculative decoding on" : (want_mtp ? ", MTP requested but OFF (see above)" : ""));
 
     Lines in;
     std::thread reader([&] {
@@ -1059,6 +1106,7 @@ int main(int argc, char** argv) {
             std::string cerr;
             if (!model.ckpt_save(slot, cerr)) std::fprintf(stderr, "xolotl-dense: checkpoint: %s\n", cerr.c_str());
         };
+        if (use_df2 && !use_pf) df2.reset();
         for (int64_t i = (int64_t) resume; i < n && !failed;) {
             int64_t step = std::min<int64_t>(use_pf ? pf_step : (int64_t) NC, n - i);
             for (int64_t m : marks) if (m > i && m < i + step) { step = m - i; break; }   // stop exactly on a mark
@@ -1070,6 +1118,13 @@ int main(int argc, char** argv) {
                 const int chunk = (int) step;
                 ok = model.run(&ids[(size_t) i], chunk, last ? Logits::Last : Logits::None, model.has_mtp(), false, err) &&
                      (!model.has_mtp() || model.mtp_ingest(&ids[(size_t) i], chunk, (int) i, 0, err));
+                if (ok && use_df2) {   // the rows go to the drafter's ring; a prompt's last row waits for the first round
+                    const int ctx_rows = last ? chunk - 1 : chunk;
+                    ok = model.sync(err) && (ctx_rows < 1 || df2.context(model.run_taps(), ctx_rows, (int64_t) i, err));
+                    if (ok && last && chunk > 1)
+                        cudaMemcpy(const_cast<float*>(model.run_taps()), model.run_taps() + (size_t) (chunk - 1) * model.n_taps() * cfg.n_embd,
+                                   (size_t) model.n_taps() * cfg.n_embd * sizeof(float), cudaMemcpyDeviceToDevice);
+                }
             }
             if (!ok) {
                 fail(err);
@@ -1093,6 +1148,27 @@ int main(int argc, char** argv) {
         }
         if (failed) continue;
         if (!model.sync(err)) { fail(err); continue; }
+        // xolotl DFlash2: a prefill wrote its rows into the model's tap ring; the drafter gets the rows read in this
+        // request (at most its 2048 window), all but the last, which becomes row 0 of the first round's new rows
+        int df2_pend = 0;
+        int64_t df2_pos0 = 0;
+        if (use_df2 && n > (int64_t) resume) {
+            const int64_t R = strata::core::DenseModel::kTapRing, W = (int64_t) model.n_taps() * cfg.n_embd;
+            bool ok = true;
+            if (use_pf) {
+                df2.reset();
+                for (int64_t q = std::max<int64_t>((int64_t) resume, n - R); ok && q < n - 1;) {
+                    const int64_t slot = q % R, len = std::min<int64_t>(n - 1 - q, R - slot);
+                    ok = df2.context(model.ring_taps() + (size_t) slot * W, len, q, err);
+                    q += len;
+                }
+                if (ok) ok = cudaMemcpy(const_cast<float*>(model.run_taps()), model.ring_taps() + (size_t) ((n - 1) % R) * W,
+                                        (size_t) W * sizeof(float), cudaMemcpyDeviceToDevice) == cudaSuccess;
+            }
+            if (!ok) { fail(err.empty() ? "dflash2: context" : err); continue; }
+            df2_pend = 1;
+            df2_pos0 = n - 1;
+        }
         const double prompt_ms = ms_since(t_prompt);
 
         // ---- decode
@@ -1108,7 +1184,7 @@ int main(int argc, char** argv) {
         // has already put them in the penalty window, so a speculative step draws exactly what single steps would.  (It
         // used to switch speculation off whenever penalty_last_n > 0 - every thinking-off request, whose model-card
         // sampling has presence_penalty 1.5, decoded without MTP: 48 instead of ~90 tok/s.)
-        const bool speculate = model.has_mtp();
+        const bool speculate = model.has_mtp() || use_df2;
 
         // one draw from device logits; the counter is the POSITION of the token drawn, so a seed gives the same text
         // whether a token comes from a single step or from a verified pair
@@ -1179,7 +1255,19 @@ int main(int argc, char** argv) {
             if (speculate && remaining >= 2 && p + 2 <= model.max_context()) {
                 const int cap = (int) std::min<long long>({(long long) draft_max, remaining - 1, model.max_context() - p - 1});
                 const auto t0 = Clock::now();
-                if (!model.mtp_draft(next, (int) p, cap, draft_p_min, dr, &nd, err)) { fail(err); failed = true; break; }
+                if (use_df2) {
+                    if (df2_pend > 0 && !model.embed_host(next, df2_stage, err)) { fail(err); failed = true; break; }
+                    if (df2_pend > 0) {   // the committed rows since the last round, then the block for `next` at p
+                        int32_t d7[strata::core::Dflash2Drafter::kDrafts];
+                        float pr[strata::core::Dflash2Drafter::kDrafts];
+                        if (!df2.draft(model.run_taps(), df2_pend, df2_pos0, next, d7, pr, err)) { fail(err); failed = true; break; }
+                        df2_pend = 0;
+                        for (nd = 0; nd < cap && nd < strata::core::Dflash2Drafter::kDrafts; ++nd) {
+                            if (nd > 0 && pr[nd] < draft_p_min) break;
+                            dr[nd] = d7[nd];
+                        }
+                    }
+                } else if (!model.mtp_draft(next, (int) p, cap, draft_p_min, dr, &nd, err)) { fail(err); failed = true; break; }
                 t_draft += ms_since(t0);
             }
             if (nd >= draft_min && nd >= 1) {
@@ -1188,7 +1276,7 @@ int main(int argc, char** argv) {
                 cols[0] = next;
                 for (int j = 0; j < nd; ++j) cols[j + 1] = dr[j];
                 const auto t1 = Clock::now();
-                if (!model.run(cols, nd + 1, Logits::All, true, true, err)) { fail(err); failed = true; break; }
+                if (!model.run(cols, nd + 1, Logits::All, model.has_mtp(), true, err)) { fail(err); failed = true; break; }
                 int a = 0;
                 int32_t y = -1;
                 for (int j = 0; j <= nd; ++j) {
@@ -1208,7 +1296,10 @@ int main(int argc, char** argv) {
                 fed.push_back(next);
                 for (int j = 0; j < a; ++j) fed.push_back(dr[j]);
                 const auto t2 = Clock::now();
-                if (a >= 1) {                       // the MTP block learns the accepted positions with the trunk's own hidden states
+                if (use_df2) {                      // run() left columns 0..a's tap rows: the next round's new context
+                    df2_pend = a + 1;
+                    df2_pos0 = p;
+                } else if (a >= 1) {                // the MTP block learns the accepted positions with the trunk's own hidden states
                     if (!model.mtp_ingest(cols, a + 1, (int) p, 1, err)) { fail(err); failed = true; break; }
                 } else {
                     model.set_last_hidden(0);
@@ -1220,6 +1311,7 @@ int main(int argc, char** argv) {
                 if (!model.run(&next, 1, Logits::Last, model.has_mtp(), false, err) ||
                     (model.has_mtp() && !model.mtp_ingest(&next, 1, (int) p, 0, err))) { fail(err); failed = true; break; }
                 fed.push_back(next);
+                if (use_df2) { df2_pend = 1; df2_pos0 = p; }
                 int32_t y = -1;
                 if (!draw(model.logits_col(0), (uint64_t) (p + 1), y)) { fail(err); failed = true; break; }
                 t_plain += ms_since(t3);

@@ -64,6 +64,7 @@ public:
     uint64_t vram_bytes() const { return vram_; }
     int64_t n_draft_vocab() const { return n_dvocab_; }
     int n_embd() const { return N_; }
+    int mask_token() const { return mask_token_; }
     const std::vector<int>& tap_layers() const { return taps_; }
     cudaStream_t stream() const { return cs_; }
     /// Diagnostics (STRATA_DF2_DUMP): the final normalized block rows of the last draft(), host copy.

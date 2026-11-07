@@ -395,16 +395,18 @@ __global__ void conv_quant_kernel(const float* __restrict__ x, const float* __re
 
 // h += conv(x) (the finish convolution with its residual), then RMS norm of the new h with `gamma` -> xn (optional) and the planar quantization.
 // One block of 1024 threads per row: a warp owns whole 32-blocks (80 of them for 2560), so the quantization needs no exchange.
+// J = 32-blocks per warp: 3 up to H = 3072 (Flash-Next, 2560: the original kernel), 5 up to 5120 (xolotl: the 27B drafter).
+template <int J>
 __global__ void __launch_bounds__(1024) conv_rms_quant_kernel(const float* __restrict__ x, const float* __restrict__ dyn, int dyn_stride, const float* __restrict__ base,
                                                               float* __restrict__ h, const float* __restrict__ gamma, float* __restrict__ xn, int H, int group,
                                                               float eps, int8_t* __restrict__ xq, float* __restrict__ xd) {
     const int b = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int groups = H / group, nb = H / 32;
     __shared__ float red[32];
-    float v[3];
+    float v[J];
     float ss = 0.0f;
 #pragma unroll
-    for (int j = 0; j < 3; ++j) {
+    for (int j = 0; j < J; ++j) {
         const int blk = warp + j * 32;
         v[j] = 0.0f;
         if (blk < nb) {
@@ -428,7 +430,7 @@ __global__ void __launch_bounds__(1024) conv_rms_quant_kernel(const float* __res
     for (int w = 0; w < 32; ++w) tot += red[w];
     const float scale = rsqrtf(tot / (float) H + eps);
 #pragma unroll
-    for (int j = 0; j < 3; ++j) {
+    for (int j = 0; j < J; ++j) {
         const int blk = warp + j * 32;
         if (blk < nb) {
             const int c = blk * 32 + lane;
@@ -695,8 +697,11 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
 
 void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const float* base, float* h, const float* gamma, float* xn, int rows, int H, int group,
                         float eps, void* xq, float* xd, void* stream) {
-    if (H > 3 * 1024) throw std::invalid_argument("df2_conv_rms_quant: H too large");
-    conv_rms_quant_kernel<<<rows, 1024, 0, (cudaStream_t) stream>>>(x, dyn, dyn_stride, base, h, gamma, xn, H, group, eps, static_cast<int8_t*>(xq), xd);
+    if (H <= 3 * 1024)
+        conv_rms_quant_kernel<3><<<rows, 1024, 0, (cudaStream_t) stream>>>(x, dyn, dyn_stride, base, h, gamma, xn, H, group, eps, static_cast<int8_t*>(xq), xd);
+    else if (H <= 5 * 1024)
+        conv_rms_quant_kernel<5><<<rows, 1024, 0, (cudaStream_t) stream>>>(x, dyn, dyn_stride, base, h, gamma, xn, H, group, eps, static_cast<int8_t*>(xq), xd);
+    else throw std::invalid_argument("df2_conv_rms_quant: H too large");
     check("conv_rms_quant");
 }
 

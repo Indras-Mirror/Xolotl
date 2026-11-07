@@ -73,6 +73,11 @@ namespace strata::core
         /// "q4_0" (4-bit after a Hadamard rotation, about 28%) or "k8v4" (int8 keys, 4-bit values, about 40%).
         /// "f16", "q8_0" and "q4" are accepted too.  The 4-bit formats need head_dim 256.
         std::string kv = "fp16";
+        /// xolotl: rollback snapshots (draft_max of them) without the MTP block, for an external drafter (DFlash2).
+        bool spec_snapshots = false;
+        /// xolotl: layers whose output rows run() and prefill() copy for an external drafter (DFlash2: its
+        /// target_layer_ids, e.g. 5,19,33,47,61); empty = off.  See run_taps() / ring_taps().
+        std::vector<int> taps;
     };
 
     class DenseModel
@@ -175,6 +180,21 @@ namespace strata::core
         bool mtp_draft(int32_t token, int pos, int max_n, float p_min, int32_t *out, int *n_out, std::string &err);
         /// Makes column `col` of the last run() the "last hidden" (used after a rollback).
         void set_last_hidden(int col);
+
+        // ---- xolotl: an external drafter's inputs (DenseOptions::taps)
+        static constexpr int kTapRing = 2048;
+        int n_taps() const;
+        /// Device [kMaxCols][n_taps * n_embd]: the tap layers' output rows of the last run() (column j = row j).
+        const float *run_taps() const;
+        /// Device [kTapRing][n_taps * n_embd]: prefill() writes the row of position p at p % kTapRing (the last
+        /// kTapRing rows of every prompt chunk).
+        const float *ring_taps() const;
+        /// The token's embedding row (n_embd floats) on the host, dequantized from the model file.
+        bool embed_host(int32_t token, float *out, std::string &err) const;
+        /// The output head as native_mmvq reads it: weights (device or mapped), type, rows (= n_vocab).
+        const void *head_weights() const;
+        int head_type() const;
+        int64_t head_rows() const;
 
     private:
         struct Impl;
