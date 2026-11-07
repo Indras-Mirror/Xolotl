@@ -32,14 +32,14 @@ token over our 34-text quality set:
   runs swing by ~5 %).
 
 Agentic coding, the [Gauntlet](../tools/gauntlet/README.md) v3-small (6 hard tasks graded by hidden tests, 10 turns,
-thinking on, served settings, 2 runs each):
+thinking on, served settings):
 
-|          | solved     | score    | decode during the tasks |
-| -------- | ---------- | -------- | ----------------------- |
-| normal   | 8 / 12     | 4.99     | 32.6 tok/s              |
-| **fast** | **8 / 12** | **4.99** | **41.1 tok/s (+26 %)**  |
+|          | Gauntlet score (of 6) | Decode during the tasks |
+| -------- | :-------------------: | ----------------------: |
+| normal   |          4.99         |              32.6 tok/s |
+| **fast** |        **4.99**       |  **41.1 tok/s (+26 %)** |
 
-The same tasks solved and missed in both modes (each missed 04 once; 03 stays half-done in every run).
+The same tasks solved and missed in both modes (04 is missed sometimes in each; 03 stays half-done every time).
 
 ## Use it
 
