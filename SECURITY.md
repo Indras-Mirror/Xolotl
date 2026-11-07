@@ -4,15 +4,16 @@
 
 Please report anything that should not be public until it is fixed **privately**, through GitHub's private
 vulnerability reporting: the repository's **Security** tab, **Report a vulnerability**
-([direct link](https://github.com/Niko1221/Strata/security/advisories/new)). Say what you found, how to reproduce it
-(the request, the config keys involved, the Strata version), and what an attacker gains. We answer there, fix it in
+([direct link](https://github.com/Indras-Mirror/Xolotl/security/advisories/new)). Say what you found, how to reproduce it
+(the request, the config keys involved, the Xolotl commit), and what an attacker gains. We answer there, fix it in
 a release, and credit you in the advisory unless you ask us not to.
 
 Ordinary hardening ideas and findings that are safe to discuss in public are welcome as an
-[issue](https://github.com/Niko1221/Strata/issues) (#544 collects audit findings) or as a pull request, which we
+[issue](https://github.com/Indras-Mirror/Xolotl/issues) (upstream Strata's audit findings are collected in [Strata #544](https://github.com/Niko1221/Strata/issues/544)) or as a pull request, which we
 review like our own code.
 
-Supported: the latest release. Fixes go into the next release, not into older ones.
+Supported: the latest commit on `main` (Xolotl has no releases). The server code below is Strata's, so the same
+protections apply.
 
 ## What the server exposes
 
@@ -74,6 +75,8 @@ the model. The section above is about the engine's HTTP server. This is what the
   See [packaging/UPDATES.md](packaging/UPDATES.md).
 
 ### How far to trust `curl | sh` and `irm | iex`
+
+(This is upstream Strata's installer. Xolotl itself is built from source - see [AGENTS.md](AGENTS.md).)
 
 The Terminal installs with one line:
 

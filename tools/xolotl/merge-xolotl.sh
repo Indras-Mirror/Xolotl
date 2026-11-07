@@ -30,7 +30,7 @@ done
 [ "$APPLY" = 1 ] || { echo; echo "dry run only - re-run with --apply to merge"; exit 0; }
 
 # NOTE: merge order matters.  Drop legacy tools/ds4/ds4_* BEFORE merging mimo if Mal approves it
-# (MERGE_SCOPE.md SEC 6 - it removes ~30 of mimo's 46 hunks).  Kernels first, CMakeLists last.
+# (docs/history/MERGE_SCOPE-2026-10-16.md SEC 6 - it removes ~30 of mimo's 46 hunks).  Kernels first, CMakeLists last.
 for r in origin/glm origin/mimo; do
     echo "== merging $r =="
     if git merge --no-commit --no-ff "$r"; then

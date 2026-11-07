@@ -28,7 +28,7 @@ The profile (`expert-profile.bin`) is a **static residency plan**: an ordered li
 
 ### File format
 
-Defined in [`include/strata/core/expert_cache.hpp:43`](include/strata/core/expert_cache.hpp:43), read by [`src/core/expert_cache.cpp:12`](src/core/expert_cache.cpp:12):
+Defined in [`include/strata/core/expert_cache.hpp:43`](../../include/strata/core/expert_cache.hpp:43), read by [`src/core/expert_cache.cpp:12`](../../src/core/expert_cache.cpp:12):
 
 ```
 offset  0  "STRP"                        magic, 4 bytes
@@ -40,7 +40,7 @@ offset 24  n_ranked × (uint16 layer, uint16 expert)   the ordered list
 
 The engine uses **only the ordered list**. The lookup table is the tool's internal work. The `slots` field is informational: it is the "built for N slots" that shows up in the log.
 
-Validation ([`src/core/expert_cache.cpp:32`](src/core/expert_cache.cpp:32)): if `(n_layers, n_expert)` does not match the model geometry, the engine stops with
+Validation ([`src/core/expert_cache.cpp:32`](../../src/core/expert_cache.cpp:32)): if `(n_layers, n_expert)` does not match the model geometry, the engine stops with
 
 ```
 read_expert_profile: <file> is 48x512 but this model is 64x256 -
@@ -49,7 +49,7 @@ it is a profile for a different artifact
 
 ### The ranking matters more than the slot count
 
-MoE routing follows a power law. The repo models it like this in [`src/program/generate.cpp:1998`](src/program/generate.cpp:1998):
+MoE routing follows a power law. The repo models it like this in [`src/program/generate.cpp:1998`](../../src/program/generate.cpp:1998):
 
 ```
 dispatched mass for rank r  ∝  (r+1)^-1.2
@@ -59,7 +59,7 @@ Exponent 1.2 < 1 → heavy tail: the few experts at the top take almost all the 
 
 ### The default trap, with the numbers
 
-[`tools/make_default_profile.py`](tools/make_default_profile.py) generates pairs in **layer-major** order: all 512 experts of layer 0, then layer 1, etc. Useful only as a placeholder to get the engine started.
+[`tools/make_default_profile.py`](../../tools/make_default_profile.py) generates pairs in **layer-major** order: all 512 experts of layer 0, then layer 1, etc. Useful only as a placeholder to get the engine started.
 
 With 9615 slots (the ones that fit on a 3090/4090 with IQ3_S):
 
@@ -117,7 +117,7 @@ Same slots, same number of experts in VRAM. The *right* 39% of experts carries 9
 
 ### From hit rate to tok/s
 
-Model from the costs in [`include/strata/spec/controller.hpp:25`](include/strata/spec/controller.hpp:25), window T=4 (n = k+1 = 4):
+Model from the costs in [`include/strata/spec/controller.hpp:25`](../../include/strata/spec/controller.hpp:25), window T=4 (n = k+1 = 4):
 
 ```
 step_ms = dense(n) + experts(n) + sync + draft
@@ -222,11 +222,11 @@ Why exactly those flags:
 
 | Flag | Reason in the code |
 |---|---|
-| `--prefill 0` | **the most important one**. With prefill active the prompt travels in batch inside `prefill.run()` and never goes through `drive_pool`: zero records for the prompt tokens. Only `drive_pool` ([`generate.cpp:590`](src/program/generate.cpp:590)) and `drive_pool_multi` ([`generate.cpp:622`](src/program/generate.cpp:622)) write the trace |
-| `--expert-cache 0` | disables the cache → `hit_fn = nullptr` ([`generate.cpp:2789`](src/program/generate.cpp:2789)). The pool sees all k experts with no hit/miss ambiguity |
-| `--spec 0` | uses `drive_pool` instead of `drive_pool_multi`. The multi path writes **unit weights** ([`generate.cpp:627`](src/program/generate.cpp:627)), the single path writes the real router weights |
+| `--prefill 0` | **the most important one**. With prefill active the prompt travels in batch inside `prefill.run()` and never goes through `drive_pool`: zero records for the prompt tokens. Only `drive_pool` ([`generate.cpp:590`](../../src/program/generate.cpp:590)) and `drive_pool_multi` ([`generate.cpp:622`](../../src/program/generate.cpp:622)) write the trace |
+| `--expert-cache 0` | disables the cache → `hit_fn = nullptr` ([`generate.cpp:2789`](../../src/program/generate.cpp:2789)). The pool sees all k experts with no hit/miss ambiguity |
+| `--spec 0` | uses `drive_pool` instead of `drive_pool_multi`. The multi path writes **unit weights** ([`generate.cpp:627`](../../src/program/generate.cpp:627)), the single path writes the real router weights |
 | no `--expert-profile` | the trace must not be contaminated by a previous residency |
-| **not** `--no-pool` | forbidden: [`generate.cpp:2775`](src/program/generate.cpp:2775) exits with "needs the expert pool" |
+| **not** `--no-pool` | forbidden: [`generate.cpp:2775`](../../src/program/generate.cpp:2775) exits with "needs the expert pool" |
 
 You need a **free GPU** (~18 GiB). At the end it prints:
 
@@ -249,7 +249,7 @@ python3 tools/make_profile.py /tmp/trace.bin --no-base \
   --out /home/albus/workspaces/AI/Strata-data/profiles/iq3_s-chat.bin
 ```
 
-`--no-base` is the key for "from scratch": without it, the tool puts the `--base` ranking first and your pairs end up behind ([`make_profile.py:82`](tools/make_profile.py:82)). With `--no-base` the order is: pairs from the trace by descending frequency, then the missing ones **interleaved across layers** ([`make_profile.py:91`](tools/make_profile.py:91)) — exactly what avoids the layer-major trap.
+`--no-base` is the key for "from scratch": without it, the tool puts the `--base` ranking first and your pairs end up behind ([`make_profile.py:82`](../../tools/make_profile.py:82)). With `--no-base` the order is: pairs from the trace by descending frequency, then the missing ones **interleaved across layers** ([`make_profile.py:91`](../../tools/make_profile.py:91)) — exactly what avoids the layer-major trap.
 
 More traces are merged by summing the frequencies:
 
@@ -305,7 +305,7 @@ Below ~2000 decode tokens the tail ranking is noise; above ~30000 you gain nothi
 |---|---|
 | Same model, different quantization (Q2_0 ↔ IQ3_S) | **yes**, reuse the same file. Routing depends on the weights, not on how they are quantized |
 | Pruned model (256 experts) | **yes**, with `--n-expert 256` |
-| Architecture with a different number of layers or experts | **no**: the engine rejects the file. You need a new trace and a parameterized tool (`N_LAYER, N_EXPERT` are hard-coded in [`make_profile.py:23`](tools/make_profile.py:23)) |
+| Architecture with a different number of layers or experts | **no**: the engine rejects the file. You need a new trace and a parameterized tool (`N_LAYER, N_EXPERT` are hard-coded in [`make_profile.py:23`](../../tools/make_profile.py:23)) |
 | Dense model (Qwen3.8-27B) | **irrelevant**: no experts, no profile |
 | Different workload (code → chat) | the profile stays valid but performs worse: regenerate it |
 
@@ -316,7 +316,7 @@ Strata-data/profiles/qwen3.8-flash-next.bin
 Strata-data/profiles/coder-iq1_m.bin
 ```
 
-`--expert-profile` is also mandatory for two features that otherwise will not start: layer split across multiple GPUs ([`generate.cpp:1264`](src/program/generate.cpp:1264)) and `--resident-cpu-experts` ([`generate.cpp:1250`](src/program/generate.cpp:1250)).
+`--expert-profile` is also mandatory for two features that otherwise will not start: layer split across multiple GPUs ([`generate.cpp:1264`](../../src/program/generate.cpp:1264)) and `--resident-cpu-experts` ([`generate.cpp:1250`](../../src/program/generate.cpp:1250)).
 
 ### 2.7 Controlling what stays resident
 
@@ -327,7 +327,7 @@ Strata-data/profiles/coder-iq1_m.bin
 | `--expert-cache 0` | cache disabled, everything on the CPU pool |
 | `--expert-cache-per-layer` | each layer gets **its own** slots instead of a shared counter |
 
-The last one is decisive. From the help in [`generate.cpp:506`](src/program/generate.cpp:506): without per-layer, the shared counter sends the first slots all to the low layers → **2.97%** hit. With per-layer: **21.4%** at 8 slots/layer, **70.4%** at 64/layer.
+The last one is decisive. From the help in [`generate.cpp:506`](../../src/program/generate.cpp:506): without per-layer, the shared counter sends the first slots all to the low layers → **2.97%** hit. With per-layer: **21.4%** at 8 slots/layer, **70.4%** at 64/layer.
 
 The profile is only the **initial state**: the adaptive tier then swaps experts based on what the conversation actually dispatches, every `--adapt-every` round.
 
@@ -361,7 +361,7 @@ build-dense/strata-dense --selftest
 
 ### 3.2 Available flags
 
-From [`src/program/dense_main.cpp:254`](src/program/dense_main.cpp:254) — there are few, and `--serve` is **mandatory**:
+From [`src/program/dense_main.cpp:254`](../../src/program/dense_main.cpp:254) — there are few, and `--serve` is **mandatory**:
 
 ```
 strata-dense --serve --native <model.gguf> [--context N]
@@ -374,11 +374,11 @@ strata-dense --serve --native <model.gguf> [--context N]
 | `--context` / `-c` | context cells, default 32768 |
 | `--selftest` | tests the CUDA kernels against a CPU reference, no model needed |
 
-The flags `setup` passes to `strata` (`--gpu-layers`, `--cache`, …) are **silently ignored** here ([`dense_main.cpp:258`](src/program/dense_main.cpp:258)).
+The flags `setup` passes to `strata` (`--gpu-layers`, `--cache`, …) are **silently ignored** here ([`dense_main.cpp:258`](../../src/program/dense_main.cpp:258)).
 
 ### 3.3 stdin/stdout protocol
 
-Documented in [`src/program/dense_main.cpp:1`](src/program/dense_main.cpp:1):
+Documented in [`src/program/dense_main.cpp:1`](../../src/program/dense_main.cpp:1):
 
 ```
 out   INFO key=value ...                    facts for the Monitor
@@ -410,7 +410,7 @@ printf 'GEN 128 temperature=0 top_k=1 %s\nQUIT\n' "$(cat /tmp/q.txt)" \
   | build-dense/strata-dense --serve --native "$GGUF" --context 4096
 ```
 
-`temperature=0` = greedy ([`include/strata/kernels/sampler.hpp:19`](include/strata/kernels/sampler.hpp:19)).
+`temperature=0` = greedy ([`include/strata/kernels/sampler.hpp:19`](../../include/strata/kernels/sampler.hpp:19)).
 
 ### 3.5 Run through the server (OpenAI/Anthropic + web app)
 
@@ -426,7 +426,7 @@ python3 chat.py --port 8080
 
 ### 3.6 VRAM budget and weights in host memory
 
-The model computes by itself how much fits in VRAM ([`src/core/dense_model.cpp:441`](src/core/dense_model.cpp:441)):
+The model computes by itself how much fits in VRAM ([`src/core/dense_model.cpp:441`](../../src/core/dense_model.cpp:441)):
 
 ```
 budget = free VRAM − KV cache − 1 GiB margin
@@ -443,7 +443,7 @@ That line is the number one bottleneck of the dense path. To control it:
 | Lever | Effect |
 |---|---|
 | shorter `--context N` | the KV cache takes less space, more weights fit into VRAM |
-| `STRATA_DENSE_GPU_MIB=<MiB>` | explicit weight budget, ignores the auto-computation ([`dense_model.cpp:451`](src/core/dense_model.cpp:451)) |
+| `STRATA_DENSE_GPU_MIB=<MiB>` | explicit weight budget, ignores the auto-computation ([`dense_model.cpp:451`](../../src/core/dense_model.cpp:451)) |
 | smaller quantization | fewer total bytes to place |
 
 If the KV does not fit even with the margin, the engine stops with:
@@ -459,13 +459,13 @@ dense model: the KV cache for a context of N needs X MiB, but only Y MiB of VRAM
 STRATA_DENSE_DEBUG=0:2 build-dense/strata-dense --serve --native "$GGUF"
 ```
 
-Traces the device vector statistics for steps with `0 <= position < 2`, layer by layer ([`dense_model.cpp:417`](src/core/dense_model.cpp:417), [`:286`](src/core/dense_model.cpp:286)). Useful to understand whether a layer produces NaN or the wrong scale.
+Traces the device vector statistics for steps with `0 <= position < 2`, layer by layer ([`dense_model.cpp:417`](../../src/core/dense_model.cpp:417), [`:286`](../../src/core/dense_model.cpp:286)). Useful to understand whether a layer produces NaN or the wrong scale.
 
 ### 3.8 Known limits of the dense path
 
 - **No speculative decoding.** The loop is pure autoregressive, one token per forward pass. GDN has a recurrent state that advances one token at a time and the residual stream creates a sequential dependency: you cannot batch T tokens in a single pass.
-- **Prompt read one token at a time** ([`dense_main.cpp:20`](src/program/dense_main.cpp:20)). Correct and comparable with llama.cpp; a batched prefill is the next optimization, not a prerequisite.
-- **Conversation cache for prefixes only.** The GDN state cannot be rolled back: a request reuses the state only if everything it consumed is a prefix of the new prompt. Otherwise reset and prompt reread ([`dense_main.cpp:16`](src/program/dense_main.cpp:16)).
+- **Prompt read one token at a time** ([`dense_main.cpp:20`](../../src/program/dense_main.cpp:20)). Correct and comparable with llama.cpp; a batched prefill is the next optimization, not a prerequisite.
+- **Conversation cache for prefixes only.** The GDN state cannot be rolled back: a request reuses the state only if everything it consumed is a prefix of the new prompt. Otherwise reset and prompt reread ([`dense_main.cpp:16`](../../src/program/dense_main.cpp:16)).
 
 ---
 
@@ -490,7 +490,7 @@ engine/strata \
 python3 serve/server.py --engine strata --config strata-iq3_s.json --port 4332
 ```
 
-Speculation: `--spec T` (T ≤ 8) enables the verify window, `--mtp <dir>` the draft layer, `--suffix-draft N` the prompt lookup (default 3, `0` turns it off). The suffix drafter has no weights and costs microseconds: it pays off on code and repeated text, +6-11% ([`generate.cpp:1358`](src/program/generate.cpp:1358)).
+Speculation: `--spec T` (T ≤ 8) enables the verify window, `--mtp <dir>` the draft layer, `--suffix-draft N` the prompt lookup (default 3, `0` turns it off). The suffix drafter has no weights and costs microseconds: it pays off on code and repeated text, +6-11% ([`generate.cpp:1358`](../../src/program/generate.cpp:1358)).
 
 Diagnostics in every run:
 

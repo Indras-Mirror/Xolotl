@@ -8,7 +8,7 @@ What I've measured is one setup: **RTX 4090 (24 GB), 110 GB DDR4 (90 GB until 1 
   Everything measured here is on Linux.
 - **GPU:** NVIDIA, compute capability 7.5 or newer (RTX 20/30/40/50). Build with your card's architecture:
   `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 30, `89` for RTX 40, `120` for RTX 50 (use CUDA 13.x for RTX 50; 12.8 builds
-  had prompt-path crashes). **Tesla V100 (sm_70):** experimental DS41-on-Buster path only — see [BUSTER.md](../BUSTER.md)
+  had prompt-path crashes). **Tesla V100 (sm_70):** experimental DS41-on-Buster path only — see [BUSTER.md](BUSTER.md)
   (`STRATA_EXPERIMENTAL_SM60=ON`, CUDA 12.x, no chunk-MMQ on Volta).
 - **VRAM:** 24 GB is what I run. Smaller cards work with smaller prompt batches (slower prefill) and fewer experts on
   the card: community runs on 12 GB cards (RTX 3060 with 46 GB RAM: 149 tok/s prefill at 8K, 8-10 tok/s decode; RTX

@@ -99,6 +99,8 @@ Get a model:
   [fast-mode](#fast-mode-deepseek-v41) sidecar (~40 GB), built once with `ds41_generate --build-shadow`.
 - **Qwen3.8-Flash-Next:** **[XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored)**
   (the two `.gguf` shards plus `pack-qfn45/`).
+- **Qwen3.8-27B:** any dense Qwen3.8-27B GGUF. `python tools/dense_setup.py --download UD-Q4_K_M --build --arch 89` fetches
+  one and writes its run config; add `--mtp --ngram-chain` to its engine args for the fast (still exact) decode.
 
 Then serve it (edit the model paths in the DeepSeek and GLM configs first):
 
@@ -135,7 +137,10 @@ pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up
 | [DeepSeek-V4.1 on Windows](docs/WINDOWS.md)        | native MSVC + CUDA build, configs, RTX 50 notes                                   |
 | [GLM-5.3-Flash engine](docs/glm)                   | KDA + MLA attention, the LoRA on routed experts, soft pruning                     |
 | [LFM3-Omni engine](docs/LFM3.md)                   | pictures, audio, video and speech on a 2B model, park/unpark beside a big one     |
+| [Qwen3.8-27B dense howto](docs/dense/HOWTO.md)     | dense vs MoE paths, binaries, configs, MTP (by Mirko Perrone, also in Italian)    |
+| [Setting up with an agent](AGENTS.md)              | the build-and-serve steps for an AI agent (or a person) setting Xolotl up         |
 | [Qwen3.8 / upstream Strata](README.strata.md)      | the Strata engine this grew from                                                  |
+| [History](docs/history/README.md)                  | earlier session notes, kept as written                                            |
 | [Brand kit](docs/brand/XOLOTL_BRAND.md)            | logo, banner, palette                                                             |
 
 ## Credits

@@ -6,7 +6,7 @@ A DeepSeek-V4 engine built on <a href="https://github.com/Niko1221/Strata">Strat
 > **Status: experimental, single-developer research code.** It generates correct, coherent text and beats
 > llama.cpp's best configuration on the machine below, but it has been measured on exactly one PC, has no server or
 > chat UI of its own yet, and serves one sequence at a time. Expect rough edges. The upstream Strata README (the
-> Qwen3.8-Flash engine this is built on) is in [README.strata.md](README.strata.md).
+> Qwen3.8-Flash engine this is built on) is in [README.strata.md](../../README.strata.md).
 
 ## What this is
 
@@ -102,7 +102,7 @@ experts a conversation actually needs move in. On held-out text (9.6K tokens, pe
 
 Calibration: `ds4_generate --prefill-chunk 4096 --chunk-mmq --saliency sal.bin` on a mixed prompt
 (`tools/ds4/make_reap_prompts.py`), then `tools/ds4/reap_prune.py sal.bin --frac 0.25 -o prune.txt`. The saliency
-accumulator and `reap_prune.py` come from the Strata-GLM work. Details: [FINDINGS s37](docs/ds4/FINDINGS.md).
+accumulator and `reap_prune.py` come from the Strata-GLM work. Details: [FINDINGS s37](FINDINGS.md).
 
 The first token's logits match llama.cpp's (same top-1; KL 0.03-0.10, which is the difference between the GPU's and
 the CPU's 8-bit activation rounding).
@@ -208,6 +208,6 @@ resolve toward the cache. It trades quality for speed - measured: 0.05 → +9% d
 Built on [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors (MIT). Uses
 [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), including its DeepSeek-V4 hyper-connection kernels,
 as the reference implementation. DeepSeek-V4-Flash by [DeepSeek](https://huggingface.co/deepseek-ai). The engine's
-design notes and every measurement behind the numbers above are in [docs/ds4/](docs/ds4/) (`FINDINGS.md`).
+design notes and every measurement behind the numbers above are in [docs/ds4/](.) (`FINDINGS.md`).
 
-License: MIT (see [LICENSE](LICENSE)).
+License: MIT (see [LICENSE](../../LICENSE)).

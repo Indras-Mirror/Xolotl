@@ -347,7 +347,7 @@ backend's captured graphs are dropped too, so nothing replays against freed memo
   (#17, NektoDron).
 - **Multi-GPU layer split** (AtticusG3 / buster, Niko1221, bsvinay): `--layer-split` across cards with a PCIe hand-off,
   an optional head device for the output head + DSpark, a VRAM expert cache per GPU and sm_70 (V100) support:
-  [docs/MULTI_GPU.md](../MULTI_GPU.md), [BUSTER.md](../../BUSTER.md). Under a split the engine serves one request at a
+  [docs/MULTI_GPU.md](../MULTI_GPU.md), [BUSTER.md](../BUSTER.md). Under a split the engine serves one request at a
   time with its own split-aware conversation cache; batch slots and the pool are single-card.
 - **Remote expert card** (`--remote-device`, masahiro hibi): a second GPU holds extra experts for the first, with
   `--route-bias-remote`.

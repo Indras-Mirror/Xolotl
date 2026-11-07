@@ -1,4 +1,8 @@
-# Contributing to Strata
+# Contributing to Xolotl
+
+Xolotl is built on [Strata](https://github.com/Niko1221/Strata); these are Strata's rules, and Xolotl follows them.
+Xolotl issues and pull requests go to [Indras-Mirror/Xolotl](https://github.com/Indras-Mirror/Xolotl); a problem in the
+upstream Strata core can also go to [Niko1221/Strata](https://github.com/Niko1221/Strata).
 
 **AI assistance is welcome. The contributor is responsible for understanding the change and supplying real evidence.**
 
@@ -7,8 +11,8 @@ You should be able to explain every changed line and answer review questions abo
 
 ## Before starting
 
-1. Search [issues](https://github.com/Niko1221/Strata/issues) and
-   [pull requests](https://github.com/Niko1221/Strata/pulls), including closed discussions. Add new evidence to an
+1. Search [issues](https://github.com/Indras-Mirror/Xolotl/issues) and
+   [pull requests](https://github.com/Indras-Mirror/Xolotl/pulls), including closed discussions. Add new evidence to an
    existing thread when it covers your problem.
 2. Read [AGENTS.md](AGENTS.md) and the documentation for the component you want to change.
 3. Get maintainer agreement on scope before substantial features, refactors, architecture changes, or changes to
@@ -21,10 +25,10 @@ the situation, bring it to the original discussion and let a maintainer decide w
 
 ## Report a problem people can investigate
 
-Use the matching [issue form](https://github.com/Niko1221/Strata/issues/new/choose). A bug report should include:
+Use the matching [issue form](https://github.com/Indras-Mirror/Xolotl/issues/new/choose). A bug report should include:
 
 - The smallest steps or command that reproduce the problem, and the expected and actual behavior.
-- Strata version or commit, OS, GPU and VRAM, and relevant model, quantization, and configuration.
+- Xolotl commit, OS, GPU and VRAM, and relevant model, quantization, and configuration.
 - The exact error and relevant logs, with credentials and private content removed.
 - Whether you reproduced it yourself. Label a finding based only on reading code or a scanner as
   **unconfirmed static analysis**, and explain the suspected path without presenting it as an observed failure.
