@@ -8,6 +8,15 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Qwen3.8-27B: MTP stays on with thinking off, decode 52 -> 111 tok/s (8 Nov)
+
+`xolotl-dense` switched speculative decoding off whenever a repetition or presence penalty was set. Every thinking-off
+request carries Qwen's model-card sampling (presence penalty 1.5), so voice mode and every no-thinking chat decoded one
+token at a time. A penalty only changes the sampling, and each verified column is drawn after the tokens before it are in
+the penalty window, so speculation now stays on and the text is exactly what single steps give (greedy answer checked
+word for word). Fresh 2K / 6K / 16K prompts, thinking off: 52.3 / 52.0 / 47.8 -> 105.3 / 110.7 / 102.7 tok/s.
+Thinking-on requests (the Gauntlet, 89 tok/s) were never affected.
+
 ### Gauntlet v3 is the main table, with each model's own API beside it (8 Nov)
 
 The README now leads with the [Gauntlet](../../tools/gauntlet/README.md) v3-small (6 hard agentic coding tasks graded by

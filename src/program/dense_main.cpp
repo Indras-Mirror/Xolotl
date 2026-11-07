@@ -1104,7 +1104,11 @@ int main(int argc, char** argv) {
             const size_t take = std::min<size_t>((size_t) sp.penalty_last_n, fed.size());
             hist.assign(fed.end() - (std::ptrdiff_t) take, fed.end());
         }
-        const bool speculate = model.has_mtp() && sp.penalty_last_n == 0;   // penalties would need the window per draft
+        // A penalty changes only the sampling: each verified column is drawn after the previous ones were emitted, and emit()
+        // has already put them in the penalty window, so a speculative step draws exactly what single steps would.  (It
+        // used to switch speculation off whenever penalty_last_n > 0 - every thinking-off request, whose model-card
+        // sampling has presence_penalty 1.5, decoded without MTP: 48 instead of ~90 tok/s.)
+        const bool speculate = model.has_mtp();
 
         // one draw from device logits; the counter is the POSITION of the token drawn, so a seed gives the same text
         // whether a token comes from a single step or from a verified pair
