@@ -66,8 +66,11 @@ export STRATA_PRESTAGE_GIB="${STRATA_PRESTAGE_GIB:-1.5}"
 # pre-merge build dir (build-ds4-gpu) is still found so an old checkout of this script keeps working
 # build-ds41 = ds41_generate built against third_party/llama.cpp-x75 (cmake -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp-x75
 # -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON -DGGML_CUDA=ON); preferred over build-xolotl when present (2026-11-01)
-if [ -z "${STRATA_BUILD_DIR:-}" ] && [ -x "$PWD/build-ds41/ds41_generate" ]; then BUILD_DIR="$PWD/build-ds41"; else BUILD_DIR="${STRATA_BUILD_DIR:-$PWD/build-xolotl}"; fi
-[ -x "$BUILD_DIR/ds41_generate" ] || [ ! -x "$PWD/build-ds4-gpu/ds41_generate" ] || BUILD_DIR="$PWD/build-ds4-gpu"
+# One build: build-xolotl (2026-11-08 - a stale build-ds41 used to win silently whenever it existed, so the wrappers ran
+# a 4 Nov engine without fast mode).  STRATA_BUILD_DIR still overrides it, and the engine log names the binary.
+BUILD_DIR="${STRATA_BUILD_DIR:-$PWD/build-xolotl}"
+[ -x "$BUILD_DIR/ds41_generate" ] || { echo "ds41-engine: no $BUILD_DIR/ds41_generate (ninja -C build-xolotl ds41_generate)" >&2; exit 2; }
+echo "ds41-engine: $BUILD_DIR/ds41_generate ($(date -r "$BUILD_DIR/ds41_generate" '+%F %H:%M'))" >&2
 # systemd-run --user applies the MemoryMax cap (DS41_MEMORY_MAX, default 100G: arena 80 + engine + page cache on the 109 GiB box, 2026-11-01) and the no-swap guard.  It does not exist in a container
 # without a user manager (unprivileged LXC, some Docker setups; issue #60), so fall back to a plain exec there
 # rather than failing to start.  STRATA_NO_SCOPE=1 forces the fallback on a box that does have systemd.
