@@ -2,17 +2,13 @@
 
 <h1 align="center">Xolotl</h1>
 
-<p align="center"><b>DeepSeek-V4.1-Flash - all 552 billion parameters - on one gaming PC, at 27 tok/s.</b><br>
-Plus GLM-5.3-Flash, Qwen3.8-Flash-Next and Qwen3.8-27B: one engine, one OpenAI / Anthropic-compatible server.<br>
+<p align="center"><b>DeepSeek-V4.1-Flash - all 552 billion parameters - on one gaming PC, at 33 tok/s on real agent tasks (41 in fast mode).</b><br>
+Plus GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.8-27B and LFM3-Omni: one engine, one OpenAI / Anthropic-compatible server.<br>
 Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily extended · Linux · NVIDIA · MIT</p>
 
 > **A Strata fork.** Xolotl keeps [Strata](https://github.com/Niko1221/Strata)'s engine, server and kernels at its
 > core (merged at 0.1.44.1) and adds ~71,000 lines on top: the DeepSeek-V4.1 and V4-Flash engines, the GLM-5.3-Flash
 > engine and the Qwen3.8-27B dense port, each with its own quantisation and expert-tiering work.
->
-> **Starred this as Strata-DSV4.1?** You are in the right place. Strata-DSV4.1 grew into **Xolotl**: the same
-> DeepSeek-V4.1 engine (faster now), plus GLM-5.3-Flash and the Qwen3.8 models, in one tree. Old links and clones
-> redirect here; nothing DeepSeek-V4.1 was removed.
 
 ## Latest
 
@@ -102,35 +98,28 @@ compress-then-correct from [PROMETHEVS](https://github.com/Magnvs7/Promethevs) (
 
 ## What one PC can do
 
-**One RTX 4090 (24 GB) · Ryzen 7 5700X · 90 GB DDR4 · one NVMe drive** (110 GB RAM since 1 Nov; the numbers below
-are from the 90 GB runs unless marked). Every number is measured on that machine,
-through the real server, while it solved real tasks (21 HumanEval problems, 10 tool-call tasks, 3 agentic bug-fix
-loops), greedy, thinking on with a 32K-token thinking budget.
+**One RTX 4090 (24 GB) · Ryzen 7 5700X · 110 GB DDR4 · one NVMe drive.** Every number is measured on that machine,
+through the real server, while the model works through the [Gauntlet](tools/gauntlet/README.md) v3-small: 6 hard
+agentic coding tasks graded by hidden tests, 10 turns each, thinking on (32K-token budget), each model as it is
+served, 2 runs per model. Decode is the generation speed during those tasks.
 
-| Model | Size | Prefill | Decode | HumanEval | Tool calls | Agentic | Context |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **[DeepSeek-V4.1-Flash](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)** | 552B MoE | **180-320 tok/s** | **26.8 tok/s** | 21/21 | 10/10 | 3/3 | 512K |
-| **[DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)** (XQ) | 552B MoE | **289-409 tok/s** | **25.7 tok/s** | 21/21 | 10/10 | 3/3 | 512K |
-| **GLM-5.3-Flash** | 320B MoE | **290-375 tok/s** | **25.3 tok/s** | 19/21 | 10/10 | 3/3 | 512K |
-| **Qwen3.8-Flash-Next** | 125B MoE | **3,000-3,430 tok/s** | **127.8 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
-| **Qwen3.8-27B** (dense) | 27B | **1,240-1,390 tok/s** | **98.5 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
-| **[LFM3-Omni-2B](https://huggingface.co/IndrasMirror/LFM3-Omni-2B-XQ-Uncensored)** (XQ-6.0, omni) | 2B | **26,000-32,800 tok/s** | **~300 tok/s** | 13/21 | 9/10 | 0/3 | 32K |
+| Model | Size | Solved | Score (of 6) | Decode | Prefill | Context |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **[DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)** (XQ) | 552B MoE | 8/12 | 4.99 | **32.6 tok/s** | **289-409 tok/s** | 512K |
+| the same, [fast mode](#fast-mode-deepseek-v41) | 552B MoE | 8/12 | 4.99 | **41.1 tok/s** | | 512K |
+| **GLM-5.3-Flash** | 320B MoE | (running 8 Nov) | | | **290-375 tok/s** | 512K |
+| **[Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored)** | 125B MoE | 7/12 | 4.49 | **157 tok/s** | **3,800-4,070 tok/s** | 200K |
+| **Qwen3.8-27B** (dense) | 27B | (running 8 Nov) | | | **1,240-1,390 tok/s** | 200K |
 
-<sub>Decode = generation speed during those tasks. Prefill = a fresh 6K-17K-token prompt through the server
-(`tools/throughput.py`; Qwen3.8-Flash-Next: 3,430 / 3,005 tok/s at 6.5K / 16.7K, Qwen3.8-27B: 1,385 / 1,244 tok/s,
-DeepSeek-V4.1: 178 / 268 tok/s at 6.1K / 16.5K - its prompt batch is sized from free VRAM, ~6-9K tokens per sweep
-on a 24 GB card with the speculative-decode draft loaded).
-DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts (the default since 2026-10-17):
-187 / 317 tok/s at 6.4K / 16.7K. GLM-5.3-Flash: soft prune + `--route-bias 0.25`
-(`tools/glm/serve/strata-glm-maya-abl-512k-bias.json`), prefill 301 / 374 tok/s at 6.1K / 15.6K and 368-376 on fresh
-30K / 44K prompts. DeepSeek-V4.1-Flash-1017 V4 (25 Oct): dense half Q8_0, `rank-1017-v4.bin` + `--tier-batch-pcie 0.25`,
-prefill 289-297 / 395-409 tok/s at 6.1K / 16.5K; full HumanEval (164) 162/164. How close the DeepSeek quant gets to DeepSeek's own API on the same tasks:
-[docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md#deepseek-v41-quant-vs-the-deepseek-api).
-LFM3-Omni-2B (2 Nov, `xolotl-lfm3`, alone on the card): a non-reasoning model, so thinking off; prefill 32,796 / 26,049
-tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speech out at 12x real time) - see
-[docs/LFM3.md](docs/LFM3.md). Its agentic 0/3 is the 2B model calling a tool the agent does not have.</sub>
+<sub>Score = the sum of each task's progress (1 per solved task, partial credit from the hidden tests otherwise),
+averaged over the 2 runs. Prefill = a fresh 6K-17K-token prompt through the server (`tools/throughput.py`;
+Qwen3.8-Flash-Next at 16K since the 6 Nov speed-ups). DeepSeek-V4.1's Gauntlet runs have its dense half at Q6_K, as
+it is served; its prefill column and the engine's Q8_0 reference numbers: [docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md).
+The older table (21 HumanEval problems, 10 tool calls, 3 agentic loops) is there too: every model scores 19-21/21,
+10/10, 3/3 on it, so it no longer tells them apart. LFM3-Omni-2B (a 2B voice model, not a coding agent):
+[docs/LFM3.md](docs/LFM3.md).</sub>
 
-**Speed-ups since those runs** (same 4090 box; before/after on the same prompt and settings; full log in
+**Speed-ups** (same 4090 box; before/after on the same prompt and settings; full log in
 [docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md#speed-log)):
 
 | Date | Change | Model | Prefill before | Prefill after | Decode |
@@ -198,24 +187,8 @@ python3 -m serve.server --engine strata --config <your-27b.json> --port 8090    
 
 Then point any OpenAI- or Anthropic-compatible client at `http://127.0.0.1:<port>/v1`.
 
-### Will it run on my machine? (DeepSeek-V4.1)
-
-What I've measured is one setup: **RTX 4090 (24 GB), 90 GB DDR4, Linux, NVMe**. Beyond that:
-
-- **OS:** Linux, or Windows 11 natively (MSVC + CUDA; build and serve steps in [docs/WINDOWS.md](docs/WINDOWS.md)).
-  Everything measured here is on Linux.
-- **GPU:** NVIDIA, compute capability 7.5 or newer (RTX 20/30/40/50). Build with your card's architecture:
-  `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 30, `89` for RTX 40, `120` for RTX 50 (use CUDA 13.x for RTX 50; 12.8 builds
-  had prompt-path crashes). **Tesla V100 (sm_70):** experimental DS41-on-Buster path only — see [BUSTER.md](BUSTER.md)
-  (`STRATA_EXPERIMENTAL_SM60=ON`, CUDA 12.x, no chunk-MMQ on Volta).
-- **VRAM:** 24 GB is what I run. 16 GB should load but is untested, and prompts get processed in smaller batches, so
-  prefill will be slower. Below 16 GB won't work.
-- **RAM:** 90 GB here, with a 64 GB expert cache in RAM. Less RAM means a smaller cache, so more experts come off the
-  NVMe each token and decode is slower. More RAM helps: around 256 GB holds every expert.
-- **Disks:** about 152 GiB for the quant plus ~200 GB for the Engram tables, and ~40 GB more for the optional fast
-  mode. All of it wants a fast NVMe on ext4 or NTFS.
-  **Not exFAT** (Linux's exFAT driver serialises parallel reads; expert reads were 5x slower here) and not a hard
-  drive (the Engram lookups are ~48 small random reads per token).
+**Will it run on my machine?** NVIDIA RTX 20 or newer, the more RAM the better, a fast NVMe on ext4 or NTFS (not
+exFAT): the details for DeepSeek-V4.1 are in [docs/WILL_IT_RUN.md](docs/WILL_IT_RUN.md).
 
 ## How it works, in one paragraph
 

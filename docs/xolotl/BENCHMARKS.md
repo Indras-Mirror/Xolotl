@@ -34,6 +34,35 @@ tokens (within each engine's own run-to-run variation), the 27B's teacher-forced
 nats on average, and the server builds byte-identical engine prompts for every model.
 
 
+### The README's main table until 8 Nov 2026
+
+Same harness (21 HumanEval, 10 tool calls, 3 agentic loops, greedy, 32K thinking budget), one row per model as served
+then; the 1017 V4 row has its dense half at Q8_0. The README now leads with the Gauntlet v3-small instead, because
+every model scores 19-21/21, 10/10, 3/3 here. Hardware: the 4090 box with 90 GB DDR4 (110 GB since 1 Nov).
+
+| Model | Size | Prefill | Decode | HumanEval | Tool calls | Agentic | Context |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **[DeepSeek-V4.1-Flash](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)** | 552B MoE | **180-320 tok/s** | **26.8 tok/s** | 21/21 | 10/10 | 3/3 | 512K |
+| **[DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)** (XQ) | 552B MoE | **289-409 tok/s** | **25.7 tok/s** | 21/21 | 10/10 | 3/3 | 512K |
+| **GLM-5.3-Flash** | 320B MoE | **290-375 tok/s** | **25.3 tok/s** | 19/21 | 10/10 | 3/3 | 512K |
+| **Qwen3.8-Flash-Next** | 125B MoE | **3,000-3,430 tok/s** | **127.8 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
+| **Qwen3.8-27B** (dense) | 27B | **1,240-1,390 tok/s** | **98.5 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
+| **[LFM3-Omni-2B](https://huggingface.co/IndrasMirror/LFM3-Omni-2B-XQ-Uncensored)** (XQ-6.0, omni) | 2B | **26,000-32,800 tok/s** | **~300 tok/s** | 13/21 | 9/10 | 0/3 | 32K |
+
+<sub>Decode = generation speed during those tasks. Prefill = a fresh 6K-17K-token prompt through the server
+(`tools/throughput.py`; Qwen3.8-Flash-Next: 3,430 / 3,005 tok/s at 6.5K / 16.7K, Qwen3.8-27B: 1,385 / 1,244 tok/s,
+DeepSeek-V4.1: 178 / 268 tok/s at 6.1K / 16.5K - its prompt batch is sized from free VRAM, ~6-9K tokens per sweep
+on a 24 GB card with the speculative-decode draft loaded).
+DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts (the default since 2026-10-17):
+187 / 317 tok/s at 6.4K / 16.7K. GLM-5.3-Flash: soft prune + `--route-bias 0.25`
+(`tools/glm/serve/strata-glm-maya-abl-512k-bias.json`), prefill 301 / 374 tok/s at 6.1K / 15.6K and 368-376 on fresh
+30K / 44K prompts. DeepSeek-V4.1-Flash-1017 V4 (25 Oct): dense half Q8_0, `rank-1017-v4.bin` + `--tier-batch-pcie 0.25`,
+prefill 289-297 / 395-409 tok/s at 6.1K / 16.5K; full HumanEval (164) 162/164. How close the DeepSeek quant gets to DeepSeek's own API on the same tasks:
+[below](#deepseek-v41-quant-vs-the-deepseek-api).
+LFM3-Omni-2B (2 Nov, `xolotl-lfm3`, alone on the card): a non-reasoning model, so thinking off; prefill 32,796 / 26,049
+tok/s at 5.3K / 14K, decode 292-310 tok/s; it also hears, sees and speaks (speech out at 12x real time) - see
+[docs/LFM3.md](../LFM3.md). Its agentic 0/3 is the 2B model calling a tool the agent does not have.</sub>
+
 ## Prefill on a real prompt (`tools/throughput.py`)
 
 The prompt column above is HumanEval's short prompts (a few hundred new tokens each, where the fixed per-request
