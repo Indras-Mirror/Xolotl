@@ -13,11 +13,19 @@
 #
 # The attachment matches the engine names in any checkout's build-xolotl/ or build-vision/bin/. xolotl-lfm3 is left
 # out: next to another model it calls that server's /v1/vram on localhost (park / unpark), which needs a TCP socket.
+#
+# attach_disconnected: the CUDA driver hands the engines files with no path (memfd / unlinked shared memory); without
+# the flag AppArmor logs "Failed name lookup - disconnected path" and denies getattr / mmap on them (seen 8 Nov 2026).
+#
+# NOTE for whoever changes an engine: any network use in a listed engine (socket, curl, HTTP, even 127.0.0.1) is
+# DENIED here, and the engine fails with "Permission denied". Look for it with
+#   journalctl -k | grep 'profile="xolotl-engine"'
+# and keep networking in the Python server, or drop that engine's name from the list below.
 
 abi <abi/4.0>,
 include <tunables/global>
 
-profile xolotl-engine /**/build-{xolotl,vision/bin}/{strata,xolotl-dense,strata-dense,ds41_generate,glm_generate,ds4_generate,strata-vision} {
+profile xolotl-engine /**/build-{xolotl,vision/bin}/{strata,xolotl-dense,strata-dense,ds41_generate,glm_generate,ds4_generate,strata-vision} flags=(attach_disconnected) {
   # everything an engine does: files (model, packs, caches, logs), /dev/nvidia*, raw block reads of Engram, pinned
   # memory, threads, signals, CUDA's IPC (MPS) over unix sockets
   file,

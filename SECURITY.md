@@ -26,6 +26,13 @@ Checked on 8 Nov 2026:
   rule the kernel enforces (one `sudo` to install). The one exception is `xolotl-lfm3`: next to another model
   (`--peer-vram`) it runs `curl` to that server's `/v1/vram` on localhost to share the GPU, so it is left out of the
   profile.
+  **If you add network code to an engine** (any socket, curl, an HTTP fetch, even to localhost), the profile blocks it
+  and that engine fails with a permission error (`EACCES`, "Permission denied" on `socket()`) or won't start. Check
+  with `journalctl -k | grep 'profile="xolotl-engine"'` (DENIED lines name the engine and the operation). Then
+  either keep the network part in the Python server, leave that engine out of the profile's name list (as with
+  `xolotl-lfm3`), or remove the profile. Tested under the profile on 8 Nov 2026: DeepSeek-V4.1 fast, QFN45, the 27B
+  and Flash-Next start and answer, `xol-lease` sleep / wake / unload / load works, and LFM3 (unconfined, with its
+  speech and vision helpers) chats, speaks and parks / unparks over `--peer-vram`.
 - **The server listens on `127.0.0.1`** unless you pass `--host`. It connects out only to what you configure (MCP
   servers in the run config, a voice backend) and to an image URL that a client request contains. Remote JSON-schema
   `$ref`s are never fetched. Chat templates from model files render in Jinja's immutable sandbox. Nothing loads
