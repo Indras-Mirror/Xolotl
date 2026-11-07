@@ -49,6 +49,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -468,6 +469,38 @@ int selftest() {
                     std::copy(o.begin(), o.end(), ref.begin() + (size_t) h * D);
                 }
                 report(f.name, compare(from_dev(dout, ref.size()), ref), 5e-3);
+                {   // xolotl: an 8-column window in one launch (dense_attn_decode_multi_fmt), crossing the 256-cell split
+                    // boundary: every column must be BITWISE what the same column gives alone, and close to the old kernel
+                    const int NW = 8, c0 = 252;
+                    auto qw = rnd((size_t) NW * H * D);
+                    float *dqw = to_dev(qw), *dow = nullptr, *do1 = nullptr, *dold = nullptr, *dscr8 = nullptr;
+                    cudaMalloc((void**) &dow, (size_t) NW * H * D * 4);
+                    cudaMalloc((void**) &do1, (size_t) H * D * 4);
+                    cudaMalloc((void**) &dold, (size_t) H * D * 4);
+                    cudaMalloc((void**) &dscr8, (size_t) NW * strata::kernels::dense_attn_scratch_bytes(H, D, max_ctx));
+                    strata::kernels::dense_attn_decode_multi_fmt(dqw, dk, dv, f.kf, f.vf, dow, dscr8, H, HK, D, c0, NW, max_ctx, scale, nullptr);
+                    const std::vector<float> win = from_dev(dow, (size_t) NW * H * D);
+                    double mism = 0, old_abs = 0;
+                    for (int c = 0; c < NW; ++c) {
+                        strata::kernels::dense_attn_decode_multi_fmt(dqw + (size_t) c * H * D, dk, dv, f.kf, f.vf, do1, dscr8, H, HK, D,
+                                                                     c0 + c, 1, max_ctx, scale, nullptr);
+                        strata::kernels::dense_attn_decode_fmt(dqw + (size_t) c * H * D, dk, dv, f.kf, f.vf, dold, dscr, H, HK, D,
+                                                               c0 + c, max_ctx, scale, nullptr);
+                        const std::vector<float> one = from_dev(do1, (size_t) H * D), old = from_dev(dold, (size_t) H * D);
+                        for (size_t i = 0; i < one.size(); ++i) {
+                            if (std::memcmp(&one[i], &win[(size_t) c * H * D + i], 4) != 0) ++mism;
+                            old_abs = std::max(old_abs, (double) std::fabs(one[i] - old[i]));
+                        }
+                    }
+                    char nm[80];
+                    Diff dm{}; dm.abs = mism;
+                    std::snprintf(nm, sizeof nm, "%s window x8 (bits off)", f.name);
+                    report(nm, dm, 0.5);
+                    Diff dd{}; dd.abs = old_abs;
+                    std::snprintf(nm, sizeof nm, "%s window vs old kernel", f.name);
+                    report(nm, dd, 1e-4);
+                    cudaFree(dqw); cudaFree(dow); cudaFree(do1); cudaFree(dold); cudaFree(dscr8);
+                }
                 cudaFree(dq); cudaFree(dkf); cudaFree(dvf); cudaFree(dk); cudaFree(dv); cudaFree(dout); cudaFree(dscr);
             }
         }
@@ -787,6 +820,27 @@ int check_model(const std::string& gguf, bool with_mtp, const std::string& kv) {
 
 }  // namespace
 
+// xolotl: the n-gram chain (NInfer's --ngram chain, in the style of llama.cpp ngram-mod): a pool maps a hash of the
+// last n tokens to the token that last followed them, over everything the conversation has consumed.  After the MTP
+// drafts, the proposal continues from the pool while it has an answer, so a round that reproduces code, JSON or a
+// tool call offers many more tokens.  The verification is unchanged: the text is exactly what single steps give.
+struct NgramPool {
+    int n = 8;
+    std::unordered_map<uint64_t, int32_t> next;
+    size_t indexed = 0;                              // tokens of `h` already in the pool
+    static uint64_t key(const int32_t* t, int n) {
+        uint64_t k = 1469598103934665603ull;         // FNV-1a over the token ids
+        for (int i = 0; i < n; ++i) { k ^= (uint32_t) t[i]; k *= 1099511628211ull; }
+        return k;
+    }
+    void reset() { next.clear(); indexed = 0; }
+    void update(const std::vector<int32_t>& h) {
+        if (h.size() < indexed) reset();
+        for (size_t i = std::max(indexed, (size_t) n); i < h.size(); ++i) next[key(&h[i - (size_t) n], n)] = h[i];
+        indexed = h.size();
+    }
+};
+
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") return selftest();
@@ -808,6 +862,8 @@ int main(int argc, char** argv) {
     bool serve = false, want_mtp = false, mtp_force = false;
     std::string kv_type = "fp16";
     int draft_max = 2, draft_min = 1;
+    bool ngram_on = false;                             // xolotl: --ngram-chain (MTP proposal + n-gram continuation)
+    int ngram_n = 8, ngram_max = 7, ngram_min = 3;     // match length, total drafts, extension needed to go wide
     float draft_p_min = 0.0f;
     // 0: the default prompt chunk; >0: ask for that chunk; <0 (--no-prefill): feed the prompt through run()
     long long prompt_chunk = 0;
@@ -826,6 +882,10 @@ int main(int argc, char** argv) {
         else if (a == "--mtp-force") mtp_force = true;
         else if (a == "--draft-max" || a == "--spec-draft-n-max") { draft_max = std::atoi(next("--draft-max")); draft_max_set = true; }
         else if (a == "--dflash2") df2_pack = next("--dflash2");
+        else if (a == "--ngram-chain") ngram_on = true;
+        else if (a == "--ngram-n") ngram_n = std::atoi(next("--ngram-n"));
+        else if (a == "--ngram-max") ngram_max = std::atoi(next("--ngram-max"));
+        else if (a == "--ngram-min") ngram_min = std::atoi(next("--ngram-min"));
         else if (a == "--draft-min" || a == "--spec-draft-n-min") draft_min = std::atoi(next("--draft-min"));
         else if (a == "--draft-p-min" || a == "--spec-draft-p-min") draft_p_min = std::strtof(next("--draft-p-min"), nullptr);
         else if (a == "--native" || a == "--model" || a == "--gguf") gguf = next("--native");
@@ -870,7 +930,11 @@ int main(int argc, char** argv) {
     strata::core::DenseOptions opt;
     opt.mtp = want_mtp;
     opt.mtp_force = mtp_force;
-    opt.draft_max = draft_max;
+    if (ngram_on) {
+        ngram_max = std::max(draft_max, std::min(ngram_max, strata::core::DenseModel::kMaxCols - 1));
+        if (ngram_n < 2) ngram_n = 2;
+    }
+    opt.draft_max = ngram_on ? ngram_max : draft_max;   // rollback snapshots for the widest window
     opt.kv = kv_type;
     if (use_df2) { opt.spec_snapshots = true; opt.taps = df2.tap_layers(); }
     if (!model.load(gguf, context, err, opt)) {
@@ -968,6 +1032,8 @@ int main(int argc, char** argv) {
     reader.detach();
 
     std::vector<int32_t> fed;                      // every token the state has consumed, in order
+    NgramPool ngram;                               // xolotl: --ngram-chain
+    ngram.n = ngram_n;
     std::string line;
     while (in.pop(line)) {
         if (line == "QUIT") break;
@@ -1173,6 +1239,8 @@ int main(int argc, char** argv) {
 
         // ---- decode
         long long produced = 0, drafts_offered = 0, drafts_accepted = 0;
+        long long ng_drafted = 0, ng_accepted = 0, ng_wide = 0;
+        if (ngram_on) ngram.reset();                // rebuilt from this request's tokens at its first draft
         const char* finish = "length";
         const auto t_dec = Clock::now();
         std::vector<int32_t> hist;                  // penalty window, most recent last
@@ -1251,9 +1319,11 @@ int main(int argc, char** argv) {
             const int64_t p = model.position();
             const long long remaining = budget - produced;
             int32_t dr[NC];
-            int nd = 0;
+            int nd = 0, nd_mtp = 0;
             if (speculate && remaining >= 2 && p + 2 <= model.max_context()) {
-                const int cap = (int) std::min<long long>({(long long) draft_max, remaining - 1, model.max_context() - p - 1});
+                const int cap_all = (int) std::min<long long>({(long long) (ngram_on ? ngram_max : draft_max), remaining - 1,
+                                                                 model.max_context() - p - 1});
+                const int cap = std::min(cap_all, draft_max);
                 const auto t0 = Clock::now();
                 if (use_df2) {
                     if (df2_pend > 0 && !model.embed_host(next, df2_stage, err)) { fail(err); failed = true; break; }
@@ -1268,6 +1338,25 @@ int main(int argc, char** argv) {
                         }
                     }
                 } else if (!model.mtp_draft(next, (int) p, cap, draft_p_min, dr, &nd, err)) { fail(err); failed = true; break; }
+                nd_mtp = nd;
+                if (ngram_on && cap_all > nd) {      // continue the proposal from the pool
+                    ngram.update(fed);
+                    const int N = ngram.n;
+                    int32_t tail[NC + 64];
+                    int tl = 0;
+                    const size_t from = fed.size() > (size_t) N ? fed.size() - (size_t) N : 0;
+                    for (size_t i = from; i < fed.size(); ++i) tail[tl++] = fed[i];
+                    tail[tl++] = next;
+                    for (int j = 0; j < nd; ++j) tail[tl++] = dr[j];
+                    int ext = nd;
+                    while (ext < cap_all && tl >= N) {
+                        const auto it = ngram.next.find(NgramPool::key(&tail[tl - N], N));
+                        if (it == ngram.next.end()) break;
+                        dr[ext++] = it->second;
+                        tail[tl++] = it->second;
+                    }
+                    if (ext - nd >= ngram_min) { ng_drafted += ext - nd; ++ng_wide; nd = ext; }
+                }
                 t_draft += ms_since(t0);
             }
             if (nd >= draft_min && nd >= 1) {
@@ -1292,6 +1381,7 @@ int main(int argc, char** argv) {
                 emitted_spec += a + 1;
                 drafts_offered += nd;
                 drafts_accepted += a;
+                if (a > nd_mtp) ng_accepted += a - nd_mtp;
                 if (a < nd && !model.rollback(a, err)) { fail(err); failed = true; break; }
                 fed.push_back(next);
                 for (int j = 0; j < a; ++j) fed.push_back(dr[j]);
@@ -1339,6 +1429,9 @@ int main(int argc, char** argv) {
                          cycles ? (double) emitted_spec / (double) cycles : 0.0, cycles ? t_draft / (double) cycles : 0.0,
                          cycles ? t_verify / (double) cycles : 0.0, cycles ? t_ingest / (double) cycles : 0.0, plain_steps,
                          plain_steps ? t_plain / (double) plain_steps : 0.0);
+            if (ngram_on)
+                std::fprintf(stderr, "xolotl-dense:   n-gram chain: %lld drafted, %lld accepted, %lld wide rounds\n",
+                             ng_drafted, ng_accepted, ng_wide);
     }
     cudaFree(d_next);
     cudaFree(d_hist);
