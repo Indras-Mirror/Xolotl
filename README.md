@@ -19,7 +19,7 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 Full notes for every item: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
 - **7 Nov - DeepSeek-V4.1 fast mode (opt-in): +27 % decode for under a point of quality** (26 -> 33 tok/s on the 4090,
-  short34 top-1 86.2 % vs 87.0 %). A 2-bit (Q2_K) copy of the biggest experts in a sidecar file.
+  short34 top-1 86.2 % vs 87.0 %, Gauntlet 8/12 in both modes). A 2-bit (Q2_K) copy of the biggest experts in a sidecar file.
   [Fast mode](#fast-mode-deepseek-v41)
 - **7 Nov - Xolotl Direct (Linux, experimental, opt-in): NVMe straight into VRAM on a GeForce card.** Experts read
   from the drive skip system RAM: one expert 11 -> 3.1 ms, zero RAM-bus traffic, the same output. With the
@@ -79,8 +79,18 @@ build-xolotl/ds41_generate -m V41-XQ-1017-v4.gguf --build-shadow /nvme/V4.fast.x
 XOLOTL_SHADOW=$(cat /nvme/V4.fast.x41s.list)  <your usual serve command>
 ```
 
-It is lossy, so it is opt-in: use it for long agent runs, drafts and chat, and the normal mode where every token
-counts. Agentic-coding results (the Gauntlet, normal vs fast) are running and will be added here. Everything else
+Agentic coding, the [Gauntlet](tools/gauntlet/README.md) v3-small (6 hard tasks graded by hidden tests, 10 turns,
+thinking on, served settings, 2 runs each):
+
+| | solved | score | decode during the tasks |
+|---|---|---|---|
+| normal | 8 / 12 | 4.99 | 32.6 tok/s |
+| **fast** | **8 / 12** | **4.99** | **41.1 tok/s (+26 %)** |
+
+The same tasks solved and missed in both modes (each missed 04 once; 03 stays half-done in every run).
+
+It is lossy, so it is opt-in: on the Gauntlet it cost nothing measurable, but short34 shows it moves a few tokens in a
+hundred, so keep the normal mode where every token counts. Everything else
 (switches, the importance matrix, what was tried): [docs/XOLOTL_FAST.md](docs/XOLOTL_FAST.md). The idea is
 compress-then-correct from [PROMETHEVS](https://github.com/Magnvs7/Promethevs) (Ryan Flavell).
 

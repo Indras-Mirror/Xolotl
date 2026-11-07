@@ -29,7 +29,17 @@ token over our 34-text quality set:
 - Also measured, and dropped: a shadow of only the MXFP4 experts (85.73 %, +24 %), the 1,000 best-ranked experts
   kept exact (85.40 %, +15 %), an imatrix-weighted Q2_0 (84.04 %, +42 %).
 - Speed is one 8K run per arm, same window (the decoded text moves how many drafted tokens are accepted, so single
-  runs swing by ~5 %). Agentic-coding results (Gauntlet) are being run and will be added here.
+  runs swing by ~5 %).
+
+Agentic coding, the [Gauntlet](../tools/gauntlet/README.md) v3-small (6 hard tasks graded by hidden tests, 10 turns,
+thinking on, served settings, 2 runs each):
+
+| | solved | score | decode during the tasks |
+|---|---|---|---|
+| normal | 8 / 12 | 4.99 | 32.6 tok/s |
+| **fast** | **8 / 12** | **4.99** | **41.1 tok/s (+26 %)** |
+
+The same tasks solved and missed in both modes (each missed 04 once; 03 stays half-done in every run).
 
 ## Use it
 

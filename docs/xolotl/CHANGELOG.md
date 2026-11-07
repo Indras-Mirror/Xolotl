@@ -17,7 +17,8 @@ version 84.46 %), NLL 0.540 (0.512 / 0.566); decode **33.0 vs 26.1 tok/s (+27 %)
 VRAM. The sidecar is ~15 % bigger (~40 GB). `--build-shadow` defaults to Q2_K now (`XOLOTL_SHADOW_TYPE=42` = the old
 Q2_0). Also measured and dropped: a shadow of only the MXFP4 experts (85.73 %, +24 %), the 1,000 best-ranked experts
 kept exact (85.40 %, +15 %), an imatrix-weighted Q2_0 (84.04 %, +42 %): the 2-bit format, not the encoder, was the
-limit. Details: [docs/XOLOTL_FAST.md](../XOLOTL_FAST.md).
+limit. Agentic coding (Gauntlet v3-small, 6 tasks, 2 runs each, served settings): **8/12 solved in both modes, score
+4.99 vs 4.99, decode 41.1 vs 32.6 tok/s (+26 %)** during the tasks. Details: [docs/XOLOTL_FAST.md](../XOLOTL_FAST.md).
 
 ### DeepSeek-V4.1 fast mode: a 2-bit shadow of the biggest experts (7 Nov, opt-in, lossy)
 
