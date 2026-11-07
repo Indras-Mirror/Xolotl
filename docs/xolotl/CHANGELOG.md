@@ -8,6 +8,17 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### DeepSeek-V4.1 fast mode now uses Q2_K: under a point of quality for +27 % decode (7 Nov)
+
+The fast-mode sidecar is now built as **Q2_K** (llama.cpp's 2-bit k-quant, a scale and a minimum per 16 weights)
+instead of Q2_0, weighted by an importance matrix recorded while serving (`XOLOTL_IMATRIX_OUT`, then
+`XOLOTL_SHADOW_IMATRIX` at build time). Weight error 0.35 -> 0.27. short34 top-1 **86.16 %** (normal 87.01 %, the Q2_0
+version 84.46 %), NLL 0.540 (0.512 / 0.566); decode **33.0 vs 26.1 tok/s (+27 %)** on the 4090, ~320 more experts in
+VRAM. The sidecar is ~15 % bigger (~40 GB). `--build-shadow` defaults to Q2_K now (`XOLOTL_SHADOW_TYPE=42` = the old
+Q2_0). Also measured and dropped: a shadow of only the MXFP4 experts (85.73 %, +24 %), the 1,000 best-ranked experts
+kept exact (85.40 %, +15 %), an imatrix-weighted Q2_0 (84.04 %, +42 %): the 2-bit format, not the encoder, was the
+limit. Details: [docs/XOLOTL_FAST.md](../XOLOTL_FAST.md).
+
 ### DeepSeek-V4.1 fast mode: a 2-bit shadow of the biggest experts (7 Nov, opt-in, lossy)
 
 `ds41_generate --build-shadow F` writes a Q2_0 copy of every MXFP4 and Q3_K expert weight (3,543 experts, 54.7 ->

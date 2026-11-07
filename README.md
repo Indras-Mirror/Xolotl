@@ -18,8 +18,9 @@ Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily ext
 
 Full notes for every item: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
-- **7 Nov - DeepSeek-V4.1 fast mode (opt-in, lossy): +29-43 % decode** (~26 -> 34-37 tok/s on the 4090). A 2-bit copy
-  of the biggest experts in a sidecar file; short34 top-1 84.5 % vs 87.0 %. [How](docs/XOLOTL_FAST.md)
+- **7 Nov - DeepSeek-V4.1 fast mode (opt-in): +27 % decode for under a point of quality** (26 -> 33 tok/s on the 4090,
+  short34 top-1 86.2 % vs 87.0 %). A 2-bit (Q2_K) copy of the biggest experts in a sidecar file.
+  [Fast mode](#fast-mode-deepseek-v41)
 - **7 Nov - Xolotl Direct (Linux, experimental, opt-in): NVMe straight into VRAM on a GeForce card.** Experts read
   from the drive skip system RAM: one expert 11 -> 3.1 ms, zero RAM-bus traffic, the same output. With the
   layer-ahead VRAM stash: +3 % decode on DeepSeek-V4.1. Needs Resizable BAR and two small kernel modules.
@@ -61,6 +62,27 @@ Full notes for every item: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
   - [Qwen3.6 serving](docs/xolotl/CHANGELOG.md#qwen36-serving-76-79-80) (#76-#80)
   - [GLM long-conversation fix](docs/xolotl/CHANGELOG.md#glm-53-flash-long-conversations-no-longer-crash-46) (#46)
   - [batch slots, the conversation pool, multi-GPU and more](docs/xolotl/CHANGELOG.md#earlier-in-october)
+
+## Fast mode (DeepSeek-V4.1)
+
+DeepSeek-V4.1's decode speed is set by how many expert bytes cross the RAM bus and the NVMe drive per token. Fast mode
+keeps a 2-bit (Q2_K) copy of the two biggest expert formats (the MXFP4 and Q3_K experts, about half of those bytes)
+in a sidecar file and reads that instead. The model file is not changed, and turning it off is unsetting one variable.
+
+| RTX 4090, V4, 8K prompt | decode | short34 top-1 | short34 NLL |
+|---|---|---|---|
+| normal | 26.1 tok/s | 87.01 % | 0.512 |
+| **fast** | **33.0 tok/s (+27 %)** | **86.16 %** | **0.540** |
+
+```bash
+build-xolotl/ds41_generate -m V41-XQ-1017-v4.gguf --build-shadow /nvme/V4.fast.x41s   # once, ~30 min CPU, ~40 GB
+XOLOTL_SHADOW=$(cat /nvme/V4.fast.x41s.list)  <your usual serve command>
+```
+
+It is lossy, so it is opt-in: use it for long agent runs, drafts and chat, and the normal mode where every token
+counts. Agentic-coding results (the Gauntlet, normal vs fast) are running and will be added here. Everything else
+(switches, the importance matrix, what was tried): [docs/XOLOTL_FAST.md](docs/XOLOTL_FAST.md). The idea is
+compress-then-correct from [PROMETHEVS](https://github.com/Magnvs7/Promethevs) (Ryan Flavell).
 
 ## What one PC can do
 

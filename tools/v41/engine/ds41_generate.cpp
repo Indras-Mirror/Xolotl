@@ -93,7 +93,7 @@ namespace {
 struct Args {
     std::string model, ids_csv, ids_file, rank, dump_logits, dump_last;
     std::string build_mirror;      // --build-mirror F [--mirror-gib N]: write the blob mirror (coldest experts by --rank) and exit
-    std::string build_shadow;      // --build-shadow F: write an expert sidecar (STRATA_SHADOW) and exit - STRATA_SHADOW_FROM=<gate/up type ids,> (default 39,11 = MXFP4, Q3_K), STRATA_SHADOW_TYPE=<ggml type id> (default 42 = Q2_0), STRATA_SHADOW_THREADS (default 16)
+    std::string build_shadow;      // --build-shadow F: write an expert sidecar (STRATA_SHADOW) and exit - STRATA_SHADOW_FROM=<gate/up type ids,> (default 39,11 = MXFP4, Q3_K), STRATA_SHADOW_TYPE=<ggml type id> (default 10 = Q2_K; 42 = Q2_0), STRATA_SHADOW_THREADS (default 16)
     double mirror_gib = 85.0;
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
     float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
@@ -426,7 +426,7 @@ int main(int argc, char ** argv) {
         Ds41FileBlobs src(a.model);
         if (!src.open(err)) { std::fprintf(stderr, "ds41_generate: experts: %s\n", err.c_str()); return 1; }
         std::vector<int> from = parse_csv(std::getenv("STRATA_SHADOW_FROM") ? std::getenv("STRATA_SHADOW_FROM") : "39,11");
-        const int to = std::getenv("STRATA_SHADOW_TYPE") ? std::atoi(std::getenv("STRATA_SHADOW_TYPE")) : 42;
+        const int to = std::getenv("STRATA_SHADOW_TYPE") ? std::atoi(std::getenv("STRATA_SHADOW_TYPE")) : 10;   // Q2_K: 86.2 % short34 top-1 vs Q2_0 84.5 % (7 Nov)
         const int th = std::getenv("STRATA_SHADOW_THREADS") ? std::max(1, std::atoi(std::getenv("STRATA_SHADOW_THREADS"))) : 16;
         // STRATA_SHADOW_SKIP_TOP=<n> (with --rank): the n best-ranked experts stay exact - the hot set the VRAM cache holds,
         // so the shadow only replaces experts served from the RAM arena / the NVMe file tier (the slow lanes)
