@@ -33,10 +33,10 @@ DeepSeek-V4.1's decode speed is set by how many expert bytes cross the RAM bus a
 keeps a 2-bit (Q2_K) copy of the two biggest expert formats (about half of those bytes) in a ~40 GB sidecar file and
 reads that instead. The model file is not changed; turning it off is unsetting one variable.
 
-| DeepSeek-V4.1 V4, RTX 4090 |    Decode, agent tasks |      Decode, 8K prompt | Gauntlet score | Next-token agreement |
-| -------------------------- | ---------------------: | ---------------------: | :------------: | :------------------: |
-| normal                     |             32.6 tok/s |             26.1 tok/s |      4.99      |        87.0 %        |
-| **fast mode**              | **41.1 tok/s (+26 %)** | **33.0 tok/s (+27 %)** |    **4.99**    |      **86.2 %**      |
+| DeepSeek-V4.1 V4, RTX 4090 | Decode, agent tasks (tok/s) | Decode, 8K prompt (tok/s) | Gauntlet score | Next-token agreement |
+| -------------------------- | --------------------------: | ------------------------: | :------------: | :------------------: |
+| normal                     |                        32.6 |                      26.1 |      4.99      |        87.0 %        |
+| **fast mode**              |            **41.1 (+26 %)** |          **33.0 (+27 %)** |    **4.99**    |      **86.2 %**      |
 
 ```bash
 build-xolotl/ds41_generate -m V41-XQ-1017-v4.gguf --build-shadow /nvme/V4.fast.x41s   # once, ~30 min CPU (or download v4-fast/ from the model's HF page)
@@ -54,16 +54,16 @@ through the real server, while the model works through the [Gauntlet](tools/gaun
 agentic coding tasks graded by hidden tests, 10 turns each, thinking on (32K-token budget), each model as it is
 served. Decode is the generation speed during those tasks.
 
-| Model                                                                                                             | Size      | Score (of 6) |     Decode |           Prefill | Context | Full-precision API (score) |
-| ----------------------------------------------------------------------------------------------------------------- | --------- | :----------: | ---------: | ----------------: | :-----: | :------------------------: |
-| **[DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)**     | 552B MoE  |     4.99     | 32.6 tok/s |     289-409 tok/s |   512K  |            4.49            |
-| **DeepSeek-V4.1 V4, [fast mode](#fast-mode-deepseek-v41)**                                                        | 552B MoE  |     4.99     | 41.1 tok/s |         measuring |   512K  |             -              |
-| **GLM-5.3-Flash**                                                                                                 | 320B MoE  |   running    |    running |     290-375 tok/s |   512K  |            5.87            |
-| **[Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored)** | 125B MoE  |     4.49     |  157 tok/s | 3,800-4,070 tok/s |   200K  |            3.90            |
-| **Qwen3.8-27B**                                                                                                   | 27B dense |   running    |    running | 1,240-1,390 tok/s |   200K  |            4.47            |
+| Model                                                                                                             | Size      | Score (of 6) | Decode (tok/s) | Prefill (tok/s) | Context | API score |
+| ----------------------------------------------------------------------------------------------------------------- | --------- | :----------: | :------------: | :-------------: | :-----: | :-------: |
+| **[DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)**     | 552B MoE  |     4.99     |      32.6      |     289-409     |   512K  |    4.49   |
+| **DeepSeek-V4.1 V4, [fast mode](#fast-mode-deepseek-v41)**                                                        | 552B MoE  |     4.99     |      41.1      |    measuring    |   512K  |     -     |
+| **GLM-5.3-Flash**                                                                                                 | 320B MoE  |   running    |    running     |     290-375     |   512K  |    5.87   |
+| **[Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored)** | 125B MoE  |     4.49     |      157       |   3,800-4,070   |   200K  |    3.90   |
+| **Qwen3.8-27B**                                                                                                   | 27B dense |     4.47     |       89       |   1,240-1,390   |   200K  |    4.47   |
 
 <sub>Score (of 6) = each task's progress summed (1 per solve, partial credit from the hidden tests), averaged over the runs.
-API = each model's own full-precision API through OpenRouter (DeepSeek-V4.1-Flash-1017, GLM-5.3-Flash, Qwen3.8-Flash,
+API score = each model's own full-precision API through OpenRouter (DeepSeek-V4.1-Flash-1017, GLM-5.3-Flash, Qwen3.8-Flash,
 Qwen3.8-27B), the same tasks and turns, reasoning on (8 Nov).
 Prefill = a fresh 6K-17K-token prompt (`tools/throughput.py`). DeepSeek-V4.1 runs here with its dense half at Q6_K, as
 it is served. More numbers, the Q8_0 references, the speed log and the older HumanEval table (every model 19-21/21
