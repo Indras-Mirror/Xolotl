@@ -15,7 +15,9 @@ tokenizer.json, or DS41_TOKENIZER_JSON).
 Scenarios: park_partial (the STRATA_SERVE_PARK_PARTIAL resume 20 positions back, then 8 back), park16 (a partial
 resume 8 back, within the window ring, then 21 back), engram_hist (a side request longer than the parked
 conversation's end overwrites the Engram history), single (one growing text dialogue, a regenerate and a re-render),
-abc (three conversations interleaved, two sharing a system prompt: the conversation pool), image (a dialogue with
+abc (three conversations interleaved, two sharing a system prompt: the conversation pool), interrupt (a reply
+interrupted past its prompt, then the prompt's last 3 tokens re-rendered: a partial resume below the newest pool
+boundary must beat the older boundary), image (a dialogue with
 synthetic SVE1 image rows and img_keys, a text side request, and the same tokens with another picture).
 """
 import argparse
@@ -180,6 +182,18 @@ def build_steps(sc, out, tokenizer_json):
             h = h + B[i * 30 + 20:(i + 1) * 30]   # the "assistant reply" as the client re-renders it
         steps.append(("regen", list(steps[-1][1]), 3, "", None))
         steps.append(("re-render 12 back", steps[-1][1][:-12] + C[:16], 3, "", None))
+    elif sc == "interrupt":
+        # xolotl 2026-11-08 (a real 64K agent session): a reply interrupted past its prompt, then the client re-renders
+        # the last 3 tokens of that prompt.  The pool holds a boundary at the end of turn 1's prompt and (switch save)
+        # one at the end of turn 2's; the request diverges 3 tokens before the latter.  Expected: resume at
+        # (len(p2) - 3) & ~1, a partial resume 4 below that boundary - before the ConvMatch::resume fix it resumed at
+        # the end of turn 1 (here 40 tokens back; in the session 10,593).  Run with --conversation-cache-min-tokens 64.
+        # A step's ids may be a function of the results so far: a client sends the model's own reply back.
+        p1 = BOS + A[:239]
+        p2 = lambda res: p1 + res[0]["tokens"] + A[239:259] + B[:20]   # continues turn 1 + its reply: a turn save
+        p3 = lambda res: res[1]["ids"][:-3] + C[:20]                   # turn 2's prompt, its last 3 re-rendered
+        steps = [("turn 1", p1, 2, "", None), ("turn 2 (its reply runs 12 past the prompt)", p2, 12, "", None),
+                 ("interrupt: re-render 3 back (expect resume (len(turn 2) - 3) & ~1)", p3, 2, "", None)]
     elif sc == "abc":
         sys_p = BOS + A[:119]
         convs = {"A": sys_p + B[:60], "B": sys_p + C[:60], "C": BOS + C[300:420]}
@@ -247,8 +261,12 @@ def main():
     eng = Engine(a.bin, common, env, out, "test")
     res = []
     try:
-        for label, ids, mx, keys, emb in steps:
+        for k, (label, ids, mx, keys, emb) in enumerate(steps):
+            if callable(ids):
+                ids = ids(res)
+                steps[k] = (label, ids, mx, keys, emb)
             r = eng.gen(ids, mx, keys, emb)
+            r["ids"] = ids
             res.append(r)
             print(f"[test] {label}: prompt {len(ids)} resume {r['resume']} tokens {r['tokens']} {r['sec']:.1f} s", flush=True)
     finally:

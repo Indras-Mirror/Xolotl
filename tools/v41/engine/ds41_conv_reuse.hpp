@@ -67,7 +67,7 @@ inline size_t conv_common_prefix(const int * a, const uint64_t * ai, size_t ain,
 /// A resume at s below a boundary b reads the window [s - SWA + 1, s) from b's ring (positions [b - RAW, b), RAW =
 /// SWA + 16) and, at an odd s, the ratio-2 state of s - 1 (b's holds b - 2, b - 1): exact for an even s, b - s <= 16.
 constexpr int64_t kConvPartialMax = 16;
-inline int64_t conv_partial_resume(int64_t lcp, int64_t boundary) {
+constexpr int64_t conv_partial_resume(int64_t lcp, int64_t boundary) {
     const int64_t s = lcp & ~(int64_t) 1;
     return (s < boundary && boundary - s <= kConvPartialMax) ? s : 0;
 }
@@ -79,8 +79,20 @@ struct ConvMatch {
     int64_t lcp = 0;            ///< common prefix of the record and the prompt
     int64_t next_boundary = -1; ///< the record's boundary above lcp (for conv_partial_resume), -1 = none
     bool has_logits = false;
-    int64_t resume() const { return pos > 0 ? pos : next_boundary > 0 ? conv_partial_resume(lcp, next_boundary) : 0; }
+    /// The furthest exact resume: the boundary under the common prefix, or a few tokens below the next boundary
+    /// (conv_partial_resume), whichever is further.  xolotl 2026-11-08: this used to take `pos` whenever there was
+    /// one, so a client that re-rendered the last 3 tokens of a 64,369-token prompt after an interrupted reply
+    /// resumed at the boundary before (53,796) and re-read 10,593 tokens, when 64,366 was reachable.
+    constexpr int64_t resume() const {
+        const int64_t part = next_boundary > 0 ? conv_partial_resume(lcp, next_boundary) : 0;
+        return part > pos ? part : pos;
+    }
 };
+// rec, boundary, next_boundary_idx, pos, lcp, next_boundary, has_logits
+static_assert(ConvMatch{1, 0, 1, 53796, 64366, 64369, false}.resume() == 64366, "partial resume beats an earlier boundary");
+static_assert(ConvMatch{1, 0, 1, 53796, 64300, 64369, false}.resume() == 53796, "beyond kConvPartialMax: the boundary");
+static_assert(ConvMatch{1, 0, -1, 53796, 64366, -1, false}.resume() == 53796, "no next boundary: the boundary");
+static_assert(ConvMatch{1, -1, 0, 0, 64367, 64369, false}.resume() == 64366, "no boundary under: even position");
 
 struct ConvRestore {
     int64_t pos = 0;            ///< the boundary the device state now holds (the snapshot tensors: rearm + restore)
