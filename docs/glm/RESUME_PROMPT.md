@@ -17,6 +17,15 @@ Read first, in this order: this file; `docs/glm/PLAN.md` (target files, port ord
 `docs/glm/FINDINGS.md`; then the DS4 docs we build on: `docs/ds4/RESUME_PROMPT.md` (rules, gates, lessons),
 `docs/ds4/ENGINE_DENSE.md`, `docs/ds4/ENGINE_MOE.md`; `git log --oneline -15`.
 
+## 2026-11-09: the next lever is MTP speculative decode
+
+Since the RAM upgrade (1 Nov) every Maya-S-v2 expert sits in the 80 GiB RAM arena (file tier 0): decode is 28.5-29
+tok/s and PCIe-bound, and short prompts use the CPU split (`STRATA_CHUNK_CPU`, 0.4). The NextN draft block was
+rejected in October (SPEC_DRAFT.md: a k-token verify touches up to 5.2x more distinct experts, and they came off the
+SSD then). With no file tier, and the CPU pool able to compute RAM experts beside the card, re-measure it: the block
+is already in our GGUF (`blk.45`), Project Maya runs it (v1.1.56, incl. multi-request MTP). Port the GLM NextN
+forward + a verify window into `glm_generate`, try k=1..3, keep it opt-in until it wins at equal quality.
+
 ## State (2026-10-10 NIGHT-2, s28) - **CURRENT** (supersedes LATE below; read FINDINGS s28 first)
 Committed on `glm` (local; push with `git push glm glm:main` when Mal says).
 **Shipped serve config** (tools/glm/serve/strata-glm-maya-abl-512k.json; the wrapper default): Maya-S-v2 + LoRA,
