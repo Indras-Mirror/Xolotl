@@ -8309,6 +8309,44 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
     auto in_from = [&](int t) { return std::find(from.begin(), from.end(), t) != from.end(); };
     ds41_sys::Stat ss{};
     ds41_sys::fstat(fd_, &ss);
+    // STRATA_SHADOW_PARENT=<index> (2026-11-07, the PROMETHEVS-style comparison): every routed expert, every role,
+    // re-quantized from the PARENT checkpoint's FP4 instead of this model's blob. The index (parent_index.py) has one
+    // line per matrix: l e role rows cols wfile woff sfile soff - weight = int8 [rows, cols/2] E2M1 pairs (even index
+    // low nibble), scale = E8M0 [rows, cols/32]; repacked losslessly to ggml MXFP4, then converted like any role.
+    struct PMat { int64_t rows = 0, cols = 0; int wf = -1, sf = -1; int64_t wo = 0, so = 0; };
+    std::vector<PMat> pm;
+    std::vector<int> pfd;
+    const char* pidx = std::getenv("STRATA_SHADOW_PARENT");
+    const bool parent = pidx && *pidx;
+    if (parent) {
+        std::FILE* f = std::fopen(pidx, "r");
+        if (!f) { err = std::string("cannot open parent index ") + pidx; return false; }
+        pm.assign((size_t) (NL * NE * 3), PMat{});
+        std::map<std::string, int> fid;
+        auto open_f = [&](const std::string& path) {
+            auto it = fid.find(path);
+            if (it != fid.end()) return it->second;
+            const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
+            if (fd >= 0) ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+            pfd.push_back(fd);
+            return fid[path] = (int) pfd.size() - 1;
+        };
+        long l, e, r, R, C, wo, so;
+        char wf[4096], sf[4096];
+        size_t got = 0;
+        while (std::fscanf(f, "%ld %ld %ld %ld %ld %4095s %ld %4095s %ld", &l, &e, &r, &R, &C, wf, &wo, sf, &so) == 9) {
+            if (l < 0 || l >= NL || e < 0 || e >= NE || r < 0 || r > 2) continue;
+            const bool ok = r < 2 ? (R == FF && C == D) : (R == D && C == FF);
+            if (!ok || C % 32) { std::fclose(f); err = "parent index: matrix shape does not match this model"; return false; }
+            PMat& m = pm[(size_t) ((l * NE + e) * 3 + r)];
+            m.rows = R; m.cols = C; m.wf = open_f(wf); m.sf = open_f(sf); m.wo = wo; m.so = so;
+            ++got;
+        }
+        std::fclose(f);
+        for (int fd : pfd) if (fd < 0) { err = "parent index: a shard does not open"; return false; }
+        if (got != (size_t) (NL * NE * 3)) { err = "parent index: " + std::to_string(got) + " of " + std::to_string(NL * NE * 3) + " matrices"; return false; }
+        std::fprintf(stderr, "build-shadow: every expert from the parent FP4 (%s, %zu shards)\n", pidx, pfd.size());
+    }
     struct Grp { int gu, d; std::string path; uint64_t stride = 0, data = 0; int fd = -1; std::vector<ShadowEnt> ent; };
     std::vector<Grp> grp;
     struct Job { int32_t l, e; int g; size_t k; };
@@ -8316,9 +8354,9 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
     for (int64_t l = 0; l < NL; ++l)
         for (int64_t e = 0; e < NE; ++e) {
             const int c = g_.cls(l, e), sg = g_.cls_gu[(size_t) c], sd = g_.cls_d[(size_t) c];
-            if (!in_from(sg) && !in_from(sd)) continue;
-            if (skip && (size_t) (l * NE + e) < skip->size() && (*skip)[(size_t) (l * NE + e)]) continue;   // stays exact
-            const int rg = in_from(sg) ? to_gu : sg, rd = in_from(sd) ? to_d : sd;
+            if (!parent && !in_from(sg) && !in_from(sd)) continue;
+            if (!parent && skip && (size_t) (l * NE + e) < skip->size() && (*skip)[(size_t) (l * NE + e)]) continue;   // stays exact
+            const int rg = parent || in_from(sg) ? to_gu : sg, rd = parent || in_from(sd) ? to_d : sd;
             size_t gi = 0;
             while (gi < grp.size() && !(grp[gi].gu == rg && grp[gi].d == rd)) ++gi;
             if (gi == grp.size()) {
@@ -8332,6 +8370,18 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
             jobs.push_back({(int32_t) l, (int32_t) e, (int) gi, grp[gi].ent.size()});
             grp[gi].ent.push_back({(int32_t) l, (int32_t) e, 0});
         }
+    if (const char* lim = std::getenv("STRATA_SHADOW_LIMIT"); lim && std::atol(lim) > 0 && jobs.size() > (size_t) std::atol(lim)) {
+        jobs.resize((size_t) std::atol(lim));   // test aid: the first n experts only
+        std::vector<int> keep(grp.size(), -1);
+        std::vector<Grp> kept;
+        for (Job& J : jobs) {
+            if (keep[(size_t) J.g] < 0) { keep[(size_t) J.g] = (int) kept.size(); kept.push_back(grp[(size_t) J.g]); kept.back().ent.clear(); }
+            J.g = keep[(size_t) J.g];
+            J.k = kept[(size_t) J.g].ent.size();
+            kept[(size_t) J.g].ent.push_back({J.l, J.e, 0});
+        }
+        grp.swap(kept);
+    }
     if (jobs.empty()) { err = "no expert has a role of those types"; return false; }
     auto wr = [](int fd, const uint8_t* p, uint64_t n, uint64_t off) {
         while (n) {
@@ -8421,11 +8471,12 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
     auto work = [&] {
         std::vector<uint8_t> src(max_), dst((size_t) smax, 0);
         std::vector<float> f((size_t) std::max(D, FF)), b((size_t) std::max(D, FF));
+        std::vector<uint8_t> pw, ps, pmx;   // STRATA_SHADOW_PARENT: one parent matrix (codes, scales, as MXFP4)
         for (size_t i; !bad && (i = nx++) < jobs.size();) {
             const Job& J = jobs[i];
             const Grp& G = grp[(size_t) J.g];
             const int c = g_.cls(J.l, J.e), sg = g_.cls_gu[(size_t) c], sd = g_.cls_d[(size_t) c];
-            read(J.l, J.e, src.data());
+            if (!parent) read(J.l, J.e, src.data());
             std::fill(dst.begin(), dst.begin() + (ptrdiff_t) G.stride, 0);
             std::map<int, std::array<double, 3>> local;
             // one role: `rows` rows of `cols`, source type st -> type dt (converted) or copied when st == dt
@@ -8446,6 +8497,39 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
                 auto& x = local[st];
                 x[0] += se; x[1] += sv; x[2] += 1;
             };
+            if (parent) {
+                // each role: the parent's E2M1 codes + E8M0 scales -> ggml block_mxfp4 rows (e, qs[j] = c[j] | c[j+16] << 4)
+                const uint64_t dgb = shadow_rb(G.gu, D) * (uint64_t) FF;
+                uint8_t* dr[3] = {dst.data(), dst.data() + dgb, dst.data() + 2 * dgb};
+                for (int r = 0; r < 3 && !bad; ++r) {
+                    const PMat& m = pm[(size_t) ((J.l * NE + J.e) * 3 + r)];
+                    const int64_t nb = m.cols / 32;
+                    pw.resize((size_t) (m.rows * m.cols / 2));
+                    ps.resize((size_t) (m.rows * nb));
+                    pmx.resize((size_t) (m.rows * nb * 17));
+                    if (ds41_sys::pread(pfd[(size_t) m.wf], pw.data(), pw.size(), m.wo) != (ssize_t) pw.size() ||
+                        ds41_sys::pread(pfd[(size_t) m.sf], ps.data(), ps.size(), m.so) != (ssize_t) ps.size()) { bad = true; break; }
+                    for (int64_t row = 0; row < m.rows; ++row)
+                        for (int64_t b = 0; b < nb; ++b) {
+                            const uint8_t* w = pw.data() + (size_t) (row * m.cols / 2 + b * 16);
+                            uint8_t* o = pmx.data() + (size_t) ((row * nb + b) * 17);
+                            o[0] = ps[(size_t) (row * nb + b)];
+                            for (int j = 0; j < 16; ++j) {   // code k sits in byte k/2, low nibble for even k
+                                const uint8_t lo = (uint8_t) ((w[j / 2] >> ((j & 1) * 4)) & 15), hi = (uint8_t) ((w[(j + 16) / 2] >> ((j & 1) * 4)) & 15);
+                                o[1 + j] = (uint8_t) (lo | (hi << 4));
+                            }
+                        }
+                    role(pmx.data(), dr[r], m.rows, m.cols, GGML_TYPE_MXFP4, r < 2 ? G.gu : G.d, r < 2 ? wgu : nullptr);
+                }
+                if (bad) { std::fprintf(stderr, "build-shadow: parent read failed at layer %d expert %d\n", J.l, J.e); break; }
+                if (!wr(G.fd, dst.data(), G.stride, G.ent[J.k].off)) { bad = true; break; }
+                std::lock_guard<std::mutex> lk(smu);
+                for (const auto& [t, x] : local) { auto& y = stat[t]; y[0] += x[0]; y[1] += x[1]; y[2] += x[2]; }
+                const size_t d = ++done;
+                if (d % 256 == 0 || d == jobs.size())
+                    std::fprintf(stderr, "build-shadow: %zu / %zu experts (%.0f s)\n", d, jobs.size(), (now_ms() - t0) / 1000.0);
+                continue;
+            }
             const uint64_t sgb = shadow_rb(sg, D) * (uint64_t) FF, dgb = shadow_rb(G.gu, D) * (uint64_t) FF;
             role(src.data(), dst.data(), FF, D, sg, G.gu, wgu);                         // gate (columns = input channels)
             role(src.data() + sgb, dst.data() + dgb, FF, D, sg, G.gu, wgu);             // up
@@ -8482,6 +8566,7 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
         std::FILE* lf = std::fopen((out + ".list").c_str(), "w");
         if (!lf || std::fprintf(lf, "%s\n", list.c_str()) < 0 || std::fclose(lf) != 0) { err = "cannot write " + out + ".list"; return false; }
     }
+    for (int fd : pfd) if (fd >= 0) ds41_sys::close(fd);
     std::fprintf(stderr, "build-shadow: done in %.0f s - XOLOTL_SHADOW=%s\n", (now_ms() - t0) / 1000.0, list.c_str());
     return true;
 }
