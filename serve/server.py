@@ -4991,6 +4991,7 @@ class Service:
         self.reasoning_budget_configured = False         # the config named reasoning_budget_tokens (0 included): no family default
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
+        self.repeat_wrap_up = True                       # ... unless the model is thinking: then the thinking is closed
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.keep_cut_tool_calls = False                  # opt-in: a whole OpenAI answer keeps a call cut at the token limit (openai_collect)
@@ -6700,6 +6701,7 @@ class Service:
                                  declared_only=declared_only)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
+        repeat_wrapped = False                          # the thinking was closed once after a repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
@@ -7075,6 +7077,21 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
+                        # A one-token run while the model is still thinking (GLM-5.3-Flash at 18,361 thinking tokens: 'Dot'
+                        # 256 times) used to end the reply with no answer after ten minutes.  Once a reply, the run is
+                        # dropped from what the engine continues from and the thinking is closed as the budget closes it,
+                        # so the model answers.  "repeat_wrap_up": false in the config ends it as "length" as before.
+                        repeat_wrap = False
+                        if (repeated and self.repeat_wrap_up and not repeat_wrapped and parser.state == "reasoning"
+                                and not cancel.is_set() and not answered):
+                            k = min(run_len, len(seg))
+                            print(f"[strata] the thinking repeated one token ({self.tok.decode([run_tok])!r}) {run_len} "
+                                  f"times in a row at {n} tokens: dropping the run and closing the thinking so the model "
+                                  "answers (repeat_wrap_up)", flush=True)
+                            del seg[len(seg) - k:]
+                            del raw_ids[len(raw_ids) - k:]
+                            repeat_wrapped, repeated, wrap, repeat_wrap = True, False, True, True
+                            run_tok, run_len = None, 0
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
@@ -7091,7 +7108,7 @@ class Service:
                         extra = self.tok.encode(text, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
-                        if wrap:
+                        if wrap and not repeat_wrap:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
                         for t in extra:
@@ -10996,6 +11013,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
+    rw = cfg.get("repeat_wrap_up", True)   # a one-token run inside the thinking closes it (false: end as "length")
+    if not isinstance(rw, bool):
+        raise SystemExit(f"[strata] config \"repeat_wrap_up\" must be true or false, not {rw!r}")
+    svc.repeat_wrap_up = rw
     if isinstance(cfg.get("preserve_thinking"), bool):
         svc.preserve_thinking = cfg["preserve_thinking"]
     if isinstance(cfg.get("add_vision_id"), bool):
