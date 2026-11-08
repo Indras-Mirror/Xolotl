@@ -8,6 +8,25 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### CPU IQ1_M gate/up rows: one decode for every token (9 Nov, for smaller cards)
+
+The same gap as the down rows below, on the gate/up side: IQ1_M experts (Qwen3.8-Flash-Next XQ 45 GB has them in 27 of its
+48 layers) ran ggml-cpu's single-token dot, decoding every block again for each token. They now take the AVX-2 rows
+DeepSeek-V4.1's CPU lane already used (`iq256x_rows`, ggml's arithmetic lane for lane below `STRATA_IQ_WIDE_MIN` tokens),
+under the gate/up rule (no AVX-512, from `STRATA_IQ_MT_MIN` tokens, default arithmetic). `STRATA_NO_IQ1M_ROWS=1` restores
+ggml's dot.
+
+| `kq_cpu_bench --dims 2560,640`, IQ1_M gate/up + Q2_0 down, Ryzen 7 5700X, 8 threads | Before (ms an expert) | After (ms an expert) |
+| --- | ---: | ---: |
+| 1 token | 0.38 | 0.36 |
+| 4 tokens | 1.22 | **1.04** |
+| 8 tokens | 2.42 | **1.56** |
+
+On a 24 GB RTX 4090 it changes nothing measurable: ~95 % of Flash-Next's decode experts are in the card's cache and
+route-resident moves most of the rest there, so the CPU computes very few (same binary, on/off interleaved, two runs
+each: 2K prefill 1,430 / 1,435 vs 1,342 / 1,416 tok/s, 8K 3,397 / 3,386 vs 3,430 / 3,380, decode inside the run-to-run
+spread). It is for cards with less VRAM (12 GB), where more experts run on the CPU; a 12 GB measurement is to come.
+
 ### CPU i-quant down rows: one decode for every token (8 Nov)
 
 The CPU pool's multi-token kernels decoded an i-quant block once for all the tokens routed to an expert, but only for
