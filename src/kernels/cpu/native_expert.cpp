@@ -549,6 +549,30 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
             }
         return;
     }
+    // IQ1_M gate/up (Qwen3.8-Flash-Next XQ: 27 of its 48 layers): ggml-cpu's dot ran once per token, decoding every block
+    // again for each one.  The DeepSeek lane's AVX-2 rows (iq256x_rows) decode a block once for all of an expert's tokens,
+    // lane for lane ggml's arithmetic below STRATA_IQ_WIDE_MIN tokens.  A CPU without AVX-512, from mt_min tokens, Default
+    // arithmetic (the gate/up rule).  STRATA_NO_IQ1M_ROWS=1 = ggml's dot.
+    static const bool iq1m_rows = cpu_avx2_ok() && !cpu_avx512_ok() && std::getenv("STRATA_NO_IQ1M_ROWS") == nullptr;
+    if (iq1m_rows && Arithmetic == NativeArithmetic::Default && f.gu_type == 29 && !mixed && nt >= mt_min && r1 > r0) {
+        const int R = r1 - r0, n = (int) f.n_embd;
+        thread_local std::vector<float> gb, ub;
+        gb.resize((size_t) nt * (size_t) R);
+        ub.resize((size_t) nt * (size_t) R);
+        float* gp[MAXT];
+        float* upp[MAXT];
+        for (int t = 0; t < nt; ++t) { gp[t] = gb.data() + (size_t) t * R; upp[t] = ub.data() + (size_t) t * R; }
+        iq256x_rows(29, blob + (size_t) r0 * f.gu_row, f.gu_row, n, act, nt, gp, 0, R);
+        iq256x_rows(29, blob + f.up_off + (size_t) r0 * f.gu_row, f.gu_row, n, act, nt, upp, 0, R);
+        const float lim = f.swiglu_limit;
+        for (int t = 0; t < nt; ++t)
+            for (int i = 0; i < R; ++i) {
+                const float g = std::min(gp[t][i], lim);
+                const float u = std::min(std::max(upp[t][i], -lim), lim);
+                ff[t][r0 + i] = (g / (1.f + std::exp(-g))) * u;
+            }
+        return;
+    }
     // UNION (xolotl): upstream's older-CPU 128-bit tier - independent of the PTQ1_0 / Q2_0 paths above (disjoint quant types)
     if (!singleton_iq && avx1 && nt >= mt_min && iq128_supported(f.gu_type)) {
         iq128_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
