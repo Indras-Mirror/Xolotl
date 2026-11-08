@@ -191,7 +191,7 @@ def corpus(tokenizer_json):
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(str(tokenizer_json))
     root = Path(__file__).resolve().parents[3]
-    return [tok.encode((root / f).read_text(errors="replace")).ids for f in ("README.md", "HANDOFF.md", "howto_eng.md")]
+    return [tok.encode((root / f).read_text(errors="replace")).ids for f in ("README.md", "docs/history/HANDOFF-2026-10-18.md", "docs/dense/HOWTO.md")]
 
 
 def main():

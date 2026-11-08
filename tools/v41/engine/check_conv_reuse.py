@@ -9,7 +9,7 @@ prefill of the same prompt as closely as the batch-shape noise of a known-good c
   check_conv_reuse.py --bin build/ds41_generate --model M.gguf --engram A:B --tokenizer tokenizer.json \
       --scenario park_partial [--ref-bin B2] [--tail 20]
 
-The prompts are token runs of the repo's README.md / HANDOFF.md / howto_eng.md (--tokenizer: the model's
+The prompts are token runs of the repo's README.md / docs/history/HANDOFF-2026-10-18.md / docs/dense/HOWTO.md (--tokenizer: the model's
 tokenizer.json, or DS41_TOKENIZER_JSON).
 
 Scenarios: park_partial (the STRATA_SERVE_PARK_PARTIAL resume 20 positions back, then 8 back), park16 (a partial
@@ -145,7 +145,7 @@ def build_steps(sc, out, tokenizer_json):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parents[3]
-    texts = corpus([root / "README.md", root / "HANDOFF.md", root / "howto_eng.md"], tokenizer_json)
+    texts = corpus([root / "README.md", root / "docs/history/HANDOFF-2026-10-18.md", root / "docs/dense/HOWTO.md"], tokenizer_json)
     T = [t for t in texts if len(t) >= 1000]
     if len(T) < 3:
         raise SystemExit("corpus too short")
