@@ -9,6 +9,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/ptq1_0.hpp"
+#include "strata/kernels/cpu/iq_avx2.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -30,7 +31,8 @@ namespace cpu = strata::kernels::cpu;
 
 namespace {
 
-int64_t kH = 2560, kFF = 640;   // --dims H,FF (DeepSeek-V4.1: 4096,2048)
+int64_t kH = 2560, kFF = 640;
+int xmode = 0;   // --x: the i-quant rows through iq256x_rows (EX + dot_rows_wide); --xgu / --xdown: one side only   // --dims H,FF (DeepSeek-V4.1: 4096,2048)
 constexpr int kMaxT = 8;
 
 int type_of(const std::string& s) {
@@ -95,6 +97,9 @@ int main(int argc, char** argv) {
         else if (a == "--mb" && more) mb = std::atoi(argv[++i]);
         else if (a == "--reps" && more) reps = std::max(1, std::atoi(argv[++i]));
         else if (a == "--ram-gbs" && more) ram = std::atof(argv[++i]);
+        else if (a == "--x") xmode = 3;
+        else if (a == "--xgu") xmode = 1;
+        else if (a == "--xdown") xmode = 2;   // gate/up/down through iq256x_rows (the EX rows: wide from 7 tokens)
         else {
             std::fprintf(stderr, "usage: kq_cpu_bench [--pairs a/b,...] [--threads 1,8] [--nt 1,2,4] [--mb 4096] [--reps 3] [--ram-gbs N]\n");
             return 2;
@@ -169,10 +174,10 @@ int main(int argc, char** argv) {
                     std::atomic<size_t> next{0};
                     auto work = [&] {
                         std::vector<float> ffb((size_t) kMaxT * kFF), outb((size_t) kMaxT * kH);
-                        std::vector<float> gb(q2_gu ? (size_t) kMaxT * kFF : 0), ub(q2_gu ? (size_t) kMaxT * kFF : 0);
+                        std::vector<float> gb((q2_gu || xmode) ? (size_t) kMaxT * kFF : 0), ub((q2_gu || xmode) ? (size_t) kMaxT * kFF : 0);
                         float* gp[kMaxT] = {};
                         float* up[kMaxT] = {};
-                        if (q2_gu)
+                        if (q2_gu || xmode)
                             for (int t = 0; t < kMaxT; ++t) { gp[t] = &gb[(size_t) t * kFF]; up[t] = &ub[(size_t) t * kFF]; }
                         float* ff[kMaxT];
                         float* out[kMaxT];
@@ -188,11 +193,19 @@ int main(int argc, char** argv) {
                                 for (int t = 0; t < nt; ++t)
                                     for (int64_t r = 0; r < kFF; ++r)
                                         ff[t][r] = (gp[t][r] / (1.f + std::exp(-gp[t][r]))) * up[t][r];
+                            } else if ((xmode & 1) && cpu::iq256x_supported(f.gu_type)) {
+                                cpu::iq256x_rows(f.gu_type, blob, f.gu_row, (int) kH, act, nt, gp, 0, (int) kFF);
+                                cpu::iq256x_rows(f.gu_type, blob + f.up_off, f.gu_row, (int) kH, act, nt, up, 0, (int) kFF);
+                                for (int t = 0; t < nt; ++t)
+                                    for (int64_t r = 0; r < kFF; ++r)
+                                        ff[t][r] = (gp[t][r] / (1.f + std::exp(-gp[t][r]))) * up[t][r];
                             } else {
                                 cpu::native_gu_rows(f, blob, act, nt, ff, 0, (int) kFF);
                             }
                             if (q2_down)
                                 cpu::q2_rows_any(blob + f.down_off, f.d_row, (int) (f.n_ff / 64), a2, nt, out, 0, (int) kH);
+                            else if ((xmode & 2) && cpu::iq256x_supported(f.d_type))
+                                cpu::iq256x_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, 0, (int) kH);
                             else
                                 cpu::native_down_rows(f, blob, hq, nt, out, 0, (int) kH);
                         }

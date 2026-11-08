@@ -613,6 +613,18 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
         tq_rows(tq_isa(), f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
+    // xolotl 2026-11-08: the i-quant DOWN rows had no multi-token path - every token ran ggml-cpu's single-token vec_dot
+    // below (the codebook decoded again per token) while the gate/up rows decode once for all tokens.  GLM-5.3-Flash Maya
+    // (IQ2_XXS gate/up, IQ2_S / IQ3_XXS down), kq_cpu_bench 8 threads, 4 tokens an expert: 4.47 -> 3.15 ms an expert.  The
+    // gate/up rule: the AVX-2 kernel on a CPU without AVX-512 (whose rows keep ggml's), from mt_min tokens (#152), Default
+    // arithmetic.  IQ4_XS (23) stays on its own branch above/below as before.  STRATA_NO_IQ_DOWN_MT=1 = ggml's dot.
+    static const bool iq_down = cpu_avx2_ok() && !cpu_avx512_ok() && std::getenv("STRATA_NO_IQ256") == nullptr &&
+                                std::getenv("STRATA_NO_IQ_DOWN_MT") == nullptr;
+    if (iq_down && Arithmetic == NativeArithmetic::Default && nt >= mt_min && f.tail_off == 0 &&
+        (f.d_type == 16 || f.d_type == 17 || f.d_type == 18 || f.d_type == 21 || f.d_type == 22)) {
+        iq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     if (cpu_avx2_ok() && kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8) &&
         (Arithmetic == NativeArithmetic::Default || (ggml_cpu_has_avx2() && ggml_cpu_has_fma()))) {   // Q5_1 / Q8_0 down: bit-exact, any group size
         kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);

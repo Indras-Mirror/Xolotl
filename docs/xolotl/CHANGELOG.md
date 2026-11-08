@@ -8,6 +8,36 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### CPU i-quant down rows: one decode for every token (8 Nov)
+
+The CPU pool's multi-token kernels decoded an i-quant block once for all the tokens routed to an expert, but only for
+gate/up: the **down** rows (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S) ran ggml-cpu's single-token dot per token, so each
+extra token cost almost as much as the first. They now take the same AVX-2 row kernels, under the gate/up rule (a CPU
+without AVX-512, from `STRATA_IQ_MT_MIN` tokens, default arithmetic; `STRATA_NO_IQ_DOWN_MT=1` restores ggml's dot).
+One token is unchanged, so decode's CPU tier is untouched; a group of 2+ tokens rounds like the gate/up kernels already
+did (any model with i-quant down experts on the CPU, e.g. a Flash-Next verify window, gets it on its next build).
+
+| `kq_cpu_bench --dims 4096,2048`, IQ2_XXS gate/up + IQ2_S down, Ryzen 7 5700X, 8 threads | Before (ms an expert) | After (ms an expert) |
+| --- | ---: | ---: |
+| 1 token | 1.93 | 1.93 |
+| 4 tokens | 4.47 | **3.02** |
+| 8 tokens | 8.23 | **5.61** |
+
+GLM's short-prompt CPU split can now take a 0.4 share (served Maya configs). Same agent replay as below:
+
+| GLM-5.3-Flash Maya 512K, tool-output turns on a 25K conversation | No split (s) | Split 0.3, old kernel (s) | **Split 0.4, new kernel (s)** |
+| --- | ---: | ---: | ---: |
+| +246 tokens | 5.47 | 4.79 | **4.63** |
+| +300 tokens | 5.56 | 4.97 | **4.82** |
+| +590 tokens | 6.21 | 5.45 | **5.36** |
+| +642 tokens | 6.30 | 5.89 | **5.49** |
+| +1,011 tokens | 6.86 | 6.13 | **6.12** |
+| +1,877 tokens | 8.02 | 7.54 | **7.46** |
+
+Exact-math perplexity (every 256-token chunk through the split): chat 5.516 (no split) / 5.305, code 3.624 / 3.617.
+`kq_cpu_bench --x / --xgu / --xdown` runs the rows through the EX entry point for comparison; `STRATA_IQ_WIDE_MIN` sets
+from how many tokens the EX lane's wide rows start (default 7, unchanged; lower measured slower here).
+
 ### GLM-5.3-Flash: the same CPU split for short prompts (8 Nov)
 
 GLM's expert tier (`ds4_moe`) gets the `STRATA_CHUNK_CPU` split too (same knobs). Since the RAM upgrade every Maya expert

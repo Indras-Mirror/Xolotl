@@ -554,7 +554,9 @@ template <int TY, bool EX> STRATA_ROWS_FN
 void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0,
                  int r1) {
     if constexpr (EX) {
-        if (nt >= 7) {   // (a prompt chunk's tokens: one decode of a block for all of them)
+        // (a prompt chunk's tokens: one decode of a block for all of them); STRATA_IQ_WIDE_MIN: from how many tokens (default 7)
+        static const int wide_min = std::getenv("STRATA_IQ_WIDE_MIN") ? std::max(1, std::atoi(std::getenv("STRATA_IQ_WIDE_MIN"))) : 7;
+        if (nt >= wide_min) {
             if constexpr (TY == 29) dot_rows_wide_iq1m(w, row_bytes, n, act, nt, out, r0, r1);
             else dot_rows_wide<TY>(w, row_bytes, n, act, nt, out, r0, r1);
             return;
