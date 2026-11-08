@@ -941,6 +941,18 @@ int main(int argc, char** argv) {
     opt.draft_max = ngram_on ? ngram_max : draft_max;   // rollback snapshots for the widest window
     opt.kv = kv_type;
     if (use_df2) { opt.spec_snapshots = true; opt.taps = df2.tap_layers(); }
+    // XOLOTL_TAP_DUMP=<file> (research only, off by default): every request appends its prompt's tap rows (the residual
+    // after each XOLOTL_TAP_LAYERS layer, e.g. 1,16,31,46,61) to the file, for offline drafter acceptance runs
+    const char* tap_dump = std::getenv("XOLOTL_TAP_DUMP");
+    if (tap_dump && !use_df2) {
+        const char* tl = std::getenv("XOLOTL_TAP_LAYERS");
+        for (const char* c = tl ? tl : "1,16,31,46,61"; *c;) {
+            char* e = nullptr;
+            opt.taps.push_back((int) std::strtol(c, &e, 10));
+            c = (*e == ',') ? e + 1 : e;
+            if (e == c && *c) break;
+        }
+    }
     if (!draft_vocab.empty() && want_mtp) {
         FILE* fv = std::fopen(draft_vocab.c_str(), "rb");
         if (fv) {
@@ -1251,6 +1263,21 @@ int main(int argc, char** argv) {
             if (!ok) { fail(err.empty() ? "dflash2: context" : err); continue; }
             df2_pend = 1;
             df2_pos0 = n - 1;
+        }
+        if (tap_dump && !use_df2 && n > (int64_t) resume) {   // XOLOTL_TAP_DUMP: n0, rows, n_taps, n_embd, tokens, rows of floats
+            const int64_t R = strata::core::DenseModel::kTapRing, W = (int64_t) model.n_taps() * cfg.n_embd;
+            const int64_t q0 = std::max<int64_t>(0, n - R);   // rows below resume are in the ring from an earlier prefill of the same tokens (run prompts so)
+            std::vector<float> rows((size_t) (n - q0) * W);
+            for (int64_t q = q0; q < n; ++q)
+                cudaMemcpy(rows.data() + (size_t) (q - q0) * W, model.ring_taps() + (size_t) (q % R) * W, (size_t) W * 4, cudaMemcpyDeviceToHost);
+            if (std::FILE* tf = std::fopen(tap_dump, "ab")) {
+                const int32_t hdr[4] = {(int32_t) q0, (int32_t) (n - q0), model.n_taps(), cfg.n_embd};
+                std::fwrite(hdr, 4, 4, tf);
+                std::fwrite(ids.data() + q0, 4, (size_t) (n - q0), tf);
+                std::fwrite(rows.data(), 4, rows.size(), tf);
+                std::fclose(tf);
+                std::fprintf(stderr, "xolotl-dense: XOLOTL_TAP_DUMP %s: %lld rows from %lld\n", tap_dump, (long long) (n - q0), (long long) q0);
+            } else std::fprintf(stderr, "xolotl-dense: XOLOTL_TAP_DUMP: cannot write %s\n", tap_dump);
         }
         const double prompt_ms = ms_since(t_prompt);
 
