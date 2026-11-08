@@ -124,3 +124,8 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+
+# local-only (xolotl, 2026-11-09)
+/runs/
+/third_party/llama.cpp-x75/
+*.bak-2026*
