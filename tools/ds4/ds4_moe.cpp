@@ -33,6 +33,7 @@
 #if defined(DS4_MOE_CUDA)
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/pinned.hpp"
+#include "strata/kernels/elementwise.hpp"   // scatter_rows_f32 (STRATA_CHUNK_CPU)
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -137,6 +138,37 @@ struct Arena {
     }
 };
 
+/// STRATA_CHUNK_CPU (xolotl 2026-11-08, ported from ds41_moe): a small prompt batch - an agent turn's tool output -
+/// touches nearly every expert of a layer for a few tokens each, and copying them to the card is the turn's floor (GLM
+/// Maya, every expert in the RAM arena: +246 tokens on a 25K conversation took 5.47 s, as long as the 150-token reply).
+/// The CPU pool computes the layer's lowest-count arena experts instead (read once, from RAM; the routed-expert LoRA
+/// applied by the pool as in decode) in a thread while the card runs the rest; their rows are scattered into c_parts
+/// before the weighted sum.  Routing is unchanged.  STRATA_CHUNK_CPU=1 on; _FRAC: the CPU's share of the layer's
+/// streamed experts (default 0.5); _MAXTOK: an expert with more tokens stays on the card (default 8); _MAXN: wider
+/// batches skip it (default 2048).
+struct ChunkCpu4 {
+    std::vector<char> mask;           ///< expert -> the CPU computes it in this call
+    std::vector<int32_t> ue, ufirst;  ///< the CPU experts; expert u owns rows [ufirst[u], ufirst[u + 1])
+    std::vector<int32_t> rrow, ent_tok;
+    int64_t nr = 0;
+    float* h_rows = nullptr;          ///< mapped pinned rows (nr x H), read by the scatter over the link
+    float* h_rows_dev = nullptr;
+    int64_t h_cap = 0;
+    int32_t* d_rrow = nullptr;
+    std::vector<uint8_t> nact;        ///< per token: the layer's native activation
+    std::vector<char> act_done;
+    std::vector<cpu::ExpertJobMulti> jobs;
+    std::thread th;
+    int64_t layers = 0, entries = 0;
+    double cpu_ms = 0, wait_ms = 0, gb = 0;
+    void join() { if (th.joinable()) th.join(); }
+    ~ChunkCpu4() {
+        join();
+        if (h_rows) cudaFreeHost(h_rows);
+        if (d_rrow) cudaFree(d_rrow);
+    }
+};
+
 /// All the device state, so the CPU-only flavour has none of it to leak.
 struct Gpu {
     Arena arena;
@@ -172,6 +204,7 @@ struct Gpu {
     int c_pre_layer = -1, c_pre_half = -1;
     int64_t c_pre_sl = 0;
     std::vector<int32_t> c_pre_e;
+    std::shared_ptr<struct ChunkCpu4> ccpu;   ///< STRATA_CHUNK_CPU: the CPU's share of a prompt chunk (null = never used)
     void *c_w = nullptr, *c_out = nullptr;   ///< run_chunk: the top-k weights and the summed rows on the card
     void *c_x = nullptr, *c_xq = nullptr, *c_parts = nullptr, *c_scratch = nullptr, *c_ptr = nullptr,
          *c_start = nullptr, *c_ng = nullptr, *c_dst = nullptr, *c_tokv = nullptr, *c_exp = nullptr, *c_stage[2] = {};
@@ -2223,6 +2256,94 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         slot_e[(size_t) e] = sl;
         order[sl >= 0 ? 0 : gp.arena.ptr(layer, e) ? 1 : 2].push_back((int32_t) e);
     }
+    // ---- STRATA_CHUNK_CPU: the CPU takes the lowest-count arena experts (out of order[1], so the card's entry layout
+    // below never holds their entries), started now so it runs under the whole card side of the call
+    ChunkCpu4* cc = nullptr;
+    {
+        static const bool on = std::getenv("STRATA_CHUNK_CPU") && std::atoi(std::getenv("STRATA_CHUNK_CPU")) == 1;
+        static const double frac = std::getenv("STRATA_CHUNK_CPU_FRAC") ? std::atof(std::getenv("STRATA_CHUNK_CPU_FRAC")) : 0.5;
+        static const int maxtok = std::getenv("STRATA_CHUNK_CPU_MAXTOK") ? std::max(1, std::atoi(std::getenv("STRATA_CHUNK_CPU_MAXTOK"))) : cpu::MAXT;
+        static const int maxn = std::getenv("STRATA_CHUNK_CPU_MAXN") ? std::atoi(std::getenv("STRATA_CHUNK_CPU_MAXN")) : 2048;
+        if (on && frac > 0 && im.pool && x_host && n <= maxn && !im.cfg.saliency && !order[1].empty()) {
+            std::vector<char> pre((size_t) NX, 0);   // prestaged: already on its way to the card
+            if (gp.c_pre_layer == (int) layer) for (int32_t e : gp.c_pre_e) if (e >= 0 && e < NX) pre[(size_t) e] = 1;
+            std::vector<int32_t> cand;
+            for (int32_t e : order[1]) if (cnt[(size_t) e] <= maxtok && !pre[(size_t) e]) cand.push_back(e);
+            std::stable_sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) { return cnt[(size_t) a] < cnt[(size_t) b]; });
+            const size_t take = std::min(cand.size(), (size_t) (frac * (double) (order[1].size() + order[2].size())));
+            int64_t ne_cpu = 0;
+            for (size_t i = 0; i < take; ++i) ne_cpu += cnt[(size_t) cand[i]];
+            if (take > 0 && ne_cpu < NE) {   // the card keeps an entry of its own (the weighted sum)
+                if (!gp.ccpu) gp.ccpu = std::make_shared<ChunkCpu4>();
+                cc = gp.ccpu.get();
+                cc->join();
+                cc->mask.assign((size_t) NX, 0);
+                cc->ue.assign(cand.begin(), cand.begin() + (std::ptrdiff_t) take);
+                cc->ufirst.clear();
+                std::vector<int32_t> cf((size_t) NX, 0);
+                int32_t at = 0;
+                for (int32_t e : cc->ue) { cc->mask[(size_t) e] = 1; cc->ufirst.push_back(at); cf[(size_t) e] = at; at += cnt[(size_t) e]; }
+                cc->ufirst.push_back(at);
+                cc->nr = at;
+                cc->rrow.resize((size_t) at);
+                cc->ent_tok.resize((size_t) at);
+                for (int64_t j = 0; j < NE; ++j) {
+                    if (!cc->mask[(size_t) ids[j]]) continue;
+                    const int32_t q = cf[(size_t) ids[j]]++;
+                    cc->rrow[(size_t) q] = (int32_t) j;
+                    cc->ent_tok[(size_t) q] = (int32_t) (j / K);
+                }
+                std::vector<int32_t> keep;
+                for (int32_t e : order[1]) if (!cc->mask[(size_t) e]) keep.push_back(e);
+                order[1].swap(keep);
+                if (cc->nr > cc->h_cap) {
+                    if (cc->h_rows) cudaFreeHost(cc->h_rows);
+                    if (cc->d_rrow) cudaFree(cc->d_rrow);
+                    cc->h_cap = std::max<int64_t>(cc->nr + cc->nr / 2, 1024);
+                    ck(cudaHostAlloc((void**) &cc->h_rows, (size_t) cc->h_cap * (size_t) H * 4, cudaHostAllocMapped), "chunk cpu rows");
+                    ck(cudaHostGetDevicePointer((void**) &cc->h_rows_dev, cc->h_rows, 0), "chunk cpu rows dev");
+                    ck(cudaMalloc(&cc->d_rrow, sizeof(int32_t) * (size_t) cc->h_cap), "chunk cpu rrow");
+                }
+                const cpu::NativeFmt& f = im.fl[(size_t) layer];
+                const size_t ab = (size_t) std::max<int64_t>(1, f.act_bytes);
+                if (cc->nact.size() < (size_t) n * ab) cc->nact.resize((size_t) n * ab);
+                cc->act_done.assign((size_t) n, 0);
+                if (cc->jobs.size() < (size_t) cc->nr) cc->jobs.resize((size_t) cc->nr);
+                ++cc->layers;
+                cc->entries += cc->nr;
+                cc->gb += (double) take * (double) BL / 1e9;
+                cc->th = std::thread([&im, cc, &gp, layer, x_host, H, ab]() {
+                    const cpu::NativeFmt& f = im.fl[(size_t) layer];
+                    const double tc = now_ms();
+                    int nj = 0;
+                    for (size_t u = 0; u < cc->ue.size(); ++u) {
+                        const int32_t e = cc->ue[u];
+                        const uint8_t* blob = gp.arena.ptr(layer, e);
+                        cpu::ExpertJobMulti* jb = nullptr;
+                        for (int32_t q = cc->ufirst[u]; q < cc->ufirst[u + 1]; ++q) {
+                            if (!jb || jb->nt == cpu::MAXT) {
+                                jb = &cc->jobs[(size_t) nj++];
+                                jb->blob = blob;
+                                jb->nt = 0;
+                                jb->fmt = nullptr;
+                                for (int t = 0; t < cpu::MAXT; ++t) { jb->nact[t] = nullptr; jb->out[t] = nullptr; jb->act[t] = nullptr; }
+                                set_job_lora(im, *jb, layer, e);
+                            }
+                            const int32_t tt = cc->ent_tok[(size_t) q];
+                            uint8_t* slot = cc->nact.data() + (size_t) tt * ab;
+                            if (!cc->act_done[(size_t) tt]) { cpu::native_quant_act(f, x_host + (size_t) tt * (size_t) H, slot); cc->act_done[(size_t) tt] = 1; }
+                            jb->nact[jb->nt] = slot;
+                            jb->out[jb->nt] = cc->h_rows + (size_t) q * (size_t) H;
+                            ++jb->nt;
+                        }
+                    }
+                    if (nj > 0) im.pool->run_split_multi_native(f, cc->jobs.data(), nj);
+                    cc->cpu_ms += now_ms() - tc;
+                });
+            }
+        }
+    }
+    struct CcJoin { ChunkCpu4* c; ~CcJoin() { if (c) c->join(); } } cc_join{cc};   // every return path waits for the pool
     std::vector<int32_t> first((size_t) NX + 1, 0);
     {
         int32_t at = 0;
@@ -2237,6 +2358,7 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
     std::vector<int32_t> exp;
     if (lora_on) exp.resize((size_t) NE);
     for (int64_t j = 0; j < NE; ++j) {
+        if (cc && cc->mask[(size_t) ids[j]]) continue;   // the CPU's rows (scattered in before the weighted sum)
         const int32_t p = fill[(size_t) ids[j]]++;
         dst[(size_t) p] = (int32_t) j;
         tok[(size_t) p] = (int32_t) (j / K);
@@ -2537,6 +2659,14 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         chunk_prestage(im, nl, h_last >= 0 ? 1 - h_last : 0);
     }
 
+    if (cc) {   // STRATA_CHUNK_CPU: the CPU's rows into c_parts
+        const double tw = now_ms();
+        cc->join();
+        cc->wait_ms += now_ms() - tw;
+        ck(cudaMemcpyAsync(cc->d_rrow, cc->rrow.data(), sizeof(int32_t) * (size_t) cc->nr, cudaMemcpyHostToDevice, gp.s), "chunk cpu rrow");
+        strata::kernels::scatter_rows_f32(cc->h_rows_dev, (float*) gp.c_parts, cc->d_rrow, cc->nr, H, gp.s);
+        st.cpu += cc->nr;
+    }
     // ---- outputs: the top-k mix on the card, n rows back ----
     if (tok_scale.empty()) {
         ck(cudaMemcpyAsync(gp.c_w, w, sizeof(float) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_w");
@@ -2652,6 +2782,13 @@ const std::vector<int64_t>& Ds4MoeTier::saliency_count() const { return im_->sal
 void Ds4MoeTier::release_chunk() {
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu) return;
+    if (im_->gpu->ccpu && im_->gpu->ccpu->layers) {
+        ChunkCpu4& c = *im_->gpu->ccpu;
+        std::fprintf(stderr, "chunk cpu: %lld layers, %lld entries, %.1f GB of arena experts on the CPU in %.0f ms (pool), "
+                             "the card waited %.0f ms for it\n", (long long) c.layers, (long long) c.entries, c.gb, c.cpu_ms, c.wait_ms);
+        c.layers = c.entries = 0;
+        c.gb = c.cpu_ms = c.wait_ms = 0;
+    }
     if (chunk_prof() && g_cprof.calls) {
         const ChunkProf& c = g_cprof;
         std::fprintf(stderr, "chunk prof: %lld calls, %lld launches: wall %.0f ms = waits on reads %.0f + wave/copy waits "

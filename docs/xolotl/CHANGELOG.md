@@ -8,6 +8,27 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### GLM-5.3-Flash: the same CPU split for short prompts (8 Nov)
+
+GLM's expert tier (`ds4_moe`) gets the `STRATA_CHUNK_CPU` split too (same knobs). Since the RAM upgrade every Maya expert
+sits in the 80 GiB arena, so a small agent turn's floor is all PCIe: a 250-token batch touches nearly all 288 experts in
+all 42 layers, and +246 tokens on a 25K conversation took 5.47 s, as long as the 150-token reply after it. The CPU
+unpacks GLM's i-quants at ~11 GB/s against PCIe's ~22, so its share is 0.3 here (0.5 overloads it; a 4-token cap was no
+better). The pool applies the routed-expert LoRA as it does in decode.
+
+| GLM-5.3-Flash Maya 512K (served flags), 25K-token conversation, tool-output turns | Before (s) | After (s) |
+| --- | ---: | ---: |
+| +246 tokens | 5.47 | **4.79** |
+| +300 tokens | 5.56 | **4.97** |
+| +590 tokens | 6.21 | **5.45** |
+| +642 tokens | 6.30 | **5.89** |
+| +1,011 tokens | 6.86 | **6.13** |
+| +1,877 tokens | 8.02 | **7.54** |
+
+Exact-math perplexity (skips off, every 256-token chunk through the split): chat 5.516 -> 5.362, code 3.624 -> 3.600.
+The CPU's rows keep more activation precision than the card's q8_1 MMQ path (GLM's chunked ppl moves 1-2 % with the
+expert path), so the drift is toward the exact model. Decode is unchanged (28.5-31 tok/s, PCIe-bound).
+
 ### DeepSeek-V4.1: the CPU takes the quiet experts of a short prompt (8 Nov)
 
 **`STRATA_CHUNK_CPU=1`** (opt-in; on in the served config). An agent turn's tool output (a few hundred tokens) runs
