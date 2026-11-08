@@ -53,5 +53,9 @@
     "temperature": 1,
     "top_p": 0.95
   },
-  "reasoning_budget_tokens": 32768
+  "reasoning_budget_tokens": 32768,
+  "env": {
+    "STRATA_CHUNK_CPU": "1",
+    "STRATA_CHUNK_CPU_FRAC": "0.3"
+  }
 }
