@@ -243,13 +243,16 @@ def main():
     ap.add_argument("--vision", action="store_true")
     ap.add_argument("--no-ref", action="store_true", help="skip the fresh engine (decisions only)")
     ap.add_argument("--ref-all", action="store_true", help="a fresh reference for every step, not only the reused ones")
+    ap.add_argument("--gpu", action="store_true", help="CUDA backend + GPU experts (pass the arena etc. via --extra); "
+                    "batch shapes differ between reuse and fresh, so judge by KL / top-1, not bitexact")
     ap.add_argument("--tail", type=int, default=0, help="STRATA_SERVE_DUMP_TAIL: compare the last N prompt rows too")
     a = ap.parse_args()
     if not a.tokenizer:
         ap.error("--tokenizer (or DS41_TOKENIZER_JSON) is required")
     out = Path(a.out or tempfile.mkdtemp(prefix="ds41-reuse-"))
     out.mkdir(parents=True, exist_ok=True)
-    common = ["-m", a.model, "--engram", a.engram, "--backend", "cpu", "--experts", "cpu", "--arena-gib", "0",
+    dev = ["--backend", "cuda", "--experts", "gpu"] if a.gpu else ["--backend", "cpu", "--experts", "cpu", "--arena-gib", "0"]
+    common = ["-m", a.model, "--engram", a.engram, *dev,
               "--ctx", "8192", "--threads", str(a.threads), "--prompt-batch", "512", "--prefill-chunk", "64",
               "--stop", "1"] + (["--vision"] if a.vision else []) + (a.extra.split() if a.extra else [])
     env = dict(kv.split("=", 1) for kv in a.env)
@@ -258,7 +261,7 @@ def main():
     env.update(tail_env)
     sc = a.scenario
     steps = build_steps(sc, out, a.tokenizer)
-    eng = Engine(a.bin, common, env, out, "test")
+    eng = Engine(a.bin, common, env, out, "test", cpu=not a.gpu)
     res = []
     try:
         for k, (label, ids, mx, keys, emb) in enumerate(steps):
@@ -276,7 +279,7 @@ def main():
         summary["steps"].append({"label": label, "prompt": len(ids), "resume": r["resume"], "tokens": r["tokens"],
                                  "sec": round(r["sec"], 1)})
     if not a.no_ref:
-        ref = Engine(a.ref_bin or a.bin, common, {"STRATA_SERVE_PARK": "0", **tail_env}, out, "fresh")
+        ref = Engine(a.ref_bin or a.bin, common, {"STRATA_SERVE_PARK": "0", **tail_env}, out, "fresh", cpu=not a.gpu)
         try:
             for (label, ids, mx, keys, emb), r, st in zip(steps, res, summary["steps"]):
                 if r["resume"] == 0 and not a.ref_all:
