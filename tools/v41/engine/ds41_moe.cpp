@@ -380,6 +380,37 @@ struct RemoteChunk {
     double wait_ms = 0;
 };
 
+/// STRATA_CHUNK_CPU (xolotl 2026-11-08): a small prompt batch - an agent turn's tool output - streams ~185 distinct
+/// experts a layer to the card for ~5 tokens each: a 161-token turn moved 59 GB (47 GB of it from the RAM arena) in
+/// 3.7 s, the 15.8 GB/s the link gives, while its kernels took 0.47 s.  Here the CPU pool computes the layer's
+/// lowest-count RAM-arena experts instead (read once, from RAM, where they already are), in a thread, while the card
+/// runs the rest; their rows are scattered into c_parts before the weighted sum, as the remote helper's are.  Routing
+/// is unchanged; the rows come from the decode CPU tier's kernels (not bitwise the card's).
+/// STRATA_CHUNK_CPU=1 on; _FRAC: the share of the layer's streamed bytes the CPU takes (default 0.5); _MAXTOK: an
+/// expert with more tokens stays on the card (default 8, one pool job); _MAXN: wider batches skip it (default 2048).
+struct ChunkCpu {
+    std::vector<char> mask_e;         ///< the current layer: expert -> the CPU computes it in this call
+    bool pending = false;             ///< the current run_chunk's CPU work is out (th running or done, not collected)
+    int64_t nr = 0;                   ///< its rows (entries)
+    std::vector<int32_t> rrow;        ///< CPU row i -> parts row (the entry j)
+    std::vector<int32_t> ent_tok;     ///< CPU row i -> token
+    std::vector<int32_t> ue, ufirst;  ///< the CPU experts; expert u owns rows [ufirst[u], ufirst[u + 1])
+    float* h_rows = nullptr;          ///< mapped pinned rows (nr x H): the scatter reads them over the link
+    float* h_rows_dev = nullptr;
+    int64_t h_cap = 0;
+    int32_t* d_rrow = nullptr;
+    int64_t d_cap = 0;
+    std::unique_ptr<strata::kernels::cpu::ActQ[]> actq;   ///< per token (Q2_0-class kernels)
+    int64_t actq_cap = 0;
+    std::vector<uint8_t> nact;        ///< per (token, gate/up act format) native activations
+    std::vector<char> act_done;
+    std::vector<strata::kernels::cpu::ExpertJobMulti> jobs;
+    std::thread th;
+    std::atomic<int> status{0};
+    int64_t calls = 0, entries = 0, layers = 0;
+    double gb = 0, cpu_ms = 0, wait_ms = 0;
+};
+
 #ifdef STRATA_XOLP2P
 /// STRATA_P2P: one blob's three role slices as raw reads - each slice 4 KiB-aligned from the model's raw partition
 /// (rf, a0..a1) into a slot's raw area at raw_off, its bytes at src_off there, n of them, for blob offset at.
@@ -514,6 +545,7 @@ struct Gpu {
     Arena arena;
     std::unique_ptr<Remote> remote;    ///< STRATA_DS41_REMOTE (null = off)
     std::unique_ptr<RemoteChunk> rchunk;   ///< its prompt-chunk segment (null = off)
+    std::unique_ptr<ChunkCpu> ccpu;        ///< STRATA_CHUNK_CPU: the CPU's share of a prompt chunk (null = never used)
     std::unique_ptr<SpecStash> spec;   ///< spec_read's stash (opened on first use)
     std::unique_ptr<ReadPool> rpool;   ///< D3's file-tier readers (persistent; created on first use)
     // STRATA_FILE_DEFER (gpu_run_n_ex): a layer's deferred file-tier reads and q8_1 rows, by layer parity (layer l's
@@ -5735,6 +5767,159 @@ bool remote_chunk_collect(Ds41MoeImpl& im, int64_t layer) {
     return true;
 }
 
+/// STRATA_CHUNK_CPU: waits for a CPU share still running (an error path left it) - its rows are dropped.
+void chunk_cpu_drop(Gpu& gp) {
+    if (!gp.ccpu) return;
+    if (gp.ccpu->th.joinable()) gp.ccpu->th.join();
+    gp.ccpu->pending = false;
+}
+
+/// STRATA_CHUNK_CPU: picks this layer's CPU experts (see ChunkCpu) and starts the pool on them.  false = the card
+/// runs the whole layer (off, no candidate, a batch too wide, or nothing left for the card's passes).
+bool chunk_cpu_post(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* x_host) {
+    static const bool on = std::getenv("STRATA_CHUNK_CPU") && std::atoi(std::getenv("STRATA_CHUNK_CPU")) == 1;
+    static const double frac = std::getenv("STRATA_CHUNK_CPU_FRAC") ? std::atof(std::getenv("STRATA_CHUNK_CPU_FRAC")) : 0.5;
+    static const int maxtok = std::getenv("STRATA_CHUNK_CPU_MAXTOK") ? std::max(1, std::atoi(std::getenv("STRATA_CHUNK_CPU_MAXTOK"))) : cpu::MAXT;
+    static const int maxn = std::getenv("STRATA_CHUNK_CPU_MAXN") ? std::atoi(std::getenv("STRATA_CHUNK_CPU_MAXN")) : 2048;
+    Gpu& gp = *im.gpu;
+    if (!on || frac <= 0 || !im.pool || !x_host || n > maxn || im.cfg.saliency) return false;
+    if (!gp.ccpu) gp.ccpu = std::make_unique<ChunkCpu>();
+    ChunkCpu& c = *gp.ccpu;
+    chunk_cpu_drop(gp);
+    const int64_t NX = im.g.n_experts, K = im.g.top_k, NE = (int64_t) n * K, H = im.g.n_embd;
+    std::vector<int32_t> cnt((size_t) NX, 0);
+    for (int64_t j = 0; j < NE; ++j) {
+        if (ids[j] < 0 || ids[j] >= NX) return false;
+        ++cnt[(size_t) ids[j]];
+    }
+    std::vector<char> pre((size_t) NX, 0);   // prestaged: already on the card
+    if (gp.c_pre_layer == (int) layer)
+        for (int32_t e : gp.c_pre_e) if (e >= 0 && e < NX) pre[(size_t) e] = 1;
+    double stream_b = 0;   // what crosses the link for this layer (arena + file tier)
+    std::vector<int32_t> cand;
+    for (int64_t e = 0; e < NX; ++e) {
+        if (!cnt[(size_t) e] || pre[(size_t) e]) continue;
+        if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;   // a VRAM hit
+        stream_b += (double) im.bl[(size_t) im.g.cls(layer, e)];
+        if (cnt[(size_t) e] <= maxtok && gp.arena.ptr(layer, e)) cand.push_back((int32_t) e);
+    }
+    if (cand.empty()) return false;
+    std::stable_sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) { return cnt[(size_t) a] < cnt[(size_t) b]; });
+    const double budget = frac * stream_b;
+    c.mask_e.assign((size_t) NX, 0);
+    c.ue.clear();
+    c.ufirst.clear();
+    std::vector<int32_t> first((size_t) NX, 0);
+    double took = 0;
+    int32_t at = 0;
+    for (int32_t e : cand) {
+        const double b = (double) im.bl[(size_t) im.g.cls(layer, e)];
+        if (took + b > budget) break;
+        took += b;
+        c.mask_e[(size_t) e] = 1;
+        c.ue.push_back(e);
+        c.ufirst.push_back(at);
+        first[(size_t) e] = at;
+        at += cnt[(size_t) e];
+    }
+    c.ufirst.push_back(at);
+    const int64_t nr = at;
+    if (nr == 0 || nr == NE) return false;   // nr == NE: the passes need an entry of their own (the weighted sum)
+    c.rrow.resize((size_t) nr);
+    c.ent_tok.resize((size_t) nr);
+    for (int64_t j = 0; j < NE; ++j) {
+        const int32_t e = ids[j];
+        if (!c.mask_e[(size_t) e]) continue;
+        const int32_t q = first[(size_t) e]++;
+        c.rrow[(size_t) q] = (int32_t) j;
+        c.ent_tok[(size_t) q] = (int32_t) (j / K);
+    }
+    if (nr > c.h_cap) {
+        if (c.h_rows) cudaFreeHost(c.h_rows);
+        c.h_cap = std::max<int64_t>(nr + nr / 2, 1024);
+        ck(cudaHostAlloc((void**) &c.h_rows, (size_t) c.h_cap * (size_t) H * 4, cudaHostAllocMapped), "chunk cpu rows");
+        ck(cudaHostGetDevicePointer((void**) &c.h_rows_dev, c.h_rows, 0), "chunk cpu rows dev");
+    }
+    if (nr > c.d_cap) {
+        if (c.d_rrow) cudaFree(c.d_rrow);
+        c.d_cap = c.h_cap;
+        ck(cudaMalloc(&c.d_rrow, sizeof(int32_t) * (size_t) c.d_cap), "chunk cpu rrow");
+    }
+    if (n > c.actq_cap) {
+        c.actq.reset(new cpu::ActQ[(size_t) n]);
+        c.actq_cap = n;
+    }
+    const size_t nf = im.nact_multi_act.size() + 1;   // + one slot for a format outside the list (as nact_slot_n's im.nact)
+    if (c.nact.size() < (size_t) n * nf * cpu::kNativeActBytes) c.nact.resize((size_t) n * nf * cpu::kNativeActBytes);
+    c.act_done.assign((size_t) n * nf, 0);
+    if (c.jobs.size() < (size_t) nr) c.jobs.resize((size_t) nr);
+    c.status.store(0);
+    c.pending = true;
+    c.nr = nr;
+    ++c.layers;
+    c.entries += nr;
+    c.gb += took / 1e9;
+    c.th = std::thread([&im, &c, &gp, layer, n, x_host, H, nf]() {
+        const double t0 = now_ms();
+        std::vector<char> q2_done((size_t) n, 0);
+        int nj = 0;
+        for (size_t u = 0; u < c.ue.size(); ++u) {
+            const int32_t e = c.ue[u];
+            const cpu::NativeFmt& fc = im.fl[(size_t) im.g.cls(layer, e)];
+            const uint8_t* blob = gp.arena.ptr(layer, e);
+            const bool q2 = cpu::q2_native_kernels(fc.gu_type);
+            const int b = q2 ? 0 : nact_act_idx(im, fc.gu_act);
+            const size_t bi = b < 0 ? nf - 1 : (size_t) b;
+            cpu::ExpertJobMulti* jb = nullptr;
+            for (int32_t q = c.ufirst[u]; q < c.ufirst[u + 1]; ++q) {
+                if (!jb || jb->nt == cpu::MAXT) {
+                    jb = &c.jobs[(size_t) nj++];
+                    jb->blob = blob;
+                    jb->nt = 0;
+                    jb->fmt = &fc;
+                    jb->lora_a = jb->lora_b = nullptr;
+                    for (int t = 0; t < cpu::MAXT; ++t) { jb->nact[t] = nullptr; jb->out[t] = nullptr; jb->act[t] = nullptr; }
+                }
+                const int32_t tt = c.ent_tok[(size_t) q];
+                const float* xt = x_host + (size_t) tt * (size_t) H;
+                if (q2) {
+                    if (!q2_done[(size_t) tt]) { cpu::act_quant_any(xt, (int) fc.n_embd, c.actq[(size_t) tt]); q2_done[(size_t) tt] = 1; }
+                    jb->act[jb->nt] = &c.actq[(size_t) tt];
+                } else {
+                    uint8_t* slot = c.nact.data() + ((size_t) tt * nf + bi) * cpu::kNativeActBytes;
+                    char& done = c.act_done[(size_t) tt * nf + bi];
+                    if (!done) { cpu::native_quant_act(fc, xt, slot); done = 1; }
+                    jb->nact[jb->nt] = slot;
+                }
+                jb->out[jb->nt] = c.h_rows + (size_t) q * (size_t) H;
+                ++jb->nt;
+            }
+        }
+        if (nj > 0) im.pool->run_split_multi_native(im.fl[(size_t) im.g.cls(layer, c.ue[0])], c.jobs.data(), nj);
+        c.cpu_ms += now_ms() - t0;
+    });
+    return true;
+}
+
+/// STRATA_CHUNK_CPU: waits for the CPU's rows and scatters them into c_parts on gp.s (the chunk sync after the
+/// weighted sum ends their use before the next layer's post can rewrite h_rows).
+bool chunk_cpu_collect(Ds41MoeImpl& im) {
+    Gpu& gp = *im.gpu;
+    ChunkCpu& c = *gp.ccpu;
+    const double tw = now_ms();
+    if (c.th.joinable()) c.th.join();
+    c.wait_ms += now_ms() - tw;
+    c.pending = false;
+    if (c.status.load() != 0) return false;
+    ck(cudaMemcpyAsync(c.d_rrow, c.rrow.data(), sizeof(int32_t) * (size_t) c.nr, cudaMemcpyHostToDevice, gp.s), "chunk cpu rrow");
+    strata::kernels::scatter_rows_f32(c.h_rows_dev, (float*) gp.c_parts, c.d_rrow, (int) c.nr, im.g.n_embd, gp.s);
+    ++c.calls;
+    Ds41MoeStats s2;
+    s2.cpu = c.nr;
+    im.st.add(s2);
+    return true;
+}
+
 // ---- layer read-ahead (STRATA_LAYER_RA=0 = off) ----
 // A prompt layer runs one class pass per format class (~15 a layer on V4).  Each pass used to read only ITS file-tier
 // blobs: wait for the previous pass's DMAs out of the bounce, start 32 reader threads, wait for them - so NVMe idled at
@@ -5846,7 +6031,9 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     const int64_t CI = cf >= 0 ? cf : layer;          // the format class this pass computes
     const int64_t BL = im.bl[(size_t) CI];
     const strata::kernels::NativeExpertLayout& GL = gp.gll[(size_t) CI];
-    const char* rmask = gp.rchunk && gp.rchunk->pending ? gp.rchunk->mask_e.data() : nullptr;   // STRATA_DS41_REMOTE
+    // the experts another worker computes in this call: STRATA_DS41_REMOTE's helper, or STRATA_CHUNK_CPU's pool
+    const char* rmask = gp.rchunk && gp.rchunk->pending ? gp.rchunk->mask_e.data()
+                      : gp.ccpu && gp.ccpu->pending ? gp.ccpu->mask_e.data() : nullptr;
     auto in_pass = [&](int64_t j) { return (cf < 0 || im.g.cls(layer, ids[j]) == cf) && !(rmask && rmask[ids[j]]); };
     const double t0 = now_ms();
     Ds41MoeStats st;
@@ -6483,6 +6670,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         return true;
     }
     if (gp.rchunk && gp.rchunk->pending && !remote_chunk_collect(im, layer)) return false;
+    if (gp.ccpu && gp.ccpu->pending && !chunk_cpu_collect(im)) return false;
     // ---- outputs: the top-k mix on the card, n rows back ----
     ck(cudaMemcpyAsync(gp.c_w, w, sizeof(float) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_w");
     strata::kernels::weighted_rows_sum((const float*) gp.c_parts, (const float*) gp.c_w, (int) K, H, n,
@@ -6582,19 +6770,22 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     }
     const int64_t NE = (int64_t) n * im.g.top_k;
     const bool rc = im.gpu->rchunk && remote_chunk_post(im, layer, n, ids, x);   // STRATA_DS41_REMOTE
+    const bool lc = !rc && chunk_cpu_post(im, layer, n, ids, x);                // STRATA_CHUNK_CPU
+    const char* skip = rc ? im.gpu->rchunk->mask_e.data() : lc ? im.gpu->ccpu->mask_e.data() : nullptr;
     std::vector<int> cl;
     for (int64_t j = 0; j < NE; ++j) {
-        if (rc && im.gpu->rchunk->mask_e[(size_t) ids[j]]) continue;   // the helper's
+        if (skip && skip[(size_t) ids[j]]) continue;   // the helper's / the CPU's
         const int c = im.g.cls(layer, ids[j]);
         if (std::find(cl.begin(), cl.end(), c) == cl.end()) cl.push_back(c);
     }
     std::sort(cl.begin(), cl.end());
     // the layer's whole file tier starts streaming now (all class passes); off with a prefetch slab or STRATA_LAYER_RA=0
     if (layer_ra_on() && !im.cstage)
-        layer_ra_start(im, layer, n, ids, im.gpu->rchunk && im.gpu->rchunk->pending ? im.gpu->rchunk->mask_e.data() : nullptr);
+        layer_ra_start(im, layer, n, ids, skip);
     for (size_t i = 0; i < cl.size(); ++i)
         if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev, cl[i], i == 0, i + 1 == cl.size())) {
             layer_ra_stop(*im.gpu);
+            chunk_cpu_drop(*im.gpu);
             return false;
         }
     layer_ra_stop(*im.gpu);
@@ -6965,6 +7156,13 @@ void Ds41MoeTier::release_chunk() {
         }
         g_cprof = ChunkProf{};
         if (im_->remote) remote_prof_print(*im_->remote, "prompt");
+    }
+    if (im_->gpu->ccpu && im_->gpu->ccpu->layers) {
+        ChunkCpu& c = *im_->gpu->ccpu;
+        std::fprintf(stderr, "chunk cpu: %lld layers, %lld entries, %.1f GB of arena experts on the CPU in %.0f ms (pool), "
+                             "the card waited %.0f ms for it\n", (long long) c.layers, (long long) c.entries, c.gb, c.cpu_ms, c.wait_ms);
+        c.layers = c.entries = c.calls = 0;
+        c.gb = c.cpu_ms = c.wait_ms = 0;
     }
     if (chunk_prof() && (g_pf.blobs || g_pf.used)) {
         const ChunkPfProf& p = g_pf;

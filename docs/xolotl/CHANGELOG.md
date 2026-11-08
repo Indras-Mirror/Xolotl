@@ -8,6 +8,38 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### DeepSeek-V4.1: the CPU takes the quiet experts of a short prompt (8 Nov)
+
+**`STRATA_CHUNK_CPU=1`** (opt-in; on in the served config). An agent turn's tool output (a few hundred tokens) runs
+as a batch, and a batch that small touches about 185 experts a layer for about 5 tokens each. Profiled on a 4090
+(PCIe 4.0, measured 15.8 GB/s host to card), a 161-token turn copied 59 GB of experts to the card in 3.7 s while its
+kernels took 0.47 s: the link was the floor. Now the CPU pool computes the layer's lowest-count experts that are in
+the RAM arena (read once, from RAM, where they already are) while the card runs the rest, and their rows join the
+card's before the weighted sum. Routing is unchanged; the CPU's rows come from the decode CPU tier's kernels.
+`STRATA_CHUNK_CPU_FRAC` (default 0.5) is the CPU's share of the layer's streamed bytes (0.7 measured no faster),
+`STRATA_CHUNK_CPU_MAXTOK` (default 8) keeps busier experts on the card, `STRATA_CHUNK_CPU_MAXN` (default 2048) skips
+wide batches.
+
+| DeepSeek-V4.1 `--fast`, 30K-token conversation, tool-output turns | Before (s) | After (s) |
+| --- | ---: | ---: |
+| +161 tokens | 4.40 | **3.83** |
+| +514 tokens | 6.00 | **5.47** |
+| +906 tokens | 7.46 | **7.01** |
+| +1,866 tokens | 10.32 | **9.80** |
+| short34 (34 fresh ~85-token prompts, batch path) | 151 | **129** |
+
+short34 against the API fixtures: NLL 0.4889 -> 0.4924, top-1 87.15 % -> 87.29 %, overlap 0.8794 -> 0.8792 (the base
+rerun was bit-identical; VRAM placement alone moves NLL ~0.03). What is left of a short turn's floor is the NVMe
+reads of experts that are only on the SSD (~2 s), which can't start before the layer's routing is known.
+
+### DeepSeek-V4.1: an interrupted reply no longer re-reads the conversation (8 Nov)
+
+After a cancelled reply a client re-renders the end of its prompt. The conversation pool then held a boundary at the
+end of that prompt and an older one below it, and the resume took the older one: in a real 64K-token agent session
+it re-read 10,593 tokens (25 s) when 64,366 of 64,369 were reusable. The resume now takes the further of the two (a
+partial resume up to 16 tokens below the newer boundary is exact). `check_conv_reuse.py --scenario interrupt` covers
+it (bit-exact on the CPU), and `--gpu` runs the reuse checks on the card in ~2 minutes instead of ~25.
+
 ### Qwen3.8-27B: a shortlist head for the MTP drafts (8 Nov)
 
 **`--draft-vocab <file>`** (after NInfer's `--lm-head-draft`): each MTP draft step read the whole 248,320-row output
