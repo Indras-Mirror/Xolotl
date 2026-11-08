@@ -93,6 +93,9 @@ build as the noise control.
 
 | Date | Change | Model | Test | Before | After | Control (old build again) | Quality |
 | --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| 8 Nov | CPU i-quant down rows: one decode for all of an expert's tokens (default on) + GLM CPU split 0.3 -> 0.4 | GLM-5.3-Flash Maya 512K | `kq_cpu_bench` 4 / 8 tokens an expert; tool-output turns on a 25K conversation | 4.47 / 8.23 ms an expert; +246 / +1,877 tokens 4.79 / 7.54 s (split 0.3) | **3.02 / 5.61 ms; 4.63 / 7.46 s** | | exact ppl chat 5.305 / code 3.617 (no split 5.516 / 3.624); 1 token unchanged |
+| 8 Nov | Prompt-chunk CPU split (`STRATA_CHUNK_CPU=1`, FRAC 0.3, served configs) | GLM-5.3-Flash Maya 512K | tool-output turns on a 25K conversation (+246 / +642 / +1,877 tokens) | 5.47 / 6.30 / 8.02 s | **4.79 / 5.89 / 7.54 s** | | exact ppl chat 5.516 -> 5.362, code 3.624 -> 3.600 |
+| 8 Nov | Prompt-chunk CPU split (`STRATA_CHUNK_CPU=1`, FRAC 0.5, served Q6 config) | DeepSeek-V4.1-Flash-1017 V4 XQ `--fast`, dense Q6_K | tool-output turns on a 30K conversation (+161 / +514 / +906 / +1,866 tokens) | 4.40 / 6.00 / 7.46 / 10.32 s | **3.83 / 5.47 / 7.01 / 9.80 s** | | short34: NLL 0.4889 -> 0.4924, top-1 87.15 -> 87.29 % |
 | 8 Nov | `--ngram-chain`: MTP proposal + n-gram continuation (up to 7 drafts) | Qwen3.8-27B IQ3_S + MTP, 200K k8v4 | rewrite a 140-line file, greedy, thinking off | decode 137.3 tok/s | **decode 173.0 tok/s (+26 %)** | | same text |
 | 8 Nov | the same | the same | new code / prose | 127.0 / 88.9 tok/s | **140.4 / 90.4 tok/s** | | same text |
 | 8 Nov | Verify attention over all columns in one launch + register RMS norm (default on) | Qwen3.8-27B IQ3_S + MTP 3 | synthetic 2K / 30K prompt + 256 tokens, 2 rounds each | decode 134.0 / 89.4 tok/s | **decode 144.0 / 98.2 tok/s (+7 / +10 %)** | 133.1 / 89.2 tok/s | MTP == plain text; selftest 0 bits off |

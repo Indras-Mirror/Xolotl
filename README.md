@@ -12,6 +12,11 @@
 
 ## Latest
 
+- **8 Nov** - Short agent turns (a tool result on a long conversation) are faster on DeepSeek-V4.1 (4.40 -> 3.83 s for
+  161 tokens) and GLM-5.3-Flash (5.47 -> 4.63 s for 246 tokens): the CPU computes some of the experts while the card
+  runs the rest, and the CPU's i-quant kernels now decode an expert once for all its tokens (-32 % at 4-8 tokens).
+  GLM-5.3-Flash decode is 28.5-29 tok/s since the RAM upgrade. Default on; numbers in the
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#cpu-i-quant-down-rows-one-decode-for-every-token-8-nov).
 - **8 Nov** - Qwen3.8-27B decode: MTP now stays on with thinking off (52 -> 111 tok/s), one-pass verify attention
   (+7-10 %) and an n-gram draft chain (`--ngram-chain`: 137 -> 173 tok/s when rewriting a file). Same text, bit for bit.
 - **8 Nov** - [Gauntlet v3](#what-one-pc-can-do) is the main table: every model on the same 6 hard agentic tasks. Our DeepSeek-V4.1 and Qwen3.8-Flash-Next builds score at or above their own full-precision APIs on it.
@@ -60,7 +65,7 @@ served. Decode is the generation speed during those tasks.
 | ----------------------------------------------------------------------------------------------------------------- | --------- | :----------: | :------------: | :-------------: | :-----: | :-------: |
 | **[DeepSeek-V4.1-Flash-1017 V4](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-1017-XQ-Uncensored)**     | 552B MoE  |     4.99     |      32.6      |     289-409     |   512K  |    4.49   |
 | **DeepSeek-V4.1 V4, [fast mode](#fast-mode-deepseek-v41)**                                                        | 552B MoE  |     4.99     |      41.1      |     258-439     |   512K  |     -     |
-| **GLM-5.3-Flash**                                                                                                 | 320B MoE  |   to come    |       23       |     312-450     |   512K  |    5.87   |
+| **GLM-5.3-Flash**                                                                                                 | 320B MoE  |   to come    |     28.5-29    |     312-450     |   512K  |    5.87   |
 | **[Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored)** | 125B MoE  |     4.49     |      157       |   3,800-4,070   |   200K  |    3.90   |
 | **Qwen3.8-27B**                                                                                                   | 27B dense |     5.50     |      105       |   1,420-1,630   |   200K  |    4.47   |
 
@@ -68,7 +73,9 @@ served. Decode is the generation speed during those tasks.
 API score = each model's own full-precision API through OpenRouter (DeepSeek-V4.1-Flash-1017, GLM-5.3-Flash, Qwen3.8-Flash,
 Qwen3.8-27B), the same tasks and turns, reasoning on (8 Nov).
 Qwen3.8-27B: one run on 8 Nov after that day's decode fixes (MTP with thinking off, one-pass verify attention,
-`--ngram-chain`); before them it scored 4.47 twice at 89 tok/s. GLM-5.3-Flash's decode is from the first task of its run (38,500 tokens; the run is parked, its score is to come).
+`--ngram-chain`); before them it scored 4.47 twice at 89 tok/s. GLM-5.3-Flash: no Gauntlet run yet (score to come); its decode is from an agent replay on 8 Nov (a 25K-token
+conversation with tool-output turns, Maya 512K as served; since the RAM upgrade every expert sits in RAM, 23 tok/s before it),
+prefill 454 tok/s on a fresh 25K prompt.
 Prefill = a fresh 6K-17K-token prompt (`tools/throughput.py`), DeepSeek-V4.1's with its dense half at Q8_0. In the
 Gauntlet DeepSeek-V4.1 runs with its dense half at Q6_K, as it is served. More numbers, the Q8_0 references, the speed log and the older HumanEval table (every model 19-21/21
 there, so it no longer separates them): [docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md).</sub>
