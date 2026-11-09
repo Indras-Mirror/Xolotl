@@ -8,6 +8,24 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Long thinking runs: a loop no longer loses the answer, a retry no longer re-reads the conversation (9 Nov)
+
+Seen on GLM-5.3-Flash in a coding agent: a reply thought for 18,361 tokens, then wrote one token ('Dot') 256 times;
+the server's loop guard (#606) ended it as "length" with no answer after ten minutes. The client's next request
+(the cut turn dropped, a new message) then read the whole 26,357-token conversation again (52 s).
+
+- **Server (every model):** a one-token run while the model is still *thinking* is dropped from what the engine
+  continues from, and the thinking is closed the way the thinking budget closes it, so the model answers. Once a
+  reply; a run in the answer still ends it. `"repeat_wrap_up": false` in the config restores the old ending.
+- **GLM engine:** the conversation snapshot now sits before the prompt's last `<|assistant|>` instead of after the
+  generation prompt, so a request that re-renders the end of the prompt resumes there (`STRATA_GLM_SNAP_TOKEN=0` =
+  the old place). A follow-up reads those few tokens again.
+
+| GLM-5.3-Flash Maya 512K, 7.4K-token prompt | Before | After |
+| --- | ---: | ---: |
+| the retry shape (last turn dropped, new message) | 7,412 tokens read again, ~17 s | **7,402 reused, 1.2 s** |
+| a normal follow-up | reused | reused (7,410 of 7,429) |
+
 ### CPU IQ1_M gate/up rows: one decode for every token (9 Nov, for smaller cards)
 
 The same gap as the down rows below, on the gate/up side: IQ1_M experts (Qwen3.8-Flash-Next XQ 45 GB has them in 27 of its
