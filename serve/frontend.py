@@ -848,6 +848,14 @@ FUNC_END = "</function>"
 # `<=NAME>` (the word `function` dropped), `<function:NAME>`, `<function =NAME>`, or the bare `<NAME>`
 _LOOSE_OPEN = re.compile(r"<\s*(?:function\s*[=:]\s*|=\s*)?([A-Za-z0-9_.\-]+)\s*>")
 _LOOSE_PART = re.compile(r"<\s*(?:function[ \t]*[=:]?\s*|=\s*)?[A-Za-z0-9_.\-]*\s*$")
+# #5276: the opener written as text, misspelt - `<toolcall>` or `<tool-call>` - then `<function=NAME>`.  A model that
+# drops the underscore writes a literal string where the template documents a tag, and the call came back as text.
+_MISSPELT_OPEN = re.compile(r"<tool-?call>(\s*)<function=(\s*[^<>\s]+\s*)>")
+#: every spelling of the opener a partial tag may be a prefix of, for _hold (streamed and whole outputs then agree)
+OPENER_TAGS = ("<tool_call>", "<toolcall>", "<tool-call>")
+_MISSPELT_ANY = re.compile(r"<tool-?call>")
+#: a misspelt opener whose follower (`<function=NAME>`) is still arriving
+_MISSPELT_PART = re.compile(r"<tool-?call>\s*<(?:f(?:u(?:n(?:c(?:t(?:i(?:o(?:n)?)?)?)?)?)?)?)?(?:=[^<>]{0,80})?$")
 
 
 # a quoted call's opener in a value: `<function=NAME>` and its first parameter or close; a bare FUNC_START is text
@@ -1371,6 +1379,53 @@ class OutputParser:
         serve/dsml.py's does, also counts what it holds)."""
         return not self.buf
 
+    def _opens_here(self, p: int) -> bool:
+        """`<tool_call>` at self.buf[p] would open a call there: in the reasoning at the start of a line, in the answer
+        anywhere outside a fence or inline code - the same rule the parser applies to the real tag (#5276)."""
+        snap = (self.fence, self.line, self.ticks)
+        self._track(self.buf[:p])
+        ok = not self._in_code() and (self.state != "reasoning" or not self.line.strip())
+        self.fence, self.line, self.ticks = snap
+        return ok
+
+    def _rewrite_misspelt(self) -> None:
+        """#5276: `<toolcall>` / `<tool-call>` written where `<tool_call>` would open a call, followed by
+        `<function=NAME>` of a declared tool, IS the opener.  Prose that names the misspelt tag, a name no tool has,
+        and any other follower are left as text.  A partial opener arriving a token at a time is held by feed()."""
+        if not self.schemas or "<tool" not in self.buf:
+            return
+        out, pos = [], 0
+        for m in _MISSPELT_OPEN.finditer(self.buf):
+            if m.start() < pos:
+                continue
+            name = m.group(2).strip()
+            if not self._callable(self.aliases.get(name, name)):
+                continue
+            if not self._opens_here(m.start()):
+                continue
+            out.append(self.buf[pos:m.start()] + CALL_START + m.group(1) + FUNC_START + m.group(2) + ">")
+            pos = m.end()
+        if out:
+            self.buf = "".join(out) + self.buf[pos:]
+
+    def _misspelt_hold(self) -> int:
+        """#5276: the length of a trailing misspelt opener that is not decided yet - `<toolcall>` followed by
+        whitespace, or by `<function=` still arriving - so it is held like a partial tag rather than streamed as
+        content (a token at a time, `<toolcall>\n<f` would otherwise be out before the name is known)."""
+        if not self.schemas:
+            return 0
+        at = self.buf.rfind("<tool")
+        if at < 0:
+            return 0
+        tail = self.buf[at:]
+        if _MISSPELT_PART.match(tail) or (_MISSPELT_ANY.match(tail) and
+                                          _MISSPELT_ANY.match(tail).end() == len(tail)):
+            return len(tail)
+        m = _MISSPELT_ANY.match(tail)
+        if m and m.end() < len(tail) and tail[m.end():len(tail)].strip() == "":
+            return len(tail)          # the opener is there, its follower has not started
+        return 0
+
     def _ok_at(self, p: int) -> bool:
         """self.buf[p] would open a call: at the start of a line, outside a code fence and inline code."""
         snap = (self.fence, self.line, self.ticks)
@@ -1428,12 +1483,21 @@ class OutputParser:
             return "wait"
         return "text"
 
+    def _after_misspelt(self, p: int) -> bool:
+        """#5276: the line before self.buf[p] is a misspelt opener - that call's opener belongs to _rewrite_misspelt,
+        so the bare-`<function=` rule must not take it first (it would emit the opener as content)."""
+        end = self.buf.rfind("\n", 0, p)
+        if end < 0:
+            return False
+        start = self.buf.rfind("\n", 0, end)
+        return self.buf[start + 1:end].strip() in ("<toolcall>", "<tool-call>")
+
     def _bare_opener(self) -> tuple[int, bool]:
         """recover: the first `<function=` in self.buf that opens a call without the wrapper (start of a line, outside
         code, a declared tool) -> (position, decided); (-1, False) for none.  A name still arriving is undecided."""
         p = self.buf.find(FUNC_START)
         while p >= 0:
-            if self._ok_at(p):
+            if self._ok_at(p) and not self._after_misspelt(p):
                 gt = self.buf.find(">", p)
                 raw_name = self.buf[p + len(FUNC_START):gt if gt >= 0 else len(self.buf)]
                 name = raw_name.strip()
@@ -1700,6 +1764,7 @@ class OutputParser:
     def feed(self, delta: str) -> list[Event]:
         final = self._at_end                # only finish() sets it, for its own empty feed
         self.buf += delta
+        self._rewrite_misspelt()            # #5276: a misspelt opener of a declared tool is the opener
         out: list[Event] = []
         while True:
             if self.state == "rcall":
@@ -1772,7 +1837,8 @@ class OutputParser:
                         self.buf = self.buf[tool + len(CALL_START):]
                     continue
                 if i < 0:
-                    keep = self._hold(self.buf, (THINK_END, CALL_START) if self.schemas else (THINK_END,))
+                    keep = max(self._hold(self.buf, (THINK_END, *OPENER_TAGS) if self.schemas else (THINK_END,)),
+                               self._misspelt_hold())
                     if len(self.buf) > keep:
                         out.append(Event("reasoning", self._track(self.buf[:len(self.buf) - keep])))
                         self.buf = self.buf[len(self.buf) - keep:]
@@ -1831,7 +1897,8 @@ class OutputParser:
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
                     # so emitting them early would make streamed and whole outputs differ.
-                    j = len(self.buf) - self._hold(self.buf, (CALL_START, THINK_END) if self.after_think else (CALL_START,))
+                    j = len(self.buf) - max(self._hold(self.buf, (*OPENER_TAGS, THINK_END) if self.after_think
+                                                       else OPENER_TAGS), self._misspelt_hold())
                     if self.recover and self.schemas:            # a line that may be becoming a bare <function=
                         k = self.buf.rfind("\n") + 1
                         tail = self.buf[k:]
