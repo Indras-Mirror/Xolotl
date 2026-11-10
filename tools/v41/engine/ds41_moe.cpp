@@ -2825,16 +2825,15 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
             if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
         }
     }
-    // uniform blobs with defer_cache, or with an auto slot budget (#15), or slots=0 + slot_gib>0 (buster layer split):
-    // the cache opens now (after the prompt chunks gave their VRAM back), at most `slots` experts (none = no cap) and
-    // slot_gib bytes of whole 256-aligned slots (open_sized's padding)
+    // Uniform blobs: open or reopen after release_cache(), including an explicit slot count with slot_gib=0.
+    // The cache opens after the prompt gives its VRAM back, at most `slots` experts (none = no cap) and
+    // slot_gib bytes of whole 256-aligned slots (open_sized's padding).
     int64_t n_uni = im_->cfg.slots > 0 ? im_->cfg.slots : 0;
     if (im_->cfg.slot_gib > 0) {
         const int64_t by_gib = (int64_t) (im_->cfg.slot_gib * 1073741824.0 / (double) ((im_->blob + 255) / 256 * 256));
         n_uni = n_uni > 0 ? std::min<int64_t>(n_uni, by_gib) : by_gib;
     }
-    if (!im_->mixed_sizes && (im_->cfg.defer_cache || im_->cfg.slot_gib > 0) && im_->gpu && !im_->gpu->cache &&
-        want_cache && n_uni > 0) {
+    if (!im_->mixed_sizes && im_->gpu && !im_->gpu->cache && want_cache && n_uni > 0) {
         std::vector<int64_t> sizes((size_t) n_uni, im_->blob);
         im_->gpu->cache.reset(new strata::core::ExpertCache());
         if (keep_cache_mode()) im_->gpu->cache->set_segment_bytes((int64_t) 64 << 20);
