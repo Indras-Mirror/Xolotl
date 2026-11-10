@@ -42,7 +42,8 @@ __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* _
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
         const int e = lane + 32 * i;
-        s[i] = p[i] + (res[e] >= 0 ? lambda : 0.0f);      // the selection score
+        // a NaN / -inf logit row (degenerate) must still pick 10 real ids: fmaxf maps NaN to the floor (Strata #5655)
+        s[i] = fmaxf(p[i], -1e30f) + (res[e] >= 0 ? lambda : 0.0f);      // the selection score
         p[i] = expf(p[i] - mx);                            // the router's probability (unnormalised)
         sum += p[i];
     }
@@ -65,7 +66,7 @@ __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* _
         if (lane == rank) { id[rank] = be; sel_p = bp; }
         sel_sum += bp;                                      // the same on every lane
     }
-    if (lane < 10) w[lane] = sel_p / fmaxf(sel_sum, 1e-30f);
+    if (lane < 10) w[lane] = isfinite(sel_sum) && sel_sum > 0.0f ? sel_p / sel_sum : 0.1f;   // degenerate row: equal weights
 }
 
 }  // namespace
