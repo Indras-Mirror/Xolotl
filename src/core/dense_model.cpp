@@ -551,6 +551,7 @@ struct DenseModel::Impl {
     // injection into `hc_inject`.  Absent on a plain dense file.
     void hc_read(const Layer& L, bool attn_mixer, float eps, int n, void* s);
     bool mtp_block(const DenseConfig& c, int n, int pos0, bool want_logits, void* s);
+    bool mtp_kv_only = true;                      // an ingest writes the block's K/V rows only (STRATA_DENSE_MTP_KV_ONLY=0: the whole block)
 
 #ifdef STRATA_DENSE_MMQ
     // ---- the same blocks over a chunk of T tokens, reading and writing Pf instead of the NC-column buffers.
@@ -784,6 +785,23 @@ bool DenseModel::Impl::mtp_block(const DenseConfig& c, int n, int pos0, bool wan
     quantize(cat, 2 * E, n, s);
     gemv(M.eh_proj, x, n, s);                       // x = the block's input and its attention residual
     dense_rms_norm(x, M.attn_norm, xn, n, E, c.rms_eps, s);
+    if (!want_logits && mtp_kv_only) {
+        // An ingest keeps nothing of the block but its K/V rows: the block is one layer, so a position's K and V come
+        // from this input alone, and the block's output is read only by a draft step (want_logits).  The rows below are
+        // attn_block()'s own launches in its order (same quantize, same projections, same norm, RoPE and append), so
+        // the cache gets the same bits; the q projection, the attention over the cache, the output projection and the
+        // whole FFN are not run.  Measured 2026-11-11 (RTX 4090, Swift-1.5 27B IQ3_S, k8v4, draft 3): prompt read-in
+        // +19 % at 2K and +29 % at 30K, greedy answers and draft cycles identical.  STRATA_DENSE_MTP_KV_ONLY=0 = the old path.
+        const int HK = c.n_head_kv, D = c.head_dim;
+        quantize(xn, E, n, s);
+        gemv(M.k, kcur, n, s);
+        gemv(M.v, vcur, n, s);
+        rms_norm_weighted(kcur, M.k_norm, n * HK, D, c.rms_eps, s);
+        dense_positions_i32(pos_dev, n * HK, HK, pos0, s);
+        native_rope_apply(kcur, kcur, n * HK, D, c.n_rot, rope, pos_dev, s);
+        dense_kv_append_rows_fmt(M.kc, M.vc, kfmt, vfmt, kcur, vcur, n, pos0, HK, D, (int) max_context, s);
+        return true;
+    }
     attn_block(c, M.q, M.k, M.v, M.o, M.q_norm, M.k_norm, M.kc, M.vc, n, pos0, s);
     add_inplace(x, mix, (int64_t) n * E, s);
     ffn_block(c, M.ffn_gate, M.ffn_up, M.ffn_down, M.post_norm, n, s);
@@ -947,6 +965,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (cs == cudaSuccess) cs = cudaHostAlloc((void**) &I.embd_stage, (size_t) NC * E * 4, cudaHostAllocDefault);
         if (cs != cudaSuccess) { err = std::string("dense model: CUDA setup: ") + cudaGetErrorString(cs); return false; }
         if (const char* e = std::getenv("STRATA_DENSE_PROF")) I.prof.enabled = e[0] && e[0] != '0';
+        if (const char* e = std::getenv("STRATA_DENSE_MTP_KV_ONLY")) I.mtp_kv_only = e[0] && e[0] != '0';
         if (const char* e = std::getenv("STRATA_DENSE_MMVQ_FAST"))      // the multi-column layout that is faster but not bitwise equal to 1 column
             if (e[0] && e[0] != '0') { native_mmvq_set_multi_exact(false); std::fprintf(stderr, "xolotl-dense: multi-column GEMV: upstream layout\n"); }
         if (const char* e = std::getenv("STRATA_DENSE_DEBUG")) {
