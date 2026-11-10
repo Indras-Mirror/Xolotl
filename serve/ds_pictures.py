@@ -18,6 +18,14 @@ import struct
 import tempfile
 from pathlib import Path
 
+#: The picture formats Pillow is allowed to open (JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF; a phone's MPO file is opened by
+#: the JPEG entry).  Pillow picks the decoder from the file's first bytes, never from its name or the client's
+#: Content-Type, so without this list a crafted JPEG 2000 (GHSA-78g4-xqwv-q3g8: an OpenJPEG heap overflow in Pillow
+#: 11.1.0 to 12.3.0, reachable from Image.open().load()) or any other rarely used decoder was reachable from a picture
+#: request.  Pillow 13 has the fix; a Python 3.10 install stays on 12.3.0, and this list keeps that install out of the
+#: JPEG 2000 decoder too.
+PICTURE_FORMATS = ("JPEG", "PNG", "GIF", "BMP", "WEBP", "TIFF", "AVIF")
+
 PATCH = 14
 MERGE = 3
 MAX_TOKENS = 1024
@@ -138,7 +146,7 @@ class DsPictures:
         except ImportError:
             raise ValueError("DeepSeek reads pictures with Pillow, which is not installed here (python -m pip install pillow)") from None
         try:
-            im = Image.open(io.BytesIO(data))
+            im = Image.open(io.BytesIO(data), formats=PICTURE_FORMATS)
             im.load()
             im = ImageOps.exif_transpose(im)
         except Exception as e:  # noqa: BLE001 - any decoder failure is the picture's
