@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "strata/prefill/mmq_ids_margin.hpp"
+
 namespace strata::prefill::mmq {
 
 /// This build has the MMQ path (the ggml sources were available to the build).
