@@ -93,6 +93,9 @@ namespace {
 
 struct Args {
     std::string model, ids_csv, ids_file, rank, dump_logits, dump_last;
+    std::string pool_cores, host_core;
+    std::vector<int> pool_cpu_ids;
+    bool help = false;
     std::string build_mirror;      // --build-mirror F [--mirror-gib N]: write the blob mirror (coldest experts by --rank) and exit
     std::string build_shadow;      // --build-shadow F: write an expert sidecar (STRATA_SHADOW) and exit - STRATA_SHADOW_FROM=<gate/up type ids,> (default 39,11 = MXFP4, Q3_K), STRATA_SHADOW_TYPE=<ggml type id> (default 10 = Q2_K; 42 = Q2_0), STRATA_SHADOW_THREADS (default 16)
     double mirror_gib = 85.0;
@@ -218,7 +221,8 @@ bool parse(int argc, char ** argv, Args & a) {
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };
-        if (k == "-m" || k == "--model") a.model = next();
+        if (k == "--help" || k == "-h") a.help = true;
+        else if (k == "-m" || k == "--model") a.model = next();
         else if (k == "--ids") a.ids_csv = next();
         else if (k == "--ids-file") a.ids_file = next();
         else if (k == "-n" || k == "--n-predict") a.n_predict = std::atoi(next().c_str());
@@ -261,6 +265,14 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--skip-miss") a.skip_miss = (float) std::atof(next().c_str());
         else if (k == "--skip-file") a.skip_file = (float) std::atof(next().c_str());
         else if (k == "--threads") a.threads = std::atoi(next().c_str());
+        else if (k == "--pool-cores") {
+            a.pool_cores = next();
+            if (a.pool_cores.empty()) { std::fprintf(stderr, "--pool-cores requires a value\n"); return false; }
+        }
+        else if (k == "--host-core") {
+            a.host_core = next();
+            if (a.host_core.empty()) { std::fprintf(stderr, "--host-core requires a value\n"); return false; }
+        }
         else if (k == "--ctx") a.ctx = std::atoll(next().c_str());
         else if (k == "--temp") a.temp = (float) std::atof(next().c_str());
         else if (k == "--seed") a.seed = (uint64_t) std::atoll(next().c_str());
@@ -322,8 +334,49 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--pcie-frac") a.pcie = std::atof(next().c_str());
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
+    if (a.help) return true;
+    if (a.pool_cores.empty())
+        if (const char * e = std::getenv("STRATA_POOL_CORES")) a.pool_cores = e;
+    if (!a.pool_cores.empty()) {
+        std::string err;
+        if (!kernels::cpu::parse_pool_cores(a.pool_cores, a.pool_cpu_ids, err)) {
+            std::fprintf(stderr, "ds41_generate: --pool-cores: %s\n", err.c_str());
+            return false;
+        }
+    }
+    if (a.host_core.empty())
+        if (const char * e = std::getenv("STRATA_HOST_CORE")) a.host_core = e;
+    if (!a.host_core.empty() && a.host_core != "first" && a.host_core != "last" && a.host_core != "sibling") {
+        std::fprintf(stderr, "ds41_generate: --host-core expects first, last or sibling\n");
+        return false;
+    }
     return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty() || !a.build_shadow.empty());
 }
+
+void usage(std::FILE * out) {
+    std::fprintf(out,
+        "usage: ds41_generate -m MODEL (--serve | --ids IDS | --ids-file FILE) [options]\n"
+        "  --threads N          CPU expert workers (0 selects the pool default)\n"
+        "  --pool-cores LIST    Explicit worker CPUs, e.g. 2,4,6 or 2-14:2 (STRATA_POOL_CORES)\n"
+        "                       Without --threads, the usable list determines the worker count\n"
+        "  --host-core WHERE    Pin the executor after startup: first, last or sibling\n"
+        "                       STRATA_HOST_CORE sets it too; unset leaves the executor unpinned\n"
+        "  --help, -h           Show this help without loading a model\n"
+        "Other model and inference options are documented in tools/v41/engine/ds41_generate.cpp.\n");
+}
+
+struct NativeHostAffinity {
+    kernels::cpu::ThreadAffinity previous;
+    ~NativeHostAffinity() { kernels::cpu::restore_thread_affinity(previous); }
+    void pin(const std::string & selection) {
+        if (selection.empty()) return;
+        const int core = kernels::cpu::planned_host_core();
+        if (core < 0) { std::fprintf(stderr, "ds41_generate: no host CPU available for --host-core\n"); return; }
+        previous = kernels::cpu::pin_current_thread(core);
+        if (previous.valid)
+            std::fprintf(stderr, "ds41_generate: executor pinned to CPU %d (--host-core %s)\n", core, selection.c_str());
+    }
+};
 
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -417,9 +470,15 @@ int main(int argc, char ** argv) {
         ggml_log_set([](ggml_log_level lv, const char * text, void *) { if (lv != GGML_LOG_LEVEL_DEBUG) std::fputs(text, stderr); }, nullptr);
     Args a;
     if (!parse(argc, argv, a)) {
-        std::fprintf(stderr, "usage: see tools/v41/engine/ds41_generate.cpp\n");
+        usage(stderr);
         return 2;
     }
+    if (a.help) { usage(stdout); return 0; }
+    if (!a.pool_cpu_ids.empty()) kernels::cpu::set_pool_cores(a.pool_cpu_ids);
+    if (a.host_core == "first") kernels::cpu::set_host_core(kernels::cpu::HostCore::First);
+    else if (a.host_core == "last") kernels::cpu::set_host_core(kernels::cpu::HostCore::Last);
+    else if (a.host_core == "sibling") kernels::cpu::set_host_core(kernels::cpu::HostCore::Sibling);
+    NativeHostAffinity host_affinity;
     ds41_apply_mmq_cc_policy(a.backend == "cuda", a.chunk_mmq);
     if (!a.build_shadow.empty()) {   // an expert sidecar (STRATA_SHADOW / XOLOTL_SHADOW); the model file is only read
         std::string err;
@@ -1959,6 +2018,8 @@ int main(int argc, char ** argv) {
         if (pool_on) std::fprintf(stderr, "serve: conversation pool %d MiB, %d slots, records >= %d tokens\n", a.conv_mib,
                                   a.conv_slots, std::max(1, park_min));
         if (pool_on) std::fprintf(stderr, "serve: conversation pool store: %s\n", pool.kind());
+        // All existing pools, readers and startup jobs keep the broad affinity they inherited at creation.
+        host_affinity.pin(a.host_core);
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
@@ -3893,6 +3954,7 @@ int main(int argc, char ** argv) {
 
     // ---- one-shot: prompt (+ perplexity), then generate
     if (prompt.empty()) { std::fprintf(stderr, "ds41_generate: empty prompt\n"); return 2; }
+    host_affinity.pin(a.host_core);
     tier.reset_stats();
     const double tp0 = now_ms();
     std::vector<float> all;

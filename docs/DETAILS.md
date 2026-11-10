@@ -1311,6 +1311,12 @@ when two entries are the hardware threads of one core, when an entry is the host
 processor the process may use (it is left out). The option moves threads only and never changes a result. The Qwen3.6 engine
 (`strata-q36`) keeps its own `--pool-workers` and default placement.
 
+Native DeepSeek (`ds41_generate`) accepts `--pool-cores` and `STRATA_POOL_CORES`, including the config's `pool_cores`.
+Its worker-count option is `--threads N`. With zero or no configured count, the usable CPU list determines the count.
+`--host-core first|last|sibling` or `STRATA_HOST_CORE` also explicitly pins its executor after startup. Without that
+selection, native DeepSeek leaves the executor's affinity as inherited. Existing startup threads keep their own masks.
+Helpers created later can inherit the selected executor CPU. Choose CPU lists for the machine running the engine.
+
 ### Other threads (`--aux-cpus`, Linux, off by default)
 
 A thread the engine starts after the host thread is pinned inherits the host's one CPU: the adaptive tier's job thread, prefill
