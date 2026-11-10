@@ -402,7 +402,7 @@ bool fits(int t, int64_t w_rows) {
         const int cc = info.devices[id].cc;
         const size_t smpbo = info.devices[id].smpbo;
         bool any = false;
-        for (int J = 8; J <= 128 && !any; J += 8) {
+        for (int J = 8; J <= kMmqTileColsMax && !any; J += kMmqTileColsStep) {
             const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, fallback, cc);
             any = c.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(c, cc) <= smpbo;
         }
@@ -626,7 +626,7 @@ size_t overread_bytes(int t, int64_t cols) {
     int64_t blocks = over(MMQ_ITER_K);
     const ggml_cuda_device_info& info = ggml_cuda_info();
     for (int id = 0; id < info.device_count; ++id)
-        for (int J = 8; J <= 128; J += 8) {
+        for (int J = 8; J <= kMmqTileColsMax; J += kMmqTileColsStep) {
             const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, false, info.devices[id].cc);
             if (c.type != GGML_TYPE_COUNT) blocks = std::max<int64_t>(blocks, over(c.K_vram));
         }
@@ -645,7 +645,7 @@ bool whole_tiles(int t, int64_t w_rows, int n_experts) {
         const size_t smpbo = info.devices[id].smpbo;
         bool any = false, stream_k = false;
         ggml_cuda_mmq_config c0 = ggml_cuda_mmq_get_config((ggml_type) t, 8, false, cc);
-        for (int J = 8; J <= 128; J += 8) {
+        for (int J = 8; J <= kMmqTileColsMax; J += kMmqTileColsStep) {
             const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, false, cc);
             if (c.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(c, cc) > smpbo) continue;
             if (!any) c0 = c;
