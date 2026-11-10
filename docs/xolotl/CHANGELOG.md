@@ -8,6 +8,24 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Qwen3.8-27B reads prompts 19-29 % faster with its draft head on (11 Nov)
+
+With `--mtp`, every prompt token also went through the whole draft block (its attention over its cache, its output
+projection, its feed-forward), eight tokens at a time. Nothing reads that output: the block is one layer, and a
+prompt position leaves behind only its K/V rows, which come from the block's input alone. `xolotl-dense` now writes
+just those rows, with the same launches in the same order as before, so the cache holds the same bits.
+`STRATA_DENSE_MTP_KV_ONLY=0` restores the old path.
+
+| Swift-1.5 27B IQ3_S + MTP 3, k8v4, RTX 4090 (same binary, switch off / on, 2 rounds interleaved) | Before (tok/s) | After (tok/s) |
+| --- | ---: | ---: |
+| 2K prompt read-in | 1,646 / 1,716 | **1,972 / 2,032 (+19 %)** |
+| 30K prompt read-in | 1,067 / 1,106 | **1,394 / 1,402 (+29 %)** |
+| decode after the 2K / 30K prompt | 143.7 / 96.0 | 144.3 / 100.0 |
+
+Exactness: four greedy answers through the server (code, prose, a script, a summary of a 24K-character document),
+switch off against on: byte-identical text and the same draft cycles (106 / 124 / 42 / 139 cycles at 3.76 / 2.45 /
+3.10 / 2.86 tokens each), so the draft head saw the same cache. `xolotl-dense --selftest` passes.
+
 ### Thinking that repeats whole passages can be closed instead of cut off (11 Nov, opt-in)
 
 `"reasoning_loop_recovery": "wrap"` in a serve config: when the thinking repeats the same passages (the existing

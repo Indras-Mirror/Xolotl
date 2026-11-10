@@ -496,7 +496,7 @@ struct DenseModel::Impl {
                     const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0, void* s);
     void ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm, int n, void* s);
     bool mtp_block(const DenseConfig& c, int n, int pos0, bool want_logits, void* s);
-    bool mtp_kv_only = false;                     // STRATA_DENSE_MTP_KV_ONLY: an ingest writes the block's K/V rows only
+    bool mtp_kv_only = true;                      // an ingest writes the block's K/V rows only (STRATA_DENSE_MTP_KV_ONLY=0: the whole block)
 
 #ifdef STRATA_DENSE_MMQ
     // ---- the same blocks over a chunk of T tokens, reading and writing Pf instead of the NC-column buffers.
@@ -718,7 +718,8 @@ bool DenseModel::Impl::mtp_block(const DenseConfig& c, int n, int pos0, bool wan
         // from this input alone, and the block's output is read only by a draft step (want_logits).  The rows below are
         // attn_block()'s own launches in its order (same quantize, same projections, same norm, RoPE and append), so
         // the cache gets the same bits; the q projection, the attention over the cache, the output projection and the
-        // whole FFN are not run.  STRATA_DENSE_MTP_KV_ONLY=1 (opt-in until measured).
+        // whole FFN are not run.  Measured 2026-11-11 (RTX 4090, Swift-1.5 27B IQ3_S, k8v4, draft 3): prompt read-in
+        // +19 % at 2K and +29 % at 30K, greedy answers and draft cycles identical.  STRATA_DENSE_MTP_KV_ONLY=0 = the old path.
         const int HK = c.n_head_kv, D = c.head_dim;
         quantize(xn, E, n, s);
         gemv(M.k, kcur, n, s);
