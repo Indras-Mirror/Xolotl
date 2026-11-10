@@ -26,6 +26,27 @@ Exactness: four greedy answers through the server (code, prose, a script, a summ
 switch off against on: byte-identical text and the same draft cycles (106 / 124 / 42 / 139 cycles at 3.76 / 2.45 /
 3.10 / 2.86 tokens each), so the draft head saw the same cache. `xolotl-dense --selftest` passes.
 
+### Fixes ported 10-11 Nov (correctness, security, tool calls)
+
+No speed claims here; these stop faults or wrong behaviour. Each has its own tests in the pull request.
+
+| Fix | What it stops | PR |
+| --- | --- | --- |
+| Picture requests cannot reach Pillow's JPEG 2000 decoder (GHSA-78g4-xqwv-q3g8) | a heap overflow in the libopenjp2 bundled with Pillow 11.1.0-12.3.0, reachable from a crafted picture | #125 |
+| A failed engine start survives a concurrent close (upstream #4792) | a crash when a start fails while the server shuts the engine | #125 |
+| The MMQ row table's over-read margin comes from the tile bound (upstream #5108) | `Xid 31` on long prompts | #126 |
+| PCIe staging: flag B is raised behind the copies queued before it (upstream #5096, #4844) | a kernel reading an expert before its upload landed | #126 |
+| A NaN router input picks valid experts, says so, and ends the request (upstream #4825) | a fault or a silently shifted answer | #124 |
+| An assistant turn sent back without its thinking gets this server's copy back (Strata #5643) | a follow-up turn re-reading the whole previous answer | #124 |
+| Route-prior NaN guard (Strata #5655) | a NaN prior spreading into routing | #124 |
+| A misspelt opener (`<toolcall>`, `<tool-call>`) before a declared tool's `<function=NAME>` is the call (upstream #5276) | Qwen3.8-Flash-Next's call coming back as answer text, the agent waiting for a result | #128 |
+| A streaming client that stops reading gives the engine's turn back (upstream #4271) | one hung client holding every other request in the queue | #129 |
+| `moe_iq4_w4a8` compiles for sm_60-75 targets | the sm_70 build failing (#119) | #121 |
+| `requirements.txt` lists `jsonschema` and `referencing` | a fresh venv failing on `response_format` (#119) | #123 |
+
+Also new and opt-in: `STRATA_DSPARK_COST=1`, a cost-aware DSpark / lookup window for DeepSeek-V4.1 (#122, asked for
+in #120; off by default, not yet measured here).
+
 ### Thinking that repeats whole passages can be closed instead of cut off (11 Nov, opt-in)
 
 `"reasoning_loop_recovery": "wrap"` in a serve config: when the thinking repeats the same passages (the existing
