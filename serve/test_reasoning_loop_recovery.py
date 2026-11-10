@@ -134,6 +134,32 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertLess(events[-1][1]['completion_tokens'], 5000)
         self.assertEqual(events[-1][1]['reasoning_recoveries'], 0)
 
+    def test_wrap_mode_closes_the_thinking_and_the_model_answers(self):
+        """Any model family: no effort sentence is needed in the prompt (DeepSeek-V4.1 has none)."""
+        ids = self.tok.encode('<|im_start|>user\nSolve this unchanged task<|im_end|>\n'
+                              '<|im_start|>assistant\n<think>\n', parse_special=True)
+        engine = RecordingEngine(self.tok, [self.loop, 'The answer is 42.'])
+        service = Service(engine, self.tok, None)
+        service.answer_room = False
+        service.reasoning_loop_recovery = "wrap"
+        events = list(service.run(ids, True, [], 40000, {}, threading.Event()))
+        text = ''.join(getattr(e, 'text', '') or '' for kind, e in events if kind == 'event' and e.kind == 'content')
+        self.assertEqual(len(engine.calls), 2)                   # the loop, then the answer
+        second = self.tok.decode(engine.calls[1][0])
+        self.assertTrue(second.endswith('</think>\n\n'))         # the thinking was closed as the budget closes it
+        self.assertEqual(engine.calls[1][0][:len(ids)], ids)     # the prompt is untouched: the engine resumes
+        self.assertIn('The answer is 42.', text)
+        self.assertLess(events[-1][1]['completion_tokens'], 20000)
+        self.assertEqual(events[-1][1]['reasoning_recoveries'], 1)
+
+    def test_wrap_mode_is_once_a_reply(self):
+        engine = RecordingEngine(self.tok, [self.loop, '<think>\n' + self.loop, 'never'])
+        service = Service(engine, self.tok, None)
+        service.answer_room = False
+        service.reasoning_loop_recovery = "wrap"
+        list(service.run(self.ids, True, [], 60000, {}, threading.Event()))
+        self.assertLessEqual(len(engine.calls), 2)
+
     def test_disabled_is_one_pass(self):
         engine, events = self.run_case(False)
         self.assertEqual(len(engine.calls), 1)

@@ -249,7 +249,9 @@ REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
-# low-effort instruction in place of the xhigh one.  Both off by default.
+# low-effort instruction in place of the xhigh one (Qwen prompts only: it needs their effort sentence); "wrap" closes
+# the thinking the way the thinking budget does and lets the model answer (any model family; once a reply).  All off
+# by default.
 HIGH_EFFORT = EFFORT_TEXT["xhigh"]
 LOW_EFFORT = EFFORT_TEXT["low"]
 LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
@@ -6856,6 +6858,7 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
+        loop_wrap = False                               # "wrap": this pass ended on a passage loop, close the thinking
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
@@ -7090,7 +7093,12 @@ class Service:
                                         if self.reasoning_loop_recovery == "stop":
                                             looped = True        # #728: end the reply here, as for a repeated token
                                             break
-                                        if not emb:              # "recover": not for a request with pictures
+                                        if self.reasoning_loop_recovery == "wrap":
+                                            if not answered and not cancel.is_set():
+                                                recovery_count += 1      # once a reply
+                                                loop_wrap = wrap = True
+                                                break
+                                        elif not emb:            # "recover": not for a request with pictures
                                             recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
                                             if recover_prompt is not None:
                                                 break
@@ -7231,7 +7239,13 @@ class Service:
                         extra = self.tok.encode(text, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
-                        if wrap and not repeat_wrap:
+                        if wrap and loop_wrap:
+                            loop_wrap = False
+                            st["reasoning_recoveries"] = recovery_count
+                            print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) "
+                                  f"at {n} tokens: closing the thinking so the model answers (reasoning_loop_recovery: "
+                                  "\"wrap\")", flush=True)
+                        elif wrap and not repeat_wrap:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
                         for t in extra:
@@ -11155,11 +11169,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if budget:
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
-    recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
+    recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true) | "wrap"
     if recovery is True:
         recovery = "recover"
-    if recovery is not False and recovery not in ("stop", "recover"):
-        raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
+    if recovery is not False and recovery not in ("stop", "recover", "wrap"):
+        raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\", \"recover\" or \"wrap\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)

@@ -8,6 +8,22 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Thinking that repeats whole passages can be closed instead of cut off (11 Nov, opt-in)
+
+`"reasoning_loop_recovery": "wrap"` in a serve config: when the thinking repeats the same passages (the existing
+detector, checked every 512 output tokens), the server closes the thinking the way the thinking budget closes it and
+the model answers. Once a reply; off by default. The two older modes do not cover every model: `"recover"` rewrites
+Qwen's effort sentence, so it does nothing on a prompt without one (DeepSeek-V4.1), and `"stop"` ends the reply with no
+answer.
+
+Why: one saved DeepSeek-V4.1 trace (a LiveCodeBench hard problem, 52,475 tokens, it passed) repeats the same
+six-line check 76 times over 60 % of its thinking; the detector fires on it at about 7,200 tokens.
+
+Checked on the CPU only (`serve.test_reasoning_loop_recovery`: two new cases, 20 pass; `serve.test_server` 360,
+`serve.test_dsv41` 70 pass). **Not measured on a model yet**: it changes the reply when it fires, and the detector
+also fired on 2 of 86 saved Qwen3.8-27B traces that were step-by-step work, not loops. So it stays opt-in until a
+pass-rate A/B.
+
 ### Long thinking runs: a loop no longer loses the answer, a retry no longer re-reads the conversation (9 Nov)
 
 Seen on GLM-5.3-Flash in a coding agent: a reply thought for 18,361 tokens, then wrote one token ('Dot') 256 times;
