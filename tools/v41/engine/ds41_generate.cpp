@@ -54,6 +54,7 @@
 #include "ds41_pipeline.hpp"
 #if defined(DS41_HAVE_DSPARK)
 #include "ds41_dspark.hpp"
+#include "ds41_window_policy.hpp"
 #endif
 
 #include "ggml.h"
@@ -3531,6 +3532,33 @@ int main(int argc, char ** argv) {
                 // draft length was the limit at the old kMaxMulti - 2 = 6 (s6: 932/972 accepted in 169 passes, only +3%
                 // over DSpark's own).
                 constexpr int kVerify = 16;
+                // STRATA_DSPARK_COST=1 (opt-in, off by default): the pass's window is chosen by what it measured - the
+                // expected committed tokens per ms of DSpark's own drafts against a prompt-lookup copy, per context band.
+                // Disabled: the fixed cuts below decide, exactly as before (defaults unchanged).  The rule is Project
+                // Maya's MIT-licensed draft policy (include/strata/spec/draft_policy.hpp, the same one the 27B MTP path
+                // uses); ds41_window_policy.hpp is the seam.  It only picks WHICH drafts are verified: sampling, grammar
+                // state, batch slots, caches and cancellation keep their contracts, and the output is unchanged.
+                static const bool cost_window_on = [] {
+                    const char* v = std::getenv("STRATA_DSPARK_COST");
+                    return v != nullptr && v[0] != '0';
+                }();
+                static strata::spec::DraftPolicy cost_pol(strata::spec::DraftPolicy::kMaxT);
+                static const bool cost_pol_ready = [] {
+                    cost_pol.set_robust(true);
+                    if (const char* tab = std::getenv("STRATA_DSPARK_COST_TABLE"); tab != nullptr && tab[0] != '\0') {
+                        // "T1,T2,..;T1,T2,..;T1,..": row costs of the 3 context bands (< 6K, < 24K, longer); one list seeds the first
+                        double ms[strata::spec::DraftPolicy::kMaxT] = {};
+                        int n = 0, bucket = 0;
+                        for (const char* q = tab; *q != '\0' && bucket < strata::spec::DraftPolicy::kCtxBuckets;) {
+                            if (n < strata::spec::DraftPolicy::kMaxT) ms[n++] = std::atof(q);
+                            while (*q != '\0' && *q != ',' && *q != ';') ++q;
+                            const bool end_list = *q == ';' || *q == '\0';
+                            if (*q != '\0') ++q;
+                            if (end_list) { cost_pol.seed_costs(ms, n, 6.0, bucket++); n = 0; }
+                        }
+                    }
+                    return true;
+                }();
                 static const int lk_max = std::getenv("STRATA_SERVE_LOOKUP") ? std::max(0, std::min(kVerify - 2, std::atoi(std::getenv("STRATA_SERVE_LOOKUP")))) : 0;
                 static const int lk_g = std::getenv("STRATA_LOOKUP_NGRAM") ? std::max(1, std::atoi(std::getenv("STRATA_LOOKUP_NGRAM"))) : 3;
                 static const bool lk_agree = !(std::getenv("STRATA_LOOKUP_AGREE") && std::getenv("STRATA_LOOKUP_AGREE")[0] == '0');
@@ -3570,8 +3598,9 @@ int main(int argc, char ** argv) {
                         k = kk;
                     }
                     const bool refeed = dirty && ((P + 1) & 1);
-                    for (int i = 0; i < k; ++i) dr[i] = sp_ids[i];
                     bool is_lk = false;
+                    int lk_k = 0, lk_match = 0;   // the copy the search finds (0 = none); taken or not just below
+                    int lkr[kVerify];
                     if (lk_max > 0 && lk_cool > 0) --lk_cool;
                     else if (lk_max > 0) {
                         // the sequence is hist + t (t = the token for P+1, not in hist yet); find the latest earlier q with
@@ -3590,13 +3619,36 @@ int main(int argc, char ** argv) {
                                 const int L = std::min({cap, m - lk_g + 1, n - q});
                                 if (L < 2) break;   // the latest match copies too little: not worth a pass
                                 if (lk_agree && sq(q + 1) != sp_ids[0]) break;
-                                for (int i = 0; i < L; ++i) dr[i] = sq(q + 1 + i);
-                                k = L;
-                                is_lk = true;
+                                for (int i = 0; i < L; ++i) lkr[i] = sq(q + 1 + i);
+                                lk_k = L;
+                                lk_match = m;
                                 break;
                             }
                         }
                     }
+                    float round_p[kVerify] = {};   // this round's draft confidences as probabilities (STRATA_DSPARK_COST)
+                    if (cost_window_on) {
+                        // DSpark's own width first (its drafts' confidences through the learned acceptance curve), then
+                        // the copy against it: both are capped by the cuts above - the policy only narrows them.
+                        strata::spec::DraftPolicy::ChainState st;
+                        const int cap_rows = std::min(kVerify, k + 1);
+                        for (int i = 0; i < k; ++i) {
+                            round_p[i] = 1.0f / (1.0f + std::exp(-sp_conf[i]));
+                            cost_pol.keep_draft(st, i, round_p[i], cap_rows);
+                        }
+                        const int mtp_rows = std::clamp(st.best_rows, 1, cap_rows);
+                        k = mtp_rows - 1;
+                        if (lk_k > 0) {
+                            const auto w = strata::ds41::choose_window(cost_pol, {mtp_rows, lk_k, lk_match},
+                                                                       kVerify - 1 - (refeed ? 1 : 0));
+                            is_lk = w.lookup;
+                            k = w.drafts;
+                        }
+                    } else if (lk_k > 0) {
+                        is_lk = true;
+                        k = lk_k;
+                    }
+                    for (int i = 0; i < k; ++i) dr[i] = is_lk ? lkr[i] : sp_ids[i];
                     vt.clear();
                     if (refeed) vt.push_back(prev);
                     vt.push_back(t);
@@ -3670,6 +3722,10 @@ int main(int argc, char ** argv) {
                         ferr = "DSpark step: " + dsp->last_error(); finish = "error"; break;
                     }
                     sq_ms[0] += tq1 - tq0; sq_ms[1] += tq2 - tq1; sq_ms[2] += now_ms() - tq2;
+                    if (cost_window_on) {   // the round's cost (verify + sample + the DSpark step), as draft_policy.hpp prices it
+                        cost_pol.observe(is_lk, k + 1, acc, lk_match, now_ms() - tq0);
+                        if (!is_lk && k > 0) cost_pol.observe_probs(round_p, k, acc);
+                    }
                     hist.push_back(t);
                     bool more = true;
                     for (int i = 0; i < acc && more; ++i) { hist.push_back(drafts[i]); more = emit(drafts[i]); }
@@ -3682,6 +3738,8 @@ int main(int argc, char ** argv) {
                 }
                 if (lk_pass > 0)
                     std::fprintf(stderr, "serve: lookup %ld/%ld drafts accepted in %ld passes\n", lk_acc, lk_dr, lk_pass);
+                if (cost_window_on)   // the round times learned so far (per window size and context band)
+                    std::fprintf(stderr, "serve: draft window costs (STRATA_DSPARK_COST): %s\n", cost_pol.cost_table_text().c_str());
                 dsp_next = P + 1;   // the ring holds every position <= P (the last emitted token is not fed)
                 if (std::strcmp(finish, "error") == 0) dsp_next = -1;
                 live_dirty = dirty;   // the last pass rejected drafts: the ratio-2 state ring holds rejected positions

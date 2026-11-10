@@ -166,8 +166,9 @@ if(XOLOTL_DIRECT AND TARGET ds41_moe_cuda)
 endif()
 # the end-to-end engine: CUDA tier when built, else the CPU-only tier
 if(TARGET ds41_dense AND TARGET ds41_moe_cuda)
+    # src/spec/draft_policy.cpp: STRATA_DSPARK_COST's window rule (the one the 27B MTP path uses; OFF unless asked for)
     add_executable(ds41_generate ${_v41_dir}/ds41_generate.cpp ${_v41_dir}/ds41_cuda_policy.cpp ${_v41_dir}/ds41_pipeline.cpp
-                                  ${_v41_dir}/ds41_conversation.cpp)
+                                  ${_v41_dir}/ds41_conversation.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/spec/draft_policy.cpp)
     target_include_directories(ds41_generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(ds41_generate PRIVATE ds41_dense ds41_moe_cuda)
     # the batch-slot gates (ds41_batch.hpp) on the CPU backend with the real model
@@ -183,11 +184,18 @@ elseif(TARGET ds41_dense AND TARGET ds41_moe_cpu)
     endif()
     # ds41_cuda_policy.cpp: ds41_generate calls ds41_apply_mmq_cc_policy unconditionally (a no-op off CUDA)
     add_executable(ds41_generate ${_v41_dir}/ds41_generate.cpp ${_v41_dir}/ds41_cuda_policy.cpp ${_v41_dir}/ds41_pipeline.cpp
-                                  ${_v41_dir}/ds41_conversation.cpp)
+                                  ${_v41_dir}/ds41_conversation.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/spec/draft_policy.cpp)
     target_include_directories(ds41_generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(ds41_generate PRIVATE ds41_dense ds41_moe_cpu)
     add_executable(test_ds41_batch ${_v41_dir}/test_ds41_batch.cpp)
     target_link_libraries(test_ds41_batch PRIVATE ds41_dense ds41_moe_cpu)
+endif()
+# STRATA_DSPARK_COST's window seam (ds41_window_policy.hpp): the real policy, no model needed
+if(STRATA_BUILD_TESTS)
+    add_executable(test_ds41_window_policy ${_v41_dir}/test_ds41_window_policy.cpp
+                                           ${CMAKE_CURRENT_SOURCE_DIR}/src/spec/draft_policy.cpp)
+    target_include_directories(test_ds41_window_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_v41_dir})
+    add_test(NAME test_ds41_window_policy COMMAND test_ds41_window_policy)
 endif()
 # STRATA_DS41_REMOTE's helper: a second GPU's process that computes the routed experts it holds (ds41_remote.hpp)
 if(TARGET ds41_moe_cuda)
