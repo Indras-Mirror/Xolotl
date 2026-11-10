@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import json
 import os
@@ -2079,7 +2080,11 @@ class IncrementalPrompts(unittest.TestCase):
             status, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 64, "messages": msgs})
             self.assertEqual(status, 200, b)
             prompt = self.svc.template.render(msgs)
-            self.assertEqual(self.engine.last_ids, full.encode_prompt(msgs, None, {}))
+            # the reference is the same messages with the thinking the server wrote put back into the turns a client
+            # dropped it from (Service._restore_reasoning; serve/test_restore_reasoning.py covers that on its own)
+            expect = copy.deepcopy(msgs)
+            self.svc._restore_reasoning(expect)
+            self.assertEqual(self.engine.last_ids, full.encode_prompt(expect, None, {}))
             if turn:
                 self.assertGreater(self.svc.prompts.last_reused, len(prompt) // 3)
             msgs.append({"role": "assistant", "content": b["choices"][0]["message"]["content"]})
