@@ -12,6 +12,12 @@
 
 ## Latest
 
+- **10 Nov** - `xolotl-dense` runs the gated residual (hyper-connections), the Qwen4 generation's replacement for every
+  layer norm - the piece the dense engine was missing for a Qwen4-27B dense file, built and checked before that file
+  exists. Same kernels the MoE path uses, plain-residual models untouched, and a file carrying a feature the engine
+  lacks (a QSA indexer, PLE) is refused by name. Bit-identical across batching on a synthetic model; parity against a
+  reference forward pass needs the weights, which do not exist yet.
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#xolotl-dense-runs-the-gated-residual-hyper-connections-10-nov).
 - **8 Nov** - Short agent turns (a tool result on a long conversation) are faster on DeepSeek-V4.1 (4.40 -> 3.83 s for
   161 tokens) and GLM-5.3-Flash (5.47 -> 4.63 s for 246 tokens): the CPU computes some of the experts while the card
   runs the rest, and the CPU's i-quant kernels now decode an expert once for all its tokens (-32 % at 4-8 tokens).

@@ -24,6 +24,47 @@ Checked on the CPU only (`serve.test_reasoning_loop_recovery`: two new cases, 20
 also fired on 2 of 86 saved Qwen3.8-27B traces that were step-by-step work, not loops. So it stays opt-in until a
 pass-rate A/B.
 
+### `xolotl-dense` runs the gated residual (hyper-connections) (10 Nov)
+
+`xolotl-dense` served Qwen3.8-27B and its fine-tunes - a plain pre-norm residual. The Qwen4 generation, whose 27B
+dense model is announced but unreleased, carries the Flash-Next additions on top of that skeleton; the largest of
+them is **hyper-connections**: the residual is not one vector but a stack of streams (Flash-Next: 4 of 2560 wide,
+rank 320), and every layer norm is replaced by a mixer that reads all of them and writes back per-stream.
+
+This is the missing piece for a Qwen4-27B dense file. Whether that file also carries the QSA indexer or PLE tables
+is unknown until it ships - if it does, the engine says so and refuses rather than half-runs it.
+
+The dense engine now runs them, on the same kernels the MoE path already uses (`gr_read`/`gr_write` in
+`kernels/gr.hpp` - no new CUDA):
+
+- **Config:** `hyper_connection.count` and `hyper_connection.low_rank` are read from the file; absent keys mean the
+  plain residual, so every existing model is untouched.
+- **Per layer:** `hc_{attn,ffn}_{down,up,inject,norm}` replace `attn_norm`/`post_attention_norm`; the matrices are
+  uploaded in the BF16 engine form the mixer takes, one host rounding from whatever the file stores.
+- **Output:** `output_hc_{norm,down,up}` collapse the stack where `output_norm` used to sit.
+- **Refused, each with its own message, rather than half-run:** hyper-connections with the MTP block (that block has
+  its own `nextn_hc_head` mixer), with drafter taps (a tap is one `n_embd` row; an HC layer holds `hc`), and on the
+  MMQ prompt path (the prompt falls back to `run()`, `NC` tokens per call - correct, just not the fast path).
+- **Also refused ahead of a load:** a QSA indexer and PLE n-gram embeddings, which the dense engine has no kernels
+  for. `xolotl-dense --check <file>` names whichever the file carries instead of failing on a shape much later. An
+  architecture string this engine was never validated on is opt-in: `STRATA_DENSE_EXPERIMENTAL_ARCH=1`.
+
+Verification, without a single Qwen4 weight (none exist):
+
+| check | result |
+| --- | --- |
+| `dense_arch_test` (18 checks: what is refused, the opt-in, the HC geometry) | all pass |
+| synthetic HC model (`tools/qwen4_hc_fixture.py`), `--check` | loads; `hyper-connections: 2 streams of 256, rank 8` |
+| the same model, 40 tokens one at a time vs chunks of 3,2,5,1,8,4 | max logit difference **0** (bit-identical) |
+| a real Qwen3.8-class dense file (VISTA-4B-Q8_0) on the same build | passes: bit-identical singletons vs chunks, MMQ prefill 1.48 % (no "before" number was taken, so this is a pass, not a comparison) |
+
+The bit-identical line is the meaningful one: the multi-column read (`gr_read_multi`) and the single-token read
+(`gr_read` + its workspace) agree exactly, which is what an implementer gets wrong first.
+
+**Not yet proven: numerical parity of a whole forward pass.** The kernels are the ones Flash-Next validates against
+the reference and the wiring is self-consistent, but nothing here has compared the output against a reference model.
+When Qwen4-27B lands, the first task is that comparison, not a benchmark.
+
 ### Long thinking runs: a loop no longer loses the answer, a retry no longer re-reads the conversation (9 Nov)
 
 Seen on GLM-5.3-Flash in a coding agent: a reply thought for 18,361 tokens, then wrote one token ('Dot') 256 times;

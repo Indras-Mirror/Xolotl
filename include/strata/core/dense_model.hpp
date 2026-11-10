@@ -51,10 +51,15 @@ namespace strata::core
         int n_embd = 0, n_ff = 0, n_vocab = 0;
         int n_head = 0, n_head_kv = 0, head_dim = 0, n_rot = 0;
         int ssm_d_conv = 0, ssm_state = 0, ssm_k_heads = 0, ssm_v_heads = 0;
+        /// Hyper-connections (the Flash-Next / Qwen4 gated residual): `hc` residual streams of `n_embd` and the
+        /// rank of their down/up bottleneck. 0 = the plain pre-norm residual (Qwen3.8-27B, architecture qwen35).
+        int hc = 0, hc_lr = 0;
         float rms_eps = 1e-6f, rope_base = 1e7f;
         int32_t eos_id = -1; ///< tokenizer.ggml.eos_token_id: the id that ends an answer
         int conv_channels() const { return 2 * ssm_state * ssm_k_heads + ssm_state * ssm_v_heads; }
         int value_dim() const { return ssm_state * ssm_v_heads; }
+        int hc_dim() const { return hc * n_embd; }
+        bool has_hc() const { return hc > 0; }
     };
 
     enum class Logits

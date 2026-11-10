@@ -3,14 +3,17 @@
 
 #include "strata/artifact/dequant.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/dense_arch.hpp"
 #include "strata/kernels/dense_kernels.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/gr.hpp"
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_gdn_preprocess.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #ifdef STRATA_DENSE_MMQ
 #include "strata/prefill/moe_mmq.hpp"
 #endif
@@ -53,6 +56,11 @@ struct Layer {
     float* attn_norm = nullptr;
     float* post_norm = nullptr;
     QMat ffn_gate, ffn_up, ffn_down;
+    // Hyper-connections (the gated residual): the two mixers' weights, in the engine form gr_read takes.  The
+    // matrices are BF16 (uint16_t) and the norms F32, exactly as the MoE path pins them in layout.cpp.
+    uint16_t *hc_attn_down = nullptr, *hc_attn_up = nullptr, *hc_attn_inject = nullptr;
+    uint16_t *hc_ffn_down = nullptr, *hc_ffn_up = nullptr, *hc_ffn_inject = nullptr;
+    float *hc_attn_norm = nullptr, *hc_ffn_norm = nullptr;
     // GDN mixer
     QMat qkv, z, ssm_out;
     float *conv_w = nullptr, *dt = nullptr, *ssm_a = nullptr, *ssm_norm = nullptr;
@@ -278,6 +286,17 @@ struct DenseModel::Impl {
 
     float* output_norm = nullptr;
     QMat head;
+    // ---- hyper-connections (hc > 0): the residual STACK and its mixers.  Absent (null) on a plain dense file.
+    uint16_t *out_hc_down = nullptr, *out_hc_up = nullptr;
+    float* out_hc_norm = nullptr;
+    float* R = nullptr;                 ///< [NC][hc * n_embd]  the residual stack, hc streams per column
+    float* hc_xn = nullptr;             ///< [NC][hc * n_embd]  gr_read's activated streams (its workspace, mine here)
+    float* hc_gated = nullptr;          ///< [NC][hc * n_embd]  the gated stream product, before the mean
+    float* hc_lo = nullptr;             ///< [NC][hc_lr]        the bottleneck
+    float* hc_inject = nullptr;         ///< [NC][hc]           one injection per stream, per column
+    strata::kernels::GrShapes gr_shape;
+    strata::kernels::GrWorkspace gr_ws;  ///< the single-token gr_read path's scratch (carved from gr_ws_mem)
+    void* gr_ws_mem = nullptr;
     void* q8_1 = nullptr;                           // shared activation scratch of the native GEMVs
     int64_t max_context = 0;
 
@@ -383,6 +402,38 @@ struct DenseModel::Impl {
         }
         if (!alloc(out, n * 4, err, name.c_str())) return false;
         const cudaError_t s = cudaMemcpy(*out, host.data(), n * 4, cudaMemcpyHostToDevice);
+        if (s != cudaSuccess) { err = "dense model: upload " + name + ": " + cudaGetErrorString(s); return false; }
+        return true;
+    }
+
+    // A matrix uploaded in the engine's BF16 form, which is what `gr_read`'s projections take (the MoE path pins the
+    // same form: layout.cpp calls these Bf16InF32).  A BF16 source round-trips exactly; an F32 source is rounded
+    // once here, on the host, so the kernel sees exactly what the reference does.
+    bool upload_bf16(const Found* f, const std::string& name, uint64_t expect, uint16_t** out, std::string& err) {
+        if (!f) { err = "dense model: missing tensor " + name; return false; }
+        uint64_t n = 1;
+        for (uint64_t d : f->tensor->shape) n *= d;
+        if (expect && n != expect) {
+            err = "dense model: " + name + " has " + std::to_string(n) + " values, expected " + std::to_string(expect);
+            return false;
+        }
+        if (n > (uint64_t) INT_MAX) { err = "dense model: " + name + " is too large to convert on the host"; return false; }
+        const uint8_t* src = f->file->tensor_data(*f->tensor);
+        std::vector<float> host(n);
+        if (!dequant_row(f->tensor->type, src, (int) n, host.data())) {
+            err = "dense model: " + name + " is " + upper_type(f->tensor->type) + ", which cannot be read as floats";
+            return false;
+        }
+        std::vector<uint16_t> bf(n);
+        for (uint64_t i = 0; i < n; ++i) {
+            uint32_t x;
+            std::memcpy(&x, &host[i], 4);
+            if ((x & 0x7fffffffu) > 0x7f800000u) { bf[i] = (uint16_t) ((x >> 16) | 0x40); continue; }   // NaN stays NaN
+            x += 0x7fffu + ((x >> 16) & 1u);                                                             // round to nearest even
+            bf[i] = (uint16_t) (x >> 16);
+        }
+        if (!alloc(out, n * 2, err, name.c_str())) return false;
+        const cudaError_t s = cudaMemcpy(*out, bf.data(), n * 2, cudaMemcpyHostToDevice);
         if (s != cudaSuccess) { err = "dense model: upload " + name + ": " + cudaGetErrorString(s); return false; }
         return true;
     }
@@ -495,6 +546,10 @@ struct DenseModel::Impl {
     void attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv, const QMat& wo,
                     const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0, void* s);
     void ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm, int n, void* s);
+    void ffn_matmul(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, int n, void* s);
+    // One hyper-connection read: the residual stack in, the mixer's input written into `xn` and the per-stream
+    // injection into `hc_inject`.  Absent on a plain dense file.
+    void hc_read(const Layer& L, bool attn_mixer, float eps, int n, void* s);
     bool mtp_block(const DenseConfig& c, int n, int pos0, bool want_logits, void* s);
 
 #ifdef STRATA_DENSE_MMQ
@@ -581,18 +636,35 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
     gemv(wo, mix, n, s);
 }
 
-// x += ffn(rms_norm(x, post_norm)), for n columns
-void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm,
-                                 int n, void* s) {
-    const int E = c.n_embd;
-    dense_rms_norm(x, post_norm, xn, n, E, c.rms_eps, s);
-    quantize(xn, E, n, s);
+// The FFN itself over n columns: `xn` holds the mixer's input, `mix` receives the output.  No residual add - the
+// caller owns the residual (add_inplace on a plain model, gr_write on a hyper-connection one).
+void DenseModel::Impl::ffn_matmul(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, int n, void* s) {
+    quantize(xn, c.n_embd, n, s);
     gemv(g, ffn_g, n, s);
     gemv(u, ffn_u, n, s);
     dense_swiglu(ffn_g, ffn_u, ffn_h, (int64_t) n * c.n_ff, s);
     quantize(ffn_h, c.n_ff, n, s);
     gemv(d, mix, n, s);
+}
+
+// x += ffn(rms_norm(x, post_norm)), for n columns
+void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm,
+                                 int n, void* s) {
+    const int E = c.n_embd;
+    dense_rms_norm(x, post_norm, xn, n, E, c.rms_eps, s);
+    ffn_matmul(c, g, u, d, n, s);
     add_inplace(x, mix, (int64_t) n * E, s);
+}
+
+// One hyper-connection read: the residual stack (R) -> the mixer's input (xn) and the per-stream injection.
+// The same kernels the MoE path runs (kernels/gr.hpp, `build_hc_mix`), so a dense and a MoE file of this family
+// mix their streams identically.
+void DenseModel::Impl::hc_read(const Layer& L, bool attn_mixer, float eps, int n, void* s) {
+    strata::kernels::gr_read_multi(R, attn_mixer ? L.hc_attn_norm : L.hc_ffn_norm,
+                                   attn_mixer ? L.hc_attn_down : L.hc_ffn_down,
+                                   attn_mixer ? L.hc_attn_up : L.hc_ffn_up,
+                                   attn_mixer ? L.hc_attn_inject : L.hc_ffn_inject,
+                                   eps, gr_shape, gr_ws, hc_xn, hc_lo, hc_gated, xn, hc_inject, n, s);
 }
 
 #ifdef STRATA_DENSE_MMQ
@@ -772,13 +844,27 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (!arch) { err = "dense model: missing general.architecture"; return false; }
         cfg_.arch = arch->s;
         const std::string a = cfg_.arch + ".";
-        if (cfg_.arch.rfind("qwen3", 0) != 0) {
-            err = "dense model: architecture '" + cfg_.arch + "' is not a qwen35 dense model";
-            return false;
-        }
         if (g0.get(a + "expert_count") && g0.get(a + "expert_count")->u > 0) {
             err = "dense model: this GGUF is a MoE model; run it with `strata`, not `xolotl-dense`";
             return false;
+        }
+        {
+            // Qwen4-generation dense files carry the Flash-Next additions.  Hyper-connections are served (below);
+            // a QSA indexer and PLE are not, and an architecture this engine was never validated on is opt-in.
+            strata::core::DenseArchProbe probe;
+            const strata::MetaValue* hc = g0.get(a + "hyper_connection.count");
+            probe.hyper_connections = hc != nullptr && hc->is_num() && hc->num() > 0;
+            const strata::MetaValue* ix = g0.get(a + "attention.indexer.head_count");
+            probe.qsa_indexer = ix != nullptr && ix->is_num() && ix->num() > 0;
+            const strata::MetaValue* pl = g0.get(a + "ple.layers");
+            probe.ple = pl != nullptr && pl->type == strata::MetaType::ARRAY && pl->count > 0;
+            if (!probe.ple)
+                for (const auto& entry : I.index)
+                    if (entry.first.ends_with(".ple_key.weight")) { probe.ple = true; break; }
+            const char* experimental = std::getenv("STRATA_DENSE_EXPERIMENTAL_ARCH");
+            const std::string refusal = strata::core::dense_arch_refusal(
+                cfg_.arch, probe, experimental != nullptr && experimental[0] == '1');
+            if (!refusal.empty()) { err = refusal; return false; }
         }
         int64_t v = 0;
         auto need = [&](const char* key, int& dst) {
@@ -798,6 +884,15 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         cfg_.n_nextn = meta_int(g0, a + "nextn_predict_layers", v) ? (int) v : 0;
         cfg_.n_layer = block_count - cfg_.n_nextn;
         if (cfg_.n_layer <= 0) { err = "dense model: no trunk layers"; return false; }
+        // Hyper-connections (the Qwen4 gated residual).  Absent keys mean the plain pre-norm residual.
+        cfg_.hc = meta_int(g0, a + "hyper_connection.count", v) && v > 0 ? (int) v : 0;
+        cfg_.hc_lr = meta_int(g0, a + "hyper_connection.low_rank", v) ? (int) v : 0;
+        if (!cfg_.has_hc()) cfg_.hc_lr = 0;
+        if (const std::string why = strata::core::dense_hc_refusal(cfg_.hc, cfg_.hc_lr, cfg_.n_embd, with_mtp);
+            !why.empty()) {
+            err = why;
+            return false;
+        }
         if (const auto* e = g0.get(a + "attention.layer_norm_rms_epsilon")) cfg_.rms_eps = (float) e->num();
         if (const auto* e = g0.get(a + "rope.freq_base")) cfg_.rope_base = (float) e->num();
         // The rope the analytic kernel applies: the process scaling (rope_scaling.hpp, `none` unless a caller
@@ -1013,9 +1108,24 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             const bool has_attn = I.find(p + "attn_q.weight") != nullptr;
             if (has_gdn == has_attn) { err = "dense model: " + at + "needs exactly one of attn_qkv.weight / attn_q.weight"; return false; }
             L.attn = has_attn;
-            if (!I.upload_floats(I.find(p + "attn_norm.weight"), p + "attn_norm.weight", E, &L.attn_norm, err)) return false;
-            if (!I.upload_floats(I.find_any({"post_attention_norm.weight", "ffn_norm.weight"}, p), p + "post_attention_norm.weight",
-                                 E, &L.post_norm, err)) return false;
+            if (cfg_.has_hc()) {
+                // The gated residual replaces BOTH layer norms: the mixer's two reads are the equivalent of
+                // rms_norm(attn_norm) and rms_norm(post_attention_norm), with the streams mixed in.
+                const int HD = cfg_.hc_dim();
+                if (!I.upload_floats(I.find(p + "hc_attn_norm.weight"), p + "hc_attn_norm.weight", HD, &L.hc_attn_norm, err) ||
+                    !I.upload_floats(I.find(p + "hc_ffn_norm.weight"), p + "hc_ffn_norm.weight", HD, &L.hc_ffn_norm, err) ||
+                    !I.upload_bf16(I.find(p + "hc_attn_down.weight"), p + "hc_attn_down.weight", (uint64_t) HD * cfg_.hc_lr, &L.hc_attn_down, err) ||
+                    !I.upload_bf16(I.find(p + "hc_attn_up.weight"), p + "hc_attn_up.weight", (uint64_t) HD * cfg_.hc_lr, &L.hc_attn_up, err) ||
+                    !I.upload_bf16(I.find(p + "hc_attn_inject.weight"), p + "hc_attn_inject.weight", (uint64_t) HD * cfg_.hc, &L.hc_attn_inject, err) ||
+                    !I.upload_bf16(I.find(p + "hc_ffn_down.weight"), p + "hc_ffn_down.weight", (uint64_t) HD * cfg_.hc_lr, &L.hc_ffn_down, err) ||
+                    !I.upload_bf16(I.find(p + "hc_ffn_up.weight"), p + "hc_ffn_up.weight", (uint64_t) HD * cfg_.hc_lr, &L.hc_ffn_up, err) ||
+                    !I.upload_bf16(I.find(p + "hc_ffn_inject.weight"), p + "hc_ffn_inject.weight", (uint64_t) HD * cfg_.hc, &L.hc_ffn_inject, err))
+                    return false;
+            } else {
+                if (!I.upload_floats(I.find(p + "attn_norm.weight"), p + "attn_norm.weight", E, &L.attn_norm, err)) return false;
+                if (!I.upload_floats(I.find_any({"post_attention_norm.weight", "ffn_norm.weight"}, p), p + "post_attention_norm.weight",
+                                     E, &L.post_norm, err)) return false;
+            }
             if (!I.upload_mat(I.find(p + "ffn_gate.weight"), p + "ffn_gate.weight", E, cfg_.n_ff, L.ffn_gate, total, err) ||
                 !I.upload_mat(I.find(p + "ffn_up.weight"), p + "ffn_up.weight", E, cfg_.n_ff, L.ffn_up, total, err) ||
                 !I.upload_mat(I.find(p + "ffn_down.weight"), p + "ffn_down.weight", cfg_.n_ff, E, L.ffn_down, total, err))
@@ -1075,7 +1185,19 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         }
 
         // ---- 7. the output side
-        if (!I.upload_floats(I.find("output_norm.weight"), "output_norm.weight", E, &I.output_norm, err)) return false;
+        if (cfg_.has_hc()) {
+            // The final mixer replaces output_norm: it collapses the residual stack to the one vector the head takes.
+            const int HD = cfg_.hc_dim();
+            I.gr_shape = strata::kernels::GrShapes{cfg_.n_embd, cfg_.hc, cfg_.hc_lr};
+            if (!I.upload_floats(I.find("output_hc_norm.weight"), "output_hc_norm.weight", HD, &I.out_hc_norm, err) ||
+                !I.upload_bf16(I.find("output_hc_down.weight"), "output_hc_down.weight",
+                               (uint64_t) HD * cfg_.hc_lr, &I.out_hc_down, err) ||
+                !I.upload_bf16(I.find("output_hc_up.weight"), "output_hc_up.weight",
+                               (uint64_t) HD * cfg_.hc_lr, &I.out_hc_up, err))
+                return false;
+        } else if (!I.upload_floats(I.find("output_norm.weight"), "output_norm.weight", E, &I.output_norm, err)) {
+            return false;
+        }
         const Found* head = I.find("output.weight");
         if (!head) head = tok;                                   // tied embeddings
         if (!I.upload_mat(head, head == tok ? "token_embd.weight (tied head)" : "output.weight", E, cfg_.n_vocab,
@@ -1145,10 +1267,32 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                   I.alloc(&I.pos_dev, K * (uint64_t) std::max(H, HK) * 4, err, "positions") &&
                   I.alloc(&I.hid, K * E * f, err, "hidden") && I.alloc(&I.h_last, (uint64_t) E * f, err, "last hidden") &&
                   I.alloc(&I.d_tok, 16, err, "sampler output") && I.alloc(&I.d_prob, 16, err, "draft probability");
+        if (ok && cfg_.has_hc()) {
+            // The residual stack and gr_read's explicit scratch, NC columns each (gr_read_multi writes these
+            // per token; the single-token path carves the same numbers out of gr_ws_mem).
+            const uint64_t HD = (uint64_t) cfg_.hc_dim();
+            ok = I.alloc(&I.R, K * HD * f, err, "residual stack") &&
+                 I.alloc(&I.hc_xn, K * HD * f, err, "hyper-connection streams") &&
+                 I.alloc(&I.hc_gated, K * HD * f, err, "hyper-connection gate") &&
+                 I.alloc(&I.hc_lo, K * (uint64_t) cfg_.hc_lr * f, err, "hyper-connection bottleneck") &&
+                 I.alloc(&I.hc_inject, K * (uint64_t) cfg_.hc * f, err, "hyper-connection injection") &&
+                 I.alloc(&I.gr_ws_mem, strata::kernels::gr_workspace_bytes(I.gr_shape), err, "gr_read workspace");
+            if (ok) {
+                strata::kernels::gr_workspace_init(I.gr_shape, I.gr_ws_mem, I.gr_ws);
+                std::fprintf(stderr, "xolotl-dense: hyper-connections: %d streams of %d, rank %d\n", cfg_.hc, cfg_.n_embd,
+                             cfg_.hc_lr);
+            }
+        }
         if (ok && with_mtp)
             ok = I.alloc(&I.m_e, K * E * f, err, "MTP embeddings") && I.alloc(&I.hin, K * E * f, err, "MTP hidden input") &&
                  I.alloc(&I.cat, K * 2 * E * f, err, "MTP concat") && I.alloc(&I.mtp_logits, (uint64_t) cfg_.n_vocab * f, err, "MTP logits") &&
                  I.alloc(&I.mtp_h, (uint64_t) E * f, err, "MTP output hidden");
+        if (ok && !opt.taps.empty() && cfg_.has_hc()) {
+            // A tap is one n_embd vector per layer; a hyper-connection layer holds hc of them.  The drafter would
+            // have to be trained on the stack, so refuse rather than feed it a shape it was not built for.
+            err = "dense model: drafter taps (--dflash2) are not wired for a hyper-connection model";
+            return false;
+        }
         if (ok && !opt.taps.empty()) {
             I.tap_slot.assign((size_t) cfg_.n_layer, -1);
             for (size_t t = 0; t < opt.taps.size(); ++t) {
@@ -1297,14 +1441,25 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
         if (I.prof.enabled) I.prof.begin(s);
         if (!I.upload_embeddings(I.embd, tokens, n, E, cfg_.n_vocab, I.x, err)) { I.prof.on = false; return false; }
         if (dbg) trace_vec("embed", pos0, -1, "", I.x, n * E, s);
+        // A hyper-connection model starts as the embedding broadcast to every stream (the reference's own initial
+        // condition); a plain one keeps the single vector in `x`.
+        if (cfg_.has_hc()) strata::kernels::broadcast_streams(I.x, I.R, E, cfg_.hc, n, s);
 
         for (int l = 0; l < cfg_.n_layer; ++l) {
             Layer& L = I.layers[(size_t) l];
-            dense_rms_norm(I.x, L.attn_norm, I.xn, n, E, cfg_.rms_eps, s);
+            if (cfg_.has_hc()) I.hc_read(L, /*attn_mixer=*/true, cfg_.rms_eps, n, s);   // -> xn (the mixer's input)
+            else dense_rms_norm(I.x, L.attn_norm, I.xn, n, E, cfg_.rms_eps, s);
             if (!L.attn) I.gdn_block(cfg_, L, n, snapshot, s);
             else I.attn_block(cfg_, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, n, (int) pos0, s);
-            add_inplace(I.x, I.mix, (int64_t) n * E, s);
-            I.ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, s);
+            if (cfg_.has_hc()) {
+                strata::kernels::gr_write_multi(I.R, I.mix, I.hc_inject, I.gr_shape, I.R, n, s);
+                I.hc_read(L, /*attn_mixer=*/false, cfg_.rms_eps, n, s);                // -> xn again
+                I.ffn_matmul(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, n, s);            // -> mix
+                strata::kernels::gr_write_multi(I.R, I.mix, I.hc_inject, I.gr_shape, I.R, n, s);
+            } else {
+                add_inplace(I.x, I.mix, (int64_t) n * E, s);
+                I.ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, s);
+            }
             if (I.n_taps && I.tap_slot[(size_t) l] >= 0)   // this layer's output rows for the drafter
                 cudaMemcpy2DAsync(I.taps_run + (size_t) I.tap_slot[(size_t) l] * E, (size_t) I.n_taps * E * 4, I.x, (size_t) E * 4,
                                   (size_t) E * 4, (size_t) n, cudaMemcpyDeviceToDevice, (cudaStream_t) s);
@@ -1316,7 +1471,14 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
         snap_cols_ = n;
 
         if (lg != Logits::None || keep_hidden) {
-            dense_rms_norm(I.x, I.output_norm, I.hid, n, E, cfg_.rms_eps, s);     // h_nextn: the post-norm hidden
+            if (cfg_.has_hc()) {
+                // The final mixer collapses the stack to the one vector the head takes (no output_norm: the
+                // mixer's own norm plays that role, exactly as lm_head_mix does on the MoE path).
+                strata::kernels::gr_read_multi(I.R, I.out_hc_norm, I.out_hc_down, I.out_hc_up, nullptr, cfg_.rms_eps,
+                                               I.gr_shape, I.gr_ws, I.hc_xn, I.hc_lo, I.hc_gated, I.hid, nullptr, n, s);
+            } else {
+                dense_rms_norm(I.x, I.output_norm, I.hid, n, E, cfg_.rms_eps, s);     // h_nextn: the post-norm hidden
+            }
             if (lg == Logits::Last) {
                 I.quantize(I.hid + (size_t) (n - 1) * E, E, 1, s);
                 I.gemv(I.head, I.logits, 1, s);
@@ -1348,6 +1510,12 @@ int64_t DenseModel::prefill_chunk() const { return pf_chunk_; }
 bool DenseModel::prefill_setup(int64_t chunk, std::string& err) {
     pf_ready_ = false;
     pf_chunk_ = 0;
+    if (cfg_.has_hc()) {
+        // The chunked path runs rms_norm over a single vector; a hyper-connection file mixes hc streams first.
+        // run() serves the prompt instead - correct, NC tokens per call, and nothing else changes.
+        err = "dense model: hyper-connections are served on the run() path; the prompt is fed NC tokens per call";
+        return false;
+    }
 #ifdef STRATA_DENSE_MMQ
     Impl& I = *impl_;
     if (chunk <= 0) chunk = kPrefillDefaultCols;
