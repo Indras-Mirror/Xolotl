@@ -64,31 +64,61 @@ struct Tab16 {
     const char* p[kGatherGroupMax];
 };
 
+// cp.async, ldmatrix and mma.sync s8 need sm_80: below it (the sm_60..75 targets of the CUDA 12 and CUDA 13 release engines) the
+// device side is a trap, never launched because arch_ok() declines those cards on the host
 __device__ __forceinline__ void cp8(uint32_t dst, const void* src) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    __trap();   // never launched below sm_80: arch_ok() declines those cards
+#else
     asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(dst), "l"(src));
+#endif
 }
 __device__ __forceinline__ void cp16(uint32_t dst, const void* src) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    __trap();   // never launched below sm_80: arch_ok() declines those cards
+#else
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
+#endif
 }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void cp_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    __trap();   // never launched below sm_80: arch_ok() declines those cards
+#else
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
 template <int N>
 __device__ __forceinline__ void cp_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    __trap();   // never launched below sm_80: arch_ok() declines those cards
+#else
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+#endif
 }
 __device__ __forceinline__ void ldsm4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, uint32_t addr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    r0 = r1 = r2 = r3 = 0;
+    __trap();   // never launched below sm_80: arch_ok() declines those cards
+#else
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                  : "r"(addr));
+#endif
 }
 __device__ __forceinline__ void lds128(float4& v, uint32_t addr) {
     asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];\n" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "r"(addr));
 }
 template <uint32_t C0>
 __device__ __forceinline__ void mma_s8(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    c[0] = c[1] = c[2] = c[3] = 0;
+    __trap();   // never launched below sm_80: arch_ok() declines those cards
+#else
     asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
         "{%10, %10, %10, %10};\n"
         : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(C0));
+#endif
 }
 
 constexpr uint32_t kMagicBits = 0x4B400000u;   // 1.5 * 2^23
@@ -315,6 +345,9 @@ __global__ void __launch_bounds__(kThreads, C::MINB)
     iq4_w4a8_kernel(Tab16 tab, const char* __restrict__ y, const int32_t* __restrict__ ids,
                     const int32_t* __restrict__ bounds, float* __restrict__ dst, int64_t ld_dst, int nk,
                     int64_t row_bytes, int64_t ncols_y, int nty, int ntx) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    __trap();   // never launched below sm_80: arch_ok() declines those cards
+#else
     extern __shared__ __align__(16) unsigned char smem[];
     const int it = blockIdx.x % nty, rest = blockIdx.x / nty;
     const int jt = rest % ntx, z = rest / ntx;
@@ -337,6 +370,7 @@ __global__ void __launch_bounds__(kThreads, C::MINB)
     STRATA_W4A8_NT(9) STRATA_W4A8_NT(10) STRATA_W4A8_NT(11) STRATA_W4A8_NT(12)
     STRATA_W4A8_NT(13) STRATA_W4A8_NT(14) STRATA_W4A8_NT(15) STRATA_W4A8_NT(16)
 #undef STRATA_W4A8_NT
+#endif
 }
 
 // configurations (STRATA_W4A8_CFG): 1 CTA/SM, 2 stages, two FFMAs (EPI 1), rows of 72 bytes, the pipelined loop;
