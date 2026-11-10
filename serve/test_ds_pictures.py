@@ -239,5 +239,45 @@ class Serve(unittest.TestCase):
         self.assertEqual(self.engine.seen_ids.count(self.img), 274)
 
 
+class DecoderAllowList(unittest.TestCase):
+    """GHSA-78g4-xqwv-q3g8: Pillow 11.1.0-12.3.0 carry an OpenJPEG heap overflow in Image.open().load(), and Pillow picks
+    the decoder from the file's first bytes.  PICTURE_FORMATS keeps a JPEG 2000 file (or any other rarely used codec) out
+    of the decoder on every Pillow version; the formats the vision path does serve still open."""
+
+    @unittest.skipIf(Image is None, "Pillow is not installed")
+    def test_jpeg_2000_is_refused(self):
+        out = io.BytesIO()
+        Image.new("RGB", (8, 8), (10, 120, 200)).save(out, format="JPEG2000")
+        with self.assertRaises(ValueError):
+            D.DsPictures.decode(out.getvalue())          # the DeepSeek picture reader
+        from serve.server import Vision
+        with self.assertRaises(ValueError):
+            Vision.normalize(out.getvalue())             # the generic vision path
+
+    @unittest.skipIf(Image is None, "Pillow is not installed")
+    def test_the_served_formats_still_open(self):
+        for fmt in D.PICTURE_FORMATS:
+            if fmt == "AVIF":                            # the encoder is not in every Pillow build
+                try:
+                    probe = io.BytesIO()
+                    Image.new("RGB", (8, 8), (1, 2, 3)).save(probe, format=fmt)
+                except (KeyError, OSError):
+                    continue
+            probe = io.BytesIO()
+            try:
+                Image.new("RGB", (8, 8), (1, 2, 3)).save(probe, format=fmt)
+            except (KeyError, OSError):
+                continue                                 # this build cannot write it: nothing to read back
+            with Image.open(io.BytesIO(probe.getvalue()), formats=D.PICTURE_FORMATS) as im:
+                im.load()
+                self.assertEqual(im.size, (8, 8), fmt)
+
+    def test_the_list_has_no_decoder_the_vision_path_does_not_serve(self):
+        self.assertEqual(set(D.PICTURE_FORMATS),
+                         {"JPEG", "PNG", "GIF", "BMP", "WEBP", "TIFF", "AVIF"})
+        for banned in ("JPEG2000", "MPO", "JPEG2000", "ICO", "PSD", "EPS", "FLI", "SGI"):
+            self.assertNotIn(banned, D.PICTURE_FORMATS)
+
+
 if __name__ == "__main__":
     unittest.main()
