@@ -163,6 +163,39 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "%s cache-reopen slots%lld slot_gib0 enabled%d: %lld residents (expected %lld)\n",
                              ok ? "ok" : "FAIL", (long long) cfg.slots, on, (long long) got,
                              (long long) (on ? expected : 0));
+                if (on && ok) {
+                    const int l = layers.front();
+                    const int64_t D = g.n_embd, K = g.top_k;
+                    std::vector<int32_t> ids;
+                    for (const auto& le : ranked)
+                        if (le.first == l && tier.resident(l, le.second) && (int64_t) ids.size() < K &&
+                            std::find(ids.begin(), ids.end(), le.second) == ids.end()) ids.push_back(le.second);
+                    if ((int64_t) ids.size() != K) {
+                        std::fprintf(stderr, "FAIL cache-reopen: fewer than top_k resident experts on first test layer\n");
+                        return 1;
+                    }
+                    std::vector<float> x((size_t) D), weights((size_t) K, 0.25f), output((size_t) D),
+                                       reference((size_t) D, 0.0f), one((size_t) D);
+                    std::vector<uint8_t> expert(src.blob_bytes());
+                    for (int64_t i = 0; i < D; ++i) x[(size_t) i] = 0.3f * std::sin((float) i * 0.17f);
+                    tier.reset_stats();
+                    if (!tier.run(l, ids.data(), weights.data(), x.data(), output.data())) {
+                        std::fprintf(stderr, "FAIL cache-reopen: resident run failed\n"); return 1;
+                    }
+                    for (int64_t k = 0; k < K; ++k) {
+                        src.read(l, ids[(size_t) k], expert.data());
+                        ref_expert(g, g.cls(l, ids[(size_t) k]), expert.data(), x.data(), one.data());
+                        for (int64_t i = 0; i < D; ++i) reference[(size_t) i] += weights[(size_t) k] * one[(size_t) i];
+                    }
+                    const auto stats = tier.stats();
+                    const double error = rel(output, reference);
+                    const bool finite = std::all_of(output.begin(), output.end(), [](float v) { return std::isfinite(v); }) &&
+                                        std::all_of(reference.begin(), reference.end(), [](float v) { return std::isfinite(v); });
+                    const bool values_ok = finite && stats.hits == K && stats.cpu == 0 && stats.pcie == 0 && error < 3e-2;
+                    all_ok = all_ok && values_ok;
+                    std::fprintf(stderr, "%s cache-reopen resident reference L%d: %lld hits, rel %.3e, finite%d\n",
+                                 values_ok ? "ok" : "FAIL", l, (long long) stats.hits, error, finite);
+                }
             }
             if (!all_ok) return 1;
         }
