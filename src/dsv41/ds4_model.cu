@@ -10385,6 +10385,12 @@ struct Model::Impl {
                     err = "router picked expert " + std::to_string(e) + " (layer " + std::to_string(l.il) + ", token " + std::to_string(t) + ", pick " + std::to_string(i) + ", of " + std::to_string(l.k_exp) + ")";
                     return false;
                 }
+                // (a non-finite gate input: route_kernel then gave a valid pick but a NaN weight - the layer's output would be
+                //  garbage; said here, where the picks are on the host anyway, instead of a request that answers nonsense)
+                if (!std::isfinite(h_w[t * kPicks + i])) {
+                    err = "the router's weight is not finite (layer " + std::to_string(l.il) + ", token " + std::to_string(t) + ", pick " + std::to_string(i) + "): the gate's input went NaN or infinite";
+                    return false;
+                }
                 ++pr[e];
                 l.heat[(size_t) e] += 1.0f;
                 if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);

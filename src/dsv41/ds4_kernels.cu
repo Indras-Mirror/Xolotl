@@ -505,6 +505,21 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
 }
 
 // ---------------------------------------------------------------- the router
+// A pick that never came out: every score left is NaN (the gate's input went non-finite), so nothing beat -FLT_MAX and the
+// index is still the 0x7fffffff it started as - and the next line read sc[0x7fffffff] (shared memory), then vram[0x7fffffff] /
+// vs[0x7fffffff] in the kernels after it: a memory fault far from the cause (Project Maya v1.1.45's chain: NaN routing, then an
+// illegal memory access; upstream #4825).  The lowest expert not picked yet instead - a valid index, so nothing reads outside its
+// tables; the weights stay NaN, the layer's output is garbage as it was, and the host-routed path says so (its picks are checked
+// there).  Only reached by a kernel's one thread when a pick is missing, so a finite router pays one compare a pick.
+__device__ __forceinline__ int route_fallback_pick(const int* pick, int r, int n) {
+    int ix = 0;
+    for (bool again = true; again;) {   // (the picks are few and unsorted: start over when one of them is the candidate)
+        again = false;
+        for (int q = 0; q < r && !again; ++q)
+            if (pick[q] == ix) ++ix, again = true;
+    }
+    return ix < n ? ix : 0;
+}
 __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                                     int n, int k, float route_scale, int* idx, float* w,
                                                     const float* __restrict__ bias_vl, const VlBits vl) {
@@ -540,6 +555,7 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
             int ix = 0x7fffffff;
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            if (ix >= n) ix = route_fallback_pick(pick, r, n);   // (a non-finite gate input: see route_fallback_pick)
             pick[r] = ix;
             bs[ix] = -FLT_MAX;
         }
@@ -1621,6 +1637,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
             int ix = 0x7fffffff;
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            if (ix >= n) ix = route_fallback_pick(pick, r, n);   // (a non-finite gate input: see route_fallback_pick)
             pick[r] = ix;
             bs[ix] = -FLT_MAX;
         }
@@ -1683,6 +1700,7 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
             int ix = 0x7fffffff;
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            if (ix >= n) ix = route_fallback_pick(req->ahead[t] + off, r, n);   // (a non-finite gate input: see route_fallback_pick)
             req->ahead[t][off + r] = ix < n ? ix : -1;
             if (ix < n) bs[ix] = -FLT_MAX;
         }

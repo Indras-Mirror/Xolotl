@@ -1893,6 +1893,24 @@ class StrataEngine:
                         break
 
     @staticmethod
+    def _swallow_trailing_done(lines_q, wait: float = 0.3) -> None:
+        """A request that ends on `ERR ...` is over, but an engine that also prints the request's `DONE` after it (the DeepSeek
+        engine did, after its NaN stop) would hand that DONE to the NEXT request as its own: 0 tokens at once, and every answer
+        after it one request late.  So a short wait for a trailing DONE (or ERR) of the same request, taken off the queue and
+        dropped, before the request is reported failed and the FIFO released.  An engine that prints only the ERR costs the wait."""
+        end = time.monotonic() + wait
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            try:
+                late = lines_q.get(timeout=left)
+            except queue.Empty:
+                return
+            if late is None or late.startswith(("DONE", "ERR")):
+                return
+
+    @staticmethod
     def sampling_keys(sampling: dict, *, grammar_replay: bool = False) -> str:
         keys = ""
         t = sampling.get("temperature")
@@ -3076,6 +3094,7 @@ class StrataEngine:
                         self._send(f"{head} {','.join(str(int(t)) for t in ids)}")
                         continue
                     done = True
+                    self._swallow_trailing_done(self.lines)  # an engine that ended the request on ERR may still print its DONE
                     raise ValueError(line[4:].strip())
         finally:
             with getattr(self, "wlock", None) or contextlib.nullcontext():
