@@ -71,7 +71,7 @@ double rel(const std::vector<float> & a, const std::vector<float> & b) {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: test_ds41_moe <file.gguf> [--layers 0,1] [--tokens 8] [--gpu] [--chunk N] [--chunk-mmq] [--multi N] [--remote N [--remote-gib G]]\n"); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: test_ds41_moe <file.gguf> [--layers 0,1] [--tokens 8] [--gpu] [--chunk N] [--chunk-mmq] [--multi N] [--remote N [--remote-gib G]] [--cache-reopen-check]\n"); return 2; }
     std::string path = argv[1];
     int nchunk = 0;   // --chunk N: also N tokens at once through run_chunk (the prompt path), each row vs the reference
     std::vector<int> layers = { 0 };
@@ -79,6 +79,7 @@ int main(int argc, char ** argv) {
     bool gpu = false, chunk_mmq = false;
     int remote = -1, nmulti = 0;   // --remote N [--remote-gib G]: a second card holds experts after the VRAM head;
     double remote_gib = 2.0;       // --multi N: N tokens at once through run_multi (the serve / verify path)
+    bool cache_reopen_check = false; // --cache-reopen-check: fixed slots survive release + seed; disabled stays off
     bool noref = false;            // --no-ref: the chunk pass is only timed (3 runs), not checked
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -95,11 +96,29 @@ int main(int argc, char ** argv) {
         else if (a == "--remote-gib" && i + 1 < argc) remote_gib = std::atof(argv[++i]);
         else if (a == "--multi" && i + 1 < argc) nmulti = std::atoi(argv[++i]);
         else if (a == "--no-ref") noref = true;
+        else if (a == "--cache-reopen-check") cache_reopen_check = true;
+    }
+    if (cache_reopen_check && !gpu) {
+        std::fprintf(stderr, "--cache-reopen-check requires --gpu\n");
+        return 2;
     }
     Ds41FileBlobs src(path);
     std::string err;
     if (!src.open(err)) { std::fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
     const Ds41MoeGeom & g = src.geom();
+    if (cache_reopen_check) {
+        size_t bytes = 0;
+        for (int64_t c = 0; c < g.n_classes(); ++c) {
+            if (!g.per_expert() && !g.routed(c)) continue;
+            kernels::cpu::NativeFmt fmt;
+            if (!ds41_moe_class_layout(g, c, fmt, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+            if (bytes && bytes != fmt.bytes) {
+                std::fprintf(stderr, "--cache-reopen-check requires uniform expert blob sizes\n");
+                return 2;
+            }
+            bytes = fmt.bytes;
+        }
+    }
     std::printf("%lld layers, %zu classes:", (long long) g.n_layers, g.cls_gu.size());
     for (size_t c = 0; c < g.cls_gu.size(); ++c) std::printf(" %d/%d", g.cls_gu[c], g.cls_d[c]);
     std::printf("\n");
@@ -123,6 +142,63 @@ int main(int argc, char ** argv) {
         if (!tier.seed_from_ranked(ranked, err)) { std::fprintf(stderr, "seed: %s\n", err.c_str()); return 1; }
         std::printf("tier %s: %lld resident, %lld remote, %lld arena\n", tier.mode(), (long long) tier.resident(),
                     (long long) tier.remote_experts(), (long long) tier.arena_experts());
+        if (cache_reopen_check) {
+            const int64_t expected = tier.resident();
+            if (expected <= 0) { std::fprintf(stderr, "FAIL cache-reopen: initial seed has no residents\n"); return 1; }
+            // Match serve with explicit --slots: open_cache() sets slot_gib to zero after a prompt
+            // released the cache. Repeat it, with a disabled-cache negative control between releases.
+            const bool enabled[] = {true, false, true};
+            bool all_ok = true;
+            for (bool on : enabled) {
+                tier.release_cache();
+                tier.set_slot_gib(0.0);
+                tier.set_cache_enabled(on);
+                if (!tier.seed_from_ranked(ranked, err)) {
+                    std::fprintf(stderr, "FAIL cache-reopen seed enabled%d: %s\n", on, err.c_str());
+                    return 1;
+                }
+                const int64_t got = tier.resident();
+                const bool ok = got == (on ? expected : 0);
+                all_ok = all_ok && ok;
+                std::fprintf(stderr, "%s cache-reopen slots%lld slot_gib0 enabled%d: %lld residents (expected %lld)\n",
+                             ok ? "ok" : "FAIL", (long long) cfg.slots, on, (long long) got,
+                             (long long) (on ? expected : 0));
+                if (on && ok) {
+                    const int l = layers.front();
+                    const int64_t D = g.n_embd, K = g.top_k;
+                    std::vector<int32_t> ids;
+                    for (const auto& le : ranked)
+                        if (le.first == l && tier.resident(l, le.second) && (int64_t) ids.size() < K &&
+                            std::find(ids.begin(), ids.end(), le.second) == ids.end()) ids.push_back(le.second);
+                    if ((int64_t) ids.size() != K) {
+                        std::fprintf(stderr, "FAIL cache-reopen: fewer than top_k resident experts on first test layer\n");
+                        return 1;
+                    }
+                    std::vector<float> x((size_t) D), weights((size_t) K, 0.25f), output((size_t) D),
+                                       reference((size_t) D, 0.0f), one((size_t) D);
+                    std::vector<uint8_t> expert(src.blob_bytes());
+                    for (int64_t i = 0; i < D; ++i) x[(size_t) i] = 0.3f * std::sin((float) i * 0.17f);
+                    tier.reset_stats();
+                    if (!tier.run(l, ids.data(), weights.data(), x.data(), output.data())) {
+                        std::fprintf(stderr, "FAIL cache-reopen: resident run failed\n"); return 1;
+                    }
+                    for (int64_t k = 0; k < K; ++k) {
+                        src.read(l, ids[(size_t) k], expert.data());
+                        ref_expert(g, g.cls(l, ids[(size_t) k]), expert.data(), x.data(), one.data());
+                        for (int64_t i = 0; i < D; ++i) reference[(size_t) i] += weights[(size_t) k] * one[(size_t) i];
+                    }
+                    const auto stats = tier.stats();
+                    const double error = rel(output, reference);
+                    const bool finite = std::all_of(output.begin(), output.end(), [](float v) { return std::isfinite(v); }) &&
+                                        std::all_of(reference.begin(), reference.end(), [](float v) { return std::isfinite(v); });
+                    const bool values_ok = finite && stats.hits == K && stats.cpu == 0 && stats.pcie == 0 && error < 3e-2;
+                    all_ok = all_ok && values_ok;
+                    std::fprintf(stderr, "%s cache-reopen resident reference L%d: %lld hits, rel %.3e, finite%d\n",
+                                 values_ok ? "ok" : "FAIL", l, (long long) stats.hits, error, finite);
+                }
+            }
+            if (!all_ok) return 1;
+        }
     }
     std::mt19937_64 rng(7);
     std::normal_distribution<float> nd(0.0f, 1.0f);

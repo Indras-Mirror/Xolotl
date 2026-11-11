@@ -87,13 +87,14 @@ lowers it further (10 GiB free: 190 tok/s at 16.5K). Its decode here follows a 6
 
 ## Speed log
 
-Engine speed-ups, newest first, each measured before/after on the same box (RTX 4090, Ryzen 7 5700X, 110 GB RAM), the
-same prompt and the same settings, one change at a time. "Runs" = repeats per arm, with a second run of the old
-build as the noise control.
+Engine speed-ups, newest first, each measured before/after on the same box (normally RTX 4090, Ryzen 7 5700X,
+110 GB RAM; other hardware is marked), the same prompt and settings, one change at a time. "Runs" = repeats per arm,
+with a second run of the old build as the noise control.
 
 | Date | Change | Model | Test | Before | After | Control (old build again) | Quality |
 | --- | --- | --- | --- | ---: | ---: | ---: | --- |
 | 11 Nov | Prompt ingest of the MTP draft block writes its K/V rows only (default on; `STRATA_DENSE_MTP_KV_ONLY=0` = old) | Qwen3.8-27B IQ3_S + MTP 3, k8v4 | synthetic 2K / 30K prompt, same binary, switch off / on, 2 rounds interleaved | read-in 1,646 / 1,067 tok/s | **read-in 1,972 / 1,394 tok/s (+19 / +29 %)** | 1,716 / 1,106 | same text and draft cycles (4 greedy answers) |
+| 10 Nov | Reopen uniform cache after explicit-slot release ([record](measurements/ds41-fixed-slots-reopen.json)) | DeepSeek-V4.1-Flash-1017, uniform Q3_K experts | RTX 5090 + EPYC 9654; `--slots 780`; ABBA, 2 prompts/group/process; prose 4K + 256 tokens / code 8K + 512 tokens | pooled decode 40.47 / 41.96 tok/s | **48.15 / 53.33 tok/s (+18.98 / +27.10%)** | A2: 40.10 / 41.14 tok/s | Greedy continuations differ; quality parity untested |
 | 8 Nov | CPU i-quant down rows: one decode for all of an expert's tokens (default on) + GLM CPU split 0.3 -> 0.4 | GLM-5.3-Flash Maya 512K | `kq_cpu_bench` 4 / 8 tokens an expert; tool-output turns on a 25K conversation | 4.47 / 8.23 ms an expert; +246 / +1,877 tokens 4.79 / 7.54 s (split 0.3) | **3.02 / 5.61 ms; 4.63 / 7.46 s** | | exact ppl chat 5.305 / code 3.617 (no split 5.516 / 3.624); 1 token unchanged |
 | 8 Nov | Prompt-chunk CPU split (`STRATA_CHUNK_CPU=1`, FRAC 0.3, served configs) | GLM-5.3-Flash Maya 512K | tool-output turns on a 25K conversation (+246 / +642 / +1,877 tokens) | 5.47 / 6.30 / 8.02 s | **4.79 / 5.89 / 7.54 s** | | exact ppl chat 5.516 -> 5.362, code 3.624 -> 3.600 |
 | 8 Nov | Prompt-chunk CPU split (`STRATA_CHUNK_CPU=1`, FRAC 0.5, served Q6 config) | DeepSeek-V4.1-Flash-1017 V4 XQ `--fast`, dense Q6_K | tool-output turns on a 30K conversation (+161 / +514 / +906 / +1,866 tokens) | 4.40 / 6.00 / 7.46 / 10.32 s | **3.83 / 5.47 / 7.01 / 9.80 s** | | short34: NLL 0.4889 -> 0.4924, top-1 87.15 -> 87.29 % |
@@ -107,6 +108,13 @@ build as the noise control.
 | 6 Nov | the same | the same | 8K prompt + 512 tokens, 3 interleaved rounds | decode 25.74 tok/s | **decode 26.45 tok/s (+2.7 %)** | | the same text and expert counts in round 1 |
 | 6 Nov | IQ1_M experts on MMQ for prompts (`STRATA_MMQ_IQ1M`, default on) | Qwen3.8-Flash-Next XQ 45 GB | 16,383-token prompt + 1,024 tokens, 3 runs | prefill 3,239 tok/s | **prefill 3,796 tok/s (+17.2 %)** | 3,281 tok/s (+1.3 %) | closer to Q8_0: prompt KL 0.224 -> 0.184 (20 prompts), top-1 90 % both |
 | 6 Nov | the same, recheck on the public build (default on vs `STRATA_MMQ_IQ1M=0`) | Qwen3.8-Flash-Next XQ 45 GB | the same, 2 runs | prefill 3,430 tok/s | **prefill 3,890 tok/s (+13.4 %)** | | |
+
+The 10 Nov row uses one RTX 5090 (32 GB) + EPYC 9654 and recovers a broken explicit `--slots 780` configuration:
+the control loses its cache; the fix reseeds 780 slots. Before/after pool both A/B processes, with three warmups per
+process excluded. This is not the default RTX 4090/AUTO profile or a Maya speed claim. Prefill falls 3.19 / 3.26%;
+median client first-token latency rises 4880 to 5039 / 7394 to 7674 ms with cache reopening/seeding work.
+Greedy continuations differ; broad quality was not tested. The [per-request record](measurements/ds41-fixed-slots-reopen.json)
+retains output hashes, native route/pass counts, individual rates and process ranges without request/output text.
 
 Decode for the IQ1_M rows: 130.8 / 124.5 / 127.1 tok/s (before / after / control), then 135.9 / 132.9 (before /
 after). The time per verify window was 3-4 % higher with it in both A/Bs, while a rerun of the old build alone moved 3 %:
