@@ -2062,6 +2062,13 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
         return false;
     }
     im_->pool.reset(new cpu::ExpertPool(cfg.threads > 0 ? cfg.threads : 0));
+    if (im_->pool->explicit_cores()) {
+        const auto & cores = im_->pool->worker_cores();
+        const size_t count = std::min(cores.size(), (size_t) im_->pool->workers());
+        const std::vector<int> used(cores.begin(), cores.begin() + count);
+        std::fprintf(stderr, "ds41_moe: %d CPU workers, explicit logical CPUs %s%s\n", im_->pool->workers(),
+                     cpu::format_cpu_list(used).c_str(), count < (size_t) im_->pool->workers() ? ", remaining workers unpinned" : "");
+    }
     im_->jobs.resize((size_t) geom.top_k);
     im_->parts.assign((size_t) geom.top_k * (size_t) geom.n_embd, 0.0f);
     im_->nact.assign(cpu::kNativeActBytes, 0);
