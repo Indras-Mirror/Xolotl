@@ -4,6 +4,7 @@
 
 #include "ds41_engram.hpp"
 #include "ds41_ops.hpp"
+#include "ds41_predict.hpp"
 #include "ds41_sys.hpp"
 
 #include "ggml-alloc.h"
@@ -374,6 +375,7 @@ struct Ds41Dense::Impl {
     std::map<int, ggml_tensor *> logits_out;   // decode head graph output, by nrows
     std::map<int, ggml_tensor *> predict_out;  // predict graph output, by layer
     std::map<std::pair<int, int>, ggml_tensor *> predict_out_n;   // predict_multi output, by (layer, pass width)
+    std::vector<int32_t> predict_readback_scratch;
     std::map<int, ggml_tensor *> fpredict_out; // finish_predict graph output, by the predicted layer
     std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead; // finish_predict_ahead extra outputs
 
@@ -1615,7 +1617,7 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
     ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(il, "exp_probs_b.bias")),
                                 ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1));
-    *out = ggml_argsort_top_k(gc, sc, 16);
+    *out = ds41_prediction_topk(gc, sc);
     ggml_set_output(*out);
     ggml_build_forward_expand(gf, *out);
     return gf;
@@ -2991,7 +2993,7 @@ bool Ds41Dense::predict_multi(int il, int * top_ids) {
     }
     o = im.predict_out_n[{ il, (int) n }];
     if (!im.compute(it->second, true)) return false;
-    ggml_backend_tensor_get(o, top_ids, 0, sizeof(int32_t) * 16 * (size_t) n);
+    ds41_prediction_readback(o, top_ids, im.predict_readback_scratch);
     return true;
 }
 
