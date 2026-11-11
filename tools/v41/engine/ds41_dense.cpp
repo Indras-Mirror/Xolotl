@@ -4,6 +4,7 @@
 
 #include "ds41_engram.hpp"
 #include "ds41_ops.hpp"
+#include "ds41_predict.hpp"
 #include "ds41_sys.hpp"
 
 #include "ggml-alloc.h"
@@ -1615,7 +1616,7 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
     ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(il, "exp_probs_b.bias")),
                                 ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1));
-    *out = ggml_argsort_top_k(gc, sc, 16);
+    *out = ds41_prediction_topk(gc, sc);
     ggml_set_output(*out);
     ggml_build_forward_expand(gf, *out);
     return gf;
