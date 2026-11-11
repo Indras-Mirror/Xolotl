@@ -1,4 +1,4 @@
-// Exercise the production predictor's top-k graph and its flat D2H payload.
+// Exercise the production predictor's strided top-k graph and packed host IDs.
 #include "ds41_predict.hpp"
 
 #include "ggml-alloc.h"
@@ -49,6 +49,8 @@ void check_width(ggml_backend_t backend, int width) {
     ggml_tensor* scores = ggml_new_tensor_2d(resources.context, GGML_TYPE_F32, kExperts, width);
     ggml_set_input(scores);
     ggml_tensor* prediction = strata::v41::ds41_prediction_topk(resources.context, scores);
+    require(prediction->op == GGML_OP_VIEW && prediction->nb[1] == kExperts * sizeof(int32_t),
+            "test requires the original strided top-k view");
     ggml_set_output(prediction);
     ggml_cgraph* graph = ggml_new_graph_custom(resources.context, 16, false);
     ggml_build_forward_expand(graph, prediction);
@@ -59,6 +61,7 @@ void check_width(ggml_backend_t backend, int width) {
     resources.buffer = ggml_backend_alloc_ctx_tensors(resources.context, backend);
     require(resources.buffer != nullptr, "CUDA tensor allocation failed");
 
+    std::vector<int32_t> readback_scratch;
     for (int iteration = 0; iteration < 4; ++iteration) {
         std::vector<float> values((size_t) width * kExperts);
         std::vector<int32_t> expected((size_t) width * kPredictions);
@@ -83,9 +86,9 @@ void check_width(ggml_backend_t backend, int width) {
         ggml_backend_tensor_set(scores, values.data(), 0, values.size() * sizeof(float));
         require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
                 "CUDA predictor graph execution failed");
-        // predict_multi and the queued actor consume this exact flat layout.
+        // Exercise the same readback function as predict_multi.
         std::vector<int32_t> actual((size_t) width * kPredictions, -1);
-        ggml_backend_tensor_get(prediction, actual.data(), 0, actual.size() * sizeof(int32_t));
+        strata::v41::ds41_prediction_readback(prediction, actual.data(), readback_scratch);
         for (size_t index = 0; index < actual.size(); ++index) {
             if (actual[index] != expected[index]) {
                 std::fprintf(stderr,
@@ -95,9 +98,6 @@ void check_width(ggml_backend_t backend, int width) {
                 throw std::runtime_error("flat predictor payload differs from the per-row oracle");
             }
         }
-        require(ggml_is_contiguous(prediction), "prediction payload must be contiguous");
-        require(width == 1 || prediction->nb[1] == kPredictions * sizeof(int32_t),
-                "prediction row stride differs from its flat consumer contract");
     }
     std::printf("PASS CUDA prediction width=%d executions=4\n", width);
 }

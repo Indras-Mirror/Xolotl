@@ -375,6 +375,7 @@ struct Ds41Dense::Impl {
     std::map<int, ggml_tensor *> logits_out;   // decode head graph output, by nrows
     std::map<int, ggml_tensor *> predict_out;  // predict graph output, by layer
     std::map<std::pair<int, int>, ggml_tensor *> predict_out_n;   // predict_multi output, by (layer, pass width)
+    std::vector<int32_t> predict_readback_scratch;
     std::map<int, ggml_tensor *> fpredict_out; // finish_predict graph output, by the predicted layer
     std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead; // finish_predict_ahead extra outputs
 
@@ -2992,7 +2993,7 @@ bool Ds41Dense::predict_multi(int il, int * top_ids) {
     }
     o = im.predict_out_n[{ il, (int) n }];
     if (!im.compute(it->second, true)) return false;
-    ggml_backend_tensor_get(o, top_ids, 0, sizeof(int32_t) * 16 * (size_t) n);
+    ds41_prediction_readback(o, top_ids, im.predict_readback_scratch);
     return true;
 }
 
