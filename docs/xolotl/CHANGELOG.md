@@ -26,6 +26,21 @@ Exactness: four greedy answers through the server (code, prose, a script, a summ
 switch off against on: byte-identical text and the same draft cycles (106 / 124 / 42 / 139 cycles at 3.76 / 2.45 /
 3.10 / 2.86 tokens each), so the draft head saw the same cache. `xolotl-dense --selftest` passes.
 
+### The fused router ops and batched copies (#87) stay opt-in: flat on a 4090 (11 Nov)
+
+Xiaomi2008's #87 (`-DSTRATA_DSV41_ROUTE_OP=ON -DSTRATA_DSV41_COPIES_OP=ON`) measured +2.8 % on an RTX 5090. On this
+RTX 4090 it is inside the noise, so the default build keeps both off. The options stay in the tree for larger cards.
+
+| DeepSeek-V4.1 served Q6 config, 8K prompt, 512 tokens, RTX 4090, 3 rounds interleaved | Off | On |
+| --- | ---: | ---: |
+| decode, tok/s (three rounds) | 27.88 / 25.82 / 27.62 | 26.84 / 27.65 / 27.31 |
+| mean | 27.11 | 27.27 |
+| the one pair that produced the same text (same passes, same tokens): decode wall | 18.33 s | 18.48 s |
+| same pair: ms a pass | 115.27 | 116.22 |
+
+The rounds differ by up to 7 % on their own because the sampled text differs (155 to 188 passes for 512 tokens); the
+same-text pair is the fair one, and it shows no gain.
+
 ### Fixes ported 10-11 Nov (correctness, security, tool calls)
 
 No speed claims here; these stop faults or wrong behaviour. Each has its own tests in the pull request.
