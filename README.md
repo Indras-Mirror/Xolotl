@@ -12,6 +12,10 @@
 
 ## Latest
 
+- **11 Nov** - An NVIDIA L20 (Ada, 92 SMs) now takes row tables measured on itself instead of an RTX 4070/4080's (`891`):
+  15 multi-column cells and two one-column cells it wins with, and a card that stops running 22 splits it loses with. Same
+  text, bit for bit; default on, `STRATA_MMVQ_IL_891=0` turns it off.
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#an-nvidia-l20-gets-row-tables-it-was-measured-on-11-nov).
 - **11 Nov** - Qwen3.8-27B reads prompts 19-29 % faster with its draft head on (30K prompt: 1,067 -> 1,394 tok/s):
   a prompt token now leaves only its K/V rows in the draft block instead of running the whole block. Same text, bit for
   bit; default on. [CHANGELOG](docs/xolotl/CHANGELOG.md#qwen38-27b-reads-prompts-19-29--faster-with-its-draft-head-on-11-nov).

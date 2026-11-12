@@ -100,6 +100,23 @@ inline bool mmvq_il_89_resolve(const char* env, bool hip, int cc, bool v026 = fa
     return mmvq_il_89_default(hip, cc, v026);
 }
 
+/// STRATA_MMVQ_IL_891 (the same row tables for an Ada card in the 80-99 SM band, which kIlRows_89 says nothing about: its two
+/// source runs were an RTX 4070 with 46 SMs and an RTX 4080 with 48) when the user set nothing: ON off a 026 build, for the cards
+/// `il_is_891_band` - an NVIDIA L20 is 92 SMs, 47.4 GiB, 864 GB/s and answers 891 rather than 89.  Bitwise the same output again:
+/// only the rows-a-warp split differs, and a cell the card itself did not measure stays the plain kernel.
+inline bool mmvq_il_891_default(bool v026 = false) { return !v026; }
+
+/// The compute-capability key an Ada card takes: 891 for the 80-99 SM band (an NVIDIA L20: 92), 89 for everything else the
+/// 4070/4080 table covers, including a 128-SM RTX 4090, which nobody here has run the bench on.
+inline bool il_is_891_band(int sms) { return sms >= 80 && sms < 100; }
+
+/// The answer for STRATA_MMVQ_IL_891 given the variable's text (nullptr = unset): "1" and "0" win, anything else is the rule above.
+inline bool mmvq_il_891_resolve(const char* env, bool v026 = false) {
+    if (env != nullptr && env[0] == '1') return true;
+    if (env != nullptr && env[0] == '0') return false;
+    return mmvq_il_891_default(v026);
+}
+
 /// STRATA_GR_UP_WIDE (the hyper-connection up projection, one warp a row; bitwise the old kernel) when the user set nothing: ON for a compute
 /// capability 12.0 card (STRATA_SM120_PERF=0 turns the set off), CUDA builds only.
 inline bool gr_up_wide_default(bool hip, int major, int minor, bool v026 = false) { return !v026 && !hip && sm120_default(major, minor); }
