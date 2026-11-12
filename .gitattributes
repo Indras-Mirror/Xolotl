@@ -28,3 +28,6 @@ docker/compose/* text eol=lf
 
 # vendored KaTeX (serve/web/vendor): the files are hashed byte for byte (PROVENANCE.json), never convert their line endings.
 serve/web/vendor/** -text
+
+# patches are applied byte for byte by git apply (fetch-llama.sh, CMake's reverse check): never convert their line endings (#134)
+*.patch -text

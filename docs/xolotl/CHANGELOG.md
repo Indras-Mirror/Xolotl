@@ -8,6 +8,14 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### The ggml patch applies again on a Windows checkout (12 Nov)
+
+`tools/xolotl/ggml/xolotl-ggml.patch` stopped applying on Windows with `core.autocrlf=true` after #133: the `top-k.cu` part has
+11 empty context lines, and a CRLF copy of a bare empty line is no longer a valid context line (`corrupt patch at line 1857`).
+`.gitattributes` now keeps every `*.patch` byte for byte (`-text`), and those 11 lines carry their leading space. On Linux the
+patch applies at 6050b467, passes the reverse check CMake runs, and gives the upstream `top-k.cu` blob 19cb45d1. A plain pull
+fixes an existing Windows clone: the patch file itself changed, so git writes it out again under the new rule. Reported, diagnosed and worked around by trojy13 (#134).
+
 ### An NVIDIA L20 gets row tables it was measured on (11 Nov)
 
 An L20 is compute capability 8.9, so it ran `kIlRows_89` / `kIl1Rows_89` - tables read off an RTX 4070 (46 SMs) and an RTX
