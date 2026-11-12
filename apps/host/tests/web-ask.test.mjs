@@ -157,6 +157,7 @@ test('the profile names the search service in the gate\'s question, and carries 
   const base = { off: new Set(), search: { provider: 'builtin', key: '' }, servers: {}, webWithoutAsking: false };
   assert.deepEqual(gateOf(base), { provider: 'DuckDuckGo, or Bing when DuckDuckGo is busy', skipAsk: false });
   assert.deepEqual(gateOf({ ...base, search: { provider: 'exa', key: 'k' }, webWithoutAsking: true }), { provider: 'Exa', skipAsk: true });
+  assert.equal(gateOf({ ...base, search: { provider: 'keirolabs', key: 'k' } }).provider, 'Keirolabs');
   assert.equal(gateOf({ ...base, search: { provider: 'perplexity', key: '' } }).provider, 'DuckDuckGo, or Bing when DuckDuckGo is busy', 'a service without its key is not used, so it is not named');
 });
 

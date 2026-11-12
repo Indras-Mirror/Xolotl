@@ -123,7 +123,7 @@ export class SearchUnavailable extends Error {
 }
 
 /** The one plain sentence for the person. The words "Settings → Tools → Web search" are where the key goes in the app. */
-export const LIMITED_SENTENCE = 'Web search is limited right now. Try again in a minute, or add a search key (Exa, Perplexity or DeepSeek) in Settings → Tools → Web search.';
+export const LIMITED_SENTENCE = 'Web search is limited right now. Try again in a minute, or add a search key (Exa, Perplexity, DeepSeek or Keirolabs) in Settings → Tools → Web search.';
 /** What the tool answers: the sentence, then what the model should do (it must not keep searching). */
 export const BLOCKED_MESSAGE = `${LIMITED_SENTENCE} Do not retry this search: go on with what you know and tell the person, in one plain sentence, that web search was limited.`;
 export const UNREACHABLE_MESSAGE = 'The search could not reach the internet. Check the connection and try again. Do not retry this search now: go on with what you know and say that search was unavailable.';

@@ -92,7 +92,7 @@ test('every source refuses: one plain sentence with the place to add a key; late
   assert.equal(error.code, 'WEB_RATE_LIMITED');
   assert.equal(error.message, BLOCKED_MESSAGE);
   assert.ok(error.message.startsWith(LIMITED_SENTENCE));
-  assert.match(LIMITED_SENTENCE, /^Web search is limited right now\. Try again in a minute, or add a search key \(Exa, Perplexity or DeepSeek\) in Settings → Tools → Web search\.$/);
+  assert.match(LIMITED_SENTENCE, /^Web search is limited right now\. Try again in a minute, or add a search key \(Exa, Perplexity, DeepSeek or Keirolabs\) in Settings → Tools → Web search\.$/);
   assert.match(error.message, /Do not retry this search/, 'the model is told to stop');
   const used = w.calls.length;
   assert.equal(used, 2, 'one request per source, nothing more');

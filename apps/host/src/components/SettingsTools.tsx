@@ -34,7 +34,7 @@ export interface CustomTool {
 }
 export interface ToolsState {
   groups: ToolGroup[];
-  search: { provider: 'builtin' | 'exa' | 'perplexity' | 'deepseek'; keySet: boolean };
+  search: { provider: 'builtin' | 'exa' | 'perplexity' | 'deepseek' | 'keirolabs'; keySet: boolean };
   /** Skip the once-per-chat question before the first web search or page in Manual mode. Off unless the person turned it on. */
   webWithoutAsking: boolean;
   browser: { enabled: boolean; found: boolean; name: string | null; missing?: 'component' };
@@ -51,6 +51,7 @@ const SEARCH_CHOICES = [
   { value: 'exa', label: 'Exa (your own key)' },
   { value: 'perplexity', label: 'Perplexity (your own key)' },
   { value: 'deepseek', label: 'DeepSeek (your own key)' },
+  { value: 'keirolabs', label: 'Keirolabs (your own key)' },
 ];
 const KIND_CHOICES = [
   { value: 'instructions', label: 'Follow my instructions' },
