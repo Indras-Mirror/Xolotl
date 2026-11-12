@@ -3,6 +3,12 @@
 #   build-ds4-cuda: ds4_generate      (dense on the CUDA backend, the full expert tier)
 #   build-ds4     : ds4_generate_cpu  (CPU backend + the CPU-only tier; for the mini model and machines w/o a GPU)
 set(_ds4_engine_inc ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4)
+# The original DeepSeek-V4-Flash (pre-4.1) engine: superseded by ds41_generate (tools/v41/engine) and OFF by default.
+# Only these executables are gated - ds4_dense / ds4_moe_cuda / ds4_moe_cpu still build, glm_generate links them.
+option(STRATA_BUILD_DS4_GENERATE "Build the pre-4.1 DeepSeek-V4 engine executables (ds4_generate, ds4_mtp_bench)" OFF)
+if(NOT STRATA_BUILD_DS4_GENERATE)
+  return()
+endif()
 if(TARGET ds4_dense AND TARGET ds4_moe_cuda)
   add_executable(ds4_generate ${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/ds4_generate.cpp)
   target_include_directories(ds4_generate PRIVATE ${_ds4_engine_inc})
