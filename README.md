@@ -12,6 +12,9 @@
 
 ## Latest
 
+- **13 Nov** - Keirolabs joins Exa, Perplexity and DeepSeek as a keyed web search choice in Settings > Tools (your own
+  key; nothing changes without one). By Manasbh (#136).
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#keirolabs-as-a-keyed-web-search-service-13-nov).
 - **11 Nov** - An NVIDIA L20 (Ada, 92 SMs) now takes row tables measured on itself instead of an RTX 4070/4080's (`891`):
   15 multi-column cells and two one-column cells it wins with, and a card that stops running 22 splits it loses with. Same
   text, bit for bit; default on, `STRATA_MMVQ_IL_891=0` turns it off.

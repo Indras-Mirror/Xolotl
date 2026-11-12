@@ -8,6 +8,14 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Keirolabs as a keyed web search service (13 Nov)
+
+Settings > Tools > Web search has a fourth keyed choice, Keirolabs (your own key), beside Exa, Perplexity and DeepSeek. With
+its key saved, the agent's searches go to Keirolabs' lite search (`createKeirolabsSearch` in `apps/host/server/web-search-keyed.mjs`,
+the same shape as Exa's: titles, links and snippets); the key reaches the agent only as `STRATA_SEARCH_KEY`, as before. Without a
+key nothing changes, and the rate-limit sentence still names only Exa, Perplexity and DeepSeek. Contributed by Manasbh (#136),
+who works at Keirolabs and said so in the PR.
+
 ### The ggml patch applies again on a Windows checkout (12 Nov)
 
 `tools/xolotl/ggml/xolotl-ggml.patch` stopped applying on Windows with `core.autocrlf=true` after #133: the `top-k.cu` part has
