@@ -55,7 +55,7 @@ export const modeOf = value => (Object.hasOwn(MODE_PRESETS, value) ? value : DEF
 
 /** The approval gate plugin (plain ESM, loaded by absolute path). */
 export const GATE_PLUGIN = fileURLToPath(new URL('./plugins/strata-gate.mjs', import.meta.url));
-/** The app's web search (DuckDuckGo, or the person's own Exa / Perplexity key), registered with the Harness's web seam. */
+/** The app's web search (DuckDuckGo, or the person's own Exa / Perplexity / Keirolabs key), registered with the Harness's web seam. */
 /** Compaction that measures the real prompt and summarises in pieces that fit the window (plugins/strata-context.mjs). */
 export const CONTEXT_PLUGIN = fileURLToPath(new URL('./plugins/strata-context.mjs', import.meta.url));
 export const MODELS_PLUGIN = fileURLToPath(new URL('./plugins/strata-models.mjs', import.meta.url));
@@ -64,7 +64,7 @@ export const SEARCH_PLUGIN = fileURLToPath(new URL('./plugins/strata-search.mjs'
 export const CUSTOM_TOOLS_SCRIPT = fileURLToPath(new URL('./custom-tools-mcp.mjs', import.meta.url));
 
 /** The search service as the person knows it, for the question that comes before the first web search in a chat. */
-const SEARCH_NAMES = Object.freeze({ builtin: 'DuckDuckGo, or Bing when DuckDuckGo is busy', exa: 'Exa', perplexity: 'Perplexity', deepseek: 'DeepSeek' });
+const SEARCH_NAMES = Object.freeze({ builtin: 'DuckDuckGo, or Bing when DuckDuckGo is busy', exa: 'Exa', perplexity: 'Perplexity', deepseek: 'DeepSeek', keirolabs: 'Keirolabs' });
 
 /** What Settings -> Tools says when nothing was chosen. */
 const NO_TOOLS_SETTINGS = Object.freeze({ off: new Set(), search: { provider: 'builtin', key: '' }, webWithoutAsking: false, browserEnabled: false, browserPath: null, browserCli: null, servers: {}, hasInstructionTools: false, hasCommandTools: false, toolFile: null });
@@ -303,7 +303,7 @@ export function buildProfile({ local = [], connections = [], gate = true, tools 
   const ownRows = [...own('instructions', tools.hasInstructionTools), ...own('commands', tools.hasCommandTools), ...browserRows];
   // Web search: DuckDuckGo with no key unless the person chose a keyed service AND saved its key (then that one; never a half-set-up one).
   const searchOn = !tools.off.has('search');
-  const keyed = ['exa', 'perplexity', 'deepseek'].includes(tools.search.provider) && tools.search.key ? tools.search.provider : null;
+  const keyed = ['exa', 'perplexity', 'deepseek', 'keirolabs'].includes(tools.search.provider) && tools.search.key ? tools.search.provider : null;
   if (searchOn && keyed) env.STRATA_SEARCH_KEY = tools.search.key;
   const webRows = !searchOn ? [] : keyed === 'deepseek'
     ? [{ id: 'web', config: { searchProvider: 'deepseek-official', fetchProvider: 'http' } }, { id: 'web-search-deepseek', config: { apiKeyEnv: 'STRATA_SEARCH_KEY' } }]

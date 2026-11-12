@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { GROUP_IDS, TOOL_GROUPS } from './tools-catalog.mjs';
 import { SHELLS, clampTimeoutSec } from './custom-command-run.mjs';
 
-export const SEARCH_PROVIDERS = ['builtin', 'exa', 'perplexity', 'deepseek'];
+export const SEARCH_PROVIDERS = ['builtin', 'exa', 'perplexity', 'deepseek', 'keirolabs'];
 const KINDS = ['instructions', 'command', 'server'];
 const NAME = /^[A-Za-z][A-Za-z0-9 _-]{0,39}$/;
 const MAX_CUSTOM = 40;

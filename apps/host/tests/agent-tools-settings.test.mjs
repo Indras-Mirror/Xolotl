@@ -21,7 +21,7 @@ import { createAgentTools } from '../server/agent/tools-settings.mjs';
 import { findBrowser, browserCandidates, findPlaywrightMcp } from '../server/agent/browser-probe.mjs';
 import { manualDecision, planDecision } from '../server/agent/plugins/strata-gate.mjs';
 import { createDuckDuckGoSearch, looksBlocked, parseHtmlResults, parseLiteResults, realUrl, BLOCKED_MESSAGE } from '../server/web-search-ddg.mjs';
-import { createExaSearch, createPerplexitySearch } from '../server/web-search-keyed.mjs';
+import { createExaSearch, createKeirolabsSearch, createPerplexitySearch } from '../server/web-search-keyed.mjs';
 
 const HARNESS = process.env.STRATA_HARNESS_DIR;
 const skip = !HARNESS || !resolveHarness({ env: process.env }).ok ? 'STRATA_HARNESS_DIR is not set to a built Harness' : false;
@@ -116,6 +116,10 @@ test('profile: a keyed service is used only with its key saved; the key travels 
   const ds = buildProfile({ local: [], connections: [], tools: view('deepseek', 'ds-secret') });
   assert.deepEqual(entriesOf(ds).find(x => x.id === 'web-search-deepseek').config, { apiKeyEnv: 'STRATA_SEARCH_KEY' });
   assert.equal(entriesOf(ds).find(x => x.id === 'web').config.searchProvider, 'deepseek-official');
+  const keiro = buildProfile({ local: [], connections: [], tools: view('keirolabs', 'keiro-secret') });
+  assert.equal(entriesOf(keiro).find(x => x.id === 'web').config.searchProvider, 'keirolabs');
+  assert.equal(entriesOf(keiro).flatMap(x => x.insert ?? []).find(x => x.id === 'strata-web-search').config.provider, 'keirolabs');
+  assert.equal(keiro.env.STRATA_SEARCH_KEY, 'keiro-secret'); assert.ok(!keiro.patch.includes('keiro-secret'));
   assert.notEqual(noKey.signature, exa.signature, 'a changed choice restarts the agent');
 });
 
@@ -226,6 +230,32 @@ test('search: Exa and Perplexity use the person\'s key, map their answers, and s
     assert.equal(createExaSearch({ key: () => '' }).available(), false);
     globalThis.fetch = async () => new Response('{}', { status: 401 });
     await assert.rejects(createExaSearch({ key: 'the-key' }).search({ query: 'q' }), /did not accept the key/);
+  } finally { globalThis.fetch = real; }
+});
+
+test('search: Keirolabs posts the query to its lite search with the person\'s key and maps the results', async () => {
+  const real = globalThis.fetch;
+  try {
+    const sent = [];
+    globalThis.fetch = async (url, init) => {
+      sent.push({ url: String(url), init });
+      return new Response(JSON.stringify({ results: [
+        { position: 1, title: 'K', url: 'https://k.example', snippet: 's', publishedDate: '2026-11-01' },
+        { position: 2, title: null, url: 'https://bare.example', snippet: null, publishedDate: '' },
+        { position: 3, title: 'No link', url: '', snippet: 'dropped' },
+      ], count: 3 }));
+    };
+    const k = await createKeirolabsSearch({ key: () => 'the-key' }).search({ query: 'q', maxResults: 5 });
+    assert.deepEqual(k, { sources: [{ url: 'https://k.example', title: 'K', snippet: 's', publishedAt: '2026-11-01' }, { url: 'https://bare.example' }], truncated: false });
+    assert.equal(sent[0].url, 'https://api.keirolabs.cloud/api/v2/search/lite');
+    assert.equal(sent[0].init.method, 'POST');
+    assert.equal(sent[0].init.headers.authorization, 'Bearer the-key');
+    assert.deepEqual(JSON.parse(sent[0].init.body), { query: 'q', maxResults: 5 });
+    await createKeirolabsSearch({ key: 'the-key' }).search({ query: 'q' });
+    assert.deepEqual(JSON.parse(sent[1].init.body), { query: 'q' }, 'no count asked: the service default');
+    assert.equal(createKeirolabsSearch({ key: () => '' }).available(), false);
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: 'Invalid API key' }), { status: 401 });
+    await assert.rejects(createKeirolabsSearch({ key: 'the-key' }).search({ query: 'q' }), /Keirolabs did not accept the key/);
   } finally { globalThis.fetch = real; }
 });
 
