@@ -465,7 +465,10 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     // native branch uses the pinned CUDA FP32 activation contract.
     // `<<<1, 256>>>`: one block, because the output is ONE scalar and a second block would only add a global
     // round trip.  256 threads is the reduction's width, not the problem's size.
-    if (use_native) {
+    // A null gate is the dense FFN (Route B): no scalar, so nothing is multiplied and `out` is the FFN result.
+    if (gate_inp_bf16 == nullptr) {
+        // nothing to do
+    } else if (use_native) {
         bf16_gemv_fp32_mmvf(x_f32, gate_inp_bf16, g, n_embd, 1, stream);
         launch_sigmoid_scale_rows(out, g, (int) n_embd, 1, (cudaStream_t) stream);
     } else {

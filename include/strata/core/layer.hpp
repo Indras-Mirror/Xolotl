@@ -191,6 +191,17 @@ bool moe_shared(const WeightTable& tables, const ModelGeometry& g, int64_t layer
 bool moe_combine_parts(const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b, const float* parts,
                        float* out, void* stream, std::string& err);
 
+/// Route B: the DENSE FFN, for a geometry with no routed experts (`n_expert == 0`).
+///
+///     out = ffn_down( silu(ffn_gate(x)) * ffn_up(x) )
+///
+/// `blk.N.ffn_gate/up/down.weight`, through the same projections and activation contract as the shared expert -
+/// `shared_expert` with a null scalar gate, so there is no per-token gate and no routed/shared combination.  The
+/// caller writes the result into the block output that `gr_write` folds into the residual.  It reads only `x` and
+/// uses the MoE block's workspace (`x_q8_0`/`x_q8k`/`x_bf16`/`sh_scratch`), so no new buffers are needed.
+bool dense_ffn(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const MoEBuffers& b,
+               const float* x, float* out, void* stream, std::string& err);
+
 /// Plan v0.3 P3 (default ON): the shared expert runs at the END OF `pre[l]`, after the doorbell has rung, so
 /// the GPU computes it while the host runs the CPU pool; `post[l]` then only combines.  Same kernels on the
 /// same inputs in the same stream order relative to their consumers, so the result is bitwise unchanged.

@@ -513,6 +513,57 @@ if (w_ginp->kind != WeightKind::Bf16InF32) {        err = v.name("ffn_gate_inp_s
     }
     return true;
 }
+// ---- Route B: the dense FFN, beside the MoE block.
+//
+//     out = ffn_down( silu(ffn_gate(x)) * ffn_up(x) )
+//
+// The same three projections, in the same formats and with the same activation contract as the shared expert:
+// `shared_expert` with a NULL scalar gate IS this FFN (`shared_expert.hpp`), so the arithmetic is the one already
+// pinned for the shared expert rather than a second SwiGLU implementation.  Called when the geometry has no routed
+// experts (`n_expert == 0`) from `block_layer_post` in place of the route/combine split.
+bool dense_ffn(const WeightTable& tables, const ModelGeometry& g, int64_t layer, const MoEBuffers& b,
+               const float* x, float* out, void* stream, std::string& err) {
+    using namespace strata::kernels;
+    const LayerView v(tables, layer);
+    const WeightRef* w_gate = v.get("ffn_gate.weight");
+    const WeightRef* w_up = v.get("ffn_up.weight");
+    const WeightRef* w_down = v.get("ffn_down.weight");
+    const char* missing = !w_gate ? "ffn_gate.weight" : !w_up ? "ffn_up.weight" : !w_down ? "ffn_down.weight" : nullptr;
+    if (missing) { err = v.name(missing) + " is missing"; return false; }
+    SForm f_gate, f_up, f_down;
+    if (!sform_of(*w_gate, f_gate, v.name("ffn_gate.weight"), err)) return false;
+    if (!sform_of(*w_up, f_up, v.name("ffn_up.weight"), err)) return false;
+    if (!sform_of(*w_down, f_down, v.name("ffn_down.weight"), err)) return false;
+    Planes p_gate, p_up, p_down;
+    if (!plane_ptrs(*w_gate, v.name("ffn_gate.weight"), p_gate, err)) return false;
+    if (!plane_ptrs(*w_up, v.name("ffn_up.weight"), p_up, err)) return false;
+    if (!plane_ptrs(*w_down, v.name("ffn_down.weight"), p_down, err)) return false;
+    // BOTH quantized images of the activation, for the same reason `moe_shared` makes them: which one a projection
+    // takes is a property of its own tensor (`SForm::act_kind`), and a pack may mix the families per tensor.
+    if (!w_gate->native_data || !w_up->native_data) {
+        f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
+        quantize_q8_K(x, b.x_q8k, g.n_embd, stream);
+        quantize_q8_0(x, b.x_q8_0, g.n_embd, stream);
+    } else {
+        f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
+    }
+    NativeSharedWeights native;
+    native.gate_type = w_gate->native_type; native.gate_data = w_gate->native_data;
+    native.up_type = w_up->native_type; native.up_data = w_up->native_data;
+    native.down_type = w_down->native_type; native.down_data = w_down->native_data;
+    native.q8_1 = w_gate->native_q8_1 ? w_gate->native_q8_1 :
+                  w_up->native_q8_1 ? w_up->native_q8_1 : w_down->native_q8_1;
+    try {
+        shared_expert(b.x_q8_0, b.x_q8k, b.x_bf16, f_gate, p_gate.codes, p_gate.scales, p_gate.offset,
+                      f_up, p_up.codes, p_up.scales, p_up.offset, f_down, p_down.codes, p_down.scales,
+                      p_down.offset, /*gate_inp=*/nullptr, b.sh_scratch, out,
+                      g.n_embd, g.n_ff, /*tpr=*/32, stream, x, &native);
+    } catch (const std::exception& error) {
+        err = v.name("dense_ffn") + ": " + error.what();
+        return false;
+    }
+    return true;
+}
 bool moe_combine_parts(const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b, const float* parts,
                        float* out, void* stream, std::string& err) {
     using namespace strata::kernels;
@@ -557,6 +608,8 @@ bool layer_fused_gr() { return g_fused_gr; }
 void layer_set_shared_early(bool enabled) { g_shared_early = enabled; }
 bool layer_shared_early() { return g_shared_early; }
 bool moe_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,               const float* x, const float* parts, float* out, void* stream, std::string& err,               const Doorbell* db) {
+// Route B: no routed experts means no router, no host pool and no combine - the dense FFN is the whole block.
+if (!g.has_experts()) return dense_ffn(tables, g, layer, b, x, out, stream, err);
 // The two halves in sequence.  `moe_route` publishes `ids`/`weights` for THIS layer and `moe_finish`
 // combines `parts` with them, so a caller of this wrapper must have `parts` ready BEFORE the call - which
 // is what `session_token` (the uncaptured path) does and what the captured loop CANNOT, which is why the
@@ -1566,9 +1619,18 @@ st_begin(layer, 3, stream);
     }
     st_end(layer, 3, stream);        }
     if (run4) {
-    st_begin(layer, 4, stream);    {        const bool ok = moe_route(tables, g, layer, k, mb, bb.mixed, stream, err, db);        st_end(layer, 4, stream);        if (!ok) return false;    }
-    // Plan v0.3 P3: after the ring, so the GPU computes the shared expert while the host runs the pool.
-    if (g_shared_early && !moe_shared(tables, g, layer, mb, bb.mixed, stream, err)) return false;
+    st_begin(layer, 4, stream);
+    if (g.has_experts()) {
+        const bool ok = moe_route(tables, g, layer, k, mb, bb.mixed, stream, err, db);
+        st_end(layer, 4, stream);
+        if (!ok) return false;
+        // Plan v0.3 P3: after the ring, so the GPU computes the shared expert while the host runs the pool.
+        if (g_shared_early && !moe_shared(tables, g, layer, mb, bb.mixed, stream, err)) return false;
+    } else {
+        // Route B: a dense FFN has no router and no host expert pool, so nothing is published here.  The FFN runs
+        // in block_layer_post, where the MoE's combine runs - the same position in the stream.
+        st_end(layer, 4, stream);
+    }
     }
     // Every stage this call was asked to run has run.  There is no other way out: the old `return ok;`
     // lived inside the stage-4 block and restructuring that left the function with no return at all.
@@ -1607,8 +1669,11 @@ bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t
 // `bb.mixed` and `bb.inject` are what `block_layer_pre` left, and NOTHING between the two calls may touch
 // them - that is what makes `post[l]` safe to launch after the host has run the pool.
 st_begin(layer, 5, stream);
-    if (g_shared_early ? !moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)
-                       : !moe_finish(tables, g, layer, k, mb, bb.mixed, parts, bb.block_out, stream, err)) return false;
+    if (!g.has_experts()) {
+        if (!dense_ffn(tables, g, layer, mb, bb.mixed, bb.block_out, stream, err)) return false;
+    } else if (g_shared_early ? !moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)
+                              : !moe_finish(tables, g, layer, k, mb, bb.mixed, parts, bb.block_out, stream, err))
+        return false;
     st_end(layer, 5, stream);    dump_half(bb, g, layer, bb.block_out, (uint64_t) g.n_embd, g.n_embd, stream);    dump_half(bb, g, layer, bb.inject, (uint64_t) 2 * g.n_embd + g.hc, g.hc, stream);    st_begin(layer, 6, stream);
     const bool steer = strata::kernels::cvec().covers(layer);   // --control-vector-scaled: after this write
     try {

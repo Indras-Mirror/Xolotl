@@ -158,9 +158,12 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     // fallback.
     if (name == "blk.1.ple_key.weight")
         return include_ple_key && (tensor.type == 42 || tensor.type == 18 || tensor.type == 23 || tensor.type == 8);
+    // The last three are Route B's dense FFN.  They are new names, so a Flash-Next pack (which has
+    // ffn_gate_shexp/ffn_gate_exps and no bare ffn_gate.weight) matches none of them and is uploaded as before.
     static const char* suffixes[] = {".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight",
         ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
-        ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
+        ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight",
+        ".ffn_gate.weight", ".ffn_up.weight", ".ffn_down.weight"};
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }

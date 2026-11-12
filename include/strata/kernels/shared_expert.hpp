@@ -48,6 +48,10 @@ struct NativeSharedWeights {
 /// test that only checks the output, and the capture test found it in one run.
 uint64_t shared_expert_scratch_bytes(int64_t n_ff);
 
+/// `gate_inp_bf16 == nullptr` computes the UNGATED SwiGLU FFN: the same three projections with no per-token scalar
+/// multiply.  That is Route B's dense FFN (the strata path's `dense_ffn`); every other argument and the arithmetic of
+/// the three projections are unchanged.
+///
 /// `x_q8_0` and `x_q8k` are the TWO QUANTIZED IMAGES of the same activation, and which one a projection uses is
 /// decided per weight by its `SForm::act_kind`.  There is no fp16 activation here any more.
 ///

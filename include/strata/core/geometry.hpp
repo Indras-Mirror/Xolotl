@@ -61,6 +61,9 @@ struct ModelGeometry {
 
     constexpr bool has_indexer() const { return idx_q_heads > 0; }              ///< false: dense attention only
     constexpr bool has_hyper_connections() const { return hc > 0; }             ///< false: plain pre-norm residual
+    /// False: a dense FFN in place of the MoE block (Route B).  The file carries no expert_count (or a zero one) and
+    /// reads its FFN width from `feed_forward_length`; `n_ff_shexp` is 0 because there is no shared expert.
+    constexpr bool has_experts() const { return n_expert > 0; }
     constexpr int64_t hc_dim() const { return hc * n_embd; }
     /// `layer % qsa_interval == qsa_interval - 1` is full attention.  Derived, not a second list.
     constexpr int64_t n_qsa_layers() const { return n_layers / qsa_interval; }

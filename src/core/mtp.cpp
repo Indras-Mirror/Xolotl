@@ -274,6 +274,15 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
     g_ = &g;
     ss_ = &ss;
+    // Route B: the trunk has a dense FFN (n_expert == 0), but THIS drafter is the MoE block - rt_dir from
+    // tools/mtp_rt.py carries 512 routed experts, a router and a shared expert, and record_rest runs them.  A dense
+    // MTP layer (Qwen4-27B's own HC/QSA/dense-FFN block) has no packer and no forward here; refuse by name at load
+    // rather than failing later on a missing mlp.shared_expert.gate_proj.weight.
+    if (!g.has_experts()) {
+        err = "mtp: the draft layer is the MoE block (router + routed experts + shared expert); a dense Qwen4 MTP "
+              "layer has no runtime pack or forward here yet. Run without --mtp, or let --dflash2 speculate.";
+        return false;
+    }
     if (ple_ss_ == nullptr) ple_ss_ = &ss;
     max_t_ = max_t;
     rt_dir_ = rt_dir;
