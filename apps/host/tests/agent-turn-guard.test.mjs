@@ -15,7 +15,7 @@ const HARNESS = process.env.STRATA_HARNESS_DIR;
 const skip = !HARNESS || !resolveHarness({ env: process.env }).ok ? 'STRATA_HARNESS_DIR is not set to a built Harness' : false;
 
 const search = (id, state, result = '') => ({ id, name: 'web_search', state, result });
-const LIMITED = 'Web search is limited right now. Try again in a minute, or add a search key (Exa, Perplexity, DeepSeek or Keirolabs) in Settings → Tools → Web search. Do not retry this search';
+const LIMITED = 'Web search is limited right now. Try again in a minute, or add a search key (Exa, Perplexity or DeepSeek) in Settings → Tools → Web search. Do not retry this search';
 
 test('three failed searches in a row stop the turn; a search that worked starts the count again', () => {
   const g = new TurnGuard({ plan: true, contextMax: 32768 });
