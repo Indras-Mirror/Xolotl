@@ -115,44 +115,49 @@ inline std::string compiled_geometry_mismatch(const ModelGeometry& g) {
     if (g.family != c.family)
         return std::string("the model is ") + strata::model_family_title(g.family) + ", this engine's kernels are built "
                "for " + strata::model_family_title(c.family);
+    // One field is run-time-sized rather than an instantiation's: a DENSE file's FFN width.  The dense path reads it as
+    // a GEMV argument (S4); only the routed/shared expert kernels have an FF contract, and a dense file has neither.
+    // It is normalised out here rather than listed as a mismatch.
+    //
+    // The HC bottleneck rank is NOT relaxed here even though the generic HC kernels take it at run time: the prompt
+    // path is a hand-written N=2560 / HC=4 / LR=320 fast path whose init refuses another geometry fatally
+    // (`src/prefill/prefill.cpp:1586`, called at `generate.cpp:18259`).  Admitting a 640-rank file here would move a
+    // clear load-time message into that failure.  See docs/qwen4/NINFER_PORT_GAPS.md §1/§6.
+    ModelGeometry cmp = g;
+    if (!cmp.has_experts()) { cmp.n_ff = c.n_ff; cmp.n_ff_shexp = c.n_ff_shexp; }
     struct F {
         const char* what;
         int64_t got, want;
     };
     const F fields[] = {
-        {"embedding_length", g.n_embd, c.n_embd},
-        {"the layer count", g.n_layers, c.n_layers},
-        {"full_attention_interval", g.qsa_interval, c.qsa_interval},
-        {"ssm.state_size", g.ssm_state_size, c.ssm_state_size},
-        {"ssm.group_count", g.ssm_k_heads, c.ssm_k_heads},
-        {"ssm.time_step_rank", g.ssm_v_heads, c.ssm_v_heads},
-        {"ssm.conv_kernel", g.ssm_d_conv, c.ssm_d_conv},
-        {"the GDN conv channels", g.ssm_conv_channels, c.ssm_conv_channels},
-        {"ssm.inner_size", g.ssm_value_dim, c.ssm_value_dim},
-        {"attention.head_count", g.n_head, c.n_head},
-        {"attention.head_count_kv", g.n_head_kv, c.n_head_kv},
-        {"attention.key_length", g.head_dim, c.head_dim},
-        {"attention.indexer.head_count", g.idx_q_heads, c.idx_q_heads},
-        {"attention.indexer.key_length", g.idx_key_dim, c.idx_key_dim},
-        {"hyper_connection.count", g.hc, c.hc},
-        {"hyper_connection.low_rank", g.hc_lr, c.hc_lr},
-        {"expert_feed_forward_length", g.n_ff, c.n_ff},
-        {"expert_shared_feed_forward_length", g.n_ff_shexp, c.n_ff_shexp},
+        {"embedding_length", cmp.n_embd, c.n_embd},
+        {"the layer count", cmp.n_layers, c.n_layers},
+        {"full_attention_interval", cmp.qsa_interval, c.qsa_interval},
+        {"ssm.state_size", cmp.ssm_state_size, c.ssm_state_size},
+        {"ssm.group_count", cmp.ssm_k_heads, c.ssm_k_heads},
+        {"ssm.time_step_rank", cmp.ssm_v_heads, c.ssm_v_heads},
+        {"ssm.conv_kernel", cmp.ssm_d_conv, c.ssm_d_conv},
+        {"the GDN conv channels", cmp.ssm_conv_channels, c.ssm_conv_channels},
+        {"ssm.inner_size", cmp.ssm_value_dim, c.ssm_value_dim},
+        {"attention.head_count", cmp.n_head, c.n_head},
+        {"attention.head_count_kv", cmp.n_head_kv, c.n_head_kv},
+        {"attention.key_length", cmp.head_dim, c.head_dim},
+        {"attention.indexer.head_count", cmp.idx_q_heads, c.idx_q_heads},
+        {"attention.indexer.key_length", cmp.idx_key_dim, c.idx_key_dim},
+        {"hyper_connection.count", cmp.hc, c.hc},
+        {"hyper_connection.low_rank", cmp.hc_lr, c.hc_lr},
+        {"expert_feed_forward_length", cmp.n_ff, c.n_ff},
+        {"expert_shared_feed_forward_length", cmp.n_ff_shexp, c.n_ff_shexp},
         // not the in-file MTP layers: Flash-Next's engine runs the trunk and takes its draft head from --mtp, so a GGUF
         // with llama.cpp's NextN block after the trunk (block_count 49, nextn_predict_layers 1) runs as the plain one
     };
-    constexpr size_t kFields = sizeof fields / sizeof fields[0];
-    for (size_t i = 0; i < kFields; ++i) {
-        // A dense file (n_expert == 0) has no routed expert FF width: the last two entries are those widths.
-        if (!g.has_experts() && i + 2 >= kFields) continue;
-        const F& f = fields[i];
+    for (const F& f : fields)
         if (f.got != f.want) {
             char buf[256];
             std::snprintf(buf, sizeof buf, "%s is %lld, this engine's kernels are built for %lld", f.what,
                           (long long) f.got, (long long) f.want);
             return buf;
         }
-    }
     return {};
 }
 

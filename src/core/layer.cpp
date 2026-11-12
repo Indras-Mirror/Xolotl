@@ -1,6 +1,7 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/qwen35_attention.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/native_dense.hpp"
@@ -1315,7 +1316,10 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     // KV streaming: every block the selection names is made resident before anything reads it
     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
     if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
-    if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
+    // The decode-attention fast kernel is an explicit 12-queries-per-KV-head instantiation.  A model of another
+    // ratio (or head width) takes the generic gather + attend below; the geometry guard still refuses such a file
+    // on this engine path, so this is the belt to that guard's braces, not a claim that 24/4 runs here.
+    if (g_fast_attn && strata::core::qsa_fast_attn_geometry(g) && !native_flash_attn_short && dump == nullptr) {
         const strata::kernels::QsaAttnPools pools = qsa_attn_pools(st);
         strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
     } else {

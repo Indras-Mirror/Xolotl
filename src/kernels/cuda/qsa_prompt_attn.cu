@@ -28,7 +28,7 @@ namespace {
 
 constexpr int HD = 256;           // head_dim
 constexpr int G = 12;             // query heads per KV head
-static_assert(HD == strata::core::kCompiledGeometry.head_dim && G == strata::core::kCompiledGeometry.n_head / strata::core::kCompiledGeometry.n_head_kv, "qsa_prompt_attn is compiled for core/geometry.hpp");
+static_assert(HD == strata::core::kCompiledGeometry.head_dim && G == strata::core::kQsaFastQueryPerKv, "qsa_prompt_attn is compiled for core/geometry.hpp");
 #ifndef D1_CH
 #define D1_CH 32
 #endif

@@ -56,7 +56,7 @@ namespace {
 constexpr int HD = 256;
 constexpr int G = 12;
 static_assert(HD == strata::core::kCompiledGeometry.head_dim &&
-              G == strata::core::kCompiledGeometry.n_head / strata::core::kCompiledGeometry.n_head_kv,
+              G == strata::core::kQsaFastQueryPerKv,
               "qsa_pattn is compiled for core/geometry.hpp");
 constexpr int CHUNK = 64;
 constexpr int THREADS = 256;

@@ -897,6 +897,8 @@ inline std::string geometry_unsupported(const core::ModelGeometry& g) {
         if (g.*pin.field != c.*pin.field)
             return std::string("qwen4exp.") + pin.key + " = " + std::to_string(g.*pin.field) +
                    ", the kernels are compiled for " + std::to_string(c.*pin.field);
+    // (hyper_connection.low_rank stays pinned here: the prompt path is a hand-written N=2560/HC=4/LR=320 fast path
+    // whose init refuses any other geometry fatally - see docs/qwen4/NINFER_PORT_GAPS.md §1/§6.)
     // a dense FFN's width is a run-time matrix dimension (the GEMVs take it as an argument); a routed expert's is the
     // shared/grouped expert kernel's contract and stays pinned.
     if (g.has_experts() && g.n_ff != c.n_ff)

@@ -79,4 +79,17 @@ inline bool is_qsa_layer(const ModelGeometry& g, int64_t layer) {
     return layer % g.qsa_interval == g.qsa_interval - 1;
 }
 
+/// The query heads per KV head the QSA FAST attention kernels are an explicit instantiation for
+/// (`qsa_decode_attn.cu`, `qsa_prompt_attn.cu`, `qsa_pattn.cu`: each holds one KV head's query rows as a 12-row
+/// group padded to 16).  It is a property of those kernels, not of the generic `kv_gather` + `qsa_attend` path,
+/// which takes `n_head`/`n_head_kv` as arguments.  A model with a different ratio (Qwen4-27B: 24 Q / 4 KV) must
+/// take the generic path; the layer loop checks this.  The prompt kernel already returns false for another ratio
+/// (its caller falls back), while the verify window has no generic fallback and is therefore still gated by the
+/// `attention.head_count_kv` pin in the geometry guard.
+inline constexpr int64_t kQsaFastQueryPerKv = kCompiledGeometry.n_head / kCompiledGeometry.n_head_kv;
+inline bool qsa_fast_attn_geometry(const ModelGeometry& g) {
+    return g.n_head_kv > 0 && g.n_head % g.n_head_kv == 0 && g.head_dim == kCompiledGeometry.head_dim &&
+           g.n_head / g.n_head_kv == kQsaFastQueryPerKv;
+}
+
 }  // namespace strata::core
