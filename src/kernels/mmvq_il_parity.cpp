@@ -422,6 +422,42 @@ int check_tables() {
                                 opt89 ? "the 4070/4080 agreement" : "the shared table", want, type, nc, n_out);
                 }
             }
+    // The 80-99 SM Ada band (an NVIDIA L20: 92 SMs) has its own tables.  Off (STRATA_MMVQ_IL_891=0, or STRATA_DEFAULTS=026)
+    // the card keeps answering 89 and the loop above is what pins that, so both loops here pin the band's own key only.
+    // kL20 is what three mmvq_il_parity --bench --emit-table runs on one agree, in the order 2/3/4 columns then the n_out
+    // classes; 41 of the 72 cells the grid covers did not agree twice and keep the plain kernel (one class, Q4_K under 2048
+    // wide, is not in the grid at all).  kL20_1 is the same runs' one-column arm, where only Q3_K's two widest classes
+    // cleared the 3 % rule twice.
+    if (const bool l20 = strata::mmvq_il_891_resolve(std::getenv("STRATA_MMVQ_IL_891"), strata::qwen_defaults_026())) {
+        const int kL20[5][3][5] = {
+            {{0, 0, 0, 0, 0}, {0, 0, 0, 1, 0}, {0, 0, 1, 0, 1}}, {{0, 0, 1, 2, 2}, {0, 1, 1, 0, 0}, {0, 0, 1, 0, 0}},
+            {{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}}, {{0, 0, 1, 0, 0}, {0, 0, 0, 0, 0}, {0, 1, 1, 0, 0}},
+            {{0, 0, 1, 0, 0}, {0, 4, 0, 0, 0}, {0, 0, 2, 0, 0}}};
+        const int kL20_1[5][5] = {{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0},
+                                  {0, 0, 0, 0, 0}, {0, 0, 0, 1, 1}};
+        for (int type : {23, 12, 13, 14, 11}) {
+            const int ti = type == 23 ? 0 : type == 12 ? 1 : type == 13 ? 2 : type == 14 ? 3 : 4;
+            for (int nc = 2; nc <= 4; ++nc)
+                for (int n_out : {512, 2560, 6144, 10240, 12288, 248320}) {
+                    const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
+                    const int want = kL20[ti][nc - 2][cls];
+                    if (const int got = native_mmvq_il_rows_for(891, type, nc, n_out); got != want) {
+                        ++bad;
+                        std::printf("FAIL table: an Ada card with 80-99 SMs is %d, its own runs say %d at type %d ncols %d "
+                                    "n_out %d\n", got, want, type, nc, n_out);
+                    }
+                }
+            for (int n_out : {512, 640, 2560, 6144, 10240, 12288}) {
+                const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
+                const int want = kL20_1[ti][cls];
+                if (const int got = native_mmvq_il_rows_for(891, type, 1, n_out); got != want) {
+                    ++bad;
+                    std::printf("FAIL table: an Ada card with 80-99 SMs is %d, its own one-column runs say %d at type %d "
+                                "n_out %d\n", got, want, type, n_out);
+                }
+            }
+        }
+    }
     // Volta has its own table (PR 1401): Q6_K at 2 columns, 2560 rows -> 1 row a warp; the Ampere table says 0 there
     if (native_mmvq_il_rows_for(70, 14, 2, 2560) != 1 || native_mmvq_il_rows_for(86, 14, 2, 2560) != 0) {
         ++bad;

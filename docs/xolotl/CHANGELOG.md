@@ -8,6 +8,47 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### An NVIDIA L20 gets row tables it was measured on (11 Nov)
+
+An L20 is compute capability 8.9, so it ran `kIlRows_89` / `kIl1Rows_89` - tables read off an RTX 4070 (46 SMs) and an RTX
+4080 (48). An L20 has 92 SMs and 864 GB/s of GDDR6 on a datacenter part, and nothing in the tree said so. `il_cc()` now
+answers `891` for an Ada card with 80-99 SMs, and that band takes `kIlRows_891` and `kIl1Rows_891`, read off three
+`mmvq_il_parity --bench --emit-table` runs on one. A cell is kept only where the runs agree:
+
+| The three runs on one L20 | cells | kept a split | agreed to stay plain | did not agree twice |
+| --- | ---: | ---: | ---: | ---: |
+| 2-4 columns (what a verify window asks) | 72 | 15 | 16 | 41 |
+| one column (what a decode of one token asks) | 24 | 2 | 8 | 14 |
+
+30 of the multi-column cells differ from `kIlRows_89`: 22 splits the consumer table has and these runs did not confirm, 4
+splits it lacks, 4 where the count itself differs. The one-column band is only Q3_K's two widest classes (2560x10240
+27.4/44.7/44.9 -> 18.6/17.8/18.2 us, 2560x12288 30.1/48.1/48.4 -> 23.2/32.2/21.3 us). `STRATA_MMVQ_IL_891=0` puts the card
+back on `89`; `STRATA_DEFAULTS=026` does the same to everything since 0.2.6.
+
+Exactness: the interleaved kernel is bitwise `native_mmvq`, and `mmvq_il_parity` passes in all four states (default,
+`STRATA_MMVQ_IL_891=0`, `STRATA_DEFAULTS=026`, `STRATA_MMVQ_IL_89=0`). The greedy answers were identical in every arm below -
+the same 256 `T` lines, the same sha256.
+
+| Same binary, on against off, 4,000-token prompt, 256 tokens, 3 rounds (tok/s) | tables on | tables off |
+| --- | ---: | ---: |
+| 27B Q4_K_M, no draft head: prompt read / decode | 1,483.7 / 42.27 | 1,487.9 / 42.29 |
+| 27B Q4LynnStyle + MTP `--draft-max 2`, prompt read / decode | 1,403.2 / 86.61 | 1,406.4 / 86.64 |
+
+Both pairs are inside the noise, and that is the honest reading: a dense decode reads one token at a time and a prompt goes
+through llama.cpp's MMQ kernels, so a 2-4 column cell is only reached by a verify window. What the tables do is stop this
+card from running a split it loses with.
+
+A third pack was tried for the multi-column half and it says the same thing from the other side: `ds41_generate` never looks
+a table up at all. The interleaved kernels' only call site is `src/core/verify.cpp:1507`, which that engine does not
+include, and its dense half links ggml. Six rounds an arm, with the box's other three cards idle, put both settings inside a
+0.1 % prompt-read spread and a decode sign that follows which arm started - and that pack's greedy answer at one offset
+changes with what ran before it, so the switch never gets a reading there at all. Numbers in the card guide.
+
+**The sm_89 switch stack, measured here.** `xolotl-dense` never calls `apply_nv_defaults`, so the nine exact switches of
+`nv_default_env(8, 9)` - +8.1 % decode on an RTX 4090's MoE model - are simply unset on the dense engine. Set by hand on this
+card against leaving them unset: decode 85.95 against 86.65 tok/s (-0.8 %), prompt read 1,405.3 against 1,406.1 (-0.06 %),
+same text. So they stay unset, and nothing changed for them to change. Card guide: [docs/NVIDIA_L20.md](../NVIDIA_L20.md).
+
 ### Qwen3.8-27B reads prompts 19-29 % faster with its draft head on (11 Nov)
 
 With `--mtp`, every prompt token also went through the whole draft block (its attention over its cache, its output

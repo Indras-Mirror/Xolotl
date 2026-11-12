@@ -3684,6 +3684,20 @@ constexpr IlRows kIlRows_89[] = {
     {14, {{0, 0, 0, 0, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, 1, 1}}},   // Q6_K
     {11, {{0, 0, 1, 0, 1}, {0, 1, 1, 1, 1}, {0, 1, 1, 1, 1}}},   // Q3_K
 };
+// Ada in the 80-99 SM band (an NVIDIA L20: 92 SMs, 47.4 GiB, 864 GB/s), read off mmvq_il_parity --bench --emit-table on one
+// (three runs, 2026-11-11).  A cell is kept only where the runs agree: 41 of the 72 cells this grid covers did not pick the
+// same rows count twice, so they keep the plain kernel rather than a split this card never measured twice - the same
+// instability 3453 saw on the 5-8 column table.  15 cells kept a split, 16 agreed to stay plain, and one class (Q4_K under
+// 2048 wide) is not in the grid at all.  30 cells differ from what kIlRows_89 gives this card today: 22 splits the consumer
+// table has and these runs did not confirm, 4 splits it lacks, 4 where the count itself differs.  Bitwise equal to
+// native_mmvq, so the table is only speed.
+constexpr IlRows kIlRows_891[] = {
+    {23, {{0, 0, 0, 0, 0}, {0, 0, 0, 1, 0}, {0, 0, 1, 0, 1}}},   // IQ4_XS
+    {12, {{0, 0, 1, 2, 2}, {0, 1, 1, 0, 0}, {0, 0, 1, 0, 0}}},   // Q4_K
+    {13, {{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}}},   // Q5_K
+    {14, {{0, 0, 1, 0, 0}, {0, 0, 0, 0, 0}, {0, 1, 1, 0, 0}}},   // Q6_K
+    {11, {{0, 0, 1, 0, 0}, {0, 4, 0, 0, 0}, {0, 0, 2, 0, 0}}},   // Q3_K
+};
 // sm_80: read off mmvq_il_parity --bench --emit-table on a CMP 170HX (GA100, 70 SMs, HBM2e 1.5 TB/s), the same 3% rule;
 // bitwise equal to native_mmvq (the tool checks every case).
 constexpr IlRows kIlRows_80[] = {
@@ -3752,6 +3766,13 @@ constexpr Il1Rows kIl1Rows_86[] = {
 constexpr Il1Rows kIl1Rows_89[] = {
     {11, {0, 0, 1, 1, 1}},   // Q3_K
 };
+// The 80-99 SM Ada band, the same three runs as kIlRows_891.  Only Q3_K's two biggest classes clear the 3% rule twice here
+// (2560x10240 27.4/44.7/44.9 -> 18.6/17.8/18.2 us, 2560x12288 30.1/48.1/48.4 -> 23.2/32.2/21.3 us); its 6144x2560 and
+// 2560x6144 cells did not agree run to run, so they stay the plain kernel, and 89's one-column row for class 2 is one of
+// the cells this card loses with rather than wins.
+constexpr Il1Rows kIl1Rows_891[] = {
+    {11, {0, 0, 0, 1, 1}},   // Q3_K
+};
 // Tesla P40 (sm_61), the same three runs: IQ4_XS 2560x10240 102 -> 58 us, the Q5_K head 1754 -> 1507 us
 constexpr Il1Rows kIl1Rows_61[] = {
     {23, {2, 2, 4, 4, 4}},   // IQ4_XS
@@ -3770,6 +3791,7 @@ constexpr Il1Arch kIl1Arch[] = {
     {61, kIl1Rows_61, sizeof(kIl1Rows_61) / sizeof(Il1Rows)},
     {86, kIl1Rows_86, sizeof(kIl1Rows_86) / sizeof(Il1Rows)},
     {89, kIl1Rows_89, sizeof(kIl1Rows_89) / sizeof(Il1Rows)},   // Ada: the RTX 4070 and 4080 agree
+    {891, kIl1Rows_891, sizeof(kIl1Rows_891) / sizeof(Il1Rows)},  // the 80-99 SM Ada band, its own runs
 };
 bool il_env_on(const char* name) {
     const char* v = std::getenv(name);
@@ -3794,6 +3816,7 @@ constexpr IlArch kIlArch[] = {
     {80, kIlRows_80, sizeof(kIlRows_80) / sizeof(IlRows)},   // sm_80: measured on a CMP 170HX
     {86, kIlRows_86, sizeof(kIlRows_86) / sizeof(IlRows)},   // 143-dense: RTX A4000 with the real shapes (Q3_K added)
     {89, kIlRows_89, sizeof(kIlRows_89) / sizeof(IlRows)},   // Ada: the cells where an RTX 4070 and an RTX 4080 agree
+    {891, kIlRows_891, sizeof(kIlRows_891) / sizeof(IlRows)},  // Ada in the 80-99 SM band (an NVIDIA L20, 92): its own three runs
     // 147-verify: RTX PRO 5000 Blackwell (110 SMs).  Only 12.0 cards with 80+ SMs (il_cc's 1201) take it: the shared table
     // was measured on an RTX 5070 (48 SMs) and stays that card's
     {1201, kIlRows_120, sizeof(kIlRows_120) / sizeof(IlRows)},
@@ -3880,6 +3903,12 @@ int il_cc() {
         int sms = 0;
         if (cc[dev] == 120 && cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && sms >= 80)
             cc[dev] = 1201;
+        // An Ada card in the 80-99 SM band (an NVIDIA L20: 92 SMs) answers 891 and takes its own table; the 46/48-SM cards
+        // kIlRows_89 was measured on, and a 128-SM RTX 4090 nobody here has benched, keep 89.  STRATA_MMVQ_IL_891=0 (or
+        // STRATA_DEFAULTS=026) leaves the band on 89 - what it answered before this table (A/B).
+        if (cc[dev] == 89 && cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess &&
+            strata::il_is_891_band(sms) &&
+            strata::mmvq_il_891_resolve(std::getenv("STRATA_MMVQ_IL_891"), strata::qwen_defaults_026())) cc[dev] = 891;
         // STRATA_MMVQ_IL_SM80=0: an sm_80 card takes the shared table as before kIlRows_80 (A/B)
         if (cc[dev] == 80 && !strata::sm80_default_on(std::getenv("STRATA_MMVQ_IL_SM80"), strata::qwen_defaults_026())) cc[dev] = 81;   // =0 or STRATA_DEFAULTS=026
         cudaGetLastError();
