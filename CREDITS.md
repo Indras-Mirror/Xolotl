@@ -42,6 +42,9 @@
   - HIP shared int4 alignment (#105); completed-response and EOS-drain cancellation fixes (#107, #108)
   - the persistent prefix cache (#99); native GBNF for Qwen Flash and DeepSeek V4.1 (#112, #113)
   - nonblocking prefix lookups and the minimum restore gain (#115); the MiniMax sampling replay keyword (#116)
+  - the uniform expert cache reopen after an explicit-slot release (#130); explicit CPU worker and host placement for native
+    DeepSeek (#131); DeepSeek-V4.1 predictor IDs read at their row stride (#132); the upstream CUDA radix top-k cutoff-tie fix
+    backport (#133)
 - **[Xiaomi2008](https://github.com/Xiaomi2008)**: IQ1_S routed experts for Unsloth's DeepSeek-V4.1 UD-IQ1_M (#86); ds41
   fused router ops and batched state copies (#87); DSML tool-call fixes and the opt-in keep_cut_tool_calls (#106,
   #109, #110)
@@ -51,6 +54,7 @@
   numbers
 - **[kelheor](https://github.com/kelheor)**: the vision `pread` fix (#51); the Windows ds41 build fixes (#94, #118: portable mkdir / 64-bit stat / free space for the dense cache and --build-shadow)
 - **[exye137](https://github.com/exye137)**: the thread-local CUDA stream leak (#57)
+- **[Yoongger](https://github.com/Yoongger)**: the NVIDIA L20 (92-SM Ada) interleaved-row mmvq tables and their A/B on the L20 (#135)
 - **[penink-WH](https://github.com/penink-WH)**: the AC922 rig
 - **[cpacsm75](https://github.com/cpacsm75)**: 192 GB arena tuning on Windows (#77); the RTX 5090 arena and `--kv-q8`
   numbers at 256K/512K (#114)
