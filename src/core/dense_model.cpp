@@ -283,6 +283,8 @@ struct DenseModel::Impl {
     };
     EmbdSrc embd, embd_mtp;
     float* embd_stage = nullptr;                    // pinned, NC * n_embd floats
+    const float* const* img_rows = nullptr;         // set_embd_rows(): per-cell image rows (nullptr = the table)
+    int64_t img_n = 0;
 
     float* output_norm = nullptr;
     QMat head;
@@ -517,12 +519,17 @@ struct DenseModel::Impl {
     }
 
     // n embedding rows -> device, one copy; the pinned stage is reused only after the previous copy finished
+    // cell0 >= 0: the rows are cells cell0.., and a cell with an image row (set_embd_rows) takes that row instead
     bool upload_embeddings(const EmbdSrc& src, const int32_t* toks, int n, int E, int n_vocab, float* dst,
-                           std::string& err, float* stage = nullptr) {
+                           std::string& err, float* stage = nullptr, int64_t cell0 = -1) {
         float* st = stage ? stage : embd_stage;
         if (cudaEventSynchronize(embed_done) != cudaSuccess) { err = "dense model: embedding event"; return false; }
         for (int j = 0; j < n; ++j) {
             if (toks[j] < 0 || toks[j] >= n_vocab) { err = "dense model: token id outside the vocabulary"; return false; }
+            if (cell0 >= 0 && img_rows != nullptr && cell0 + j < img_n && img_rows[cell0 + j] != nullptr) {
+                std::memcpy(st + (size_t) j * E, img_rows[cell0 + j], (size_t) E * sizeof(float));
+                continue;
+            }
             const uint8_t* row = src.f.file->tensor_data(*src.f.tensor) + (size_t) toks[j] * src.row_bytes;
             if (!dequant_row(src.type, row, E, st + (size_t) j * E)) { err = "dense model: embedding dequantization"; return false; }
         }
@@ -837,6 +844,11 @@ const float* DenseModel::ring_taps() const { return impl_->taps_ring; }
 const void* DenseModel::head_weights() const { return impl_->head.dev; }
 int DenseModel::head_type() const { return impl_->head.type; }
 int64_t DenseModel::head_rows() const { return impl_->head.n_out; }
+void DenseModel::set_embd_rows(const float* const* rows, int64_t n) {
+    impl_->img_rows = rows;
+    impl_->img_n = rows != nullptr ? n : 0;
+}
+
 bool DenseModel::embed_host(int32_t token, float* out, std::string& err) const {
     const Impl& I = *impl_;
     if (token < 0 || token >= cfg_.n_vocab) { err = "dense model: token id outside the vocabulary"; return false; }
@@ -1458,7 +1470,7 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
     const bool dbg = I.dbg_from >= 0 && pos0 < I.dbg_to && pos0 + n > I.dbg_from;
     try {
         if (I.prof.enabled) I.prof.begin(s);
-        if (!I.upload_embeddings(I.embd, tokens, n, E, cfg_.n_vocab, I.x, err)) { I.prof.on = false; return false; }
+        if (!I.upload_embeddings(I.embd, tokens, n, E, cfg_.n_vocab, I.x, err, nullptr, pos0)) { I.prof.on = false; return false; }
         if (dbg) trace_vec("embed", pos0, -1, "", I.x, n * E, s);
         // A hyper-connection model starts as the embedding broadcast to every stream (the reference's own initial
         // condition); a plain one keeps the single vector in `x`.
@@ -1663,7 +1675,7 @@ bool DenseModel::prefill(const int32_t* tokens, int64_t n, Logits lg, std::strin
         for (int64_t i = 0; i < n;) {
             const int64_t T = std::min(pf_chunk_, n - i);
             const int64_t pos0 = pos_;
-            if (!I.upload_embeddings(I.embd, tokens + i, (int) T, E, cfg_.n_vocab, P.x, err, P.stage)) {
+            if (!I.upload_embeddings(I.embd, tokens + i, (int) T, E, cfg_.n_vocab, P.x, err, P.stage, pos0)) {
                 I.prof.on = false;
                 return false;
             }
