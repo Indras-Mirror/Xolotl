@@ -1176,8 +1176,16 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                 (uint64_t) (NC + DenseModel::kTapRing) * opt.taps.size() * (uint64_t) cfg_.n_embd * 4;
             // the decode attention's partials: one region per column of a window (the extra NC - 1, ~19 MB each at 200K)
             const uint64_t scratch_extra = (uint64_t) (NC - 1) * dense_attn_scratch_bytes(cfg_.n_head, cfg_.head_dim, (int) max_context);
+            // the prompt prefill's scratch for a 512-token chunk (allocated lazily at the first prompt, so it has to be
+            // kept out of the weights' budget or a full card fails on its first request; see size_scratch below)
+            const uint64_t pf_reserve = [&]() -> uint64_t {
+                const uint64_t per_tok = 4ull * (3ull * E + 2ull * C + 3ull * cfg_.ssm_v_heads + 2ull * V + 2ull * H * 2 * D +
+                                                 3ull * H * D + 2ull * HK * D + 3ull * cfg_.n_ff + std::max(H, HK)) + 4 +
+                                         2ull * std::max({E, V, cfg_.n_ff, H * D});   // + the q8_1 copy of the widest input
+                return 512ull * per_tok + (16ull << 20);
+            }();
             auto reserved_for = [&](bool mtp) {
-                return (uint64_t) n_attn * kv_per_layer + (mtp ? kv_full_layer : 0) +
+                return pf_reserve + (uint64_t) n_attn * kv_per_layer + (mtp ? kv_full_layer : 0) +
                        ((mtp || opt.spec_snapshots) ? (uint64_t) n_gdn * snap_one * (uint64_t) draft_max : 0) + tap_bytes + scratch_extra;
             };
             size_t free_b = 0, total_b = 0;
