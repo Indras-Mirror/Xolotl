@@ -446,6 +446,13 @@ struct DenseModel::Impl {
     strata::kernels::GrWorkspace gr_ws;  ///< the single-token gr_read path's scratch (carved from gr_ws_mem)
     void* gr_ws_mem = nullptr;
     void* q8_1 = nullptr;                           // shared activation scratch of the native GEMVs
+    // xolotl: the interleaved copy of q8_1 (native_q8_1_interleave) for native_mmvq_il at 2..8 columns - one 16-byte
+    // load reads a position of every column, where native_mmvq's exact kernels issue one 4-byte load per column (LSU-
+    // bound at 8: ncu 78 % LSU, DRAM 72 %).  Written once per quantize(), on the first GEMV that takes it; bitwise
+    // native_mmvq's output.  STRATA_MMVQ_IL=0 keeps native_mmvq.
+    void* q8_il = nullptr;
+    bool il_ready = false;
+    int il_n_in = 0;
     int64_t max_context = 0;
 
     // ---- the batched prompt path (prefill_setup() / prefill()); see the block definitions below.
@@ -685,13 +692,27 @@ struct DenseModel::Impl {
     }
 
     // y = W x for n columns; the activation must already be quantized (quantize()) with the same n.
+    static bool mmvq_il_on() {
+        static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL"); return v == nullptr || v[0] != '0'; }();
+        return on;
+    }
     void gemv(const QMat& w, float* y, int n, void* s) {
         PScope ps(&prof, w.type == 12 ? Prof::GEMV_Q4K : w.type == 14 ? Prof::GEMV_Q6K : w.type == 8 ? Prof::GEMV_Q80 : Prof::GEMV_OTHER, s);
+        if (n >= 2 && q8_il != nullptr && w.n_in == il_n_in && mmvq_il_on() && native_mmvq_il_supported(w.type, n, w.n_out)) {
+            if (!il_ready) {
+                native_q8_1_interleave(q8_1, q8_il, w.n_in, n, s);
+                il_ready = true;
+            }
+            native_mmvq_il(w.type, w.dev, q8_1, q8_il, y, w.n_in, w.n_out, n, s);
+            return;
+        }
         native_mmvq(w.type, w.dev, q8_1, y, w.n_in, w.n_out, n, s);
     }
     void quantize(const float* x, int n_in, int n, void* s) {
         PScope ps(&prof, Prof::QUANT, s);
         native_quantize_q8_1(x, q8_1, n_in, n, s);
+        il_ready = false;
+        il_n_in = n_in;
     }
 
     // ---- the blocks.  Input is I.xn (the normalized residual) unless stated; the output goes to I.mix.
@@ -1467,6 +1488,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         const int max_in = std::max({2 * E, cfg_.n_ff, V, H * D});
         const uint64_t f = 4, K = NC;
         bool ok = I.alloc(&I.q8_1, native_q8_1_bytes(max_in, NC), err, "q8_1 scratch") &&
+                  I.alloc(&I.q8_il, native_q8_1_il_bytes(max_in, NC), err, "q8_1 interleaved scratch") &&
                   I.alloc(&I.x, K * E * f, err, "x") && I.alloc(&I.xn, K * E * f, err, "xn") &&
                   I.alloc(&I.mix, K * E * f, err, "mix") && I.alloc(&I.qkv, K * C * f, err, "qkv") &&
                   I.alloc(&I.h, K * C * f, err, "h") &&

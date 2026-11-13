@@ -51,7 +51,7 @@ const Case CASES[] = {   // xolotl dense27: the 27B XQ serve file's matrices by 
     {"ffn gate Q4_K", 12, 5120, 17408, 256, 144, {0, 2}},
     {"head Q6_K", 14, 5120, 248320, 256, 210, {208, -1}},
 };
-const int WIDTHS[] = {1, 2, 4, 8};
+const int WIDTHS[] = {1, 2, 4, 6, 8};
 
 bool ck(cudaError_t e, const char* what) {
     if (e == cudaSuccess) return true;
@@ -77,9 +77,14 @@ struct Buf {
     float* y = nullptr;     // 8 columns of output
 };
 
+// B column = native_mmvq_il (bmode < 0): the interleaved copy of the activations (native_q8_1_interleave, per width)
+bool g_bil = false;
+void* g_xil = nullptr;
 // one call of the case at `ncols` on weight copy `k` into y
 void call(const Case& c, const Buf& b, int k, int ncols, float* y, cudaStream_t s) {
-    if (c.type == 30)
+    if (g_bil && c.type != 30)
+        K::native_mmvq_il(c.type, b.w[(size_t) k], b.xq, g_xil, y, c.n_in, c.n_out, ncols, s);
+    else if (c.type == 30)
         K::bf16_gemv_fp32_mmvf_multi(b.xf, c.n_in, (const uint16_t*) b.w[(size_t) k], y, c.n_out, c.n_in, c.n_out, ncols, s);
     else
         K::native_mmvq(c.type, b.w[(size_t) k], b.xq, y, c.n_in, c.n_out, ncols, s);
@@ -124,7 +129,7 @@ int main(int argc, char** argv) {
         cudaSetDevice(dev);
         cudaDeviceProp pr{};
         cudaGetDeviceProperties(&pr, dev);
-        std::printf("\n=== device %d: %s (sm_%d%d, L2 %d KB), %d reps, median ms per call, B = rows mode %d ===\n", dev, pr.name,
+        std::printf("\n=== device %d: %s (sm_%d%d, L2 %d KB), %d reps, median ms per call, B = rows mode %d (<0: native_mmvq_il, -1 table, -2/-3/-5 1/2/4 rows) ===\n", dev, pr.name,
                     pr.major, pr.minor, pr.l2CacheSize / 1024, reps, bmode);
         std::printf("%-18s %4s %9s %9s %7s %7s %8s %8s  %s\n", "case", "cols", "A ms", "B ms", "A GB/s", "B GB/s", "A +col", "B +col",
                     "bitwise B=A, A=1col, B=1col");
@@ -170,7 +175,8 @@ int main(int argc, char** argv) {
                  ck(cudaMemcpy(b.xf, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "copy x") &&
                  ck(cudaMalloc(&b.y, ybytes), "malloc y");
             if (ok && c.type != 30) {
-                ok = ck(cudaMalloc(&b.xq, K::native_q8_1_bytes(c.n_in, 8)), "malloc xq");
+                ok = ck(cudaMalloc(&b.xq, K::native_q8_1_bytes(c.n_in, 8)), "malloc xq") &&
+                     ck(cudaMalloc(&g_xil, K::native_q8_1_il_bytes(c.n_in, 8)), "malloc xil");
                 if (ok) K::quantize_q8_1_rows(b.xf, 8, c.n_in, b.xq, s);
             }
             float *ya = nullptr, *yb = nullptr, *y1 = nullptr;
@@ -183,9 +189,16 @@ int main(int argc, char** argv) {
                 const double ta = median_ms(c, b, T, reps, s, ev);
                 call(c, b, 0, T, ya, s);
                 for (int j = 0; j < T; ++j) call_col(c, b, j, y1, s);
-                K::native_mmvq_set_b6_rows(bmode);
+                if (bmode >= 0) K::native_mmvq_set_b6_rows(bmode);
+                else {   // -1: native_mmvq_il with its table; -2 / -3 / -5: 1 / 2 / 4 rows a warp
+                    if (T >= 2 && c.type != 30) K::native_q8_1_interleave(b.xq, g_xil, c.n_in, T, s);
+                    K::native_mmvq_il_tune(-bmode - 1);
+                    g_bil = true;
+                }
                 const double tb = median_ms(c, b, T, reps, s, ev);
                 call(c, b, 0, T, yb, s);
+                g_bil = false;
+                K::native_mmvq_il_tune(0);
                 K::native_mmvq_set_b6_rows(0);
                 if (!ck(cudaStreamSynchronize(s), "run")) return 1;
                 cudaMemcpy(ha.data(), ya, ha.size() * 4, cudaMemcpyDeviceToHost);
@@ -203,7 +216,7 @@ int main(int argc, char** argv) {
                             a_1 ? "ok" : "diff", b_1 ? "ok" : "DIFF", nonfinite ? " NONFINITE" : "");
             }
             for (void* d : b.w) cudaFree(d);
-            cudaFree(b.xq); cudaFree(b.xf); cudaFree(b.y); cudaFree(ya); cudaFree(yb); cudaFree(y1);
+            cudaFree(b.xq); cudaFree(g_xil); g_xil = nullptr; cudaFree(b.xf); cudaFree(b.y); cudaFree(ya); cudaFree(yb); cudaFree(y1);
         }
         for (auto& e : ev) cudaEventDestroy(e);
         cudaStreamDestroy(s);

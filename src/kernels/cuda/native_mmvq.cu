@@ -3751,8 +3751,22 @@ constexpr IlRows58 kIlRows58_80[] = {   // CMP 170HX, as kIlRows_80
     {14, {{0, 0, 4, 2, 4}, {0, 0, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 0, 4, 2, 4}}},   // Q6_K
     {11, {{0, 0, 4, 2, 4}, {0, 0, 4, 1, 4}, {0, 0, 1, 1, 1}, {1, 1, 1, 1, 1}}},   // Q3_K
 };
+// xolotl: RTX 4090 (AD102, 128 SMs; il_rows' key 8941 for an sm_89 card with 100+ SMs, 5..8 columns only), the
+// Qwen3.8-27B dense shapes in dense27_mmvq_bench (rows 1 / 2 a warp at 4 / 6 / 8 columns, plain kernel; the P1/P2
+// variants lost everywhere but the Q6_K head, +6 %): GB/s at 8 columns vs native_mmvq's exact layout - Q5_K 6144 / 10240 /
+// 17408 rows 571 -> 728 / 577 -> 782 / 598 -> 798, IQ4_XS 5120 / 17408 246 -> 811 / 625 -> 811, Q4_K 17408 538 -> 765,
+// Q6_K 248320 636 -> 825, Q3_K 5120 228 -> 512; every output bitwise native_mmvq's.  The <4096-row classes were not
+// measured (0: native_mmvq); columns 5 / 7 take the 6 / 8 column choice.
+constexpr IlRows58 kIlRows58_4090[] = {
+    {23, {{0, 0, 1, 2, 2}, {0, 0, 1, 2, 2}, {0, 0, 1, 2, 2}, {0, 0, 1, 2, 2}}},   // IQ4_XS
+    {12, {{0, 0, 2, 2, 2}, {0, 0, 2, 2, 2}, {0, 0, 2, 2, 2}, {0, 0, 2, 2, 2}}},   // Q4_K
+    {13, {{0, 0, 1, 1, 2}, {0, 0, 1, 1, 2}, {0, 0, 1, 1, 2}, {0, 0, 1, 1, 2}}},   // Q5_K
+    {14, {{0, 0, 2, 2, 2}, {0, 0, 2, 2, 2}, {0, 0, 2, 2, 2}, {0, 0, 2, 2, 2}}},   // Q6_K
+    {11, {{0, 0, 2, 2, 2}, {0, 0, 2, 2, 2}, {0, 0, 2, 2, 2}, {0, 0, 2, 2, 2}}},   // Q3_K
+};
 struct Il58Arch { int cc; const IlRows58* t; size_t n; };
 constexpr Il58Arch kIl58Arch[] = {
+    {8941, kIlRows58_4090, sizeof(kIlRows58_4090) / sizeof(IlRows58)},   // xolotl: sm_89 with 100+ SMs (RTX 4090)
     {80, kIlRows58_80, sizeof(kIlRows58_80) / sizeof(IlRows58)},
     {120, kIlRows58_120, sizeof(kIlRows58_120) / sizeof(IlRows58)},
     {1201, kIlRows58_120, sizeof(kIlRows58_120) / sizeof(IlRows58)},   // a 12.0 card with 80+ SMs (il_cc)
@@ -3915,7 +3929,24 @@ int il_cc() {
     }
     return cc[dev];
 }
-int il_rows(int type, int ncols, int n_out) { return native_mmvq_il_rows_for(il_cc(), type, ncols, n_out); }
+// xolotl: 5..8 columns on an sm_89 card with 100+ SMs (RTX 4090) look up key 8941 (kIlRows58_4090); everything else,
+// and that card's 1..4 columns, keep il_cc()'s key.  STRATA_MMVQ_IL_4090=0 gives the card what it answered before.
+int il_wide_cc() {
+    static int cc[16] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return il_cc();
+    if (cc[dev] == 0) {
+        int sms = 0;
+        cc[dev] = il_cc();
+        if (cc[dev] == 89 && il_env_on("STRATA_MMVQ_IL_4090") &&
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && sms >= 100) cc[dev] = 8941;
+        cudaGetLastError();
+    }
+    return cc[dev];
+}
+int il_rows(int type, int ncols, int n_out) {
+    return native_mmvq_il_rows_for(ncols > 4 ? il_wide_cc() : il_cc(), type, ncols, n_out);
+}
 int il_pf_table(int type, int ncols, int n_out) {
     if (il_cc() != 80 || ncols < 2 || ncols > 8) return 0;   // only the CMP 170HX measured one
     const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
