@@ -35,6 +35,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/dense_model.hpp"
 #include "strata/core/dflash2.hpp"
+#include "strata/core/nv_defaults.hpp"
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/dense_kernels.hpp"
 #include "strata/kernels/native_gdn.hpp"
@@ -863,7 +864,24 @@ struct NgramPool {
     }
 };
 
+// xolotl: the multi-column (verify window) MMVQ layout from the card's default table.  The other engines get it through
+// apply_nv_defaults; the rest of that table is MoE-engine switches, so the dense engine takes only STRATA_B6_MMVQ_ROWS
+// (bitwise the default exact layout; 4090, Qwen3.8-27B XQ, DFlash2 k7, 2K prompt, 4 interleaved rounds each order:
+// 184.8 vs 171.3 tok/s, +7.9 %).  A value the user set wins; STRATA_SM89_PERF=0 (etc.) leaves it off.
+static void dense_nv_defaults() {
+    int dev = 0;
+    cudaDeviceProp p{};
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) return;
+    for (const auto& kv : strata::core::nv_default_env(p.major, p.minor)) {
+        if (kv.first != "STRATA_B6_MMVQ_ROWS" || std::getenv(kv.first.c_str()) != nullptr) continue;
+        setenv(kv.first.c_str(), kv.second.c_str(), 0);
+        std::fprintf(stderr, "xolotl-dense: sm_%d%d default STRATA_B6_MMVQ_ROWS=%s (exact; set it to 0 to turn it off)\n",
+                     p.major, p.minor, kv.second.c_str());
+    }
+}
+
 int main(int argc, char** argv) {
+    dense_nv_defaults();
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") return selftest();
         if (std::string(argv[i]) == "--check") {
