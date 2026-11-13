@@ -20,6 +20,8 @@ darkc0de's abliterated `Muse-Glimmer-30B-heretic` as bartowski's IQ4_NL GGUF (16
 | decode with `--ngram 8`, free writing (a story) | 48.4 tok/s (0.98x: little to copy) |
 | decode with `--dflash` (Meta's drafter, 15 drafts a pass): quoting a document / a code edit | 341-379 / 186-254 tok/s (7.3-8.0x / 3.9-5.3x) |
 | decode with `--dflash`, 7 drafts a pass: an explanation with code / a story | 85-113 / 62-65 tok/s (1.8-2.4x / 1.3-1.4x) |
+| decode with `--dflash` adaptive (the default: about 3 past the recent accepted count, doubled after a fully kept block): quoting / code edit / story / explanation | 358-382 / 177-214 / 64-69 / 87-90 tok/s |
+| ElixirOffice in-app bench (14 spreadsheet tasks, ngram + DFlash) | 13/14 in 291 s (fails only the combined clean-up task) |
 | next turn on a reused prefix (+191 / +159 tokens) | 0.1 s |
 | card memory while serving (whole GPU, nvidia-smi) | 19.2 GB |
 | parity with llama.cpp, 4,096 tokens | mean KL 1.0e-3, 99.0 % same top token at equal batch size; as close as llama.cpp is to itself (see below) |
@@ -62,7 +64,7 @@ first window, 2.7e-3 after it wraps), so the ring is not the cause either.
   plain decode would pick (up to batch-size rounding: replayed through a fresh pass, no emitted token sits more than 0.4
   logit below the top pick, same as with drafting off). It pays off where the reply repeats the context: code edits,
   quoting, tool calls with long arguments. A request can lower it with `ngram=K`.
-- **DFlash** (`--dflash <dflash.gguf>`): Meta ships Glimmer with a block drafter (`dflash-Muse-Glimmer-30B-Q4_K_M.gguf`,
+- **DFlash** (`--dflash <dflash.gguf>`): Meta ships Glimmer with a block drafter (on in the example config; `dflash-Muse-Glimmer-30B-Q4_K_M.gguf`,
   1.6 GB, in meta-models/Muse-Glimmer-30B-GGUF; five sliding-window layers of the model's width). Every forward pass of
   the model taps the residual stream entering layers 2, 14, 26, 38 and 50, fuses the five rows and writes the drafter's
   K/V for those positions into its own 2,560-cell ring, inside the same GPU graph. A draft is one non-causal pass of the

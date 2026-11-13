@@ -12,7 +12,9 @@
   "--kv-type",
   "q8",
   "--ngram",
-  "8"
+  "8",
+  "--dflash",
+  "/media/Crucial1TB/models/dflash-Muse-Glimmer-30B-Q4_K_M.gguf"
  ],
  "cwd": ".",
  "tokenizer": "/path/to/muse-glimmer/tokenizer",
