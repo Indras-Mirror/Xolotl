@@ -89,6 +89,8 @@ namespace strata::core
         /// Empty = drafts use the full head.
         std::vector<int32_t> draft_vocab;
         int draft_vocab_extra = 16384;  ///< rows kept free after the shortlist for draft_vocab_extend()
+        int64_t kv_resident = 0;        ///< cells per KV head kept in VRAM, the rest in host RAM (0 = all in VRAM, -1 = auto: what fits)
+        int vram_reserve_mib = 0;       ///< VRAM left free for another program (the vision encoder) when budgeting
     };
 
     class DenseModel

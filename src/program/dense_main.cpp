@@ -118,6 +118,11 @@ void usage() {
                  "  --draft-vocab FILE: MTP drafts score only these token ids (int32 LE, a frequency shortlist such as\n"
                  "                  data/packs/qwen3.8-27b/draft-vocab-65536.i32); verification keeps the full head (same output).\n"
                  "  --vision: --serve takes GENI requests too (images; embeddings from strata-vision, the model's mmproj).\n"
+                 "  --kv-resident N|auto: keep N KV cells per head of every attention layer in VRAM and the rest in pinned\n"
+                 "                  host RAM (one address range, read over PCIe only once the context passes N); auto = every\n"
+                 "                  cell that fits beside the weights.  Full attention reads every cell, so past N each token\n"
+                 "                  costs the spilled bytes over PCIe (about 1 ms per 24 MB).  0 = all in VRAM (the default).\n"
+                 "  --vram-reserve-mib N: leave N MiB of VRAM free for another program (the vision encoder) when budgeting.\n"
                  "  --prompt-chunk N feeds the prompt N tokens at a time through MMQ instead of 8 at a time through\n"
                  "  the GEMVs (0 is the default; --no-prefill forces the old path).  The chunked path reads the KV\n"
                  "  cache in whatever format --kv picked.\n"
@@ -889,6 +894,8 @@ int main(int argc, char** argv) {
     std::string draft_vocab;                           // xolotl: --draft-vocab <file of int32 token ids>, MTP shortlist head
     bool draft_max_set = false;
     bool vision = false;                               // --vision: GENI requests (image embeddings + M-RoPE table)
+    long long kv_resident = 0;                         // --kv-resident N|auto: KV cells per head in VRAM (0 = all, -1 = auto)
+    int vram_reserve_mib = 0;                          // --vram-reserve-mib N: VRAM left for another program (the encoder)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -903,6 +910,12 @@ int main(int argc, char** argv) {
         else if (a == "--dflash2") df2_pack = next("--dflash2");
         else if (a == "--ngram-chain") ngram_on = true;
         else if (a == "--vision") vision = true;
+        else if (a == "--kv-resident") {
+            const std::string v = next("--kv-resident");
+            kv_resident = v == "auto" ? -1 : std::atoll(v.c_str());
+            if (kv_resident == 0 && v != "0") { std::fprintf(stderr, "xolotl-dense: --kv-resident takes a cell count or auto\n"); return 2; }
+        }
+        else if (a == "--vram-reserve-mib") vram_reserve_mib = std::max(0, std::atoi(next("--vram-reserve-mib")));
         else if (a == "--draft-vocab") draft_vocab = next("--draft-vocab");
         else if (a == "--ngram-n") ngram_n = std::atoi(next("--ngram-n"));
         else if (a == "--ngram-max") ngram_max = std::atoi(next("--ngram-max"));
@@ -957,6 +970,8 @@ int main(int argc, char** argv) {
     }
     opt.draft_max = ngram_on ? ngram_max : draft_max;   // rollback snapshots for the widest window
     opt.kv = kv_type;
+    opt.kv_resident = kv_resident;
+    opt.vram_reserve_mib = vram_reserve_mib;
     if (use_df2) { opt.spec_snapshots = true; opt.taps = df2.tap_layers(); }
     // XOLOTL_TAP_DUMP=<file> (research only, off by default): every request appends its prompt's tap rows (the residual
     // after each XOLOTL_TAP_LAYERS layer, e.g. 1,16,31,46,61) to the file, for offline drafter acceptance runs
