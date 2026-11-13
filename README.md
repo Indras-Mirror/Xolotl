@@ -12,6 +12,10 @@
 
 ## Latest
 
+- **14 Nov** - Qwen3.8-27B with DFlash2: the 8-token verify pass got cheaper, **171 -> 204 tok/s** on a best-case 2K
+  prompt (our 13.7 GiB XQ quant, one 4090). The dense engine now reads one position of all 8 drafted tokens per load
+  and uses the multi-column layout the other engines already had. Same text, bit for bit; default on. Real agent-task
+  numbers next. [CHANGELOG](docs/xolotl/CHANGELOG.md#qwen38-27b-with-dflash2-the-8-token-verify-gets-cheaper-171---204-toks-14-nov).
 - **13 Nov** - [Muse Glimmer 30B](docs/GLIMMER.md) (Meta, dense) natively at its full 512K context on one 24 GB
   card: 47 tok/s decode, 1.3-8x faster with Meta's DFlash drafter (up to 379 tok/s), 3,100 tok/s prefill, tool calls, reasoning and pictures through the usual server.
   [CHANGELOG](docs/xolotl/CHANGELOG.md#muse-glimmer-30b-natively-at-512k-13-nov).

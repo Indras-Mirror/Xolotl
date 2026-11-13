@@ -8,6 +8,32 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Qwen3.8-27B with DFlash2: the 8-token verify gets cheaper, 171 -> 204 tok/s (14 Nov)
+
+DFlash2 drafts 7 tokens and checks all 8 in one pass, so every GEMV of that pass multiplies 8 columns. Those 8-column
+GEMVs were the slow part: a Q5_K matrix ran at ~600 GB/s with 8 columns against ~900 with 1-4, the IQ4_XS down
+projection at 246. Nsight Compute on the Q5_K kernel at 8 columns shows why: the load/store pipe is the bottleneck
+(78 %, DRAM only 72 %), because each lane issues one 4-byte activation load per column per int. Two changes, both
+bit-exact and default on:
+
+- **B6 layout in the dense engine.** `xolotl-dense` never applied the card's default switch table, so the B6 multi-column
+  layout (each column's activations loaded once per weight block and reused across rows) that the other engines get on
+  sm_60/86/89 was off. It now takes `STRATA_B6_MMVQ_ROWS` from that table (`=0` turns it off): 171.3 -> 184.8 tok/s.
+- **The interleaved activation copy at 2-8 columns.** `native_mmvq_il` (one 16-byte load reads a position of every
+  column) already ran the MoE verify, but the dense engine never used it, and an RTX 4090 had no table for 5-8 columns,
+  so those widths fell back. `xolotl-dense` now writes the interleaved copy once per input and takes it for every
+  GEMV that supports it, and the 4090 (sm_89 with 100+ SMs) has its own 5-8 column table (`STRATA_MMVQ_IL=0` /
+  `STRATA_MMVQ_IL_4090=0` turn them off). At 8 columns: Q5_K 571-598 -> 728-798 GB/s, IQ4_XS 246-625 -> 811, Q6_K head
+  636 -> 825. Decode 186.0 -> 204.1 tok/s.
+
+Measured on Qwen3.8-27B XQ (13.7 GiB of weights, not released yet), DFlash2 k7, a 2K synthetic prompt + 256 tokens,
+interleaved rounds in both orders. That prompt is the best case for a drafter (almost every draft is accepted); on real
+agent work DFlash2 accepts 40-53 % of drafts, so expect less there - the Gauntlet run with DFlash2 is next. Every step was
+checked bit for bit: the kernel bench against the old kernels and single-column calls, `--selftest`, and 512 greedy tokens
+identical with the change on and off, DFlash2 against plain decoding, and against the previous build. DFlash2 stays
+opt-in (`--dflash2 <pack>`) until the Gauntlet says it beats MTP on real work. `dense27_mmvq_bench` (27B shapes, GB/s per
+format and width) gained the interleaved path as a column.
+
 ### Muse Glimmer 30B natively at 512K (13 Nov)
 
 `xolotl-glimmer` (`src/program/glimmer_main.cpp`) serves Meta's dense Muse Glimmer 30B: llama.cpp's muse-glimmer graph on
