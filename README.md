@@ -97,13 +97,18 @@ served. Decode is the generation speed during those tasks.
 | **DeepSeek-V4.1 V4, [fast mode](#fast-mode-deepseek-v41)**                                                        | 552B MoE  |     4.99     |      41.1      |     258-439     |   512K  |     -     |
 | **GLM-5.3-Flash**                                                                                                 | 320B MoE  |   to come    |     28.5-29    |     312-450     |   512K  |    5.87   |
 | **[Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored)** | 125B MoE  |     4.49     |      157       |   3,800-4,070   |   200K  |    3.90   |
-| **Qwen3.8-27B**                                                                                                   | 27B dense |     5.50     |      105       |   1,420-1,630   |   200K  |    4.47   |
+| **Qwen3.8-27B** (Swift-1.5 GSQ-RCO, 13.2 GB)                                                                      | 27B dense |     5.50     |      105       |   1,420-1,630   |   200K  |    4.47   |
+| **Qwen3.8-27B XQ** (ours, uncensored, 16.2 GB)                                                                    | 27B dense |     4.97     |      99.6      |   1,760-1,980   |   200K  |     -     |
+| **[Muse Glimmer 30B](docs/GLIMMER.md)** (heretic IQ4_NL)                                                          | 30B dense |     4.89     |      148       |   3,330-3,410   |   512K  |     -     |
 
 <sub>Score (of 6) = each task's progress summed (1 per solve, partial credit from the hidden tests), averaged over the runs.
 API score = each model's own full-precision API through OpenRouter (DeepSeek-V4.1-Flash-1017, GLM-5.3-Flash, Qwen3.8-Flash,
 Qwen3.8-27B), the same tasks and turns, reasoning on (8 Nov).
 Qwen3.8-27B: one run on 8 Nov after that day's decode fixes (MTP with thinking off, one-pass verify attention,
-`--ngram-chain`); before them it scored 4.47 twice at 89 tok/s. GLM-5.3-Flash: no Gauntlet run yet (score to come); its decode is from an agent replay on 8 Nov (a 25K-token
+`--ngram-chain`); before them it scored 4.47 twice at 89 tok/s. Qwen3.8-27B XQ: our XQ quant of the abliterated base
+(not uploaded yet), MTP 3 + n-gram, one run on 14 Nov (solved 4/6 vs 5/6, different tasks missed; single runs swing).
+With DFlash2 instead of MTP it gave the same tokens (153,037) at 96.8 tok/s, so MTP stays the default; DFlash2's
+200+ tok/s is a best case on predictable text. Muse Glimmer 30B: one run on 14 Nov with `--ngram 8 --dflash`, as served. GLM-5.3-Flash: no Gauntlet run yet (score to come); its decode is from an agent replay on 8 Nov (a 25K-token
 conversation with tool-output turns, Maya 512K as served; since the RAM upgrade every expert sits in RAM, 23 tok/s before it),
 prefill 454 tok/s on a fresh 25K prompt.
 Prefill = a fresh 6K-17K-token prompt (`tools/throughput.py`), DeepSeek-V4.1's with its dense half at Q8_0. In the
