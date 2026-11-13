@@ -49,6 +49,19 @@ class DriftedEnvelope(unittest.TestCase):
                     self.assertEqual(text(evs), "")
                     self.assertEqual(p.unread, 0)
 
+    def test_a_space_before_the_opener_close_is_still_the_call(self):
+        """Seen live (2026-11-13, Qwen3.8-Flash-Next + a RouterOS MCP tool): `<tool_call >` - a space before the
+        `>` - went back as text with no call, and the agent stopped there."""
+        for spelling in ("<tool_call >", "<toolcall >", "<tool-call >"):
+            for recover in (False, True):          # the server runs recover on; it leaked the opener as content
+                for width in (0, 1, 2, 3, 7):
+                    with self.subTest(spelling=spelling, recover=recover, width=width):
+                        raw = body("<function=functions.exec>").replace("<tool_call>", spelling, 1)
+                        evs, p = run(raw, width, tools=TOOLS, recover=recover)
+                        self.assertEqual(calls(evs), [("functions.exec", {"input": "1+1"})])
+                        self.assertEqual(text(evs), "")
+                        self.assertEqual(p.unread, 0)
+
     def test_the_template_form_is_unchanged(self):
         evs, p = run(body("<function=functions.exec>"), 0, tools=TOOLS)
         self.assertEqual(calls(evs), [("functions.exec", {"input": "1+1"})])
