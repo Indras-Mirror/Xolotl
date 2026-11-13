@@ -11,6 +11,7 @@
 //   out   READY <context> stop                    ("stop": this engine honours STOP)
 //   in    GEN <max_new> [key=value ...] id,id,... (keys: temperature top_p top_k min_p penalty_last_n penalty_repeat
 //                                                  penalty_freq penalty_present seed score; unknown keys are skipped)
+//   in    GENI <max_new> [key=value ...] <embeddings file> id,id,...   (--vision only: images, see below)
 //   out   SCORE <id>:<lp> ... top=<id>:<lp>                   (score=ID,... only: /v1/decide, before the first T)
 //   out   PP <position> <prompt tokens> <ms> <tok/s>          every few dozen prompt tokens
 //   out   T <id>                                              one per generated token
@@ -22,6 +23,13 @@
 // resumed from the deepest conversation checkpoint at or before the token where the two prompts start to differ
 // (--ckpt N, pinned host RAM); with no such checkpoint the state is reset and the prompt is read again.
 //
+// The vision path (--vision), the same as the MoE engine's (generate.cpp): GENI names a file of strata-vision records
+// (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd float32) in prompt order; image k's rows replace the embeddings of
+// its run of <|image_pad|> tokens, and every rope reads (t, h, w) from the M-RoPE table (strata/kernels/mrope.hpp):
+// text t = h = w = p, image row j at t = p, h = p + y, w = p + x, the text after it at p + max(nx, ny).  The table
+// is the identity for text requests, so --vision changes nothing for them.  The conversation cache matches a picture
+// by its start cell, grid and key (img_keys=<hex>,... from the server, else the embeddings' hash).
+//
 // The prompt is read one token at a time (the same step as decoding).  Correct, and the simplest thing that can
 // be checked against llama.cpp; a batched prefill is the next optimisation, not a prerequisite.
 #include "strata/artifact/gguf_reader.hpp"
@@ -31,6 +39,7 @@
 #include "strata/kernels/dense_kernels.hpp"
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_gdn_preprocess.hpp"
+#include "strata/kernels/mrope.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -56,6 +65,11 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+uint64_t fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
 
 struct Lines {
     std::mutex m;
@@ -103,6 +117,12 @@ void usage() {
                  "  `serve/server.py --engine strata --config <run config>` whose `exe` is this program.\n"
                  "  --draft-vocab FILE: MTP drafts score only these token ids (int32 LE, a frequency shortlist such as\n"
                  "                  data/packs/qwen3.8-27b/draft-vocab-65536.i32); verification keeps the full head (same output).\n"
+                 "  --vision: --serve takes GENI requests too (images; embeddings from strata-vision, the model's mmproj).\n"
+                 "  --kv-resident N|auto: keep N KV cells per head of every attention layer in VRAM and the rest in pinned\n"
+                 "                  host RAM (one address range, read over PCIe only once the context passes N); auto = every\n"
+                 "                  cell that fits beside the weights.  Full attention reads every cell, so past N each token\n"
+                 "                  costs the spilled bytes over PCIe (about 1 ms per 24 MB).  0 = all in VRAM (the default).\n"
+                 "  --vram-reserve-mib N: leave N MiB of VRAM free for another program (the vision encoder) when budgeting.\n"
                  "  --prompt-chunk N feeds the prompt N tokens at a time through MMQ instead of 8 at a time through\n"
                  "  the GEMVs (0 is the default; --no-prefill forces the old path).  The chunked path reads the KV\n"
                  "  cache in whatever format --kv picked.\n"
@@ -873,6 +893,9 @@ int main(int argc, char** argv) {
     std::string df2_pack;                              // xolotl: --dflash2 <pack>, the DFlash2 block drafter instead of MTP
     std::string draft_vocab;                           // xolotl: --draft-vocab <file of int32 token ids>, MTP shortlist head
     bool draft_max_set = false;
+    bool vision = false;                               // --vision: GENI requests (image embeddings + M-RoPE table)
+    long long kv_resident = 0;                         // --kv-resident N|auto: KV cells per head in VRAM (0 = all, -1 = auto)
+    int vram_reserve_mib = 0;                          // --vram-reserve-mib N: VRAM left for another program (the encoder)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -886,6 +909,13 @@ int main(int argc, char** argv) {
         else if (a == "--draft-max" || a == "--spec-draft-n-max") { draft_max = std::atoi(next("--draft-max")); draft_max_set = true; }
         else if (a == "--dflash2") df2_pack = next("--dflash2");
         else if (a == "--ngram-chain") ngram_on = true;
+        else if (a == "--vision") vision = true;
+        else if (a == "--kv-resident") {
+            const std::string v = next("--kv-resident");
+            kv_resident = v == "auto" ? -1 : std::atoll(v.c_str());
+            if (kv_resident == 0 && v != "0") { std::fprintf(stderr, "xolotl-dense: --kv-resident takes a cell count or auto\n"); return 2; }
+        }
+        else if (a == "--vram-reserve-mib") vram_reserve_mib = std::max(0, std::atoi(next("--vram-reserve-mib")));
         else if (a == "--draft-vocab") draft_vocab = next("--draft-vocab");
         else if (a == "--ngram-n") ngram_n = std::atoi(next("--ngram-n"));
         else if (a == "--ngram-max") ngram_max = std::atoi(next("--ngram-max"));
@@ -940,6 +970,8 @@ int main(int argc, char** argv) {
     }
     opt.draft_max = ngram_on ? ngram_max : draft_max;   // rollback snapshots for the widest window
     opt.kv = kv_type;
+    opt.kv_resident = kv_resident;
+    opt.vram_reserve_mib = vram_reserve_mib;
     if (use_df2) { opt.spec_snapshots = true; opt.taps = df2.tap_layers(); }
     // XOLOTL_TAP_DUMP=<file> (research only, off by default): every request appends its prompt's tap rows (the residual
     // after each XOLOTL_TAP_LAYERS layer, e.g. 1,16,31,46,61) to the file, for offline drafter acceptance runs
@@ -1034,11 +1066,32 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("INFO engine=dense-0.2 model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld kv=%s mtp=%d dflash2=%d draft_max=%d draft_min=%d draft_p_min=%.2f\n",
+    // The vision path: every rope kernel reads a cell's (t, h, w) from this table (strata/kernels/mrope.hpp).  It is
+    // the identity until an image request.  The dense engine captures no CUDA graphs, so setting it here is enough.
+    constexpr int32_t kImagePad = 248056;              // <|image_pad|> (Qwen3.8 image_token_id)
+    int32_t* d_mrope = nullptr;
+    std::vector<int32_t> mrope_host;
+    if (vision) {
+        const int64_t cells = model.max_context() + 64;   // + the widest verify / draft window past the context
+        mrope_host.resize((size_t) cells * 3);
+        for (int64_t c = 0; c < cells; ++c)
+            mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
+        if (cudaMalloc((void**) &d_mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
+            cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+            std::printf("ERR cannot allocate the image position table\n");
+            return 1;
+        }
+        strata::kernels::mrope_table_set(d_mrope);
+        std::fprintf(stderr, "xolotl-dense: vision on (GENI requests, M-RoPE table of %lld cells, %.1f MiB)\n",
+                     (long long) cells, mrope_host.size() * 4 / 1048576.0);
+    }
+
+    std::printf("INFO engine=dense-0.2 model=%s layers=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu context=%lld kv=%s mtp=%d dflash2=%d draft_max=%d draft_min=%d draft_p_min=%.2f vision=%d\n",
                 cfg.arch.c_str(), cfg.n_layer, cfg.n_embd, (unsigned long long) (model.weight_bytes() >> 20),
                 (unsigned long long) (model.host_weight_bytes() >> 20), (unsigned long long) (model.kv_bytes() >> 20),
                 (long long) model.max_context(), model.kv_type().c_str(), model.has_mtp() ? 1 : 0, use_df2 ? 1 : 0,
-                (model.has_mtp() || use_df2) ? draft_max : 0, (model.has_mtp() || use_df2) ? draft_min : 0, (double) draft_p_min);
+                (model.has_mtp() || use_df2) ? draft_max : 0, (model.has_mtp() || use_df2) ? draft_min : 0, (double) draft_p_min,
+                vision ? 1 : 0);
     std::printf("READY %lld stop\n", (long long) model.max_context());
     std::fflush(stdout);
     std::fprintf(stderr, "xolotl-dense: ready - %.2f GiB of weights, %.2f GiB of KV cache (%s), context %lld%s\n",
@@ -1060,16 +1113,27 @@ int main(int argc, char** argv) {
     reader.detach();
 
     std::vector<int32_t> fed;                      // every token the state has consumed, in order
+    // the vision path: the pictures among `fed` (start cell, identity hash), the current request's, its rows
+    std::vector<std::pair<int64_t, uint64_t>> fed_imgs, req_imgs;
+    bool mrope_identity = true;
+    std::vector<float> img_rows;
+    std::vector<const float*> row_ptr;
     NgramPool ngram;                               // xolotl: --ngram-chain
     ngram.n = ngram_n;
     std::string line;
     while (in.pop(line)) {
         if (line == "QUIT") break;
         in.stop.store(false);                       // a STOP between requests is stale
-        if (line.rfind("GEN ", 0) != 0) { std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n"); std::fflush(stdout); continue; }
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        if (!geni && line.rfind("GEN ", 0) != 0) {
+            std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...> or GENI <max_new> [key=value ...] <file> <id,id,...>\n");
+            std::fflush(stdout);
+            continue;
+        }
 
         char* endp = nullptr;
-        const long long max_new = std::strtoll(line.c_str() + 4, &endp, 10);
+        const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
+        std::vector<uint64_t> img_keys;            // #2228: img_keys=<hex>,... (GENI), each picture's key from the server
         strata::kernels::SamplerParams sp;
         sp.top_k = 20; sp.top_p = 1.0f; sp.temperature = 0.0f; sp.greedy = true;
         unsigned long long seed = 0;
@@ -1097,19 +1161,120 @@ int main(int argc, char** argv) {
             else if (key == "penalty_freq") sp.penalty_freq = fv;
             else if (key == "penalty_present") sp.penalty_present = fv;
             else if (key == "seed") seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+            else if (key == "img_keys") {
+                for (const char* c = tok.c_str() + eq + 1; *c;) {
+                    char* e = nullptr;
+                    const unsigned long long v = std::strtoull(c, &e, 16);
+                    if (e == c) break;
+                    img_keys.push_back((uint64_t) v);
+                    c = (*e == ',') ? e + 1 : e;
+                }
+            }
             else if (key == "score") {
                 score_bad = !parse_ids(tok.c_str() + eq + 1, score_ids) || score_ids.size() > 64;
                 for (const int32_t id : score_ids) score_bad = score_bad || id >= n_vocab;
             }
         }
         if (score_bad) { std::printf("ERR score: expected 1-64 token ids below the vocabulary size\n"); std::fflush(stdout); continue; }
+        std::string emb_path;                      // GENI: the embeddings file, the first token without an '='
+        if (geni) {
+            while (*endp == ' ') ++endp;
+            char* gap = std::strchr(endp, ' ');
+            if (gap != nullptr) { emb_path.assign(endp, (size_t) (gap - endp)); endp = gap; }
+        }
         std::vector<int32_t> ids;
-        if (max_new < 1 || !parse_ids(endp, ids)) { std::printf("ERR bad request\n"); std::fflush(stdout); continue; }
+        if (max_new < 1 || (geni && emb_path.empty()) || !parse_ids(endp, ids)) { std::printf("ERR bad request\n"); std::fflush(stdout); continue; }
         if ((long long) ids.size() + 1 > model.max_context()) {
             std::printf("ERR the prompt (%zu tokens) does not fit the context (%lld)\n", ids.size(), (long long) model.max_context());
             std::fflush(stdout);
             continue;
         }
+        if (geni && !vision) { std::printf("ERR this engine was started without --vision\n"); std::fflush(stdout); continue; }
+        req_imgs.clear();
+        if (geni || !mrope_identity) {
+            // positions for every cell this request can reach (the identity again for a text request), and the
+            // image row of every image cell
+            const int64_t nn = (int64_t) ids.size();
+            const int64_t cells = (int64_t) mrope_host.size() / 3;
+            const int E = cfg.n_embd;
+            std::string ve;
+            row_ptr.assign((size_t) nn, nullptr);
+            auto put = [&](int64_t c, int64_t t, int64_t h, int64_t w) {
+                mrope_host[(size_t) c * 3] = (int32_t) t;
+                mrope_host[(size_t) c * 3 + 1] = (int32_t) h;
+                mrope_host[(size_t) c * 3 + 2] = (int32_t) w;
+            };
+            if (!geni) {
+                for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
+            } else {
+                struct Img { int64_t n, nx, ny; size_t off; };
+                std::vector<Img> imgs;
+                img_rows.clear();
+                std::FILE* f = std::fopen(emb_path.c_str(), "rb");
+                if (!f) ve = "cannot open " + emb_path;
+                while (f && ve.empty()) {
+                    int32_t hdr[5];
+                    const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
+                    if (got == 0) break;
+                    if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 ||
+                        (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] != E) {
+                        ve = "bad embeddings file (expected strata-vision records of width " + std::to_string(E) + ")";
+                        break;
+                    }
+                    const size_t off = img_rows.size(), cnt = (size_t) hdr[1] * (size_t) E;
+                    img_rows.resize(off + cnt);
+                    if (std::fread(img_rows.data() + off, sizeof(float), cnt, f) != cnt) { ve = "short embeddings file"; break; }
+                    imgs.push_back({hdr[1], hdr[2], hdr[3], off});
+                }
+                if (f) std::fclose(f);
+                int64_t p = 0, i = 0;
+                size_t k = 0;
+                while (ve.empty() && i < nn) {
+                    if (ids[(size_t) i] != kImagePad) { put(i, p, p, p); ++p; ++i; continue; }
+                    if (k >= imgs.size()) { ve = "the prompt has more images than the embeddings file"; break; }
+                    const Img& im = imgs[k++];
+                    {   // what the conversation cache compares: a picture is its grid and its key (or its embeddings)
+                        const int64_t grid[3] = {im.n, im.nx, im.ny};
+                        uint64_t h = fnv1a(grid, sizeof grid);
+                        if (img_keys.size() == imgs.size()) h = fnv1a(&img_keys[k - 1], sizeof(uint64_t), h);
+                        else h = fnv1a(img_rows.data() + im.off, (size_t) im.n * (size_t) E * sizeof(float), h);
+                        req_imgs.push_back({i, h});
+                    }
+                    for (int64_t j = 0; j < im.n && ve.empty(); ++j)
+                        if (i + j >= nn || ids[(size_t) (i + j)] != kImagePad)
+                            ve = "image " + std::to_string(k) + " has " + std::to_string((long long) im.n) +
+                                 " rows but fewer <|image_pad|> tokens";
+                    for (int64_t j = 0; j < im.n && ve.empty(); ++j) {
+                        const int64_t y = j / im.nx, x = j % im.nx;
+                        put(i + j, p, p + y, p + x);
+                        row_ptr[(size_t) (i + j)] = img_rows.data() + im.off + (size_t) j * (size_t) E;
+                    }
+                    i += im.n;
+                    p += std::max(im.nx, im.ny);
+                }
+                if (ve.empty() && k != imgs.size()) ve = "the embeddings file has more images than the prompt";
+                if (ve.empty() && nn > 0 && ids[(size_t) (nn - 1)] == kImagePad) ve = "the prompt cannot end in an image";
+                for (int64_t c = nn; ve.empty() && c < cells; ++c) put(c, p + (c - nn), p + (c - nn), p + (c - nn));
+            }
+            // the table is read by kernels already queued: wait for them before overwriting it
+            if (ve.empty() && !model.sync(err)) ve = err;
+            if (ve.empty() && cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
+                                         cudaMemcpyHostToDevice) != cudaSuccess)
+                ve = "the image position upload failed";
+            if (!ve.empty()) {
+                // leave the table as the identity so the next text request is untouched
+                for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
+                cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                mrope_identity = true;
+                req_imgs.clear();
+                model.set_embd_rows(nullptr, 0);
+                std::printf("ERR %s\n", ve.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            mrope_identity = !geni;
+        }
+        model.set_embd_rows(geni ? row_ptr.data() : nullptr, geni ? (int64_t) row_ptr.size() : 0);
         sp.seed = seed;
 
         // ---- what of the state can be kept
@@ -1117,6 +1282,16 @@ int main(int argc, char** argv) {
         {
             const size_t lim = std::min(fed.size(), ids.size());
             while (common < lim && fed[common] == ids[common]) ++common;
+            // a picture is a run of identical <|image_pad|> ids: the prompts also part at the first picture whose
+            // start cell or identity differs
+            for (size_t k = 0; k < std::max(fed_imgs.size(), req_imgs.size()); ++k) {
+                if (k < fed_imgs.size() && k < req_imgs.size() && fed_imgs[k] == req_imgs[k]) continue;
+                int64_t at = (int64_t) 1 << 62;
+                if (k < fed_imgs.size()) at = std::min(at, fed_imgs[k].first);
+                if (k < req_imgs.size()) at = std::min(at, req_imgs[k].first);
+                common = std::min(common, (size_t) at);
+                break;
+            }
         }
         size_t resume = 0;
         if (!fed.empty() && fed.size() < ids.size() && common == fed.size()) resume = fed.size();
@@ -1241,8 +1416,12 @@ int main(int argc, char** argv) {
                 since_pp = 0;
             }
         }
+        // the pictures the state now holds: those that start in what was read (cancelled: maybe part of one)
+        fed_imgs.clear();
+        for (const auto& im : req_imgs)
+            if ((size_t) im.first < fed.size()) fed_imgs.push_back(im);
         if (failed) continue;
-        if (!model.sync(err)) { fail(err); continue; }
+        if (!model.sync(err)) { fail(err); fed_imgs.clear(); continue; }
         // xolotl DFlash2: a prefill wrote its rows into the model's tap ring; the drafter gets the rows read in this
         // request (at most its 2048 window), all but the last, which becomes row 0 of the first round's new rows
         int df2_pend = 0;
@@ -1479,5 +1658,6 @@ int main(int argc, char** argv) {
     }
     cudaFree(d_next);
     cudaFree(d_hist);
+    if (d_mrope) { strata::kernels::mrope_table_set(nullptr); cudaFree(d_mrope); }
     return 0;
 }

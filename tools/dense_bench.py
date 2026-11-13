@@ -197,6 +197,7 @@ def main() -> int:
     ap.add_argument("--env", action="append", default=[], help="NAME=VALUE for the engine (STRATA_DENSE_PROF=1)")
     ap.add_argument("--json", default="", help="write the records here")
     ap.add_argument("--timeout", type=float, default=1200.0)
+    ap.add_argument("--engine-arg", action="append", default=[], help="extra engine argument (repeat), e.g. --engine-arg=--dflash2")
     a = ap.parse_args()
 
     gguf = Path(a.gguf)
@@ -222,6 +223,7 @@ def main() -> int:
         args += ["--no-prefill"]
     elif a.prompt_chunk:
         args += ["--prompt-chunk", str(a.prompt_chunk)]
+    args += a.engine_arg
 
     env = dict(os.environ)
     for e in a.env:

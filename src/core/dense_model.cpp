@@ -18,6 +18,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #endif
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -30,12 +31,155 @@
 #include <cstring>
 #include <exception>
 #include <map>
+#include <mutex>
 #include <regex>
 #include <set>
 #include <utility>
 
 namespace strata::core {
 namespace {
+
+// ---- KV spill (--kv-resident N): a K or V cache is ONE virtual range whose pages are VRAM for the first N cells of
+// every KV head and pinned host RAM (mapped for the GPU, read over PCIe) for the rest.  Every kernel sees the same
+// flat [kv_head][cell][bytes] array as before, so nothing that reads or writes the cache changes; a context that
+// stays under N cells never touches host RAM.  The driver entry points are resolved at run time (as core/vmm.cpp does).
+struct SpillApi {
+    bool ok = false;
+    int dev = -1;
+    CUmemLocation host{};
+    size_t gran = 0;
+    decltype(&cuMemAddressReserve) reserve = nullptr;
+    decltype(&cuMemAddressFree) free_va = nullptr;
+    decltype(&cuMemCreate) create = nullptr;
+    decltype(&cuMemRelease) release = nullptr;
+    decltype(&cuMemMap) map = nullptr;
+    decltype(&cuMemUnmap) unmap = nullptr;
+    decltype(&cuMemSetAccess) access = nullptr;
+    std::string why;
+};
+template <class F> bool spill_resolve(const char* name, F& f) {
+    cudaDriverEntryPointQueryResult q{};
+    void* p = nullptr;
+#if CUDART_VERSION >= 12050
+    const cudaError_t e = cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q);
+#else
+    const cudaError_t e = cudaGetDriverEntryPoint(name, &p, cudaEnableDefault, &q);
+#endif
+    if (e != cudaSuccess || q != cudaDriverEntryPointSuccess || p == nullptr) { (void) cudaGetLastError(); return false; }
+    f = (F) p;
+    return true;
+}
+const SpillApi& spill_api() {
+    static SpillApi& a = *new SpillApi;   // never destroyed: the model frees its ranges in its destructor
+    static std::once_flag once;
+    std::call_once(once, [] {
+        decltype(&cuDeviceGetAttribute) attr = nullptr;
+        decltype(&cuMemGetAllocationGranularity) granularity = nullptr;
+        if (cudaGetDevice(&a.dev) != cudaSuccess) { a.why = "no CUDA device"; return; }
+        if (!spill_resolve("cuDeviceGetAttribute", attr) || !spill_resolve("cuMemGetAllocationGranularity", granularity) ||
+            !spill_resolve("cuMemAddressReserve", a.reserve) || !spill_resolve("cuMemAddressFree", a.free_va) ||
+            !spill_resolve("cuMemCreate", a.create) || !spill_resolve("cuMemRelease", a.release) ||
+            !spill_resolve("cuMemMap", a.map) || !spill_resolve("cuMemUnmap", a.unmap) || !spill_resolve("cuMemSetAccess", a.access)) {
+            a.why = "the driver lacks the virtual memory API";
+            return;
+        }
+        int vmm = 0, host_vmm = 0, numa = -1;
+        attr(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) a.dev);
+        attr(&host_vmm, CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) a.dev);
+        attr(&numa, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, (CUdevice) a.dev);
+        if (!vmm || !host_vmm) { a.why = "this GPU/driver cannot map host memory through the virtual memory API"; return; }
+        a.host.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+        a.host.id = numa >= 0 ? numa : 0;
+        CUmemAllocationProp pd{}, ph{};
+        pd.type = ph.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        pd.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        pd.location.id = a.dev;
+        ph.location = a.host;
+        size_t gd = 0, gh = 0;
+        if (granularity(&gd, &pd, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS ||
+            granularity(&gh, &ph, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS || !gd || !gh) {
+            a.why = "no allocation granularity for host/device pages";
+            return;
+        }
+        a.gran = std::max(gd, gh);
+        a.ok = true;
+    });
+    return a;
+}
+
+struct SpillBuf {
+    CUdeviceptr va = 0;
+    size_t size = 0;
+    struct Run { size_t off, len; CUmemGenericAllocationHandle h; };
+    std::vector<Run> runs;
+    uint64_t dev_bytes = 0, host_bytes = 0;
+};
+
+void spill_free(SpillBuf& b) {
+    const SpillApi& a = spill_api();
+    if (!a.ok) return;
+    for (auto& r : b.runs) {
+        a.unmap(b.va + r.off, r.len);
+        a.release(r.h);
+    }
+    b.runs.clear();
+    if (b.va) a.free_va(b.va, b.size);
+    b.va = 0;
+    b.size = 0;
+}
+
+// a [heads][cells][cb] cache: the pages that hold any of cells [0, hot) of any head are VRAM, the others host RAM
+bool spill_alloc(SpillBuf& b, int heads, int64_t cells, uint64_t cb, int64_t hot, std::string& err) {
+    const SpillApi& a = spill_api();
+    if (!a.ok) { err = "dense model: --kv-resident: " + a.why; return false; }
+    const uint64_t g = a.gran, region = (uint64_t) cells * cb, total = (uint64_t) heads * region;
+    b.size = (size_t) ((total + g - 1) / g * g);
+    if (a.reserve(&b.va, b.size, g, 0, 0) != CUDA_SUCCESS) { err = "dense model: --kv-resident: cannot reserve the address range"; b.va = 0; return false; }
+    const uint64_t pages = b.size / g;
+    auto hot_page = [&](uint64_t i) {
+        const uint64_t lo = i * g, hi = lo + g;
+        for (int h = 0; h < heads; ++h) {
+            const uint64_t s = (uint64_t) h * region, e = s + (uint64_t) hot * cb;
+            if (lo < e && s < hi) return true;
+        }
+        return false;
+    };
+    for (uint64_t i = 0; i < pages;) {
+        const bool dev = hot_page(i);
+        uint64_t j = i + 1;
+        while (j < pages && hot_page(j) == dev) ++j;
+        CUmemAllocationProp prop{};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        if (dev) { prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE; prop.location.id = a.dev; }
+        else prop.location = a.host;
+        SpillBuf::Run r{(size_t) (i * g), (size_t) ((j - i) * g), 0};
+        if (a.create(&r.h, r.len, &prop, 0) != CUDA_SUCCESS) {
+            err = std::string("dense model: --kv-resident: cannot allocate ") + std::to_string(r.len >> 20) + " MiB of " +
+                  (dev ? "VRAM" : "pinned host RAM") + " for the KV cache";
+            spill_free(b);
+            return false;
+        }
+        if (a.map(b.va + r.off, r.len, 0, r.h, 0) != CUDA_SUCCESS) {
+            a.release(r.h);
+            err = "dense model: --kv-resident: cannot map the KV pages";
+            spill_free(b);
+            return false;
+        }
+        b.runs.push_back(r);
+        (dev ? b.dev_bytes : b.host_bytes) += r.len;
+        i = j;
+    }
+    CUmemAccessDesc ad{};
+    ad.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    ad.location.id = a.dev;
+    ad.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (a.access(b.va, b.size, &ad, 1) != CUDA_SUCCESS) {
+        err = "dense model: --kv-resident: the GPU cannot be given access to the KV pages";
+        spill_free(b);
+        return false;
+    }
+    return true;
+}
 
 using namespace strata::kernels;
 
@@ -263,6 +407,8 @@ struct DenseModel::Impl {
     float* taps_ring = nullptr;                     // [kTapRing][n_taps * n_embd]: prefill rows at position % kTapRing
     std::vector<void*> allocations;                 // everything cudaMalloc'ed here, freed in the destructor
     std::vector<void*> host_allocs;                 // weights that did not fit in VRAM: mapped pinned host memory
+    std::vector<SpillBuf> spill;                    // --kv-resident: K/V caches split between VRAM and host RAM
+    int64_t kv_hot = 0;                             // cells per KV head kept in VRAM (max_context: all of them)
     uint64_t budget = UINT64_MAX;                   // bytes of weights that may go to VRAM
     uint64_t dev_used = 0, host_bytes = 0;
     int host_tensors = 0;
@@ -283,6 +429,8 @@ struct DenseModel::Impl {
     };
     EmbdSrc embd, embd_mtp;
     float* embd_stage = nullptr;                    // pinned, NC * n_embd floats
+    const float* const* img_rows = nullptr;         // set_embd_rows(): per-cell image rows (nullptr = the table)
+    int64_t img_n = 0;
 
     float* output_norm = nullptr;
     QMat head;
@@ -517,12 +665,17 @@ struct DenseModel::Impl {
     }
 
     // n embedding rows -> device, one copy; the pinned stage is reused only after the previous copy finished
+    // cell0 >= 0: the rows are cells cell0.., and a cell with an image row (set_embd_rows) takes that row instead
     bool upload_embeddings(const EmbdSrc& src, const int32_t* toks, int n, int E, int n_vocab, float* dst,
-                           std::string& err, float* stage = nullptr) {
+                           std::string& err, float* stage = nullptr, int64_t cell0 = -1) {
         float* st = stage ? stage : embd_stage;
         if (cudaEventSynchronize(embed_done) != cudaSuccess) { err = "dense model: embedding event"; return false; }
         for (int j = 0; j < n; ++j) {
             if (toks[j] < 0 || toks[j] >= n_vocab) { err = "dense model: token id outside the vocabulary"; return false; }
+            if (cell0 >= 0 && img_rows != nullptr && cell0 + j < img_n && img_rows[cell0 + j] != nullptr) {
+                std::memcpy(st + (size_t) j * E, img_rows[cell0 + j], (size_t) E * sizeof(float));
+                continue;
+            }
             const uint8_t* row = src.f.file->tensor_data(*src.f.tensor) + (size_t) toks[j] * src.row_bytes;
             if (!dequant_row(src.type, row, E, st + (size_t) j * E)) { err = "dense model: embedding dequantization"; return false; }
         }
@@ -821,6 +974,7 @@ DenseModel::~DenseModel() {
     if (impl_->stream) cudaStreamSynchronize(impl_->stream);
     for (void* p : impl_->allocations) cudaFree(p);
     for (void* p : impl_->host_allocs) cudaFreeHost(p);
+    for (auto& b : impl_->spill) spill_free(b);
     for (auto& c : impl_->ckpt) if (c.host) cudaFreeHost(c.host);
 #ifdef STRATA_DENSE_MMQ
     if (impl_->pf && impl_->pf->stage) cudaFreeHost(impl_->pf->stage);
@@ -837,6 +991,11 @@ const float* DenseModel::ring_taps() const { return impl_->taps_ring; }
 const void* DenseModel::head_weights() const { return impl_->head.dev; }
 int DenseModel::head_type() const { return impl_->head.type; }
 int64_t DenseModel::head_rows() const { return impl_->head.n_out; }
+void DenseModel::set_embd_rows(const float* const* rows, int64_t n) {
+    impl_->img_rows = rows;
+    impl_->img_n = rows != nullptr ? n : 0;
+}
+
 bool DenseModel::embed_host(int32_t token, float* out, std::string& err) const {
     const Impl& I = *impl_;
     if (token < 0 || token >= cfg_.n_vocab) { err = "dense model: token id outside the vocabulary"; return false; }
@@ -1005,19 +1164,36 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             for (int l = 0; l < cfg_.n_layer; ++l) {
                 if (I.find("blk." + std::to_string(l) + ".attn_q.weight")) ++n_attn; else ++n_gdn;
             }
-            const uint64_t kv_per_layer = (uint64_t) HK * (uint64_t) max_context * (kcell + vcell);
+            // --kv-resident: the cells of every trunk attention layer that live in VRAM (the rest spill to host RAM,
+            // spill_alloc); the MTP block's own cache stays whole in VRAM.  auto (-1) is settled below, once the
+            // weights are known: the weights come first (they are read every token), the KV takes what is left.
+            I.kv_hot = opt.kv_resident > 0 ? std::min<int64_t>(opt.kv_resident, max_context) : max_context;
+            uint64_t kv_per_layer = (uint64_t) HK * (uint64_t) I.kv_hot * (kcell + vcell);
+            const uint64_t kv_full_layer = (uint64_t) HK * (uint64_t) max_context * (kcell + vcell);
             const uint64_t snap_one = (uint64_t) cfg_.ssm_state * cfg_.ssm_v_heads * cfg_.ssm_state * 4 +
                                       (uint64_t) C * (cfg_.ssm_d_conv - 1) * 4;     // one snapshot of one GDN layer
             const uint64_t tap_bytes = opt.taps.empty() ? 0 :
                 (uint64_t) (NC + DenseModel::kTapRing) * opt.taps.size() * (uint64_t) cfg_.n_embd * 4;
             // the decode attention's partials: one region per column of a window (the extra NC - 1, ~19 MB each at 200K)
             const uint64_t scratch_extra = (uint64_t) (NC - 1) * dense_attn_scratch_bytes(cfg_.n_head, cfg_.head_dim, (int) max_context);
+            // the prompt prefill's scratch for a 512-token chunk (allocated lazily at the first prompt, so it has to be
+            // kept out of the weights' budget or a full card fails on its first request; see size_scratch below)
+            const uint64_t pf_reserve = [&]() -> uint64_t {
+                const uint64_t per_tok = 4ull * (3ull * E + 2ull * C + 3ull * cfg_.ssm_v_heads + 2ull * V + 2ull * H * 2 * D +
+                                                 3ull * H * D + 2ull * HK * D + 3ull * cfg_.n_ff + std::max(H, HK)) + 4 +
+                                         2ull * std::max({E, V, cfg_.n_ff, H * D});   // + the q8_1 copy of the widest input
+                return 512ull * per_tok + (16ull << 20);
+            }();
             auto reserved_for = [&](bool mtp) {
-                return (uint64_t) (n_attn + (mtp ? 1 : 0)) * kv_per_layer +
+                return pf_reserve + (uint64_t) n_attn * kv_per_layer + (mtp ? kv_full_layer : 0) +
                        ((mtp || opt.spec_snapshots) ? (uint64_t) n_gdn * snap_one * (uint64_t) draft_max : 0) + tap_bytes + scratch_extra;
             };
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
+            {   // --vram-reserve-mib N: leave N MiB free for another program (the vision encoder)
+                const uint64_t reserve = (uint64_t) std::max(0, opt.vram_reserve_mib) << 20;
+                free_b = free_b > reserve ? free_b - reserve : 0;
+            }
             const uint64_t margin = 1024ull << 20;
             auto budget_for = [&](bool mtp) -> int64_t { return (int64_t) free_b - (int64_t) reserved_for(mtp) - (int64_t) margin; };
             // the bytes of every quantized matrix the trunk (and the MTP block) will upload
@@ -1043,6 +1219,20 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                                                            (int) opt.draft_vocab.size() + std::max(0, opt.draft_vocab_extra));
             }
             const bool user_cap = std::getenv("STRATA_DENSE_GPU_MIB") != nullptr;
+            if (opt.kv_resident < 0) {   // auto: every cell that fits beside the weights stays in VRAM
+                const int64_t per_cell = (int64_t) n_attn * HK * (int64_t) (kcell + vcell);
+                kv_per_layer = 0;
+                const int64_t room = budget_for(with_mtp) - (int64_t) (trunk_bytes + (with_mtp ? mtp_bytes : 0) + draft_bytes);
+                int64_t hot = per_cell > 0 && room > 0 ? room / per_cell / 1024 * 1024 : 0;
+                hot = std::max<int64_t>(hot, std::min<int64_t>(8192, max_context));
+                I.kv_hot = std::min<int64_t>(hot, max_context);
+                kv_per_layer = (uint64_t) HK * (uint64_t) I.kv_hot * (kcell + vcell);
+            }
+            if (I.kv_hot < max_context)
+                std::fprintf(stderr, "xolotl-dense: KV spill: %lld of %lld cells per KV head in VRAM (%.2f GiB), the rest in pinned "
+                             "host RAM (%.2f GiB, read over PCIe once the context passes %lld)\n",
+                             (long long) I.kv_hot, (long long) max_context, n_attn * kv_per_layer / 1073741824.0,
+                             n_attn * (double) (kv_full_layer - kv_per_layer) / 1073741824.0, (long long) I.kv_hot);
             if (with_mtp && !user_cap && !opt.mtp_force && budget_for(true) < (int64_t) (trunk_bytes + mtp_bytes)) {
                 // the longest context at which everything, MTP included, stays in VRAM
                 const int64_t per_token = (int64_t) (n_attn + 1) * HK * (int64_t) (kcell + vcell);   // KV bytes per token, MTP layer too
@@ -1198,7 +1388,14 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                     !I.upload_floats(I.find(p + "attn_k_norm.weight"), p + "attn_k_norm.weight", D, &L.k_norm, err))
                     return false;
                 const uint64_t kb = (uint64_t) HK * (uint64_t) max_context * kcell, vb = (uint64_t) HK * (uint64_t) max_context * vcell;
-                if (!I.alloc(&L.kc, kb, err, "K cache") || !I.alloc(&L.vc, vb, err, "V cache")) return false;
+                if (I.kv_hot < max_context) {   // --kv-resident: VRAM for the first kv_hot cells, host RAM after
+                    I.spill.emplace_back();
+                    if (!spill_alloc(I.spill.back(), HK, max_context, kcell, I.kv_hot, err)) { I.spill.pop_back(); return false; }
+                    L.kc = (uint16_t*) (uintptr_t) I.spill.back().va;
+                    I.spill.emplace_back();
+                    if (!spill_alloc(I.spill.back(), HK, max_context, vcell, I.kv_hot, err)) { I.spill.pop_back(); return false; }
+                    L.vc = (uint16_t*) (uintptr_t) I.spill.back().va;
+                } else if (!I.alloc(&L.kc, kb, err, "K cache") || !I.alloc(&L.vc, vb, err, "V cache")) return false;
                 kv_bytes_ += kb + vb;
             }
         }
@@ -1458,7 +1655,7 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
     const bool dbg = I.dbg_from >= 0 && pos0 < I.dbg_to && pos0 + n > I.dbg_from;
     try {
         if (I.prof.enabled) I.prof.begin(s);
-        if (!I.upload_embeddings(I.embd, tokens, n, E, cfg_.n_vocab, I.x, err)) { I.prof.on = false; return false; }
+        if (!I.upload_embeddings(I.embd, tokens, n, E, cfg_.n_vocab, I.x, err, nullptr, pos0)) { I.prof.on = false; return false; }
         if (dbg) trace_vec("embed", pos0, -1, "", I.x, n * E, s);
         // A hyper-connection model starts as the embedding broadcast to every stream (the reference's own initial
         // condition); a plain one keeps the single vector in `x`.
@@ -1663,7 +1860,7 @@ bool DenseModel::prefill(const int32_t* tokens, int64_t n, Logits lg, std::strin
         for (int64_t i = 0; i < n;) {
             const int64_t T = std::min(pf_chunk_, n - i);
             const int64_t pos0 = pos_;
-            if (!I.upload_embeddings(I.embd, tokens + i, (int) T, E, cfg_.n_vocab, P.x, err, P.stage)) {
+            if (!I.upload_embeddings(I.embd, tokens + i, (int) T, E, cfg_.n_vocab, P.x, err, P.stage, pos0)) {
                 I.prof.on = false;
                 return false;
             }

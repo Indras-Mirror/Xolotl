@@ -89,6 +89,8 @@ namespace strata::core
         /// Empty = drafts use the full head.
         std::vector<int32_t> draft_vocab;
         int draft_vocab_extra = 16384;  ///< rows kept free after the shortlist for draft_vocab_extend()
+        int64_t kv_resident = 0;        ///< cells per KV head kept in VRAM, the rest in host RAM (0 = all in VRAM, -1 = auto: what fits)
+        int vram_reserve_mib = 0;       ///< VRAM left free for another program (the vision encoder) when budgeting
     };
 
     class DenseModel
@@ -206,6 +208,11 @@ namespace strata::core
         const float *ring_taps() const;
         /// The token's embedding row (n_embd floats) on the host, dequantized from the model file.
         bool embed_host(int32_t token, float *out, std::string &err) const;
+        /// The vision path (--vision): rows[c] is the n_embd-float embedding of cell c (an image row from strata-vision)
+        /// or nullptr (the cell's token goes through the embedding table as usual), for cells 0..n-1.  run() and
+        /// prefill() read it; the MTP drafter keeps the table row of the token (<|image_pad|>), as strata's does.  The
+        /// array and the rows must stay alive while they are set; nullptr (the default) turns it off.
+        void set_embd_rows(const float *const *rows, int64_t n);
         /// The output head as native_mmvq reads it: weights (device or mapped), type, rows (= n_vocab).
         const void *head_weights() const;
         int head_type() const;
