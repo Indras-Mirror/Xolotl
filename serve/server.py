@@ -5054,10 +5054,25 @@ class Service:
             self.stop_ids = {int(eos)}
             self.parser_cls = dsml.DsmlOutputParser
             self._force_text = dsml.to_dsml_force
+        elif family == "muse-glimmer":
+            # Muse Glimmer (local): its turn is messages to channels (to=self reasoning, to=user answer, to=<tool> ATEM
+            # calls) ending in <|eot|>; serve/atem.py reads them as the Qwen form and holds Glimmer's spelling of the
+            # markers the server writes into the engine's input
+            from serve import atem
+            sid = getattr(self.tok, "special_ids", None) or {}
+            self.stop_ids = {int(sid[k]) for k in ("eot", "eos") if sid.get(k) is not None} or self.stop_ids
+            self.parser_cls = atem.AtemOutputParser
+            self._force_text = atem.to_atem_force
+            self.reasoning_close_text = atem.REASONING_CLOSE
+            self.reasoning_wrap_up_text = atem.REASONING_WRAP_UP
+            self.answer_open_text = atem.ANSWER_OPEN
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
     _force_text = None
+    reasoning_close_text = None      # a family's spelling of REASONING_CLOSE / REASONING_WRAP_UP (Muse Glimmer)
+    reasoning_wrap_up_text = None
+    answer_open_text = None          # thinking off: appended to the prompt so the reply is the answer (Muse Glimmer)
 
     def force_text(self, force):
         """forced_call's opening of the call the reply must make, in this model's spelling."""
@@ -6141,6 +6156,9 @@ class Service:
             kwargs = {**kwargs, "add_vision_id": self.add_vision_id}
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
+        if self.family == "muse-glimmer" and effort and "reasoning_strength" not in kwargs:
+            # Glimmer's template: "Reasoning strength: low|medium|high." (the effort table's xhigh is its high)
+            kwargs = {**kwargs, "reasoning_strength": "high" if effort in ("xhigh", "max") else effort}
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
             return self.template.render(messages, tools=tools, **kwargs)
         base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
@@ -6399,6 +6417,8 @@ class Service:
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and (not self.thinking_model or kwargs.get("enable_thinking", True) is False):
             ids = ids + self.tok.encode(force, parse_special=True)
+        elif self.answer_open_text and self.thinking_model and kwargs.get("enable_thinking", True) is False:
+            ids = ids + self.tok.encode(self.answer_open_text, parse_special=True)   # Muse Glimmer: straight to the answer
         self.embeddings.path = None
         self.embeddings.keys = None
         self.embeddings.refill = None
@@ -7197,7 +7217,7 @@ class Service:
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
                             close_retried = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                            extra = self.tok.encode(self.reasoning_close_text or REASONING_CLOSE, parse_special=True)
                             if max_new - n - len(extra) >= 1:
                                 print("[strata] the reply ended inside its thinking with no answer: closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
@@ -7236,7 +7256,7 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = st["thinking_budget"] = None
-                            text = REASONING_WRAP_UP + (force or "")
+                            text = (self.reasoning_wrap_up_text or REASONING_WRAP_UP) + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
@@ -10540,6 +10560,10 @@ MODEL_CARD_SAMPLING = {
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # DeepSeek-V4.1-Flash: temperature 1.0, top_p 1.0 for local use (thinking or not), no penalties
     "deepseek41": {"thinking": {"temperature": 1.0, "top_p": 1.0}, "instruct": {"temperature": 1.0, "top_p": 1.0}},
+    # Muse Glimmer 30B (local): above temperature 0.6 it stops writing the ATEM tool-call markup (Mal's llama.cpp wrapper
+    # notes: 1.0 skips it, 0.6 / top_p 0.9 / top_k 20 gives clean calls)
+    "muse-glimmer": {"thinking": {"temperature": 0.6, "top_p": 0.9, "top_k": 20},
+                     "instruct": {"temperature": 0.6, "top_p": 0.9, "top_k": 20}},
 }
 
 
@@ -10984,8 +11008,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             delay_s=getattr(a, "script_delay", 0.0) or 0.0), None, {}
     # the model's image marker: the token its chat template writes after <|vision_start|> for each picture (Qwen's
     # <|image_pad|>; LFM3's <|image|>), expanded to one token per encoder row
-    global IMAGE_PAD
+    global IMAGE_PAD, VISION_START
     IMAGE_PAD = cfg.get("image_pad") or IMAGE_PAD
+    VISION_START = cfg.get("vision_start") or VISION_START   # local: the token before each picture's marker (Muse Glimmer: <|image_start|>)
     if isinstance(cfg.get("vision"), dict) and cfg["vision"].get("av"):   # audio / video parts to the same encoder
         from serve import frontend as _fe
         _fe.IMAGE_PARTS = _fe.IMAGE_PARTS + _fe.AV_PARTS
@@ -11025,7 +11050,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch == "deepseek41" else None)
+        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "muse-glimmer") else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])

@@ -99,11 +99,26 @@ LLAMA3_PATTERN = (
     r"|\s+"
 )
 
+# The `llama4` pre-tokenizer (Llama 4 and Meta's Muse Glimmer / Muse Spark vocabulary, 202,048 tokens): llama.cpp maps it
+# to LLAMA_VOCAB_PRE_TYPE_GPT4O (src/llama-vocab.cpp, the `tokenizer_pre == "llama4"` case, clean_spaces off).  This is
+# the tokenizer.json original, which the `regex` module reads as it is; llama.cpp's own copy spells the case classes as
+# lookaheads because std::regex has no \p{Lu}.
+GPT4O_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 # pre type -> the pattern list llama.cpp applies, in order.  The `pre` string in GGUF metadata selects it.
 PRE_PATTERNS = {
     "qwen35": [QWEN35_PATTERN],
     "joyai-llm": JOYAI_LLM_PATTERNS,
     "lfm2": [LLAMA3_PATTERN],
+    "llama4": [GPT4O_PATTERN],
 }
 IGNORE_MERGES = {"lfm2"}   # llama.cpp's ignore_merges: a whole piece found in the vocabulary is taken as it is
 

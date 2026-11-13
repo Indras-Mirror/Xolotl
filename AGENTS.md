@@ -1,7 +1,7 @@
 # AGENTS.md
 
 **Xolotl** runs very large mixture-of-experts models on one gaming PC: DeepSeek-V4.1-Flash-1017 (552B), GLM-5.3-Flash
-(320B), Qwen3.8-Flash-Next (125B), the dense Qwen3.8-27B and LFM3-Omni (2B), each behind one OpenAI- and
+(320B), Qwen3.8-Flash-Next (125B), the dense Qwen3.8-27B, LFM3-Omni (2B) and Muse Glimmer 30B (dense, Meta), each behind one OpenAI- and
 Anthropic-compatible server. It is built from [Strata](https://github.com/Niko1221/Strata) and has grown well past it
 (upstream Strata at the last merge, 31 Oct 2026: Version 0.2.8, engine 0.1.54.). The measured numbers are in the
 [README](README.md#what-one-pc-can-do) and [docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md).
@@ -45,6 +45,7 @@ on Windows 11 ([docs/WINDOWS.md](docs/WINDOWS.md)).
    python3 tools/glm/serve/serve_glm.py --engine strata --config tools/glm/serve/strata-glm-maya-abl-512k.json --port 8144
    ./scripts/xol-qfn.sh --serve-only --model <shard 1 .gguf> --pack <pack-qfn45>                                # Qwen3.8-Flash-Next
    python3 -m serve.server --engine strata --config strata-qwen3.8-27b.json --port 8090                          # Qwen3.8-27B
+   python3 -m serve.server --engine strata --config tools/glimmer/xol-glimmer.example.json --port 8133             # Muse Glimmer 30B (docs/GLIMMER.md)
    ```
 
    For the 27B, `--mtp` (with the model's MTP head) and `--ngram-chain` in the config's engine args are the fast
@@ -57,7 +58,7 @@ One big model at a time: DeepSeek-V4.1 and GLM-5.3 each take most of the RAM (an
 ## Working on the code
 
 - How it works: [docs/xolotl/HOW_IT_WORKS.md](docs/xolotl/HOW_IT_WORKS.md); per engine: [docs/DEEPSEEK_V41.md](docs/DEEPSEEK_V41.md),
-  [docs/glm](docs/glm), [docs/LFM3.md](docs/LFM3.md), and [README.strata.md](README.strata.md) for the Strata core.
+  [docs/glm](docs/glm), [docs/LFM3.md](docs/LFM3.md), [docs/GLIMMER.md](docs/GLIMMER.md), and [README.strata.md](README.strata.md) for the Strata core.
 - What changed and why, newest first: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md). Every engine speed-up has
   a before / after row in the [speed log](docs/xolotl/BENCHMARKS.md#speed-log).
 - Checks: `build-xolotl/xolotl-dense --selftest` (dense kernels against a CPU reference), `tools/throughput.py` (fresh-

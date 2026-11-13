@@ -3119,3 +3119,11 @@ if(STRATA_DENSE AND TARGET ggml-cuda AND TARGET strata_kernels)
   target_include_directories(xolotl-lfm3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(xolotl-lfm3 PRIVATE strata_kernels ggml ggml-cuda ggml-cpu ggml-base ${_strata_gpu_runtime_target})
 endif()
+
+# Muse Glimmer 30B (Meta) behind the serve protocol: llama.cpp's muse-glimmer graph on ggml-backend (CUDA + CPU fallback),
+# src/program/glimmer_main.cpp (the xolotl-lfm3 skeleton).  Same needs as xolotl-lfm3.
+if(STRATA_DENSE AND TARGET ggml-cuda AND TARGET strata_kernels)
+  add_executable(xolotl-glimmer src/program/glimmer_main.cpp)
+  target_include_directories(xolotl-glimmer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_link_libraries(xolotl-glimmer PRIVATE strata_kernels ggml ggml-cuda ggml-cpu ggml-base ${_strata_gpu_runtime_target})
+endif()

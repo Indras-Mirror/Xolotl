@@ -290,8 +290,12 @@ int main(int argc, char** argv) {
         std::string img, out;
         if (!parse_enc(line, img, out)) { std::printf("ERR expected: ENC <image> <output>\n"); std::fflush(stdout); continue; }
         const auto t0 = std::chrono::steady_clock::now();
+#if defined(STRATA_MTMD_HELPER_NO_OPT)   // llama.cpp trees whose helper takes no init options (Muse Glimmer's, tools/glimmer)
+        mtmd_helper_bitmap_wrapper bw = mtmd_helper_bitmap_init_from_file(ctx, img.c_str(), false);
+#else
         mtmd_helper_bitmap_wrapper bw = mtmd_helper_bitmap_init_from_file(ctx, img.c_str(), false,
                                                                             mtmd_helper_init_opt_default());
+#endif
         if (!bw.bitmap) { std::printf("ERR cannot read the image %s\n", img.c_str()); std::fflush(stdout); continue; }
         mtmd_input_chunks* chunks = mtmd_input_chunks_init();
         const std::string prompt = mtmd_default_marker();

@@ -1,0 +1,38 @@
+{
+ "_comment": "Muse Glimmer 30B on xolotl-glimmer (docs/GLIMMER.md): 512K context with q8 K/V on a 24 GB card, pictures on the CPU encoder. Edit the paths.",
+ "arch": "muse-glimmer",
+ "exe": "build-xolotl/xolotl-glimmer",
+ "args": [
+  "--native",
+  "/path/to/Muse-Glimmer-30B-IQ4_NL.gguf",
+  "--context",
+  "524288",
+  "--ubatch",
+  "512",
+  "--kv-type",
+  "q8",
+  "--ngram",
+  "8"
+ ],
+ "cwd": ".",
+ "tokenizer": "/path/to/muse-glimmer/tokenizer",
+ "model_name": "muse-glimmer-30b",
+ "log": "xol-glimmer.log",
+ "port": 8133,
+ "gpu": 0,
+ "sampling": {
+  "temperature": 0.6,
+  "top_p": 0.9,
+  "top_k": 20
+ },
+ "bos_token": "<|begin_of_text|>",
+ "image_pad": "<|patch|>",
+ "vision_start": "<|image_start|>",
+ "vision": {
+  "exe": "build-xolotl/xolotl-glimmer-vision",
+  "mmproj": "/path/to/mmproj-Muse-Glimmer-30B-f16.gguf",
+  "model": "/path/to/Muse-Glimmer-30B-IQ4_NL.gguf",
+  "gpu": false
+ },
+ "_vision": "pictures on the CPU (~13 s each, 391 rows for 640x480): at 512K the engine + the f16 mmproj on the GPU (4.3 GB) leave no room for a long prefill (measured 13 Nov: 23.8 GB idle, 8K prefill failed). For a smaller --context set vision.gpu true."
+}

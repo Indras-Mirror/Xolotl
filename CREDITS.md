@@ -14,6 +14,8 @@
 
 - Weights: DeepSeek, Zhipu AI and Qwen, with quants and fine-tunes by peasantsmith, ukisai, d0xin and gcsa-abliterix.
 - LFM3-Omni by [Liquid AI](https://huggingface.co/LiquidAI); its engine follows llama.cpp's LFM3 and libmtmd work.
+- Muse Glimmer by Meta Superintelligence Labs; its engine follows llama.cpp's Muse Glimmer support (ggml-org/llama.cpp
+  #26841: graph, chat parser, mtmd projector). The abliterated build it was measured with is darkc0de's, quantised by bartowski. Its DFlash drafter is Meta's; the drafter graph follows llama.cpp's `src/models/dflash.cpp`.
 
 ## Ideas
 

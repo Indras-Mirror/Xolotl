@@ -2,7 +2,7 @@
 
 <h1 align="center">Xolotl</h1>
 
-<p align="center"><b>DeepSeek-V4.1-Flash, all 552 billion parameters, on one gaming PC at 33 tok/s on real agent tasks (41 in fast mode)</b>, alongside GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.8-27B and LFM3-Omni, all behind one OpenAI- and Anthropic-compatible server. Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily extended. Linux · NVIDIA · MIT.</p>
+<p align="center"><b>DeepSeek-V4.1-Flash, all 552 billion parameters, on one gaming PC at 33 tok/s on real agent tasks (41 in fast mode)</b>, alongside GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.8-27B, LFM3-Omni and Muse Glimmer 30B, all behind one OpenAI- and Anthropic-compatible server. Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily extended. Linux · NVIDIA · MIT.</p>
 
 > **Built from [Strata](https://github.com/Niko1221/Strata), and grown a long way past it.** Niko1221's engine,
 > server and core kernels are still at the heart of it (merged at 0.1.44.1), but Xolotl adds more than 70,000 lines
@@ -12,6 +12,9 @@
 
 ## Latest
 
+- **13 Nov** - [Muse Glimmer 30B](docs/GLIMMER.md) (Meta, dense) natively at its full 512K context on one 24 GB
+  card: 47 tok/s decode, 1.3-8x faster with Meta's DFlash drafter (up to 379 tok/s), 3,100 tok/s prefill, tool calls, reasoning and pictures through the usual server.
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#muse-glimmer-30b-natively-at-512k-13-nov).
 - **13 Nov** - Keirolabs joins Exa, Perplexity and DeepSeek as a keyed web search choice in Settings > Tools (your own
   key; nothing changes without one). By Manasbh (#136).
   [CHANGELOG](docs/xolotl/CHANGELOG.md#keirolabs-as-a-keyed-web-search-service-13-nov).
@@ -168,6 +171,7 @@ pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up
 | [DeepSeek-V4.1 on Windows](docs/WINDOWS.md)        | native MSVC + CUDA build, configs, RTX 50 notes                                   |
 | [GLM-5.3-Flash engine](docs/glm)                   | KDA + MLA attention, the LoRA on routed experts, soft pruning                     |
 | [LFM3-Omni engine](docs/LFM3.md)                   | pictures, audio, video and speech on a 2B model, park/unpark beside a big one     |
+| [Muse Glimmer engine](docs/GLIMMER.md)             | Meta's dense 30B at 512K on 24 GB, its channel / ATEM tool-call format, pictures  |
 | [Qwen3.8-27B dense howto](docs/dense/HOWTO.md)     | dense vs MoE paths, binaries, configs, MTP (by Mirko Perrone, also in Italian)    |
 | [Setting up with an agent](AGENTS.md)              | the build-and-serve steps for an AI agent (or a person) setting Xolotl up         |
 | [Qwen3.8 / upstream Strata](README.strata.md)      | the Strata engine this grew from                                                  |
@@ -180,7 +184,7 @@ pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up
 
 Built on **[Strata](https://github.com/Niko1221/Strata)** by Niko1221 and [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp),
 with the Qwen3.8-27B dense port by [perronemirko](https://github.com/perronemirko/Strata). Model weights by DeepSeek,
-Zhipu AI, Qwen and Liquid AI, with quants and fine-tunes by peasantsmith, ukisai, d0xin and gcsa-abliterix. Thanks to
+Zhipu AI, Qwen, Liquid AI and Meta, with quants and fine-tunes by peasantsmith, ukisai, d0xin and gcsa-abliterix. Thanks to
 every contributor: NektoDron, Xiaomi2008, AlexeyMatskevich, paul123637-lab, kelheor, exye137, penink-WH, cpacsm75,
 jesdga95 (Basalt) and Ryan Flavell (PROMETHEVS). Who did what: **[CREDITS.md](CREDITS.md)**.
 

@@ -8,6 +8,25 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Muse Glimmer 30B natively at 512K (13 Nov)
+
+`xolotl-glimmer` (`src/program/glimmer_main.cpp`) serves Meta's dense Muse Glimmer 30B: llama.cpp's muse-glimmer graph on
+ggml-backend CUDA with the xolotl-lfm3 engine around it (serve protocol, prefix reuse, a checkpoint of the sliding rings,
+park/unpark). At 512K the 13 global layers (no position encoding) hold the context's K/V (q8, 3.5 GiB) and the 39 sliding
+layers a 2,560-cell ring: 14.4 GiB of weights + 3.5 GiB of K/V on a 24 GB card, the token table in RAM. YaRN is not needed
+(llama.cpp keeps the sliding layers at their trained rope scale), so a `--rope-scaling yarn` setting changes nothing for
+this model. `serve/atem.py` reads its turn format (`to=self` reasoning, `to=user` answer, ATEM `<atem:invoke>` tool calls)
+as the Qwen form the server knows; `arch: muse-glimmer` sets its stop tokens, sampling (0.6 / 0.9 / 20) and effort words.
+`tools/strata_tokenizer.py` gained the `llama4` pre-tokenizer (ids equal llama.cpp's on 77 test lines); pictures go through
+`xolotl-glimmer-vision` (`tools/glimmer/build-helpers.sh`). Served chat, tool call, tool round trip, thinking off and a
+picture all correct. Prefill 3,110-3,130 tok/s and decode 46-48 tok/s at 512K (llama.cpp wrapper on the same
+GGUF: ~763 / 39-42). Parity with llama.cpp over 4,096 tokens at equal batch size: mean KL 1.0e-3, 99.0 % the same top
+token, closer than llama.cpp at ubatch 512 is to itself at ubatch 256 (1.5e-3). `--ngram 8` (prompt-lookup drafts
+checked in one pass, kept only when they equal the sample plain decode draws) decodes copy-heavy replies 2.4-5.7x faster
+(116-279 tok/s) and free writing at 0.98x. `--dflash` runs Meta's DFlash block drafter natively (taps of layers 2/14/26/38/50
+fused into the drafter's ring inside the model's own graph, one non-causal draft pass, the same exact check): 186-379 tok/s
+on copy-heavy replies (3.9-8.0x), 1.3-2.4x on prose, output equal up to rounding. [docs/GLIMMER.md](../GLIMMER.md).
+
 ### Keirolabs as a keyed web search service (13 Nov)
 
 Settings > Tools > Web search has a fourth keyed choice, Keirolabs (your own key), beside Exa, Perplexity and DeepSeek. With
