@@ -257,5 +257,28 @@ class CollapsedUnderscoreNames(unittest.TestCase):
                     self.assertEqual((parser.unread, parser.unread_names), (1, [written]))
 
 
+class BareMemberOfMcpName(unittest.TestCase):
+    """2026-11-13, live on Qwen3.8-Flash-Next: the request declared `mcp__routeros__exec` and the model wrote
+    `<function=exec>`. The block went back as text (`strata_rejected_tool_calls`) and the agent stopped. The dot
+    form already had this rule; a name with only `__` did not."""
+    MCP = [plain_tool("mcp__routeros__exec"), plain_tool("mcp__routeros__get")]
+
+    def test_the_bare_member_is_the_declared_tool(self):
+        for width in (0, 1, 5):
+            with self.subTest(width=width):
+                evs, parser = run_parser("Running it.\n" + call_text("exec"), self.MCP, width)
+                found = [e.call for e in evs if e.kind == "tool_call"]
+                self.assertEqual([c.name for c in found], ["mcp__routeros__exec"])
+                self.assertEqual(found[0].arguments, {"url": "https://example.com"})
+                self.assertEqual(text_of(evs).strip(), "Running it.")
+                self.assertEqual((parser.unread, parser.unread_names), (0, []))
+
+    def test_two_tools_with_the_same_member_are_not_guessed(self):
+        tools = [plain_tool("mcp__a__exec"), plain_tool("mcp__b__exec")]
+        evs, parser = run_parser(call_text("exec"), tools)
+        self.assertEqual([e for e in evs if e.kind == "tool_call"], [])
+        self.assertEqual((parser.unread, parser.unread_names), (1, ["exec"]))
+
+
 if __name__ == "__main__":
     unittest.main()

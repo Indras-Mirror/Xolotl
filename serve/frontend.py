@@ -850,12 +850,15 @@ _LOOSE_OPEN = re.compile(r"<\s*(?:function\s*[=:]\s*|=\s*)?([A-Za-z0-9_.\-]+)\s*
 _LOOSE_PART = re.compile(r"<\s*(?:function[ \t]*[=:]?\s*|=\s*)?[A-Za-z0-9_.\-]*\s*$")
 # #5276: the opener written as text, misspelt - `<toolcall>` or `<tool-call>` - then `<function=NAME>`.  A model that
 # drops the underscore writes a literal string where the template documents a tag, and the call came back as text.
-_MISSPELT_OPEN = re.compile(r"<tool-?call>(\s*)<function=(\s*[^<>\s]+\s*)>")
+_MISSPELT_OPEN = re.compile(r"<tool[_-]?call\s*>(\s*)<function=(\s*[^<>\s]+\s*)>")
 #: every spelling of the opener a partial tag may be a prefix of, for _hold (streamed and whole outputs then agree)
 OPENER_TAGS = ("<tool_call>", "<toolcall>", "<tool-call>")
-_MISSPELT_ANY = re.compile(r"<tool-?call>")
+_MISSPELT_ANY = re.compile(r"<tool[_-]?call\s*>")
 #: a misspelt opener whose follower (`<function=NAME>`) is still arriving
-_MISSPELT_PART = re.compile(r"<tool-?call>\s*<(?:f(?:u(?:n(?:c(?:t(?:i(?:o(?:n)?)?)?)?)?)?)?)?(?:=[^<>]{0,80})?$")
+_MISSPELT_PART = re.compile(r"<tool[_-]?call\s*>\s*<(?:f(?:u(?:n(?:c(?:t(?:i(?:o(?:n)?)?)?)?)?)?)?)?(?:=[^<>]{0,80})?$")
+#: the opener still arriving, with whitespace before its `>` too - `<tool_call ` then `>` - so a streamed space
+#: is held rather than sent as content (Qwen3.8-Flash-Next wrote `<tool_call >` live; the call went back as text)
+_MISSPELT_TAIL = re.compile(r"<tool[_-]?call\s*$")
 
 
 # a quoted call's opener in a value: `<function=NAME>` and its first parameter or close; a bare FUNC_START is text
@@ -1346,6 +1349,10 @@ class OutputParser:
         for name in self.schemas:
             if isinstance(name, str) and "__" in name:
                 aliases.setdefault(name.replace("__", "_"), set()).add(name)
+                # `mcp__routeros__exec` written bare as `exec`: the same rule a dot's member gets.  Seen live
+                # (2026-11-13): the model wrote `<function=exec>` for a declared `mcp__routeros__exec`, the block
+                # went back as text and the agent stopped.
+                aliases.setdefault(name.rsplit("__", 1)[1], set()).add(name)
         self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
                         if len(names) == 1 and alias not in self.schemas}
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text
@@ -1418,6 +1425,8 @@ class OutputParser:
         if at < 0:
             return 0
         tail = self.buf[at:]
+        if _MISSPELT_TAIL.match(tail):
+            return len(tail)          # `<tool_call` / `<tool_call ` / `<tool-call `: the `>` has not arrived
         if _MISSPELT_PART.match(tail) or (_MISSPELT_ANY.match(tail) and
                                           _MISSPELT_ANY.match(tail).end() == len(tail)):
             return len(tail)
@@ -1886,6 +1895,12 @@ class OutputParser:
                     j = b
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
+                    # a misspelt or spaced opener in front of the bare call is held too, so streamed and whole agree
+                    held = max(self._hold(self.buf, OPENER_TAGS), self._misspelt_hold())
+                    if held:
+                        j = min(j, len(self.buf) - held)
+                        while j > 0 and self.buf[j - 1] == "\n":
+                            j -= 1
                     if j > 0 and self.buf[:j].strip():
                         out.append(Event("content", self._track(self.buf[:j])))
                     if not decided:
