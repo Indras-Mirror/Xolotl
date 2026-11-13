@@ -107,8 +107,9 @@ Qwen3.8-27B), the same tasks and turns, reasoning on (8 Nov).
 Qwen3.8-27B: one run on 8 Nov after that day's decode fixes (MTP with thinking off, one-pass verify attention,
 `--ngram-chain`); before them it scored 4.47 twice at 89 tok/s. Qwen3.8-27B XQ: our XQ quant of the abliterated base
 (not uploaded yet), MTP 3 + n-gram, one run on 14 Nov (solved 4/6 vs 5/6, different tasks missed; single runs swing).
-With DFlash2 instead of MTP it gave the same tokens (153,037) at 96.8 tok/s, so MTP stays the default; DFlash2's
-200+ tok/s is a best case on predictable text. Muse Glimmer 30B: one run on 14 Nov with `--ngram 8 --dflash`, as served. GLM-5.3-Flash: no Gauntlet run yet (score to come); its decode is from an agent replay on 8 Nov (a 25K-token
+Its 99.6 tok/s is the average over 153K tokens of real agent work (mostly long thinking turns); short tool-call turns
+reach ~150 tok/s with MTP and 200+ with DFlash2, and DFlash2 hits 204-222 tok/s on predictable text (best case, 2K
+prompt). With DFlash2 instead of MTP the Gauntlet gave the same tokens (153,037) at 96.8 tok/s, so MTP stays the default. Muse Glimmer 30B: one run on 14 Nov with `--ngram 8 --dflash`, as served. GLM-5.3-Flash: no Gauntlet run yet (score to come); its decode is from an agent replay on 8 Nov (a 25K-token
 conversation with tool-output turns, Maya 512K as served; since the RAM upgrade every expert sits in RAM, 23 tok/s before it),
 prefill 454 tok/s on a fresh 25K prompt.
 Prefill = a fresh 6K-17K-token prompt (`tools/throughput.py`), DeepSeek-V4.1's with its dense half at Q8_0. In the
