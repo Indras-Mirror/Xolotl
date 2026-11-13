@@ -57,7 +57,7 @@
 - **[kelheor](https://github.com/kelheor)**: the vision `pread` fix (#51); the Windows ds41 build fixes (#94, #118: portable mkdir / 64-bit stat / free space for the dense cache and --build-shadow)
 - **[exye137](https://github.com/exye137)**: the thread-local CUDA stream leak (#57)
 - **[trojy13](https://github.com/trojy13)**: the Windows CRLF patch failure, its root cause and the workaround (#134)
-- **[Yoongger](https://github.com/Yoongger)**: the NVIDIA L20 (92-SM Ada) interleaved-row mmvq tables and their A/B on the L20 (#135)
+- **[Yoongger](https://github.com/Yoongger)**: the NVIDIA L20 (92-SM Ada) interleaved-row mmvq tables and their A/B on the L20 (#135); the tool-call parser fix for a spaced `<tool_call >` opener and bare MCP `mcp__server__tool` members (#137)
 - **[penink-WH](https://github.com/penink-WH)**: the AC922 rig
 - **[cpacsm75](https://github.com/cpacsm75)**: 192 GB arena tuning on Windows (#77); the RTX 5090 arena and `--kv-q8`
   numbers at 256K/512K (#114)
