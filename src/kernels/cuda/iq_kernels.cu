@@ -3517,6 +3517,121 @@ void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int
 }
 
 
+// ---------------------------------------------------------------- xolotl: IQ3_S multi-column GEMV on the interleaved q8_1 copy
+// mmvq_multi_kernel<21, NC, SG, *> with the activations read from native_q8_1_interleave's position-major ints
+// pm[(p * nq + b) * CP + c] (nq = n_in / 32; a lane's block b is its neighbour's + 1, so a warp's loads of one position
+// are one contiguous run - the block-major copy measured 2x slower than the plain kernel) and scales dl[b * CP + c] (= __low2float(ds), as Split<21>::apply reads it): a position of
+// all CP columns is one 16-byte load (two at CP = 8), where apply issues 8 + 1 four-byte loads per column per item (the
+// q8_1 block is 36 bytes, so they cannot be vectorized; LSU-bound at 8 columns).  Same rows / lanes / items, the same
+// Split<21>::load, each column's dp4a chain over p = 0..7 in apply's order, sumi * ls, (dw * d8) * sumi, s += in item
+// order, warp_sum: every output is bitwise mmvq_multi_kernel's, so bitwise a single-column call.
+template<int NC, int CP, bool STAGE_GRID>
+__global__ void __launch_bounds__(128) mmvq_il_iq3s_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
+                                                           const int* __restrict__ pm, const float* __restrict__ dl,
+                                                           float* __restrict__ y, int n_in, int n_out) {
+    constexpr int TY = 21;
+    const int nq = n_in / 32;
+    using F = Fmt<TY>;
+    using S = Split<TY>;
+    static_assert(CP % 2 == 0 && NC <= CP, "interleaved width");
+    STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TY, STAGE_GRID>::value);
+    const uint32_t* s_grid = stage_iq_grid<TY, STAGE_GRID>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
+    const int row = blockIdx.x * 4 + threadIdx.y;
+    if (row >= n_out) return;
+    const int lane = threadIdx.x;
+    const int nb = n_in / F::qk;
+    const uint8_t* wr = w + (size_t) row * row_bytes;
+    float s[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+    for (int k = lane; k < nb * F::ipb; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        const typename S::W wv = S::template load<STAGE_GRID>(wr, kbx, iqs, s_grid);
+        const int b = kbx * (F::qk / 32) + iqs / 2;   // apply's q8_1 block: x + kbx * (qk / 32), then [iqs / 2]
+        int sumi[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) sumi[c] = 0;
+#pragma unroll
+        for (int p = 0; p < 8; ++p) {
+            int u[CP];
+            const int* src = pm + ((size_t) p * nq + b) * CP;
+            if constexpr (CP % 4 == 0) {
+#pragma unroll
+                for (int q = 0; q < CP / 4; ++q) {
+                    const int4 v = reinterpret_cast<const int4*>(src)[q];
+                    u[4 * q] = v.x; u[4 * q + 1] = v.y; u[4 * q + 2] = v.z; u[4 * q + 3] = v.w;
+                }
+            } else {
+#pragma unroll
+                for (int q = 0; q < CP / 2; ++q) {
+                    const int2 v = reinterpret_cast<const int2*>(src)[q];
+                    u[2 * q] = v.x; u[2 * q + 1] = v.y;
+                }
+            }
+#pragma unroll
+            for (int c = 0; c < NC; ++c) sumi[c] = ggml_cuda_dp4a(wv.g[p], u[c], sumi[c]);
+        }
+        float d8[CP];
+        if constexpr (CP % 4 == 0) {
+#pragma unroll
+            for (int q = 0; q < CP / 4; ++q) {
+                const float4 v = reinterpret_cast<const float4*>(dl + (size_t) b * CP)[q];
+                d8[4 * q] = v.x; d8[4 * q + 1] = v.y; d8[4 * q + 2] = v.z; d8[4 * q + 3] = v.w;
+            }
+        } else {
+#pragma unroll
+            for (int q = 0; q < CP / 2; ++q) {
+                const float2 v = reinterpret_cast<const float2*>(dl + (size_t) b * CP)[q];
+                d8[2 * q] = v.x; d8[2 * q + 1] = v.y;
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const int si = sumi[c] * wv.ls;
+            const float d = wv.dw * d8[c];
+            s[c] += d * si;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        s[c] = warp_sum(s[c]);
+        if (lane == c) y[(size_t) c * n_out + row] = s[c];
+    }
+}
+
+template<bool SG>
+static void launch_il_iq3s(dim3 grid, dim3 block, cudaStream_t s, const uint8_t* W, size_t rb, const int* pm,
+                           const float* dl, float* y, int n_in, int n_out, int ncols) {
+    switch (ncols) {
+        case 2: mmvq_il_iq3s_kernel<2, 2, SG><<<grid, block, 0, s>>>(W, rb, pm, dl, y, n_in, n_out); break;
+        case 3: mmvq_il_iq3s_kernel<3, 4, SG><<<grid, block, 0, s>>>(W, rb, pm, dl, y, n_in, n_out); break;
+        case 4: mmvq_il_iq3s_kernel<4, 4, SG><<<grid, block, 0, s>>>(W, rb, pm, dl, y, n_in, n_out); break;
+        case 5: mmvq_il_iq3s_kernel<5, 8, SG><<<grid, block, 0, s>>>(W, rb, pm, dl, y, n_in, n_out); break;
+        case 6: mmvq_il_iq3s_kernel<6, 8, SG><<<grid, block, 0, s>>>(W, rb, pm, dl, y, n_in, n_out); break;
+        case 7: mmvq_il_iq3s_kernel<7, 8, SG><<<grid, block, 0, s>>>(W, rb, pm, dl, y, n_in, n_out); break;
+        default: mmvq_il_iq3s_kernel<8, 8, SG><<<grid, block, 0, s>>>(W, rb, pm, dl, y, n_in, n_out); break;
+    }
+}
+
+}  // namespace (xolotl: iq_mmvq_il* are the public API, iq_kernels.hpp)
+
+// true when iq_mmvq_il runs the interleaved kernel for this call: IQ3_S, 2..8 columns, the split kernels in use
+// (iq_mmvq's launch_mmvq<21> path), STRATA_MMVQ_IL_IQ3S not 0
+bool iq_mmvq_il_supported(int t, int ncols) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL_IQ3S"); return !(v != nullptr && v[0] == '0'); }();
+    return on && t == 21 && ncols >= 2 && ncols <= 8 && !g_old_kernels && !split_off<21>();
+}
+void iq_mmvq_il(int t, const void* w, const int* pm, const float* dl, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (!iq_mmvq_il_supported(t, ncols)) { std::fprintf(stderr, "iq_mmvq_il: unsupported call\n"); std::exit(1); }
+    const size_t rb = iq_row_bytes(t, n_in);
+    cudaStream_t s = (cudaStream_t) stream;
+    const dim3 grid((unsigned) ((n_out + 3) / 4)), block(32, 4);
+    if (g_stage_grid_mmvq) launch_il_iq3s<true>(grid, block, s, (const uint8_t*) w, rb, pm, dl, y, n_in, n_out, ncols);
+    else launch_il_iq3s<false>(grid, block, s, (const uint8_t*) w, rb, pm, dl, y, n_in, n_out, ncols);
+    check("iq_mmvq_il");
+}
+namespace {
+
 // ---------------------------------------------------------------- S26 STRATA_EXPERT_V2=1 (opt-in): IQ3_S gate/up + IQ4_NL down
 // Bitwise equal to native_gu_multi_kernel / native_down_multi_kernel (S26 harness, real UD-IQ4_XS expert blobs, T 1-3,
 // memcmp of every output): each row's lane sums and warp_sum are the same; a warp interleaves RPW rows (more loads in

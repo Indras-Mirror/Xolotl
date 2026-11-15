@@ -26,6 +26,10 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
 
 /// y[c][r] = W[r] . x[c] for `ncols` columns of q8_1 activations (x stride n_in/32 blocks per column).
 void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream);
+// xolotl: IQ3_S, 2..8 columns, reading native_q8_1_interleave's position-major ints (pm) and scales (dl) for `ncols`:
+// bitwise iq_mmvq's output.  iq_mmvq_il_supported: when it runs (else call iq_mmvq).
+bool iq_mmvq_il_supported(int ggml_type, int ncols);
+void iq_mmvq_il(int ggml_type, const void* w, const int* pm, const float* dl, float* y, int n_in, int n_out, int ncols, void* stream);
 
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32; fp16 times `*scale` when given (device:
 /// an NVFP4 expert's s_down, read by the kernel itself so the source may be released right after it).

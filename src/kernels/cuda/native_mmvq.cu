@@ -3995,6 +3995,11 @@ bool il_arch_ok() {
 
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
     if (ncols < 1 || ncols > 8 || !g_multi_exact || !il_arch_ok()) return false;
+    if (ggml_type == 21) {   // xolotl: IQ3_S (iq_kernels.cu, no rows table); measured on the RTX 4090 only, so other
+        // cards take it with STRATA_MMVQ_IL_IQ3S=1 (=0 turns it off everywhere)
+        static const int env = [] { const char* v = std::getenv("STRATA_MMVQ_IL_IQ3S"); return v ? std::atoi(v) : -1; }();
+        return (env > 0 || (env < 0 && il_wide_cc() == 8941)) && iq_mmvq_il_supported(ggml_type, ncols);
+    }
     return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
            (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 11);
 }
@@ -4003,6 +4008,11 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
                     int n_out, int ncols, void* stream) {
     if (!native_mmvq_il_supported(ggml_type, ncols, n_out)) {
         native_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
+        return;
+    }
+    if (ggml_type == 21) {   // xolotl: IQ3_S reads the position-major ints and the scales of the interleaved copy
+        const Q81IlParts parts = q8_1_il_parts(x_il, n_in, ncols);
+        iq_mmvq_il(ggml_type, weights, parts.pm, parts.d, y, n_in, n_out, ncols, stream);
         return;
     }
     const int r = g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out);
