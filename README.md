@@ -98,6 +98,7 @@ served. Decode is the generation speed during those tasks.
 | **GLM-5.3-Flash**                                                                                                 | 320B MoE  |   to come    |     28.5-29    |     312-450     |   512K  |    5.87   |
 | **[Qwen3.8-Flash-Next XQ 45 GB](https://huggingface.co/IndrasMirror/Qwen3.8-Flash-Next-Swift-1.5-XQ-Uncensored)** | 125B MoE  |     4.49     |      157       |   3,800-4,070   |   200K  |    3.90   |
 | **Qwen3.8-27B** (Swift-1.5 GSQ-RCO, 13.2 GB)                                                                      | 27B dense |     5.50     |      105       |   1,420-1,630   |   200K  |    4.47   |
+| **[Qwen3.8-27B Swift-1.5 XQ 14 GB](https://huggingface.co/IndrasMirror/Qwen3.8-27B-Swift-1.5-XQ-Uncensored)** (ours, uncensored) | 27B dense |     6.00     |      120       |   1,840-2,120   |   200K  |     -     |
 | **Qwen3.8-27B XQ** (ours, uncensored, 16.2 GB)                                                                    | 27B dense |     4.97     |      99.6      |   1,760-1,980   |   200K  |     -     |
 | **[Muse Glimmer 30B](docs/GLIMMER.md)** (heretic IQ4_NL)                                                          | 30B dense |     4.89     |      148       |   3,330-3,410   |   512K  |     -     |
 
@@ -109,7 +110,7 @@ Qwen3.8-27B: one run on 8 Nov after that day's decode fixes (MTP with thinking o
 (not uploaded yet), MTP 3 + n-gram, one run on 14 Nov (solved 4/6 vs 5/6, different tasks missed; single runs swing).
 Its 99.6 tok/s is the average over 153K tokens of real agent work (mostly long thinking turns); short tool-call turns
 reach ~150 tok/s with MTP and 200+ with DFlash2, and DFlash2 hits 204-222 tok/s on predictable text (best case, 2K
-prompt). With DFlash2 instead of MTP the Gauntlet gave the same tokens (153,037) at 96.8 tok/s, so MTP stays the default. Muse Glimmer 30B: one run on 14 Nov with `--ngram 8 --dflash`, as served. GLM-5.3-Flash: no Gauntlet run yet (score to come); its decode is from an agent replay on 8 Nov (a 25K-token
+prompt). With DFlash2 instead of MTP the Gauntlet gave the same tokens (153,037) at 96.8 tok/s, so MTP stays the default. Qwen3.8-27B Swift-1.5 XQ 14 GB: our XQ quant (3.8 bpw) of UkisAI's Swift 1.5 after our own ARA abliteration, MTP 3 + n-gram, 15 Nov: 6/6 solved in 73K tokens and 10.4 min, the first 27B run to solve task 04; at the same seed our 13.4 GB XQ of the same model scored 4.44 (3/6, 127K tokens), so 3.8 is the served default. The engine's sampler is seeded, so repeating a run gives the same tokens (three runs: 73,190 tokens each, 118-123 tok/s); every Gauntlet row here is one sample per model. It fits 200K context, MTP and the vision encoder on the 24 GB card at once (peak 23.7 GB). Muse Glimmer 30B: one run on 14 Nov with `--ngram 8 --dflash`, as served. GLM-5.3-Flash: no Gauntlet run yet (score to come); its decode is from an agent replay on 8 Nov (a 25K-token
 conversation with tool-output turns, Maya 512K as served; since the RAM upgrade every expert sits in RAM, 23 tok/s before it),
 prefill 454 tok/s on a fresh 25K prompt.
 Prefill = a fresh 6K-17K-token prompt (`tools/throughput.py`), DeepSeek-V4.1's with its dense half at Q8_0. In the
