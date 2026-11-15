@@ -20,6 +20,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 def chat(url, messages, tools=None, max_tokens=1024):
     body = {"model": os.environ.get("TASKEVAL_MODEL", "x"), "messages": messages, "temperature": 0,
             "max_tokens": max_tokens, "stream": False}
+    # Greedy by default, so two arms are paired and a rerun gives the same tokens (the request's temperature 0 wins over
+    # the server config's sampling block, seed included). TASKEVAL_TEMPERATURE=served drops the field so the server's
+    # configured sampling applies; a number sets it. TASKEVAL_SEED=N sends a seed (a sampled run that repeats exactly,
+    # and N=1,2,3... for independent samples of the same model).
+    te = os.environ.get("TASKEVAL_TEMPERATURE", "").strip()
+    if te == "served":
+        body.pop("temperature")
+    elif te:
+        body["temperature"] = float(te)
+    if os.environ.get("TASKEVAL_SEED", "").strip():
+        body["seed"] = int(os.environ["TASKEVAL_SEED"])
     # local engines: reasoning_effort none = no thinking (a screen, not the deployed setting).
     # TASKEVAL_NO_EFFORT=1 drops it - a remote API (the DeepSeek endpoint) rejects it.
     if not os.environ.get("TASKEVAL_NO_EFFORT"):

@@ -5,6 +5,8 @@
   gauntlet.py score <outdir> ...                     pass/10, tokens, seconds, decode tok/s during the run
 
 Uses tools/taskeval's chat() (same request shape, TASKEVAL_THINK_BUDGET, timings recording) and parse_calls().
+Decoding is greedy (temperature 0), so a rerun repeats the same tokens; TASKEVAL_TEMPERATURE=served (the server's
+configured sampling) or =<t>, with TASKEVAL_SEED=1,2,3..., gives independent sampled runs to average.
 Each task's workspace is staged in a temp dir; the model gets list_files / read_file / write_file / run_tests /
 submit; after it submits (or runs out of steps) the hidden tests are copied in and pytest decides pass / fail.
 A task whose task.json carries "answer" (an exact-answer task: no workspace, no hidden tests) is graded instead on
