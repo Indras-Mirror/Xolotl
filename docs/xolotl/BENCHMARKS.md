@@ -124,6 +124,29 @@ after). The time per verify window was 3-4 % higher with it in both A/Bs, while 
 inside the noise of these runs, and the decode kernels are not the ones this change touches. Details:
 [CHANGELOG](CHANGELOG.md#iq1_m-prompts-on-mmq-6-nov).
 
+## Measured negatives
+
+Changes that were built behind an opt-in, measured, and did not earn their place, so they are not proposed as
+defaults. Recorded so the experiment is not repeated. The three DeepSeek-V4.1 verification prototypes below were
+built and screened by NektoDron (#127) on main at `c823766d7`, on one RTX 5090 (32 GB) + EPYC 9654, Q3_K target / FP8 Engram /
+MXFP4-BF16 DSpark, CPU64, native4 slots, one active request, 524288 context. **None is in the tree: there is no flag
+to set.** They were tried against a measured 19.3-21.7 ms per output versus 15.2-16.0 for Maya on the same 4K / 16K /
+32K and code-8K requests (`3acedc4`); the counter comparison also showed 3-8 % more physical target rows and 20-35 %
+more amortised generation time per row, so the gap was never one component's to close.
+
+| Change (issue) | Gate that passed | Screen that failed |
+| --- | --- | --- |
+| Bounded admission of repeated CPU misses into VRAM, independent of speculative prefetch (#127) | GPU copy/ownership at widths 1 / 2 / 8 / 16 | AUTO cache, 7 requests: prose4K 49.32 -> 46.67 tok/s, code8K 54.88 -> 49.43. A stricter 3-miss trial still lost to its fresh disabled control: 49.02 -> 46.27 and 58.12 -> 51.73 |
+| Bounded warm asynchronous dense/router handoff (#127) | 312 target-logit rows over 99 verify passes byte-identical and finite, rejected rows included; slots 0/1/2/3/0, widths 1-6 | 2,650 warm handoffs of 3,960 calls; normal-cache decode -5.6 % prose, +2.9 % code |
+| Compressor pair restored from saved window projections instead of refeeding the rejected draft through the trunk (#127) | accepted-pair and natural-pair copy / replay | the fresh OFF/OFF control itself diverges at slot reuse, first difference before that request's restore: unchanged-width state equivalence is not established, and it is not attributed to rounding. No-refeed mode was not enabled, so there is no speed figure |
+
+Earlier screens in the same effort, also negative and also absent from the tree: changing CPU worker count, the PCIe
+fraction, graph metadata capacity, Q8 small-window dispatch, and CPU-worker timing. These are ordered exploratory
+screens with individual runs retained in the issue, not statistical estimates. The one reproducible fault found
+along the way, uniform `--slots N` losing its cache after prompt release and not reopening it, is fixed (#130) and
+has its own speed-log row above; that gain applies to the broken explicit-slot configuration, not to AUTO or
+default serving.
+
 ## DeepSeek-V4.1 quant vs the DeepSeek API
 
 The same tasks, the same prompts, temperature 0. API = DeepSeek's `deepseek-flash` endpoint (full precision, default
