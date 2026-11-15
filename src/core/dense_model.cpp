@@ -1836,7 +1836,18 @@ bool DenseModel::prefill_setup(int64_t chunk, std::string& err) {
         ok = s == cudaSuccess;
     }
     if (ok) {
-        strata::prefill::mmq::iota(P.ids, t, I.stream);
+        // row ids 0..t-1 by a plain copy: mmq::iota() goes through ck(), which exit()s on a launch error, so a card
+        // filled to the last MiB killed the engine here instead of halving the chunk (DFlash2 at 200K, 14 Nov)
+        std::vector<int32_t> ids((size_t) t);
+        for (int64_t k = 0; k < t; ++k) ids[(size_t) k] = (int32_t) k;
+        const cudaError_t si = cudaMemcpy(P.ids, ids.data(), (size_t) t * sizeof(int32_t), cudaMemcpyHostToDevice);
+        if (si != cudaSuccess) {
+            cudaGetLastError();
+            err = std::string("dense model: prefill row ids: ") + cudaGetErrorString(si);
+            ok = false;
+        }
+    }
+    if (ok) {
         for (int k = 0; k < Impl::Pf::kBoundsSlots; ++k) {
             P.bounds_host[2 * k] = 0;
             P.bounds_host[2 * k + 1] = (int32_t) t;

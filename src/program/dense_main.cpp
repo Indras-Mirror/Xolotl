@@ -1023,6 +1023,16 @@ int main(int argc, char** argv) {
     const auto& cfg = model.config();
     const int n_vocab = cfg.n_vocab;
     constexpr int NC = strata::core::DenseModel::kMaxCols;
+    // Batched prompt processing: the prompt goes through MMQ in chunks instead of NC-token run() groups.  If the
+    // build has no MMQ, or a weight's type is not one MMQ covers, or the scratch does not fit, this fails and the
+    // prompt loop below keeps using run() exactly as before.  It runs BEFORE the drafter's bind/prepare: the model's
+    // VRAM budget reserved this scratch, the drafter's graphs and logits were not budgeted, and allocated first they
+    // took the scratch's room (DFlash2 at 200K, 14 Nov: "prefill mmq: iota: out of memory" at startup).
+    if (prompt_chunk >= 0) {
+        std::string perr;
+        if (!model.prefill_setup(prompt_chunk, perr))
+            std::fprintf(stderr, "xolotl-dense: prompt prefill off - %s\n", perr.c_str());
+    }
     // the drafter shares the model's embedding (its block rows: the anchor's row, then the mask token's 7 times, staged
     // in pinned memory the drafter's graphs copy from) and its output head
     float* df2_stage = nullptr;
@@ -1050,14 +1060,6 @@ int main(int argc, char** argv) {
     }
     using strata::core::Logits;
 
-    // Batched prompt processing: the prompt goes through MMQ in chunks instead of NC-token run() groups.  If the
-    // build has no MMQ, or a weight's type is not one MMQ covers, or the scratch does not fit, this fails and the
-    // prompt loop below keeps using run() exactly as before.
-    if (prompt_chunk >= 0) {
-        std::string perr;
-        if (!model.prefill_setup(prompt_chunk, perr))
-            std::fprintf(stderr, "xolotl-dense: prompt prefill off - %s\n", perr.c_str());
-    }
     {
         std::string cerr;
         if (!model.ckpt_init(n_ckpt, cerr)) std::fprintf(stderr, "xolotl-dense: checkpoints off - %s\n", cerr.c_str());
