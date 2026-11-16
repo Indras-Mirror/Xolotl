@@ -116,9 +116,11 @@ prefill 454 tok/s on a fresh 25K prompt.
 Prefill = a fresh 6K-17K-token prompt (`tools/throughput.py`), DeepSeek-V4.1's with its dense half at Q8_0. In the
 Gauntlet DeepSeek-V4.1 runs with its dense half at Q6_K, as it is served. More numbers, the Q8_0 references, the speed log and the older HumanEval table (every model 19-21/21
 there, so it no longer separates them): [docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md).
-Qwen4-Max on OpenRouter (16 Nov, greedy, the same 6 tasks / 10 turns / 32K thinking budget): **5.50/6**, 47K
-completion tokens, 56.8 tok/s e2e, $0.34 a run — the baseline the local Qwen4 quant will be scored against:
-[run, raw JSON and throughput](docs/benchmarks/2026-11-16-qwen4-max-openrouter-gauntlet-v3-small.md).</sub>
+Qwen4-Max on OpenRouter (16 Nov, the same 6 tasks / 10 turns as below): **5.50/6** greedy and **5.50/6** at
+temperature 1.0, 47K completion tokens, 56.8 tok/s e2e, ~$0.34 a run — the baseline the local Qwen4 quant will be
+scored against. Reaching for `reasoning_effort=max` made it *worse* (4.50/6, 145K tokens, 3.4x the wall time: it
+reasoned over `04-log-needle` for all ten turns and never wrote the answer file):
+[arms, raw JSON and throughput](docs/benchmarks/2026-11-16-qwen4-max-openrouter-gauntlet-v3-small.md).</sub>
 
 **Smaller cards.** The engine fits the work to the card, and what doesn't fit lives in RAM and on the SSD, so RAM
 matters as much as VRAM. Community runs on 12 GB cards: DeepSeek-V4.1 at 8-10 tok/s (RTX 3060, 46 GB RAM),
