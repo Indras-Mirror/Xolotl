@@ -1,0 +1,9 @@
+{
+ "_note": "verify/e2e/throughput-api.py against qwen/qwen4-max on OpenRouter, 2026-11-16. E2E over the wire (network included): TTFT = prefill, first-to-last content delta = decode. Not comparable to local decode numbers taken from engine timings.",
+ "model": "qwen/qwen4-max",
+ "probes": [
+  {"prompt_tokens": 6802, "prefill_ttft_s": 2.25, "prefill_tok_s": 3026, "decode_tokens": 256, "decode_tok_s": 56.1, "decode_wall_s": 6.39},
+  {"prompt_tokens": 17484, "prefill_ttft_s": 2.08, "prefill_tok_s": 8415, "decode_tokens": 256, "decode_tok_s": 59.5, "decode_wall_s": 6.45}
+ ],
+ "in_task": {"requests": 30, "output_tok_s": 56.8, "prompt_tok_s": 163, "median_step_s": 16.2, "p90_step_s": 68.3, "max_step_s": 123.0}
+}
