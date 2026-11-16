@@ -3,6 +3,7 @@
  * bundle leaves out, so these are the same two small calls written here; DeepSeek's provider is in the bundle and is used as it is).
  * Shapes follow the Harness's providers (packages/web/web-search-exa and web-search-perplexity at the pinned commit). Keirolabs has no
  * Harness package; its call is Keirolabs' lite search (titles, links and snippets, billed per request whatever the count).
+ * Keenable has no Harness package either; unlike the others it also searches without a key (its public endpoint).
  */
 import { SearchUnavailable } from './web-search-ddg.mjs';
 
@@ -62,6 +63,30 @@ export function createPerplexitySearch({ key }) {
         ? body.search_results.map(r => ({ url: r.url, ...(r.title ? { title: r.title } : {}), ...(r.snippet ? { snippet: r.snippet } : {}), ...(r.date ? { publishedAt: r.date } : {}) }))
         : (body.citations ?? []).map(url => ({ url }));
       return { ...(content ? { content } : {}), sources, truncated: false };
+    },
+  };
+}
+
+/**
+ * Keenable is the one keyed service that also works without a key: the public endpoint takes the same body and answer and
+ * asks only for the app's name in X-Keenable-Title (rate limited per address). A saved key switches to the keyed endpoint
+ * (X-API-Key), which lifts those limits. Search only (titles, links, snippets); page fetch stays with the fetch provider.
+ */
+export function createKeenableSearch({ key }) {
+  return {
+    id: 'keenable',
+    available: () => true,
+    async search(request, signal) {
+      const apiKey = typeof key === 'function' ? key() : key;
+      const body = await call('Keenable', `https://api.keenable.ai/v1/search${apiKey ? '' : '/public'}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json', ...(apiKey ? { 'x-api-key': apiKey } : { 'x-keenable-title': 'Xolotl' }) },
+        body: JSON.stringify({ query: request.query, ...(request.maxResults ? { max_results: request.maxResults } : {}) }),
+      }, signal);
+      const sources = (body.results ?? []).flatMap(r => r?.url
+        ? [{ url: r.url, ...(r.title ? { title: r.title } : {}), ...(r.snippet ? { snippet: r.snippet } : {}), ...(r.published_at ? { publishedAt: r.published_at } : {}) }]
+        : []);
+      return { sources, truncated: false };
     },
   };
 }

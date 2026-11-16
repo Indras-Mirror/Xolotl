@@ -2,13 +2,14 @@
  * Registers the app's web search with the Harness's web seam (`ctx.web`), in place of the Harness's own backends that all need a service key.
  *
  *   config.provider   'duckduckgo' (default, no key), 'exa', 'perplexity' or 'keirolabs' (the person's own key, read from the environment variable
- *                     named by config.keyEnv, which the host sets; the key is never in the profile file).
+ *                     named by config.keyEnv, which the host sets; the key is never in the profile file), or 'keenable'
+ *                     (works without a key through its public endpoint; a key in config.keyEnv lifts the public limits).
  *
  * The profile pins `web.searchProvider` to the id registered here, so a second usable backend cannot make the choice ambiguous.
  * Plain ESM, loaded by absolute path like strata-gate.mjs; its only imports are the app's own search modules next to the host.
  */
 import { createDuckDuckGoSearch } from '../../web-search-ddg.mjs';
-import { createExaSearch, createKeirolabsSearch, createPerplexitySearch } from '../../web-search-keyed.mjs';
+import { createExaSearch, createKeenableSearch, createKeirolabsSearch, createPerplexitySearch } from '../../web-search-keyed.mjs';
 
 export const name = 'strata-web-search';
 export const inject = ['web'];
@@ -21,6 +22,7 @@ export function apply(ctx, config = {}) {
     : config.provider === 'exa' ? createExaSearch({ key: keyOf })
     : config.provider === 'perplexity' ? createPerplexitySearch({ key: keyOf })
     : config.provider === 'keirolabs' ? createKeirolabsSearch({ key: keyOf })
+    : config.provider === 'keenable' ? createKeenableSearch({ key: keyOf })
     : createDuckDuckGoSearch();
   ctx.web.registerSearchProvider(provider);
 }

@@ -21,7 +21,7 @@ import { createAgentTools } from '../server/agent/tools-settings.mjs';
 import { findBrowser, browserCandidates, findPlaywrightMcp } from '../server/agent/browser-probe.mjs';
 import { manualDecision, planDecision } from '../server/agent/plugins/strata-gate.mjs';
 import { createDuckDuckGoSearch, looksBlocked, parseHtmlResults, parseLiteResults, realUrl, BLOCKED_MESSAGE } from '../server/web-search-ddg.mjs';
-import { createExaSearch, createKeirolabsSearch, createPerplexitySearch } from '../server/web-search-keyed.mjs';
+import { createExaSearch, createKeenableSearch, createKeirolabsSearch, createPerplexitySearch } from '../server/web-search-keyed.mjs';
 
 const HARNESS = process.env.STRATA_HARNESS_DIR;
 const skip = !HARNESS || !resolveHarness({ env: process.env }).ok ? 'STRATA_HARNESS_DIR is not set to a built Harness' : false;
@@ -60,6 +60,8 @@ test('Tools: a search key is saved for its service only, is never shown again, a
     assert.equal(tools.update({ search: { provider: 'perplexity' } }).search.keySet, false, 'a key belongs to its service');
     assert.throws(() => tools.update({ search: { provider: 'bing' } }), /listed search services/);
     assert.equal(saved().search.provider, 'perplexity');
+    assert.deepEqual(tools.update({ search: { provider: 'keenable' } }).search, { provider: 'keenable', keySet: false }, 'Keenable is a listed choice and needs no key');
+    assert.equal(tools.update({ search: { key: 'keenable-key-1' } }).search.keySet, true, 'its optional key is saved like any other');
   } finally { cleanup(dir); }
 });
 
@@ -121,6 +123,19 @@ test('profile: a keyed service is used only with its key saved; the key travels 
   assert.equal(entriesOf(keiro).flatMap(x => x.insert ?? []).find(x => x.id === 'strata-web-search').config.provider, 'keirolabs');
   assert.equal(keiro.env.STRATA_SEARCH_KEY, 'keiro-secret'); assert.ok(!keiro.patch.includes('keiro-secret'));
   assert.notEqual(noKey.signature, exa.signature, 'a changed choice restarts the agent');
+});
+
+test('profile: Keenable is used when chosen, with or without a key; the default with no choice stays DuckDuckGo', () => {
+  const view = (provider, key) => ({ off: new Set(), search: { provider, key }, servers: {}, hasInstructionTools: false, hasCommandTools: false, toolFile: null, browserEnabled: false });
+  const keyless = buildProfile({ local: [], connections: [], tools: view('keenable', '') });
+  assert.equal(entriesOf(keyless).find(x => x.id === 'web').config.searchProvider, 'keenable', 'chosen without a key: Keenable\'s public endpoint, not DuckDuckGo');
+  assert.equal(entriesOf(keyless).flatMap(x => x.insert ?? []).find(x => x.id === 'strata-web-search').config.provider, 'keenable');
+  assert.equal(keyless.env.STRATA_SEARCH_KEY, undefined, 'no key saved, no key in the environment');
+  const keyed = buildProfile({ local: [], connections: [], tools: view('keenable', 'keenable-secret') });
+  assert.equal(entriesOf(keyed).find(x => x.id === 'web').config.searchProvider, 'keenable');
+  assert.equal(keyed.env.STRATA_SEARCH_KEY, 'keenable-secret'); assert.ok(!keyed.patch.includes('keenable-secret'));
+  assert.notEqual(keyless.signature, keyed.signature, 'saving a key restarts the agent onto the keyed endpoint');
+  assert.equal(entriesOf(buildProfile({ local: [], connections: [] })).find(x => x.id === 'web').config.searchProvider, 'strata-duckduckgo', 'no choice: DuckDuckGo, unchanged');
 });
 
 test('profile: the groups switched off are not loaded; both web halves off drops the web plugin', () => {
@@ -256,6 +271,38 @@ test('search: Keirolabs posts the query to its lite search with the person\'s ke
     assert.equal(createKeirolabsSearch({ key: () => '' }).available(), false);
     globalThis.fetch = async () => new Response(JSON.stringify({ error: 'Invalid API key' }), { status: 401 });
     await assert.rejects(createKeirolabsSearch({ key: 'the-key' }).search({ query: 'q' }), /Keirolabs did not accept the key/);
+  } finally { globalThis.fetch = real; }
+});
+
+test('search: Keenable posts to its public endpoint with the app name when there is no key, and to the keyed endpoint with one', async () => {
+  const real = globalThis.fetch;
+  try {
+    const sent = [];
+    globalThis.fetch = async (url, init) => {
+      sent.push({ url: String(url), init });
+      return new Response(JSON.stringify({ query: 'q', mode: 'pro', results: [
+        { title: 'K', url: 'https://k.example', snippet: 's', published_at: '2026-11-01T00:00:00Z', description: '' },
+        { title: 'Bare', url: 'https://bare.example', description: '' },
+        { title: 'No link', url: '', snippet: 'dropped' },
+      ] }));
+    };
+    const k = await createKeenableSearch({ key: () => '' }).search({ query: 'q', maxResults: 5 });
+    assert.deepEqual(k, { sources: [{ url: 'https://k.example', title: 'K', snippet: 's', publishedAt: '2026-11-01T00:00:00Z' }, { url: 'https://bare.example', title: 'Bare' }], truncated: false });
+    assert.equal(sent[0].url, 'https://api.keenable.ai/v1/search/public');
+    assert.equal(sent[0].init.method, 'POST');
+    assert.equal(sent[0].init.headers['x-keenable-title'], 'Xolotl');
+    assert.equal(sent[0].init.headers['x-api-key'], undefined, 'no key: none is sent');
+    assert.deepEqual(JSON.parse(sent[0].init.body), { query: 'q', max_results: 5 });
+    assert.equal(createKeenableSearch({ key: () => '' }).available(), true, 'the public endpoint needs no key');
+    await createKeenableSearch({ key: 'the-key' }).search({ query: 'q' });
+    assert.equal(sent[1].url, 'https://api.keenable.ai/v1/search');
+    assert.equal(sent[1].init.headers['x-api-key'], 'the-key');
+    assert.equal(sent[1].init.headers['x-keenable-title'], undefined);
+    assert.deepEqual(JSON.parse(sent[1].init.body), { query: 'q' }, 'no count asked: the service default');
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: 'Invalid API key' }), { status: 401 });
+    await assert.rejects(createKeenableSearch({ key: 'the-key' }).search({ query: 'q' }), /Keenable did not accept the key/);
+    globalThis.fetch = async () => new Response('{}', { status: 429 });
+    await assert.rejects(createKeenableSearch({ key: '' }).search({ query: 'q' }), e => e.code === 'WEB_RATE_LIMITED');
   } finally { globalThis.fetch = real; }
 });
 

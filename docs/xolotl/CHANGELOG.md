@@ -8,6 +8,16 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Keenable as a web search choice, with or without a key (17 Nov)
+
+Settings > Tools > Web search has a fifth choice beside the keyed services: Keenable (no key needed). Chosen, the agent's
+searches go to Keenable (`createKeenableSearch` in `apps/host/server/web-search-keyed.mjs`, the same shape as Exa's: titles,
+links and snippets, search only - the fetch provider does not change). Unlike Exa, Perplexity and Keirolabs it works with no
+key: the public endpoint (`POST /v1/search/public`, `X-Keenable-Title: Xolotl`) is rate limited per address. An optional saved
+key switches to the keyed endpoint (`X-API-Key`) and lifts those limits; the key travels only as `STRATA_SEARCH_KEY`, as
+before. The no-key default stays DuckDuckGo - Keenable is used only when the person selects it. Proposed by KGKallasmaa
+(#139), who works with Keenable and said so in the issue.
+
 ### Qwen3.8-27B with DFlash2: the 8-token verify gets cheaper, 171 -> 204 tok/s (14 Nov)
 
 DFlash2 drafts 7 tokens and checks all 8 in one pass, so every GEMV of that pass multiplies 8 columns. Those 8-column

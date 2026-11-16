@@ -12,6 +12,9 @@
 
 ## Latest
 
+- **17 Nov** - Keenable joins the web search choices in Settings > Tools and is the first that works with no key (its
+  public endpoint; an optional key lifts the rate limits). DuckDuckGo stays the default. Proposed by KGKallasmaa (#139).
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#keenable-as-a-web-search-choice-with-or-without-a-key-17-nov).
 - **14 Nov** - Qwen3.8-27B with DFlash2: the 8-token verify pass got cheaper, **171 -> 204 tok/s** on a best-case 2K
   prompt (our 13.7 GiB XQ quant, one 4090). The dense engine now reads one position of all 8 drafted tokens per load
   and uses the multi-column layout the other engines already had. Same text, bit for bit; default on. Real agent-task

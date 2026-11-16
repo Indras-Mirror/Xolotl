@@ -34,7 +34,7 @@ export interface CustomTool {
 }
 export interface ToolsState {
   groups: ToolGroup[];
-  search: { provider: 'builtin' | 'exa' | 'perplexity' | 'deepseek' | 'keirolabs'; keySet: boolean };
+  search: { provider: 'builtin' | 'exa' | 'perplexity' | 'deepseek' | 'keirolabs' | 'keenable'; keySet: boolean };
   /** Skip the once-per-chat question before the first web search or page in Manual mode. Off unless the person turned it on. */
   webWithoutAsking: boolean;
   browser: { enabled: boolean; found: boolean; name: string | null; missing?: 'component' };
@@ -52,6 +52,7 @@ const SEARCH_CHOICES = [
   { value: 'perplexity', label: 'Perplexity (your own key)' },
   { value: 'deepseek', label: 'DeepSeek (your own key)' },
   { value: 'keirolabs', label: 'Keirolabs (your own key)' },
+  { value: 'keenable', label: 'Keenable (no key needed)' },
 ];
 const KIND_CHOICES = [
   { value: 'instructions', label: 'Follow my instructions' },
@@ -133,10 +134,10 @@ export function SettingsTools({ preview }: { preview?: ToolsState }) {
     <section className="settings-section">
       <h2 className="h4" style={{ marginBottom: 10 }}>{tr('Web search')}</h2>
       <div className="st-card st-card--flush">
-        <Field label={tr('Where results come from')} hint={tr(keyed ? 'Searches use your own account with this service.' : 'Results come from DuckDuckGo, or from Bing when DuckDuckGo is busy. You do not need an account or a key.')}>
+        <Field label={tr('Where results come from')} hint={tr(state.search.provider === 'keenable' ? (state.search.keySet ? 'Searches use your own account with this service.' : 'Searches go to Keenable with no key, at its public rate limits. A key of your own lifts those limits.') : keyed ? 'Searches use your own account with this service.' : 'Results come from DuckDuckGo, or from Bing when DuckDuckGo is busy. You do not need an account or a key.')}>
           <Select ariaLabel={tr('Where results come from')} value={state.search.provider} options={SEARCH_CHOICES} onChange={value => { setKey(''); void save({ search: { provider: value } }); }} />
         </Field>
-        {keyed ? <Field label={tr('Your key')} hint={tr(state.search.keySet ? 'A key is saved on this computer. Enter a new one to replace it.' : 'Saved on this computer only. Strata never shows it again.')}>
+        {keyed ? <Field label={tr('Your key')} hint={tr(state.search.provider === 'keenable' && !state.search.keySet ? 'Optional. Without a key, searches use Keenable’s public service. A key is saved on this computer only.' : state.search.keySet ? 'A key is saved on this computer. Enter a new one to replace it.' : 'Saved on this computer only. Strata never shows it again.')}>
           <div className="row">
             <input className="st-input" style={{ width: 190 }} type="password" aria-label={tr('Your key')} autoComplete="new-password" spellCheck={false} placeholder={tr(state.search.keySet ? 'Leave blank to keep the saved key' : 'Paste your key')} value={key} onChange={e => setKey(e.target.value)} />
             <Btn size="sm" disabled={busy || !key.trim()} onClick={() => { void save({ search: { provider: state.search.provider, key: key.trim() } }); setKey(''); pushToast('success', tr('Key saved')); }}>{tr('Save key')}</Btn>
