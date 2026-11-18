@@ -3936,6 +3936,55 @@ int32_t arena_victim(Ds41MoeImpl& im, int64_t layer, uint64_t need, const int32_
     return dup >= 0 ? dup : victim;
 }
 
+// STRATA_MOE_TRACE=<file> (diagnostic; a full device sync per routed layer, so slower): one text line per decode
+// call - its sequence, layer and per-layer call number, the routing (ids, weight bits), each routing index's tier
+// (V resident, P prefetched, E the PCIe share, G a file read run on the card, C the pool from the arena, F the pool
+// from a file read), the PCIe budget's inputs and carry, and FNV-1a hashes of the input row, each index's output row
+// and the sum.  STRATA_MOE_TRACE_RAW=<n>: for each layer's first n calls also "xc" - each index's expert recomputed
+// on the CPU (ds41_moe_cpu_expert) from the same input row, whatever tier ran it - and the raw rows in <file>.raw
+// (int32 seq, layer, call, K; then x, the K rows and the sum as floats).
+struct MoeTrace {
+    FILE* f = nullptr;
+    FILE* raw = nullptr;
+    int raw_n = 0;
+    std::vector<int64_t> calls;   // per layer
+};
+static MoeTrace* moe_trace() {
+    static MoeTrace* t = []() -> MoeTrace* {
+        const char* p = std::getenv("STRATA_MOE_TRACE");
+        if (!p || !*p) return nullptr;
+        MoeTrace* m = new MoeTrace();
+        m->f = std::fopen(p, "w");
+        if (!m->f) {
+            std::fprintf(stderr, "ds4_moe: STRATA_MOE_TRACE: cannot open %s\n", p);
+            std::abort();
+        }
+        const char* r = std::getenv("STRATA_MOE_TRACE_RAW");
+        m->raw_n = r ? std::atoi(r) : 0;
+        if (m->raw_n > 0) {
+            const std::string rp = std::string(p) + ".raw";
+            m->raw = std::fopen(rp.c_str(), "wb");
+            if (!m->raw) {
+                std::fprintf(stderr, "ds4_moe: STRATA_MOE_TRACE_RAW: cannot open %s\n", rp.c_str());
+                std::abort();
+            }
+        }
+        std::fprintf(stderr, "ds4_moe: STRATA_MOE_TRACE: %s (raw rows + CPU recompute for each layer's first %d calls)\n",
+                     p, m->raw_n);
+        return m;
+    }();
+    return t;
+}
+static uint64_t trace_hash(const void* p, size_t n) {
+    const uint8_t* b = (const uint8_t*) p;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x_host,
              const void* x_dev, float* out, void* out_dev = nullptr) {
     static const bool prof = std::getenv("DS4_TIER_PROF") != nullptr;
@@ -4101,6 +4150,8 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     // reads straight out of the pinned host arena, so a blob the arena does not hold (the file tier) stays on the
     // CPU rather than being staged through the driver - which is what the replay measured, and the reason its
     // PCIe percentage is a percentage of what the arena held.
+    int tr_elig = -1, tr_budget = -1, tr_nofile = -1;   // (STRATA_MOE_TRACE: the budget's inputs)
+    bool tr_file[kMaxParts] = {};                       // (STRATA_MOE_TRACE: pool indices read from the file tier)
     {
         int eligible = 0;
         for (int i = 0; i < nc; ++i)
@@ -4125,6 +4176,9 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             const int k = cpu_i[nc - 1 - i];
             if (gp.arena.ptr(layer, ids6[k])) pcie_i[np++] = (int32_t) k;
         }
+        tr_elig = eligible;
+        tr_budget = budget;
+        tr_nofile = no_file ? 1 : 0;
     }
     mark(8);
     int32_t cpu_keep[kMaxParts], nk = 0;
@@ -4633,7 +4687,10 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         std::vector<int> fi;
         for (int i = 0; i < nk; ++i) {
             held[(size_t) i] = gp.arena.ptr(layer, ids6[cpu_keep[i]]);
-            if (!held[(size_t) i]) fi.push_back(i);
+            if (!held[(size_t) i]) {
+                fi.push_back(i);
+                tr_file[cpu_keep[i]] = true;
+            }
         }
         n_file_call = fi.size();
         // ONE pool dispatch for the whole layer (see the join below): the batch used to be issued once per format
@@ -5216,6 +5273,68 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     st.cpu = nk - n_aafg;
     st.wall_ms = now_ms() - t0;
     im.st.add(st);
+    if (MoeTrace* tr = moe_trace()) {   // STRATA_MOE_TRACE (see moe_trace)
+        ck(cudaDeviceSynchronize(), "moe trace sync");
+        if ((int64_t) tr->calls.size() < im.g.n_layers) tr->calls.assign((size_t) im.g.n_layers, 0);
+        const int64_t call = tr->calls[(size_t) layer]++;
+        std::vector<float> xr((size_t) H), dpr((size_t) K * (size_t) H), rows((size_t) K * (size_t) H), sum((size_t) H);
+        if (x_dev) ck(cudaMemcpy(xr.data(), x_dev, (size_t) H * 4, cudaMemcpyDeviceToHost), "moe trace x");
+        else std::memcpy(xr.data(), x_host, (size_t) H * 4);
+        ck(cudaMemcpy(dpr.data(), gp.d_parts, (size_t) K * (size_t) H * 4, cudaMemcpyDeviceToHost), "moe trace parts");
+        if (out_dev) ck(cudaMemcpy(sum.data(), out_dev, (size_t) H * 4, cudaMemcpyDeviceToHost), "moe trace sum");
+        else std::memcpy(sum.data(), out, (size_t) H * 4);
+        char tier[kMaxParts + 1] = {};
+        for (int64_t k = 0; k < K; ++k) {
+            bool e_ = false, g_ = false;
+            for (int j = 0; j < np; ++j) e_ = e_ || pcie_i[j] == k;
+            for (int j = 0; j < nfg; ++j) g_ = g_ || fg_k[j] == k;
+            tier[k] = slot_i[k] >= 0 ? 'V' : pf_ptr[k] ? 'P' : e_ ? 'E' : g_ ? 'G' : cpu_k[k] ? (tr_file[k] ? 'F' : 'C') : '?';
+            const float* src = cpu_k[k] ? im.parts.data() + (size_t) k * (size_t) H : dpr.data() + (size_t) k * (size_t) H;
+            std::memcpy(rows.data() + (size_t) k * (size_t) H, src, (size_t) H * 4);
+        }
+        std::fprintf(tr->f, "%lld %lld %lld |", (long long) im.run_seq, (long long) layer, (long long) call);
+        for (int64_t k = 0; k < K; ++k) std::fprintf(tr->f, " %d", ids6[k]);
+        std::fprintf(tr->f, " |");
+        for (int64_t k = 0; k < K; ++k) {
+            uint32_t u = 0;
+            std::memcpy(&u, &wloc[k], 4);
+            std::fprintf(tr->f, " %08x", u);
+        }
+        std::fprintf(tr->f, " | %s | %d %d %d %.17g | %016llx |", tier, tr_elig, tr_budget, tr_nofile, im.pcie_carry,
+                     (unsigned long long) trace_hash(xr.data(), (size_t) H * 4));
+        for (int64_t k = 0; k < K; ++k)
+            std::fprintf(tr->f, " %016llx", (unsigned long long) trace_hash(rows.data() + (size_t) k * (size_t) H, (size_t) H * 4));
+        std::fprintf(tr->f, " | %016llx", (unsigned long long) trace_hash(sum.data(), (size_t) H * 4));
+        if (call < tr->raw_n) {
+            std::vector<uint8_t> blob((size_t) im.blob);
+            std::vector<float> ref((size_t) H);
+            std::fprintf(tr->f, " | xc");
+            for (int64_t k = 0; k < K; ++k) {
+                const int32_t e = ids6[k];
+                const uint8_t* p = gp.arena.ptr(layer, e);
+                if (!p && im.blobs) {
+                    im.blobs->read(layer, e, blob.data());
+                    p = blob.data();
+                }
+                if (!p) {
+                    std::fprintf(tr->f, " -");
+                    continue;
+                }
+                ds41_moe_cpu_expert(im.fl[(size_t) im.g.cls(layer, e)], H, im.g.n_ff, p, xr.data(), ref.data(), *im.pool);
+                std::fprintf(tr->f, " %016llx", (unsigned long long) trace_hash(ref.data(), (size_t) H * 4));
+            }
+            const int32_t hdr[4] = { (int32_t) im.run_seq, (int32_t) layer, (int32_t) call, (int32_t) K };
+            std::fwrite(hdr, 4, 4, tr->raw);
+            std::fwrite(xr.data(), 4, (size_t) H, tr->raw);
+            std::fwrite(rows.data(), 4, (size_t) K * (size_t) H, tr->raw);
+            std::fwrite(sum.data(), 4, (size_t) H, tr->raw);
+        }
+        std::fputc('\n', tr->f);
+        if (layer + 1 == im.g.n_layers) {
+            std::fflush(tr->f);
+            if (tr->raw) std::fflush(tr->raw);
+        }
+    }
     im.pf_n = 0;   // the staging is per layer; the caller must run(l) before prefetch(l+1)
     if (dem_async) {   // STRATA_DEMOTE_ASYNC: no demotion stays in flight past the token's last routed layer (what runs
         bool last = true;   // between tokens - a prompt, a cache resize, a rebalance - may touch any layer's arena)
