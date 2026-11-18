@@ -535,6 +535,9 @@ public:
     static void hit_launch(void* ud, void* stream, const int32_t* ids_dev, const float* w_dev, const void* x_dev,
                            void* out_dev);
     bool hit_arm(int64_t layer, void* out_dev);
+    /// STRATA_HIT_PF: the stamp of a graph dispatch whose prefetched expert did not arrive in time (it ran nothing of
+    /// the stage), 0 = none.  The caller stops before it uses logits computed after it.
+    int32_t hit_pf_fault() const;
     /// The same with `x` already on the device (the engine's attention output).  CUDA modes only.
     bool run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out);
 

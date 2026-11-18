@@ -1,4 +1,4 @@
-# Decode opt-ins from the DeepInfer review (rb10 - rb17)
+# Decode opt-ins from the DeepInfer review (rb10 - rb18)
 
 A decode token runs 40 layers, and each layer makes a round trip:
 
@@ -616,6 +616,116 @@ alternated twice:
 - +5.2 % and +3.7 % in the two pairs, every scenario faster.
 - Prompt times did not change: 29.0 to 29.4 s over the 12 scenarios.
 - The re-seed after the 15.7K prompt was 2344 experts in all five runs.
+
+## Waiting only for the prefetched experts a layer takes (rb18)
+
+The rb17 review pointed at two waits:
+
+- The dispatch waited for the stamp written behind ALL of the layer's prefetch DMAs, even when it took only the first.
+- The resident experts' grouped launch waited behind that wait too.
+
+`STRATA_HIT_PF_STAT=1` (a diagnostic) counts the dispatches' waits on the card. It also queues a copy behind each
+list entry's DMA, so it sees when the taken ones were home. Forced 1093, the K:\model\test configuration (rb17
+settings):
+
+| list (real DMAs) | last taken | waits | to the taken | to the end of the wait |
+|---|---|---|---|---|
+| 1 | first | 7741 | 55.3 us | 56.4 us |
+| 2 | first | 1729 | 54.6 us | 219.5 us |
+| 2 | second | 753 | 212.2 us | 213.2 us |
+
+- 10223 waits: 682 ms until the taken experts were home, 976 ms until the waits ended.
+- A list's second expert lands ~160 us after its first (about 58 GB/s for a ~9.5 MB blob).
+- In the old trace a full in-graph launch of six experts took ~54 us (gate/up 30, down 23).
+
+### `STRATA_HIT_PF=2`
+
+`=1`, and each list entry gets its own ready word, written by a 4-byte copy right behind that entry's DMA. The dispatch
+waits for the words of the entries it takes. The batch's word is no longer written. The waits drop to 725 ms; the
+"list 2, first taken" ones to 54.7 us.
+
+### `STRATA_HIT_PF=3`
+
+`=2`, and while the graph is captured the dispatch splits its run into two sets:
+
+- The residents run at once on the dense stream.
+- The prefetched experts run on a second stream, a branch of the graph: a wait kernel, then their own grouped launch
+  with their own scratch.
+- The sum runs after both, in routing order.
+
+Outside a capture it is `=2` (a stream wait there costs 0.1-0.3 ms on WDDM).
+
+### The timeout fails closed
+
+- After the 50 ms timeout, the dispatch (or the wait kernel) also zeroes the groups and the sum gate. Nothing behind it
+  reads the stage.
+- The host stops at the next layer's call, as before. It now also stops before a logits read that came after the
+  timeout (ds41_generate's head_logits), so a timeout in the last layer cannot reach a sampled token.
+- `STRATA_HIT_PF_FAULT=<layer>[:<n>]` (a test): from the layer's n-th prefetch on, no ready word is written.
+- Forced runs with n = 200, at layer 20 and at layer 39, with `=1` and with `=3`: all four stopped. Every top32
+  record before the stop was rb17's, byte for byte (203 and 208 records), and the stopped step wrote none.
+
+### Measured
+
+Forced 1093, `--slots 2378`, `--vision`, the K:\model\test configuration, interleaved (tok/s):
+
+| arm | runs | mean |
+|---|---|---|
+| rb17 | 51.40 / 51.34 / 51.28 | 51.34 |
+| rb18a `=1` | 51.26 / 51.32 / 51.20 | 51.26 |
+| rb18a `=2` | 51.75 / 51.67 / 51.78 | 51.73 (+0.8 %) |
+
+| arm | runs | mean |
+|---|---|---|
+| rb17 | 51.17 / 51.26 / 51.28 | 51.24 |
+| rb18b `=2` | 51.63 / 51.74 / 51.64 | 51.67 (+0.8 %) |
+| rb18b `=3` | 51.79 / 52.00 / 51.76 | 51.85 (+1.2 %) |
+
+- Routes 4c5a4ba7 in every run.
+- `=3` gains less than the waits suggested. In nsys (8 s of each), GPU idle in gaps of 20 us or more is ~7.7 ms a
+  token. ~5 ms of it is the file-read layers (quantize -> the sum: 832 us, 4.9 layers a token); the rest is many
+  small host gaps.
+- The same rb17 exe ran 47.45 tok/s at 18:20 and 51.3 tok/s from 19:40, with the same file and pool times. Compare
+  runs of one session only.
+
+Serve, the K:\model\test configuration (rb17 = production), srvtest with the image probe first, 12 scenarios, rb17
+/ rb18c `=3` alternated twice:
+
+| run | answers | decode, all |
+|---|---|---|
+| rb17 | reference | 58.03 tok/s |
+| rb18c `=3` | all 12 the same, the image and the cancelled stream too | 61.66 |
+| rb17, second start | all 12 the same | 62.23 |
+| rb18c `=3`, second start | all 12 the same | 62.96 |
+| rb18c `=3`, 8 s idle before each request | all 12 the same | 62.81 |
+
+- The first run of a series was the slowest here as in the rb17 check, so the first pair's +6.3 % is mostly that.
+  The second pair: +1.2 %.
+- The re-seed after the 15.7K prompt was 2344 experts in all five runs.
+
+### `STRATA_ARENA_DEDUP=1` (opt-in, NOT the same bits)
+
+The forced run still had 1392 experts both in VRAM and in the RAM arena after 1075 tokens. `gpu_run` refreshes
+`last_use` for every routed expert, so an arena copy of a VRAM expert stays "recent" though the pool never reads it.
+
+With the switch, a file read's arena victim is the least recently used expert that the VRAM cache also holds, if
+there is one. A vram_lru eviction of such an expert demotes it back into the arena (as before).
+
+Forced 1093, rb18c `=3`, 3 pairs:
+
+| arm | tok/s | file reads | file ms | both, token 1075 |
+|---|---|---|---|---|
+| off | 52.94 / 51.97 / 52.12 (52.34) | 6706 | 4762 | 1392 |
+| on | 53.66 / 53.78 / 53.83 (53.76, +2.7 %) | 5182 | 3750 | 322 |
+
+- The bits change: more misses come from the arena, so the PCIe share and the prefetches change (CPU vs card
+  rounding).
+- Its drift against rb17 on the forced trajectory: top-1 1067 / 1093, KL (top-32 lower bound) mean 7.2e-3.
+- For scale: `STRATA_PCIE_SPLIT=0` against `=1` (production has `=1`) gives top-1 1075 / 1093 and KL 7.0e-3. The route
+  bias change 0.25 / 0.15 -> 0.5 / 0.3 gives top-1 1023 / 1093 and KL 8.7e-2.
+- Two runs with the switch were byte-identical to each other.
+- Not checked: serve. Keep-cache's regrow and the re-seed after a long prompt fill VRAM from the arena, and with the
+  switch most VRAM experts have no arena copy. Those fills would read the SSD instead.
 
 ## Tried and removed
 

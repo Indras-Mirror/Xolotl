@@ -130,11 +130,34 @@ struct HitPfList {
 /// [0] = the stamp - the decision, published at once (the host plans the layer on it).  Then, if a prefetched expert is
 /// taken, the dispatch waits until *ready == the stamp (device memory, written by a copy queued behind the prefetch's
 /// DMAs), so the grouped launch behind it reads their bytes; after wait_ns it sets *err = the stamp (mapped; the host
-/// aborts on it).  *stamp_dev = the stamp.  An unarmed launch (armed word 0) only zeroes *n_groups and *sum_gate.
+/// aborts on it) and *n_groups = *sum_gate = 0, so nothing behind it reads the stage.  *stamp_dev = the stamp.  An
+/// unarmed launch (armed word 0) only zeroes *n_groups and *sum_gate.
+/// ready_item (null = none): kHitPfMax words, word j written with the stamp by a copy queued right behind list entry j's
+/// DMA.  item_wait (STRATA_HIT_PF=2): wait for the taken entries' words only, not for *ready (the whole batch).
+/// stat (STRATA_HIT_PF_STAT, device memory, kHitPfStatWords; null = off): counters of the waits, see kHitPfStatWords.
+/// Layout of the stat counters: [((n - 1) * 8 + last) * 4 + f] for a wait on a list of n entries whose last taken entry
+/// is `last`, then [256 + r * 4 + f] by r = the taken resident experts; f: 0 waits, 1 ns until the taken entries were
+/// home, 2 ns until the wait ended (the batch without item_wait), 3 waits whose taken entries were home at once.
+constexpr int kHitPfStatWords = 8 * 8 * 4 + 8 * 4;
+/// STRATA_HIT_PF=3 (device memory; grp_ptr null = no split): the run's prefetched experts as a second set for their
+/// own grouped launch (grp_ptr / ent_dst / *n_groups; the first set then holds the residents alone) and wrec[3] =
+/// {mask of the list entries taken, list entries, residents taken} for decode_hit_pf_wait.  The dispatch does not wait.
+struct HitPfSplit {
+    unsigned long long* grp_ptr = nullptr;
+    int32_t* n_groups = nullptr;
+    int32_t* ent_dst = nullptr;
+    int32_t* wrec = nullptr;
+};
 void decode_hit_dispatch_pf(const int32_t* ids, const unsigned long long* row, int K, int n_experts,
                             unsigned long long* grp_ptr, int32_t* n_groups, void* stream, int32_t* armed,
                             const HitPfList* pf, const int32_t* ready, int32_t* dec, long long wait_ns,
-                            int32_t* ent_dst, int32_t* sum_gate, bool part, int32_t* stamp_dev, int32_t* err);
+                            int32_t* ent_dst, int32_t* sum_gate, bool part, int32_t* stamp_dev, int32_t* err,
+                            const int32_t* ready_item = nullptr, bool item_wait = false,
+                            unsigned long long* stat = nullptr, HitPfSplit split = {});
+/// STRATA_HIT_PF=3: a split dispatch's wait for its taken entries' words (ready_item == *stamp_dev), queued on the
+/// stream of the prefetched set's grouped launch.  After wait_ns: *err = the stamp, *n_groups2 = *sum_gate = 0.
+void decode_hit_pf_wait(const int32_t* wrec, const int32_t* stamp_dev, const int32_t* ready_item, long long wait_ns,
+                        int32_t* n_groups2, int32_t* sum_gate, int32_t* err, unsigned long long* stat, void* stream);
 /// decode_rows_sum_sel without pool rows, the weights in device memory, and only when *gate != 0: the same bits.
 /// done (STRATA_HIT_PART, mapped pinned memory; null = none): *done = *stamp first, whatever the gate - the launches
 /// queued before this one (the grouped kernel) are finished then.

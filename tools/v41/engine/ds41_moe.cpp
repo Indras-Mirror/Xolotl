@@ -96,11 +96,13 @@ constexpr int kMaxDefer = kMaxParts;   ///< STRATA_FILE_DEFER: file-tier experts
 constexpr int kDemRing = 2;
 static_assert(kDemRing == 2 && kDemRing < kMaxParts, "demote ring");
 constexpr size_t kMetaBytes = 65536;   ///< one call's grouped-launch metadata (gpu_run: <= 12 launches x ~200 B; gpu_run_n_ex: <= ~20 x ~1 KB)
-/// STRATA_HIT_FAST: Gpu::d_hit's layout (grp_ptr, grp_start, n_groups, ent_dst, ent_tok, and STRATA_HIT_PF's sum gate)
+/// STRATA_HIT_FAST: Gpu::d_hit's layout (grp_ptr, grp_start, n_groups, ent_dst, ent_tok, and STRATA_HIT_PF's sum gate;
+/// then STRATA_HIT_PF=3's second set - grp_ptr, n_groups, ent_dst - and its wait record)
 constexpr size_t kHitPtr = 0, kHitStart = 8 * kMaxParts, kHitNg = kHitStart + 4 * (kMaxParts + 1), kHitDst = kHitNg + 4,
                  kHitTok = kHitDst + 4 * kMaxParts, kHitSg = kHitTok + 4 * kMaxParts, kHitStamp = kHitSg + 4,
-                 kHitMetaBytes = 256;
-static_assert(kHitStamp + 4 <= kHitMetaBytes, "d_hit layout");
+                 kHitPtr2 = (kHitStamp + 4 + 7) & ~(size_t) 7, kHitNg2 = kHitPtr2 + 8 * kMaxParts, kHitDst2 = kHitNg2 + 4,
+                 kHitWrec = kHitDst2 + 4 * kMaxParts, kHitMetaBytes = 512;
+static_assert(kHitWrec + 12 <= kHitMetaBytes, "d_hit layout");
 constexpr int kMetaSites = 3;   ///< gpu_run's grouped-launch sites: the VRAM hits, the PCIe share, the file misses
 constexpr int kMetaClsMax = 9;  ///< DS4 is per_expert = 9 format classes, each getting a fixed metadata slot (slice B)
 constexpr int kBatch = 512;    ///< a `ds4routes.bin` ubatch, in tokens (what route_probe tokenises)
@@ -784,9 +786,16 @@ struct Gpu {
     /// pinned block: h_pfl[2] (the list prefetch() published, per staging buffer), h_rdy_src[64] (the stamps the ready
     /// copies read, a ring), h_dec[4 * n_layers] (per layer: the dispatch's stamp, all-six, mask of the routing indices
     /// it runs; and the stamp its sum kernel writes after the grouped launch), h_err; d_pfl / d_dec / d_err are their
-    /// mappings.  d_rdy[2]: per buffer, the stamp of the last prefetch whose DMAs are home.  arm_stamp: per layer, its
-    /// last arming's stamp (the armed word's value).
+    /// mappings.  d_rdy[2]: per buffer, the stamp of the last prefetch whose DMAs are home; then (STRATA_HIT_PF=2 /
+    /// STRATA_HIT_PF_STAT) per buffer kHitPfMax words, one per list entry, each written right behind that entry's DMA.
+    /// arm_stamp: per layer, its last arming's stamp (the armed word's value).  d_pfstat: STRATA_HIT_PF_STAT's counters.
+    /// STRATA_HIT_PF=3: s_hit2 / ev_hfork / ev_hjoin, the captured graph's branch for the prefetched set's wait and
+    /// grouped launch, and that launch's own scratch d_scratch2.
     void* d_pf2 = nullptr;
+    unsigned long long* d_pfstat = nullptr;
+    cudaStream_t s_hit2 = nullptr;
+    cudaEvent_t ev_hfork = nullptr, ev_hjoin = nullptr;
+    void* d_scratch2 = nullptr;
     strata::kernels::HitPfList* h_pfl = nullptr;
     const strata::kernels::HitPfList* d_pfl = nullptr;
     int32_t* h_rdy_src = nullptr;
@@ -897,8 +906,37 @@ struct Gpu {
             std::fprintf(stderr, "ds4_moe: STRATA_HIT_PF: %lld of the kept launches had a prefetched expert; "
                          "STRATA_HIT_PART: %lld calls ran part in the graph, %lld of them summed on the dense stream\n",
                          (long long) hit_kept_pf, (long long) hit_part, (long long) hit_part_pool);
+        if (d_pfstat) {   // STRATA_HIT_PF_STAT
+            unsigned long long c[strata::kernels::kHitPfStatWords] = {};
+            if (cudaMemcpy(c, d_pfstat, sizeof(c), cudaMemcpyDeviceToHost) == cudaSuccess) {
+                unsigned long long n = 0, wn = 0, we = 0;
+                for (int i = 0; i < 64; ++i) {
+                    n += c[i * 4];
+                    wn += c[i * 4 + 1];
+                    we += c[i * 4 + 2];
+                }
+                std::fprintf(stderr, "ds4_moe: STRATA_HIT_PF_STAT: %llu waits for prefetched experts, %.1f ms until the "
+                             "taken ones were home, %.1f ms until the wait ended\n", n, wn / 1e6, we / 1e6);
+                for (int i = 0; i < 64; ++i)
+                    if (c[i * 4])
+                        std::fprintf(stderr, "  list %d, last taken %d: %8llu waits (%llu home at once), %.1f us to the taken, "
+                                     "%.1f us to the end\n", i / 8 + 1, i % 8, c[i * 4], c[i * 4 + 3],
+                                     c[i * 4 + 1] / 1e3 / c[i * 4], c[i * 4 + 2] / 1e3 / c[i * 4]);
+                for (int r = 0; r < 8; ++r) {
+                    const unsigned long long* b = c + 256 + r * 4;
+                    if (b[0])
+                        std::fprintf(stderr, "  %d resident taken too: %8llu waits (%llu home at once), %.1f us to the "
+                                     "taken, %.1f us to the end\n", r, b[0], b[3], b[1] / 1e3 / b[0], b[2] / 1e3 / b[0]);
+                }
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+        if (ev_hfork) cudaEventDestroy(ev_hfork);
+        if (ev_hjoin) cudaEventDestroy(ev_hjoin);
+        if (s_hit2) cudaStreamDestroy(s_hit2);
         void* bufs[] = {d_x, d_xq, d_parts, d_grp_ptr, d_grp_start, d_ngroups, d_ent_dst, d_ent_tok, d_scratch,
-                        d_stage, d_pf, d_meta, d_hit, d_pf2, d_rdy};
+                        d_stage, d_pf, d_meta, d_hit, d_pf2, d_rdy, d_pfstat, d_scratch2};
         if (h_rtab) cudaFreeHost(h_rtab);   // (d_rtab is its mapping)
         if (ev_hit_out) cudaEventDestroy(ev_hit_out);
         if (h_meta) cudaFreeHost(h_meta);
@@ -953,8 +991,36 @@ bool demote_async_on() {
 }
 /// STRATA_HIT_PF=1 (opt-in, see Gpu::d_pf2): STRATA_HIT_FAST=3's graph hits also take the layer's prefetched experts
 static bool hit_pf_on() {
-    static const bool on = std::getenv("STRATA_HIT_PF") && std::getenv("STRATA_HIT_PF")[0] == '1';
+    static const bool on = std::getenv("STRATA_HIT_PF") && std::getenv("STRATA_HIT_PF")[0] >= '1' &&
+                           std::getenv("STRATA_HIT_PF")[0] <= '3';
     return on;
+}
+/// STRATA_HIT_PF=2: the same, and the dispatch waits for the prefetched experts it takes, not for the whole batch
+static bool hit_pf_item() {
+    static const bool on = hit_pf_on() && std::getenv("STRATA_HIT_PF")[0] >= '2';
+    return on;
+}
+/// STRATA_HIT_PF=3: =2, and in the captured graph the residents' grouped launch does not wait: the prefetched experts
+/// run as a branch behind their own wait (the same kernels per expert, the sum after both: the same bits)
+static bool hit_pf_split() {
+    static const bool on = hit_pf_on() && std::getenv("STRATA_HIT_PF")[0] == '3';
+    return on;
+}
+/// STRATA_HIT_PF_STAT=1 (diagnostic): the dispatches' waits for prefetched experts, counted on the card and printed at
+/// the close (with STRATA_HIT_PF=1 also when the taken entries were home before the whole batch)
+static bool hit_pf_stat() {
+    static const bool on = hit_pf_on() && std::getenv("STRATA_HIT_PF_STAT") && std::getenv("STRATA_HIT_PF_STAT")[0] == '1';
+    return on;
+}
+/// STRATA_HIT_PF_FAULT=<layer>[:<n>] (a test of the timeout): from the layer's n-th prefetch on (default the first) no
+/// ready word is written, so a graph that takes one of its prefetched experts times out after 50 ms
+static bool pf_fault_inject(int64_t layer) {
+    static const char* v = std::getenv("STRATA_HIT_PF_FAULT");
+    if (!v) return false;
+    static const long long fl = std::atoll(v);
+    static const long long from = std::strchr(v, ':') ? std::atoll(std::strchr(v, ':') + 1) : 0;
+    static long long calls = 0;
+    return layer == fl && calls++ >= from;
 }
 /// STRATA_HIT_PART=1 (opt-in, with STRATA_HIT_PF): a layer with a miss runs its resident / prefetched experts in the
 /// graph too, and the call computes only the rest (see gpu_run)
@@ -3430,7 +3496,8 @@ void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n, bool d3) {
 #if defined(DS4_MOE_CUDA)
 /// STRATA_HIT_PF: prefetch()'s staging for the layer's graph hits - the list (its arming's stamp written last, after the
 /// entries) and, behind the DMAs on the prefetch stream, the copy that writes that stamp into d_rdy once they are home
-static void pf_publish(Ds41MoeImpl& im, int64_t layer) {
+/// (not with STRATA_HIT_PF=2, whose dispatch reads the entries' own words; none at all with `no_ready`, the fault test)
+static void pf_publish(Ds41MoeImpl& im, int64_t layer, bool no_ready) {
     Gpu& gp = *im.gpu;
     if ((size_t) layer >= gp.arm_stamp.size()) return;
     const int b = (int) (layer & 1);
@@ -3448,7 +3515,7 @@ static void pf_publish(Ds41MoeImpl& im, int64_t layer) {
     l->n = n;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     l->stamp = s;
-    if (n > 0 && s != 0) {
+    if (n > 0 && s != 0 && !no_ready && !hit_pf_item()) {
         int32_t* src = gp.h_rdy_src + (s & 63);   // a ring: a source word is rewritten 64 stamps later
         *src = s;
         ck(cudaMemcpyAsync(gp.d_rdy + b, src, sizeof(int32_t), cudaMemcpyHostToDevice, gp.s_pf), "pf ready");
@@ -3542,6 +3609,17 @@ void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
             ord[j + 1] = key;
         }
     }
+    // STRATA_HIT_PF=2 / STRATA_HIT_PF_STAT: each list entry's own ready word (d_rdy + 2 + buffer * kHitPfMax + its list
+    // index), written by a copy right behind its DMA
+    const bool no_ready = gp.h_pfl && pf_fault_inject(layer);
+    int32_t* item_src = nullptr;
+    int n_item = 0;
+    if (gp.h_pfl && (hit_pf_item() || hit_pf_stat()) && !no_ready && (size_t) layer < gp.arm_stamp.size() &&
+        gp.arm_stamp[(size_t) layer] != 0) {
+        const int32_t s = gp.arm_stamp[(size_t) layer];
+        item_src = gp.h_rdy_src + (s & 63);
+        *item_src = s;
+    }
     for (int i = 0; i < n && im_->pf_n < nb; ++i) {
         const int32_t e = top16[ord[i]];
         if (e < 0 || e >= im_->g.n_experts) continue;
@@ -3565,13 +3643,16 @@ void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
         if (!(dummy && no_dummy))
             ck(cudaMemcpyAsync(pf_base(gp, layer) + (size_t) im_->pf_n * (size_t) im_->blob, src,
                                (size_t) im_->bl[(size_t) im_->g.cls(layer, e)], cudaMemcpyHostToDevice, gp.s_pf), "prefetch dma");
+        if (item_src && !dummy && n_item < strata::kernels::kHitPfMax)   // (pf_publish lists the non-dummy entries in order)
+            ck(cudaMemcpyAsync(gp.d_rdy + 2 + (layer & 1) * strata::kernels::kHitPfMax + n_item++, item_src,
+                               sizeof(int32_t), cudaMemcpyHostToDevice, gp.s_pf), "pf item ready");
         // A dummy slot holds ZEROS, not the expert: it must never be matched by run() (found by
         // tools/mimo/test_mimo_moe: prefetched experts outside the arena were computed from the zero blob, rel 0.2-0.5).
         // -1 matches no expert id; the DMA above still happens, so the replay-measured timing is unchanged.
         im_->pf_e[im_->pf_n++] = dummy ? -1 : e;
     }
     if (im_->pf_n > 0) ck(cudaEventRecord(gp.ev_pf, gp.s_pf), "record prefetch");
-    if (gp.h_pfl) pf_publish(*im_, layer);   // STRATA_HIT_PF
+    if (gp.h_pfl) pf_publish(*im_, layer, no_ready);   // STRATA_HIT_PF
     im_->st.prefetch_issued += im_->pf_n;
 #else
     (void) layer;
@@ -3831,11 +3912,15 @@ void arena_check_swap(Ds41MoeImpl& im, int64_t layer, int32_t e, int32_t slot) {
 
 /// arena_adapt: the layer's least-recently-used arena expert whose slot holds `need` bytes, not routed by this call
 /// (last_use < tick) and not in `taken` - or -1.
+/// STRATA_ARENA_DEDUP=1 (opt-in, NOT the same bits: more distinct experts in RAM moves misses from the file tier to the
+/// arena, and so the PCIe share and the prefetches): an expert the VRAM cache holds goes first (the least recently used
+/// of those) - its arena copy is a duplicate, and a vram_lru eviction demotes it back into the arena.
 int32_t arena_victim(Ds41MoeImpl& im, int64_t layer, uint64_t need, const int32_t* taken, int ntaken) {
     Gpu& gp = *im.gpu;
     const int64_t NX = im.g.n_experts;
-    int32_t victim = -1;
-    int64_t best = INT64_MAX;
+    static const bool dedup = std::getenv("STRATA_ARENA_DEDUP") && std::getenv("STRATA_ARENA_DEDUP")[0] == '1';
+    int32_t victim = -1, dup = -1;
+    int64_t best = INT64_MAX, best_dup = INT64_MAX;
     for (int64_t v = 0; v < NX; ++v) {
         const int32_t vs = gp.arena.slot_of[(size_t) (layer * NX + v)];
         if (vs < 0) continue;
@@ -3846,8 +3931,9 @@ int32_t arena_victim(Ds41MoeImpl& im, int64_t layer, uint64_t need, const int32_
         for (int r = 0; r < ntaken && !t; ++r) t = taken[r] == (int32_t) v;
         if (t) continue;
         if (u < best) { best = u; victim = (int32_t) v; }
+        if (dedup && u < best_dup && gp.cache && gp.cache->slot_of(layer, v) >= 0) { best_dup = u; dup = (int32_t) v; }
     }
-    return victim;
+    return dup >= 0 ? dup : victim;
 }
 
 bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x_host,
@@ -7852,11 +7938,26 @@ static bool hit_setup(Ds41MoeImpl& im, cudaStream_t ds) {
             gp.d_dec = (int32_t*) (d + 2 * sizeof(strata::kernels::HitPfList) + 64 * 4);
             gp.h_err = gp.h_dec + 4 * im.g.n_layers;
             gp.d_err = gp.d_dec + 4 * im.g.n_layers;
-            ck(cudaMalloc(&gp.d_rdy, 2 * sizeof(int32_t)), "pf ready");
-            ck(cudaMemsetAsync(gp.d_rdy, 0, 2 * sizeof(int32_t), ds), "pf ready");
+            const size_t rb = (2 + 2 * (size_t) strata::kernels::kHitPfMax) * sizeof(int32_t);   // + the entries' words
+            ck(cudaMalloc(&gp.d_rdy, rb), "pf ready");
+            ck(cudaMemsetAsync(gp.d_rdy, 0, rb, ds), "pf ready");
+            if (hit_pf_stat()) {
+                ck(cudaMalloc(&gp.d_pfstat, strata::kernels::kHitPfStatWords * sizeof(unsigned long long)), "pf stat");
+                ck(cudaMemsetAsync(gp.d_pfstat, 0, strata::kernels::kHitPfStatWords * sizeof(unsigned long long), ds),
+                   "pf stat");
+            }
+            if (hit_pf_split()) {
+                ck(cudaStreamCreateWithFlags(&gp.s_hit2, cudaStreamNonBlocking), "s_hit2");
+                ck(cudaEventCreateWithFlags(&gp.ev_hfork, cudaEventDisableTiming), "ev_hfork");
+                ck(cudaEventCreateWithFlags(&gp.ev_hjoin, cudaEventDisableTiming), "ev_hjoin");
+                ck(cudaMalloc(&gp.d_scratch2, strata::kernels::native_expert_scratch_bytes(kMaxParts, im.g.n_ff)),
+                   "d_scratch2");
+            }
             gp.arm_stamp.assign((size_t) im.g.n_layers, 0);
             std::fprintf(stderr, "ds4_moe: STRATA_HIT_PF: the graph's hits take the layer's prefetched experts too "
-                         "(odd layers stage in a second buffer)%s\n",
+                         "(odd layers stage in a second buffer)%s%s\n",
+                         hit_pf_split() ? ", each waited for on its own, beside the residents' launch (=3)"
+                         : hit_pf_item() ? ", each waited for on its own (=2)" : "",
                          hit_part_on() ? "; STRATA_HIT_PART: and the found ones of a layer with a miss" : "");
         }
         uint8_t* hm = (uint8_t*) gp.h_rtab + tb;
@@ -7899,20 +8000,49 @@ static void hit_kernels(Ds41MoeImpl& im, int64_t layer, const int32_t* ids_dev, 
     uint8_t* dm = (uint8_t*) gp.d_hit;
     static const bool par = std::getenv("STRATA_HIT_PAR") && std::getenv("STRATA_HIT_PAR")[0] == '1';
     const bool pfk = armed && gp.h_pfl;   // STRATA_HIT_PF: also the prefetched experts (waits up to 50 ms for their DMAs)
+    const int32_t* rdy_item = pfk && (hit_pf_item() || hit_pf_stat())
+                                  ? gp.d_rdy + 2 + (layer & 1) * strata::kernels::kHitPfMax : nullptr;
+    // STRATA_HIT_PF=3, while the graph is captured (a branch costs nothing there; a stream wait outside costs 0.1-0.3
+    // ms): the prefetched experts' wait and grouped launch on s_hit2 with their own scratch, the residents' here
+    bool split = false;
+    if (pfk && hit_pf_split() && gp.s_hit2) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        split = cudaStreamIsCapturing(ds, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusActive;
+    }
+    strata::kernels::HitPfSplit sp;
+    if (split) {
+        sp.grp_ptr = (unsigned long long*) (dm + kHitPtr2);
+        sp.n_groups = (int32_t*) (dm + kHitNg2);
+        sp.ent_dst = (int32_t*) (dm + kHitDst2);
+        sp.wrec = (int32_t*) (dm + kHitWrec);
+    }
     if (pfk)
         strata::kernels::decode_hit_dispatch_pf(ids_dev, gp.d_rtab + (size_t) layer * (size_t) NX, (int) K, (int) NX,
                                                 (unsigned long long*) (dm + kHitPtr), (int32_t*) (dm + kHitNg), ds, armed,
                                                 gp.d_pfl + (layer & 1), gp.d_rdy + (layer & 1), gp.d_dec + 4 * layer,
                                                 50000000LL, (int32_t*) (dm + kHitDst), (int32_t*) (dm + kHitSg),
-                                                hit_part_on(), (int32_t*) (dm + kHitStamp), gp.d_err);
+                                                hit_part_on(), (int32_t*) (dm + kHitStamp), gp.d_err, rdy_item,
+                                                hit_pf_item(), gp.d_pfstat, sp);
     else
         strata::kernels::decode_hit_dispatch(ids_dev, gp.d_rtab + (size_t) layer * (size_t) NX, (int) K, (int) NX,
                                              (unsigned long long*) (dm + kHitPtr), (int32_t*) (dm + kHitNg), ds, armed, par);
     strata::kernels::native_quantize_q8_1((const float*) x_dev, gp.d_xq, (int) H, 1, ds);
+    if (split) {
+        ck(cudaEventRecord(gp.ev_hfork, ds), "hit fork");
+        ck(cudaStreamWaitEvent(gp.s_hit2, gp.ev_hfork, 0), "hit fork");
+        strata::kernels::decode_hit_pf_wait((const int32_t*) (dm + kHitWrec), (const int32_t*) (dm + kHitStamp), rdy_item,
+                                            50000000LL, sp.n_groups, (int32_t*) (dm + kHitSg), gp.d_err, gp.d_pfstat,
+                                            gp.s_hit2);
+        strata::kernels::native_expert_grouped(gp.gll[(size_t) c], sp.grp_ptr, (const int32_t*) (dm + kHitStart),
+                                              sp.n_groups, sp.ent_dst, (const int32_t*) (dm + kHitTok), kMaxParts, K,
+                                              gp.d_xq, gp.d_scratch2, (float*) gp.d_parts, gp.s_hit2, K);
+        ck(cudaEventRecord(gp.ev_hjoin, gp.s_hit2), "hit join");
+    }
     strata::kernels::native_expert_grouped(gp.gll[(size_t) c], (const unsigned long long*) (dm + kHitPtr),
                                           (const int32_t*) (dm + kHitStart), (const int32_t*) (dm + kHitNg),
                                           (const int32_t*) (dm + kHitDst), (const int32_t*) (dm + kHitTok), kMaxParts,
                                           K, gp.d_xq, gp.d_scratch, (float*) gp.d_parts, ds, K);
+    if (split) ck(cudaStreamWaitEvent(ds, gp.ev_hjoin, 0), "hit join");
     // STRATA_HIT_PART: the sum kernel says when the grouped launch is done (h_dec[4 * layer + 3] = the stamp): the
     // call's own card work for a layer the graph ran part of waits for that
     const bool part = pfk && hit_part_on();
@@ -7998,6 +8128,15 @@ bool Ds41MoeTier::hit_arm(int64_t layer, void* out_dev) {
 #else
     (void) layer; (void) out_dev;
     return false;
+#endif
+}
+
+int32_t Ds41MoeTier::hit_pf_fault() const {
+#if defined(DS4_MOE_CUDA)
+    const Gpu* gp = im_->gpu.get();
+    return gp && gp->h_err ? *(volatile const int32_t*) gp->h_err : 0;
+#else
+    return 0;
 #endif
 }
 

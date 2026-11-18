@@ -878,8 +878,19 @@ int main(int argc, char ** argv) {
     const int pass_max = std::max(1, std::getenv("STRATA_SERVE_PASS_M") ? std::atoi(std::getenv("STRATA_SERVE_PASS_M")) : 16);
     std::vector<float> crouted_m((size_t) std::max(pass_max, 17) * n_embd);   // 17: pass_v's DSpark seeding / verify passes
     std::string ferr;
+    // STRATA_HIT_PF: a graph whose prefetched expert did not arrive within its 50 ms ran nothing of it - stop before
+    // logits computed after it are used (the tier's next call would stop too, but not before the last layer's logits)
+    static const bool hit_pf_any = std::getenv("STRATA_HIT_PF") != nullptr;
+    long long n_head = 0;
     auto head_logits = [&](int row0, int nrows, float * out) -> bool {
         if (!ds41_head_logits(pipe, row0, nrows, out, err)) { ferr = err; return false; }
+        ++n_head;
+        for (int l = 0; hit_pf_any && l < n_layer; ++l)
+            if (const int32_t s = ds41_tier_for(pipe, l).hit_pf_fault()) {
+                std::fprintf(stderr, "ds41_generate: STRATA_HIT_PF: a graph's prefetched expert did not arrive within "
+                             "50 ms (stamp %d): stopping before logits read %lld is used\n", (int) s, n_head);
+                std::abort();
+            }
         return true;
     };
     // STRATA_DEC_PROF=1: per-stage wall time of the decode step (begin / predict+prefetch / attn_router / tier / finish)
@@ -1015,7 +1026,8 @@ int main(int argc, char ** argv) {
             }
             // STRATA_HIT_PF: the arming first, so this layer's prefetch below goes out with its stamp (an ahead layer was
             // armed before its graph went out)
-            static const bool hit_pf = std::getenv("STRATA_HIT_PF") && std::getenv("STRATA_HIT_PF")[0] == '1';
+            static const bool hit_pf = std::getenv("STRATA_HIT_PF") &&
+                                       std::getenv("STRATA_HIT_PF")[0] >= '1' && std::getenv("STRATA_HIT_PF")[0] <= '3';
             const bool arm_here = hit_graph && rdev && d.ahead_layer() != l;
             if (hit_pf && arm_here) t.hit_arm(l, rdev);
             if (mc.pf_b > 0 && !mc.cpu_only) {
