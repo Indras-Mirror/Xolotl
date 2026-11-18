@@ -13,7 +13,8 @@ ROUTES="$REPO/bench/ds4-2026-10-05/route-probe/ds4routes.bin"
 OUT="$REPO/bench/ds4-2026-10-05/moe-replay"
 BIN="$REPO/build-ds4-cuda/ds4_moe_replay"
 DONE="$HOME/.quetza-data/conductor/.done-ds4-phase3-gate"
-LOCK="$HOME/.quetza-data/conductor/ds4-gpu.lock"
+LOCK="${DS4_LOCK:-$HOME/.quetza-data/conductor/ds4-gpu.lock}"
+mkdir -p "${LOCK%/*}"   # flock creates the file, not its directory (fresh box without Quetza, #140)
 TOKENS="${1:-320}"
 OFFSET="${2:-1024}"   # a held-out 512-token block (the profile trains on the even ones)
 

@@ -8,6 +8,7 @@ if [ "${MEMGUARD_ALLOW_COMFY:-0}" != 1 ] && ss -ltn 2>/dev/null | grep -q ':8188
     echo "glm-engine: refusing - ComfyUI is running on :8188 (RAM)" >&2; exit 3
 fi
 LOCK="${DS4_LOCK:-$HOME/.quetza-data/conductor/ds4-gpu.lock}"
+mkdir -p "${LOCK%/*}"   # flock creates the file, not its directory (fresh box without Quetza, #140)
 export GGML_NO_BACKTRACE=1
 # s6: prompt chunks run without CUDA graphs (instantiating a chunk's graph ran out of VRAM on fresh ~30K prompts);
 # decode keeps them (graphs off everywhere fixed the crash but cost ~17% decode). =0 restores graphs everywhere.

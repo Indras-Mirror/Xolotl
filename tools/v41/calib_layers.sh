@@ -14,7 +14,8 @@
 set -u
 cd /home/mal/AI/Xolotl
 W=${V41_WORK:-/media/Crucial1TB/v41-calib}; mkdir -p "$W/logs"
-LOCK=~/.quetza-data/conductor/ds4-gpu.lock
+LOCK="${DS4_LOCK:-$HOME/.quetza-data/conductor/ds4-gpu.lock}"
+mkdir -p "${LOCK%/*}"   # flock creates the file, not its directory (fresh box without Quetza, #140)
 NEED=${NEED_GIB:-38}; MAX=${MAX_GIB:-44}; IDLE=${IDLE_MIN:-0}
 log() { echo "$(date '+%F %T') $*" | tee -a "$W/calib.log"; }
 stopped() { [ -f "$W/STOP" ] && { log "stop requested - exiting before layer $1"; rm -f "$W/current"; exit 0; }; }

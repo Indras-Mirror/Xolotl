@@ -37,6 +37,7 @@ def run(cases_path, out, extra):
     if avail < 75:
         sys.exit(f'refusing: MemAvailable {avail} GiB < 75 GiB')
     lock = os.environ.get('DS4_LOCK', os.path.expanduser('~/.quetza-data/conductor/ds4-gpu.lock'))
+    os.makedirs(os.path.dirname(lock), exist_ok=True)  # flock creates the file, not its directory (#140)
     cmd = ['flock', lock, 'systemd-run', '--user', '--scope', '-q', f'--unit=ds41-quality-{os.getpid()}', '-p', 'MemoryMax=84G',
            '-p', 'MemorySwapMax=0', 'build-ds4-dspark/ds41_generate'] + BASE_ARGS + extra
     log = open(out + '/engine.log', 'w')

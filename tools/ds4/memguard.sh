@@ -16,6 +16,7 @@ set -u
 MAX="$1"; NEED="$2"; shift 3
 FLOOR="${MEMGUARD_FLOOR_GIB:-4}"
 LOCK="${DS4_LOCK:-$HOME/.quetza-data/conductor/ds4-gpu.lock}"
+mkdir -p "${LOCK%/*}"   # flock creates the file, not its directory (fresh box without Quetza, #140)
 
 avail_gib() {
     # STRATA_ZFS_ARC=1: + the reclaimable OpenZFS ARC, as the ds41 engine counts it (ds41_sys.hpp mem_available_bytes)

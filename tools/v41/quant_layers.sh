@@ -10,7 +10,8 @@ set -u
 cd /home/mal/AI/Xolotl
 W=$1; FROM=$2; TO=$3; shift 3; [ "${1:-}" = "--" ] && shift
 mkdir -p "$W/logs"
-LOCK=~/.quetza-data/conductor/ds4-gpu.lock
+LOCK="${DS4_LOCK:-$HOME/.quetza-data/conductor/ds4-gpu.lock}"
+mkdir -p "${LOCK%/*}"   # flock creates the file, not its directory (fresh box without Quetza, #140)
 NEED=${NEED_GIB:-38}; MAX=${MAX_GIB:-44}
 Q="python3 tools/v41/v41_quant.py"
 log() { echo "$(date '+%F %T') $*" | tee -a "$W/quant.log"; }

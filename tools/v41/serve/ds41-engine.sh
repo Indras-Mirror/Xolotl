@@ -10,6 +10,7 @@ if [ "${MEMGUARD_ALLOW_COMFY:-0}" != 1 ] && ss -ltn 2>/dev/null | grep -q ':8188
     echo "ds41-engine: refusing - ComfyUI is running on :8188 (RAM)" >&2; exit 3
 fi
 LOCK="${DS4_LOCK:-$HOME/.quetza-data/conductor/ds4-gpu.lock}"
+mkdir -p "${LOCK%/*}"   # flock creates the file, not its directory (fresh box without Quetza, #140)
 export GGML_NO_BACKTRACE=1
 # 4 KiB pages pin the 60 GiB arena at 1.2 GB/s (load ~50 s); THP pins at ~0.16 GB/s (~4 min)
 export STRATA_NO_LARGEPAGES="${STRATA_NO_LARGEPAGES:-1}"

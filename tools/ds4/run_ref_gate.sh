@@ -10,6 +10,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 GGUF="${DS4_GGUF:-/media/mal/NVME1TB/Models/DeepSeek-V4-Flash-Q2-0731.gguf}"
 LOCK="${DS4_LOCK:-$HOME/.quetza-data/conductor/ds4-gpu.lock}"
+mkdir -p "${LOCK%/*}"   # flock creates the file, not its directory (fresh box without Quetza, #140)
 PROMPT="${1:-p64}"
 BIN="$REPO/build-ds4/ds4_ref"
 GOLD="$REPO/bench/ds4-2026-10-05/goldens/$PROMPT"
