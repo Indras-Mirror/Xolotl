@@ -253,8 +253,30 @@ static std::shared_ptr<Ds41Engram::RawMap> raw_map(const std::string & path, int
 #endif
 }
 
+// STRATA_ENGRAM_NOCACHE=1 (a test switch): the tables are opened with O_DIRECT (FILE_FLAG_NO_BUFFERING on Windows), so
+// every row read goes to the drive as on a cold page cache - a repeatable cold run on the same text.  The spans go
+// through a 4 KiB-aligned bounce buffer of the reading thread.
+static bool engram_nocache() {
+    static const bool on = std::getenv("STRATA_ENGRAM_NOCACHE") && std::getenv("STRATA_ENGRAM_NOCACHE")[0] == '1';
+    return on;
+}
+
 static inline ssize_t tread(int fd, const std::shared_ptr<Ds41Engram::RawMap> & m, void * buf, size_t n, uint64_t off) {
-    return m ? m->read(buf, n, off) : ds41_sys::pread(fd, buf, n, (int64_t) off);
+    if (m) return m->read(buf, n, off);
+    if (!engram_nocache()) return ds41_sys::pread(fd, buf, n, (int64_t) off);
+    constexpr uint64_t A = 4096;
+    const uint64_t a0 = off & ~(A - 1), a1 = (off + n + A - 1) & ~(A - 1);
+    thread_local std::vector<uint8_t> raw;
+    if (raw.size() < a1 - a0 + A) raw.resize((size_t) (a1 - a0 + A));
+    uint8_t * b = (uint8_t *) (((uintptr_t) raw.data() + A - 1) & ~(uintptr_t) (A - 1));
+    const ssize_t r = ds41_sys::pread(fd, b, (size_t) (a1 - a0), (int64_t) a0);
+    if (r < (ssize_t) (off - a0 + n)) return r < 0 ? r : 0;   // the span not read whole (a1 may pass the file's end)
+    std::memcpy(buf, b + (off - a0), n);
+    return (ssize_t) n;
+}
+
+static inline int table_open(const std::string & path) {
+    return ds41_sys::open(path.c_str(), O_RDONLY | (engram_nocache() ? O_DIRECT : 0));
 }
 
 Ds41Engram::~Ds41Engram() {
@@ -362,7 +384,7 @@ bool Ds41Engram::open_gguf(const std::string & path, std::string & err) {
     wrow_ = qtype_ == kQ5K ? dim_ / 256 * kQ5KBlock : dim_ / 32 * kIq4nlBlock;
     srow_ = 0;
     for (size_t e = 0; e < loc.size(); ++e) {
-        const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
+        const int fd = table_open(path);
         if (fd < 0) { err = "engram: cannot open " + path; return false; }
         ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
         Table t; t.fd_w = fd; t.off_w = loc[e]; t.rm_w = raw_map(path, fd); t.rows = g_->engram_rows[e];
@@ -415,23 +437,30 @@ bool Ds41Engram::read_raw(int e, uint32_t row, uint8_t * dst) const {
 }
 
 // Hot-set pack (written by ds41_engram_hot pack):
-//   "XENGHOT1" | u32 version (1) | u32 slots | u32 dim | u32 scale bytes (dim/32) | u64 geometry fingerprint | u64 count
-//   | u64 keys[count] (sorted ascending, slot << 32 | row) | raw rows[count][dim + dim/32] in key order.
+//   "XENGHOT1" | u32 version | u32 slots | u32 dim | u32 scale bytes | u64 geometry fingerprint | u64 count
+//   [version 2: | i32 table type | u32 row bytes] | u64 keys[count] (sorted ascending, slot << 32 | row)
+//   | raw rows[count][row bytes] in key order.
+// Version 1 holds the HF FP8 rows (dim + dim/32 bytes; scale bytes dim/32).  Version 2 holds a GGUF table's raw rows: the
+// table type (IQ4_NL 20: 144-byte rows, scale bytes 0) and row size must be the open tables', so it loads only into them.
 // open() refuses a pack whose geometry fingerprint differs, and spot-checks 64 rows against the tables, so a pack built
 // from another checkpoint's Engram (e.g. V4.1 vs 1017 - same geometry, different weights) is caught and skipped.
 bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
     const auto t0 = std::chrono::steady_clock::now();
-    if (qtype_ >= 0) { err = "a hot set holds FP8 rows, the tables are a GGUF's"; return false; }
     const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
     if (fd < 0) { err = "cannot open"; return false; }
     struct Hdr { char magic[8]; uint32_t version, slots, dim, srsz; uint64_t fp, count; } h {};
-    const int64_t srsz = dim_ / 32, rsz = dim_ + srsz;
+    struct Hdr2 { int32_t type; uint32_t row_bytes; } h2 {};
+    const int64_t rsz = wrow_ + srow_;
     bool ok = ds41_sys::pread(fd, &h, sizeof h, 0) == (ssize_t) sizeof h;
-    if (ok && (std::memcmp(h.magic, "XENGHOT1", 8) != 0 || h.version != 1)) { err = "not a hot-set pack"; ok = false; }
-    if (ok && (h.slots != tables_.size() || h.dim != (uint32_t) dim_ || h.srsz != (uint32_t) srsz)) { err = "shape mismatch"; ok = false; }
+    if (ok && (std::memcmp(h.magic, "XENGHOT1", 8) != 0 || (h.version != 1 && h.version != 2))) { err = "not a hot-set pack"; ok = false; }
+    if (ok && h.version == 1 && qtype_ >= 0) { err = "a version-1 pack holds FP8 rows, the tables are a GGUF's"; ok = false; }
+    if (ok && h.version == 2 && (ds41_sys::pread(fd, &h2, sizeof h2, sizeof h) != (ssize_t) sizeof h2 || h2.type != qtype_ ||
+                                 (int64_t) h2.row_bytes != rsz)) { err = "the pack's rows are another table type"; ok = false; }
+    const uint64_t hdr = sizeof h + (h.version == 2 ? sizeof h2 : 0);
+    if (ok && (h.slots != tables_.size() || h.dim != (uint32_t) dim_ || h.srsz != (uint32_t) srow_)) { err = "shape mismatch"; ok = false; }
     if (ok && h.fp != geometry_fingerprint()) { err = "geometry fingerprint mismatch (built for another model)"; ok = false; }
     ds41_sys::Stat st;
-    if (ok && (ds41_sys::fstat(fd, &st) != 0 || (uint64_t) st.st_size != sizeof h + h.count * (8 + (uint64_t) rsz))) { err = "truncated"; ok = false; }
+    if (ok && (ds41_sys::fstat(fd, &st) != 0 || (uint64_t) st.st_size != hdr + h.count * (8 + (uint64_t) rsz))) { err = "truncated"; ok = false; }
     if (ok) {
         ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
         hot_keys_.resize((size_t) h.count);
@@ -444,7 +473,7 @@ bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
             }
             return true;
         };
-        ok = rd(hot_keys_.data(), h.count * 8, sizeof h) && rd(hot_pool_.data(), hot_pool_.size(), sizeof h + h.count * 8);
+        ok = rd(hot_keys_.data(), h.count * 8, hdr) && rd(hot_pool_.data(), hot_pool_.size(), hdr + h.count * 8);
         if (!ok) err = "read failed";
     }
     ds41_sys::close(fd);
@@ -515,7 +544,7 @@ bool Ds41Engram::open_q6k(const std::vector<std::string> & paths, std::string & 
     uint64_t row0 = 0;
     for (int64_t e = 0; e < (int64_t) g_->engram_rows.size(); ++e) {
         Table t;
-        t.fd_w = ds41_sys::open(path.c_str(), O_RDONLY);
+        t.fd_w = table_open(path);
         if (t.fd_w < 0) { err = "engram: cannot open " + path; return false; }
         ds41_sys::posix_fadvise(t.fd_w, 0, 0, POSIX_FADV_RANDOM);
         t.off_w = off + row0 * (uint64_t) wrow_;
@@ -571,7 +600,7 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
                 err = "engram: " + name + " has an unexpected dtype/size";
                 return false;
             }
-            const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
+            const int fd = table_open(path);
             if (fd < 0) { err = "engram: cannot open " + path; return false; }
             ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
             (k ? t.fd_s : t.fd_w) = fd;
@@ -584,6 +613,7 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
     for (int i = 0; i < std::max(1, threads); ++i)       // the pool is the disk's queue depth
         workers_.emplace_back([this] { pump(); });
     nthreads_ = (int64_t) workers_.size();
+    if (engram_nocache()) std::fprintf(stderr, "engram: STRATA_ENGRAM_NOCACHE=1: table reads bypass the OS file cache (a test switch)\n");
     {
         const char * env = std::getenv("STRATA_ENGRAM_CACHE_ROWS");
         cache_cap_ = env ? (size_t) std::atoll(env) : (size_t) 2000000;

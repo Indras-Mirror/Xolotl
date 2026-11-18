@@ -726,6 +726,46 @@ Forced 1093, rb18c `=3`, 3 pairs:
 - Two runs with the switch were byte-identical to each other.
 - Not checked: serve. Keep-cache's regrow and the re-seed after a long prompt fill VRAM from the arena, and with the
   switch most VRAM experts have no arena copy. Those fills would read the SSD instead.
+- Serve (2026-10-29, the K:\model\test config, 12 scenarios, order rb18 / C / rb18 / C / C with 8 s gaps): all decode
+  61.48 / 64.32 -> 62.98 / 65.49 / 65.19 tok/s; C's three runs gave the same answers (the gaps too); the re-seed after
+  the 15.7K prompt 0.93 -> 1.07 s.  The sequence's first run was slow in everything, so the serve gain is 0 to +1.8 %.
+
+## Engram: a hot set for the IQ4_NL GGUF, and cold reads on demand (rb20)
+
+The Engram table here is ISTA's IQ4_NL GGUF (110.6 GB, 144-byte rows), read through the OS file cache.  A text the
+engine has not read since the cache lost its rows waits for them: forced 1093 on two new texts, `STRATA_ENG_PROF=1`,
+0.37 / 0.41 ms per pass at layer 1 on the first run, 0 on the second, decode +1.3 / +1.6 % on the second.
+
+### `STRATA_ENGRAM_NOCACHE=1` (a test switch)
+
+The tables are opened with `O_DIRECT` (`FILE_FLAG_NO_BUFFERING`), and each read goes through a 4 KiB-aligned bounce
+buffer.  Every row read then comes from the drive, so the same text can be measured cold again and again.
+
+### Hot set for a GGUF table
+
+`load_hot` refused the GGUF tables (the packs held FP8 rows).  A version-2 pack holds the GGUF table's own raw rows
+(header + table type and row size; `ds41_engram.cpp`, `load_hot`), and loads only into the same tables (the 64-row
+check against the tables stays).  `ds41_engram_hot` builds on Windows now, sizes its budgets with `--row-bytes 144`,
+and eval reads a -2 marker in a document as where its answer starts.
+
+Ranked on the strata-kld corpus (ja / en / code / koten, 385K tokens, with Strata's DETAILS.md cut out because the serve's
+long prompt reads it): 1.66M rows used by two or more 2048-token windows = a 0.22 GiB pack.  Simulated on the serve
+scenarios' text (cold cache, the 2M-row cache): decode 37.8 -> 34.6 disk reads a token, prefill 33.9K -> 26.4K a 1K
+tokens.
+
+Serve, the K:\model\test config with `STRATA_ENGRAM_NOCACHE=1`, order no hot / hot / hot / no hot:
+
+| | no hot | hot set |
+|---|---|---|
+| answers vs the production config | 12 / 12 same | 12 / 12 same |
+| Engram wait at layer 1, ms a pass | 0.95 / 1.01 | 0.85 / 0.85 |
+| the 15.7K prompt, ms | 11010 / 10802 | 10460 / 10459 (warm cache: 10483) |
+| all prompts, s | 28.7 / 28.4 | 28.0 / 28.0 (warm: 28.2) |
+| all decode, tok/s | 63.80 / 63.99 | 64.04 / 64.05 |
+
+- With every Engram read from the drive, the long prompt is only 3-5 % slower than warm, and decode ~1.5 %: the reads
+  overlap other work, and this SSD is fast.  So a hot set can win at most that, on text the cache does not hold.
+- The 0.22 GiB set takes back the long prompt's cold cost and +0.2 % decode.
 
 ## Tried and removed
 

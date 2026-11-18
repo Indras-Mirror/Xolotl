@@ -13,7 +13,9 @@
 //       each document's first (1 - decode-frac) is prefilled in --chunk batches, the rest decoded token by token.
 //       Prints disk row reads per decode token and per 1K prefill tokens for no hot set and each size.
 //   ds41_engram_hot pack --gguf G --dir D1:D2 --rank rank.bin --gib 4 --out hot.bin [--threads 32]
-//       Reads the top rows from the tables and writes the pack (format in ds41_engram.cpp, load_hot).
+//       Reads the top rows from the tables and writes the pack (format in ds41_engram.cpp, load_hot).  --dir may name an
+//       IQ4_NL Engram GGUF (on Windows the only separator is ';'): the pack is then a version-2 pack of its own rows.
+//   rank / eval take --row-bytes N for the GiB budgets (default 264, the FP8 row; 144 for an IQ4_NL GGUF table).
 #include "ds41_engram.hpp"
 
 #include <algorithm>
@@ -39,16 +41,21 @@ double now_s() {
     return std::chrono::duration<double>(clk::now().time_since_epoch()).count();
 }
 
-std::vector<std::vector<int32_t>> load_docs(const std::string & p) {
+// -2 inside a document marks where eval decodes it from (a prompt, then its answer); else eval splits at --decode-frac.
+// rank ignores the marker.
+std::vector<std::vector<int32_t>> load_docs(const std::string & p, std::vector<int64_t> * splits = nullptr) {
     std::ifstream f(p, std::ios::binary);
     if (!f) { std::fprintf(stderr, "hot: cannot open %s\n", p.c_str()); std::exit(2); }
     std::vector<std::vector<int32_t>> docs(1);
+    std::vector<int64_t> sp(1, -1);
     int32_t x;
     while (f.read(reinterpret_cast<char *>(&x), 4)) {
-        if (x < 0) { if (!docs.back().empty()) docs.emplace_back(); }
+        if (x == -2) { sp.back() = (int64_t) docs.back().size(); continue; }
+        if (x < 0) { if (!docs.back().empty()) { docs.emplace_back(); sp.push_back(-1); } }
         else docs.back().push_back(x);
     }
-    if (docs.back().empty()) docs.pop_back();
+    if (docs.back().empty()) { docs.pop_back(); sp.pop_back(); }
+    if (splits) *splits = sp;
     return docs;
 }
 
@@ -127,8 +134,11 @@ void fold(std::vector<uint64_t> & buf, std::vector<Counted> & acc) {
 }
 
 const int64_t kRowBytes = 256 + 8;   // dim + dim/32 (checked against the geometry at start)
+// a pack row's bytes for the GiB budgets: the FP8 row, --row-bytes for rank / eval (144 = an IQ4_NL GGUF table's row),
+// and for pack the open tables' own row size
+int64_t g_row_bytes = kRowBytes;
 
-size_t rows_for_gib(double gib) { return (size_t) (gib * 1024.0 * 1024 * 1024 / (double) (kRowBytes + 8)); }
+size_t rows_for_gib(double gib) { return (size_t) (gib * 1024.0 * 1024 * 1024 / (double) (g_row_bytes + 8)); }
 
 int cmd_rank(Ds41Engram & eng, int nel, const std::string & corpus, int64_t window, const std::string & out) {
     const auto docs = load_docs(corpus);
@@ -159,7 +169,7 @@ int cmd_rank(Ds41Engram & eng, int nel, const std::string & corpus, int64_t wind
     std::printf("rank: %zu docs, %" PRIu64 " tokens, %" PRIu64 " windows of %" PRId64 " -> %zu distinct rows, %" PRIu64
                 " used by one window only, %zu ranked (%.2f GiB as a pack) in %.1f s -> %s\n",
                 docs.size(), ntok, nwin, window, acc.size(), once, keep.size(),
-                (double) keep.size() * (kRowBytes + 8) / (1024.0 * 1024 * 1024), now_s() - t0, out.c_str());
+                (double) keep.size() * (g_row_bytes + 8) / (1024.0 * 1024 * 1024), now_s() - t0, out.c_str());
     for (double g : { 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0 }) {
         const size_t k = std::min(rows_for_gib(g), keep.size());
         if (k) std::printf("  %5.2f GiB = top %zu rows: last kept row used by %u windows\n", g, k, keep[k - 1].count);
@@ -170,16 +180,19 @@ int cmd_rank(Ds41Engram & eng, int nel, const std::string & corpus, int64_t wind
 int cmd_eval(Ds41Engram & eng, int nel, const std::string & rank_path, const std::string & corpus, std::vector<double> gibs,
              size_t cache_rows, double decode_frac, int64_t chunk) {
     const auto rank = read_rank(rank_path, eng.geometry_fingerprint());
-    const auto docs = load_docs(corpus);
+    std::vector<int64_t> splits;
+    const auto docs = load_docs(corpus, &splits);
     // every held-out position's keys, per document, computed once and replayed for each configuration
     struct Doc { std::vector<uint64_t> keys; int64_t n = 0, split = 0; };
     std::vector<Doc> dv;
     const int64_t per = (int64_t) nel * eng.n_cols();
     uint64_t pre_tok = 0, dec_tok = 0;
-    for (const auto & d : docs) {
+    for (size_t di = 0; di < docs.size(); ++di) {
+        const auto & d = docs[di];
         Doc x;
         x.n = (int64_t) d.size();
-        x.split = std::max<int64_t>(1, (int64_t) ((double) x.n * (1.0 - decode_frac)));
+        x.split = splits[di] >= 0 ? std::clamp<int64_t>(splits[di], 1, x.n)
+                                  : std::max<int64_t>(1, (int64_t) ((double) x.n * (1.0 - decode_frac)));
         for (int64_t p = 0; p < x.n; ++p) eng.set_token(p, d[(size_t) p]);
         keys_of(eng, nel, 0, x.n, x.keys);
         pre_tok += (uint64_t) x.split; dec_tok += (uint64_t) (x.n - x.split);
@@ -232,7 +245,7 @@ int cmd_pack(Ds41Engram & eng, const std::string & rank_path, double gib, const 
     std::vector<uint64_t> keys((size_t) k);
     for (size_t i = 0; i < k; ++i) keys[i] = rank[i].key;
     std::sort(keys.begin(), keys.end());   // ascending (slot, row) = ascending file offsets per table
-    const int64_t rsz = eng.row_dim() + eng.row_dim() / 32;
+    const int64_t rsz = eng.raw_row_bytes();
     std::vector<uint8_t> pool((size_t) k * (size_t) rsz);
     std::atomic<size_t> next { 0 }, done { 0 };
     std::atomic<int> bad { 0 };
@@ -263,11 +276,13 @@ int cmd_pack(Ds41Engram & eng, const std::string & rank_path, double gib, const 
     FILE * f = std::fopen(tmp.c_str(), "wb");
     if (!f) { std::fprintf(stderr, "pack: cannot write %s\n", tmp.c_str()); return 1; }
     struct Hdr { char magic[8]; uint32_t version, slots, dim, srsz; uint64_t fp, count; } h {};
+    struct Hdr2 { int32_t type; uint32_t row_bytes; } h2 { eng.table_type(), (uint32_t) rsz };
+    const bool v2 = eng.table_type() >= 0;   // a GGUF table's raw rows (ds41_engram.cpp, load_hot)
     std::memcpy(h.magic, "XENGHOT1", 8);
-    h.version = 1; h.slots = 2; h.dim = (uint32_t) eng.row_dim(); h.srsz = (uint32_t) (eng.row_dim() / 32);
+    h.version = v2 ? 2 : 1; h.slots = 2; h.dim = (uint32_t) eng.row_dim(); h.srsz = (uint32_t) eng.scale_row_bytes();
     h.fp = eng.geometry_fingerprint(); h.count = k;
-    bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 && std::fwrite(keys.data(), 8, k, f) == k &&
-              std::fwrite(pool.data(), 1, pool.size(), f) == pool.size();
+    bool ok = std::fwrite(&h, sizeof h, 1, f) == 1 && (!v2 || std::fwrite(&h2, sizeof h2, 1, f) == 1) &&
+              std::fwrite(keys.data(), 8, k, f) == k && std::fwrite(pool.data(), 1, pool.size(), f) == pool.size();
     ok = (std::fclose(f) == 0) && ok;
     if (!ok || std::rename(tmp.c_str(), out.c_str()) != 0) { std::fprintf(stderr, "pack: write failed\n"); return 1; }
     std::printf("pack: %zu rows (%.2f GiB) in %.1f s -> %s\n", k, (double) pool.size() / (1024.0 * 1024 * 1024), now_s() - t0, out.c_str());
@@ -301,6 +316,7 @@ int main(int argc, char ** argv) {
         else if (k == "--decode-frac") decode_frac = std::atof(nxt().c_str());
         else if (k == "--gib") { gibs = nxt(); gib = std::atof(gibs.c_str()); }
         else if (k == "--threads") threads = std::atoi(nxt().c_str());
+        else if (k == "--row-bytes") g_row_bytes = std::atoll(nxt().c_str());
         else { std::fprintf(stderr, "hot: unknown arg %s\n", k.c_str()); return 2; }
     }
     if (gguf.empty()) { std::fprintf(stderr, "hot: --gguf is required (any V4.1 GGUF: only the Engram metadata is read)\n"); return 2; }
@@ -317,12 +333,22 @@ int main(int argc, char ** argv) {
     if (cmd == "pack") {
         if (dir.empty() || rank.empty() || out.empty()) { std::fprintf(stderr, "hot: pack needs --dir --rank --out\n"); return 2; }
         std::vector<std::string> dirs;
-        for (size_t a = 0, b; a <= dir.size(); a = b + 1) { b = dir.find(':', a); if (b == std::string::npos) b = dir.size(); if (b > a) dirs.push_back(dir.substr(a, b - a)); }
+#ifdef _WIN32
+        const char sep = ';';   // a Windows path holds ':' (K:\...)
+#else
+        const char sep = ':';
+#endif
+        for (size_t a = 0, b; a <= dir.size(); a = b + 1) { b = dir.find(sep, a); if (b == std::string::npos) b = dir.size(); if (b > a) dirs.push_back(dir.substr(a, b - a)); }
         std::string e;
+#ifdef _WIN32
+        _putenv_s("STRATA_ENGRAM_CACHE_ROWS", "0");   // no row cache / hot set in the reader we pack from
+        _putenv_s("STRATA_ENGRAM_HOT", "0");
+#else
         ::setenv("STRATA_ENGRAM_CACHE_ROWS", "0", 1);   // no row cache / hot set in the reader we pack from
         ::setenv("STRATA_ENGRAM_HOT", "0", 1);
+#endif
         if (!eng.open(G, dirs, 1, e)) { std::fprintf(stderr, "hot: engram open: %s\n", e.c_str()); return 1; }
-        if (eng.raw_row_bytes() != kRowBytes) { std::fprintf(stderr, "hot: packs hold FP8 rows; these tables are %s\n", G.engram_encoding.c_str()); return 1; }
+        g_row_bytes = eng.raw_row_bytes();   // FP8 264 (a version-1 pack) or a GGUF table's row (version 2)
         return cmd_pack(eng, rank, gib, out, threads);
     }
     eng.setup_hash(G);
