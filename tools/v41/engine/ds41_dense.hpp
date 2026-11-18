@@ -58,6 +58,12 @@ struct Ds41DenseConfig {
     /// them back after it (the prompt_batch columns are ~2.6 GiB at 8192 - expert slots while decoding).
     bool    elastic_cols = false;
     bool    vision = false;            ///< opt-in image embeddings, VL routing and Engram masking
+    /// --ablate FILE (opt-in, local rb26): one direction out of every residual write, x - r (v.x) / (v.r) on the text
+    /// token embeddings, the Engram value, the attention output and the FFN output (shared + routed).  r = the write
+    /// direction, v = the read direction (n_embd floats each); Orca's DeepSeek-V4.1-Flash-1017 abliteration is this map
+    /// on those weights.  Image rows are the encoder's (Orca's mmproj carries its own); DSpark's draft layers are not
+    /// mapped (drafts only - the verify is).  Both empty = off: no graph node and no input byte changes.
+    std::vector<float> ablate_r, ablate_v;
 
     /// Batch slots (--batch-slots N): conversation states held at once, each of the full ctx_max - its window rings,
     /// ratio-2 compressor states, compressed KV + indexer keys, snapshot, park and Engram history.  Slot 0 is the one

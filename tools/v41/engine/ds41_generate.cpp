@@ -141,6 +141,8 @@ struct Args {
     double chunk_prefetch_gib = 0.0;
     int image_token = 129264;     // --image-token N: the model's <|image|> id (each image is one run of it in the prompt)
     bool vision = false;
+    std::string ablate;           // --ablate FILE: 2 x n_embd float32 (r, then v) - x - r (v.x) / (v.r) on every residual write
+                                  // (Ds41DenseConfig::ablate_r; local rb26, Orca's abliteration without its weights)
     // --serve's conversation pool: --conversation-cache-mib N (default 8192; 0 = the single park of STRATA_SERVE_PARK)
     // of host memory for conversations saved at their turn boundary, at most --conversation-cache-slots of them
     int conv_mib = 8192, conv_slots = 64;
@@ -308,6 +310,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--enc-replay") a.enc_replay = std::atoi(next().c_str());
         else if (k == "--image-token") a.image_token = std::atoi(next().c_str());
         else if (k == "--vision") a.vision = true;
+        else if (k == "--ablate") a.ablate = next();
         else if (k == "--conversation-cache-mib") a.conv_mib = std::max(0, std::atoi(next().c_str()));
         else if (k == "--conversation-cache-slots") a.conv_slots = std::max(1, std::atoi(next().c_str()));
         else if (k == "--batch-slots" || k == "--batch") { const std::string v = next(); a.batch_slots = v == "auto" ? 0 : std::max(1, std::atoi(v.c_str())); }
@@ -607,6 +610,26 @@ int main(int argc, char ** argv) {
     dc.engram_dirs = a.engram;
     dc.engram_hot = a.engram_hot;
     dc.vision = a.vision;
+    if (!a.ablate.empty()) {
+        // raw float32: r (the write direction) then v (the read direction), n_embd each; the dense init checks the size
+        std::ifstream f(a.ablate, std::ios::binary | std::ios::ate);
+        const std::streamoff bytes = f ? (std::streamoff) f.tellg() : -1;
+        if (bytes <= 0 || bytes % 8 != 0) { std::fprintf(stderr, "ds41_generate: --ablate %s: not 2 x n float32\n", a.ablate.c_str()); return 2; }
+        std::vector<float> rv((size_t) (bytes / 4));
+        f.seekg(0);
+        f.read(reinterpret_cast<char *>(rv.data()), bytes);
+        const size_t n = rv.size() / 2;
+        dc.ablate_r.assign(rv.begin(), rv.begin() + (std::ptrdiff_t) n);
+        dc.ablate_v.assign(rv.begin() + (std::ptrdiff_t) n, rv.end());
+        double vr = 0.0, rr = 0.0, vv = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            vr += (double) dc.ablate_v[i] * dc.ablate_r[i];
+            rr += (double) dc.ablate_r[i] * dc.ablate_r[i];
+            vv += (double) dc.ablate_v[i] * dc.ablate_v[i];
+        }
+        std::fprintf(stderr, "ablate: %s (%zu dims, cos(r, v) %.4f): x - r (v.x) / (v.r) on every residual write\n", a.ablate.c_str(),
+                     n, vr / std::sqrt(rr * vv));
+    }
     dc.engram_hot = a.engram_hot;
     dc.act_quant = a.act_quant;
     // --kv-fp4 / STRATA_KV_FP4=1: the compressed KV + indexer keys packed to their exact FP4 grids (Ds41DenseConfig::kv_fp4)

@@ -135,6 +135,14 @@ Top-1 agreement 0.674 vs 0.701. In the engine: 4096-token code prompt ppl 2.380,
   exact and every expert stays reachable. Cost on 4096-token perplexity: code 2.38 -> 2.87, agentic text 15.11 -> 6.39
   (better: the GSQ quant gave its cheapest formats to rarely-used experts). `--route-bias 0 --route-bias-file 0` =
   exact routing at ~3.5 tok/s.
+- **One direction out of every residual write** (opt-in, local rb26): `--ablate FILE` (2 x 5120 float32: r, then v)
+  maps x -> x - r (v.x) / (v.r) on the text token embeddings, the Engram value, the attention output and the FFN output
+  (shared + routed) - what an abliteration does to those weights, applied on top of any quant. Orca's
+  DeepSeek-V4.1-Flash-1017-abliterated is exactly this map with one pair for all 40 layers (v = the direction it zeroes,
+  r = the direction it changes along, 14 degrees apart; readers, router, HC, head and the Engram tables are untouched);
+  its mmproj changes only the four tensors that write the LM's space (x - v (v.x)), so image rows come from the encoder
+  as they are. On GSQ IQ2_XS: the same decode speed, normal answers stay normal, the canned refusals go. Without the
+  flag no graph node or input byte changes.
 - Where the time goes - prefill (8192 tokens, ~37 s): dense half ~11 s, experts ~26 s (the grouped expert kernels and
   ~10 GB/s of expert uploads). Decode (~38 ms/token): dense half ~19 ms (its Q8_0 weights read at ~880 GB/s - the
   card's bandwidth), expert tier ~16 ms.

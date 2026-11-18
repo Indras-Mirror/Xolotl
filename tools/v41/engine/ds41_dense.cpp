@@ -219,6 +219,11 @@ struct Ds41Dense::Impl {
     ggml_tensor * rknob = nullptr;        // F32 [kRK + 1, 2] smart router: protect / pool rank selectors (set_route_select)
     ggml_tensor * routed = nullptr;       // [D, NC]
     ggml_tensor * cand = nullptr;         // I32 [CB, NC]  candidate blocks of cand_layer
+    // --ablate (cfg.ablate_r / ablate_v): v [D, 1] and r / (v.r) [1, D] on the backend (nctx), the same on the host for
+    // the embedding rows.  abl_v null = off.
+    ggml_tensor * abl_v = nullptr;
+    ggml_tensor * abl_rs = nullptr;
+    std::vector<float> abl_v_h, abl_rs_h;
     struct Layer {
         int64_t ratio = 0;
         bool kv_src = false, idx_src = false, cand_src = false, uses_cand = false;
@@ -1304,6 +1309,31 @@ static void attn_tail_ops(Ds41Dense::Impl & im, ggml_context * gc, int il, std::
     outs.push_back(c_pre);
 }
 
+// --ablate: x - r (v.x) / (v.r) per column of x ([D, ...], contiguous result of x's shape); x itself when off, so a
+// graph without the flag has no extra node.  Every residual write goes through it: the Engram value, the attention
+// output and the FFN output (the embeddings get the same map on the host, ablate_rows).
+static ggml_tensor * ablate(const Ds41Dense::Impl & im, ggml_context * gc, ggml_tensor * x) {
+    if (!im.abl_v) return x;
+    const int64_t D = x->ne[0], n = ggml_nelements(x) / D;
+    ggml_tensor * x2 = ggml_reshape_2d(gc, ggml_is_contiguous(x) ? x : ggml_cont(gc, x), D, n);
+    ggml_tensor * s = ggml_mul_mat(gc, im.abl_v, x2);                       // [1, n]  v.x
+    ggml_mul_mat_set_prec(s, GGML_PREC_F32);
+    ggml_tensor * y = ggml_sub(gc, x2, ggml_mul_mat(gc, im.abl_rs, s));      // r / (v.r) x (v.x): a K = 1 product, [D, n]
+    return ggml_reshape_4d(gc, y, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
+}
+
+// The embedding rows' share of --ablate (host, n rows of D floats; text rows only - image rows are the encoder's)
+static void ablate_rows(const Ds41Dense::Impl & im, float * rows, int64_t n) {
+    if (im.abl_v_h.empty()) return;
+    const int64_t D = im.D;
+    for (int64_t t = 0; t < n; ++t) {
+        float * x = rows + t * D;
+        double s = 0.0;
+        for (int64_t i = 0; i < D; ++i) s += (double) im.abl_v_h[(size_t) i] * x[i];
+        for (int64_t i = 0; i < D; ++i) x[i] -= (float) (s * im.abl_rs_h[(size_t) i]);
+    }
+}
+
 // tail: build_attn without the FFN hc mixes, the shared expert and their writes (post_f / comb_f / shexp / pre_state)
 // - STRATA_ATTN_TAIL's single-token graphs, completed by build_attn_tail (=3: by the same ops at this graph's end)
 static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0,
@@ -1344,7 +1374,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
             ggml_tensor * m = ggml_reshape_3d(gc, b.v1(im.i_img, n, (size_t) col0 * 4), 1, 1, n);
             gate = ggml_mul(gc, gate, ggml_scale_bias(gc, m, -1.0f, 1.0f));   // gate * (1 - image)
         }
-        ggml_tensor * gv = ggml_mul(gc, ggml_repeat(gc, ggml_cont(gc, val), x), gate);
+        ggml_tensor * gv = ggml_mul(gc, ggml_repeat(gc, ablate(im, gc, ggml_cont(gc, val)), x), gate);
         x = ggml_add(gc, x, gv);
         outs.push_back(ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n, col0)));   // the block input (residual) = state + Engram
     }
@@ -1663,6 +1693,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * wo_a = ggml_reshape_3d(gc, im.BL(il, "attn_output_a.weight"), im.OGD, im.OL, im.OG);
     ggml_tensor * oa = ggml_permute(gc, ggml_mul_mat(gc, wo_a, o), 0, 2, 1, 3);              // [OL, OG, n]
     ggml_tensor * attn = ggml_mul_mat(gc, im.BL(il, "attn_output_b.weight"), b.flat2(oa, im.OL * im.OG, n));   // [D, n]
+    attn = ablate(im, gc, attn);
 
     // ---- hc_post(attention) -> FFN hc: its mixes give the next layer's pre-mix; its input uses the attention's
     ggml_tensor * h = ggml_dsv4_hc_post(gc, attn, x, a_post, a_join ? a_join : a_comb);     // [D, HC, n]
@@ -1910,7 +1941,7 @@ static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc,
             ggml_tensor * m = ggml_reshape_3d(gc, b.v1(im.i_img, n, (size_t) col0 * 4), 1, 1, n);
             gate = ggml_mul(gc, gate, ggml_scale_bias(gc, m, -1.0f, 1.0f));
         }
-        x = ggml_add(gc, x, ggml_mul(gc, ggml_repeat(gc, ggml_cont(gc, val), x), gate));
+        x = ggml_add(gc, x, ggml_mul(gc, ggml_repeat(gc, ablate(im, gc, ggml_cont(gc, val)), x), gate));
         outs.push_back(ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n, col0)));
     }
     ggml_tensor * xin = ggml_dsv4_hc_pre(gc, x, b.cols2(im.pre_state, HC, n, col0));
@@ -1992,7 +2023,7 @@ static ggml_cgraph * build_finish(Ds41Dense::Impl & im, ggml_context * gc, int64
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
-    ggml_tensor * out = ggml_add(gc, b.cols2(im.shexp, D, n, col0), b.cols2(im.routed, D, n, col0));
+    ggml_tensor * out = ablate(im, gc, ggml_add(gc, b.cols2(im.shexp, D, n, col0), b.cols2(im.routed, D, n, col0)));
     ggml_tensor * x = ggml_dsv4_hc_post(gc, out, b.cols3(im.hap, D, HC, n, col0), b.cols2(im.post_f, HC, n, col0),
                                         b.cols3(im.comb_f, HC, HC, n, col0));
     ggml_build_forward_expand(gf, ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n, col0)));
@@ -2005,7 +2036,7 @@ static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * g
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 128, false);
     const int64_t D = im.D, HC = im.HC;
-    ggml_tensor * out = ggml_add(gc, b.cols2(im.shexp, D, 1, 0), b.cols2(im.routed, D, 1, 0));
+    ggml_tensor * out = ablate(im, gc, ggml_add(gc, b.cols2(im.shexp, D, 1, 0), b.cols2(im.routed, D, 1, 0)));
     ggml_tensor * x = ggml_dsv4_hc_post(gc, out, b.cols3(im.hap, D, HC, 1, 0), b.cols2(im.post_f, HC, 1, 0),
                                         b.cols3(im.comb_f, HC, HC, 1, 0));
     ggml_tensor * st = ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, 1, 0));
@@ -2199,6 +2230,8 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     for (int r = 1; r <= 2; ++r) im.i_cbase[r] = ggml_new_tensor_1d(c, GGML_TYPE_F32, NC);
     im.i_lastblk = ggml_new_tensor_1d(c, GGML_TYPE_F32, NC);
     for (int e = 0; e < 2; ++e) im.i_eng[e] = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.EC * im.ED, NC);
+    im.abl_v = im.abl_v_h.empty() ? nullptr : ggml_new_tensor_2d(c, GGML_TYPE_F32, D, 1);
+    im.abl_rs = im.abl_v_h.empty() ? nullptr : ggml_new_tensor_2d(c, GGML_TYPE_F32, 1, D);
     // STRATA_VRAM_TRACE: WHICH state tensor owns the columns' VRAM (s13c: a batch's state alloc was 2.45-2.76 GiB and
     // a 2193.81 MiB allocation later failed with 6.83 GiB "free" - name the owner before sizing anything).
     if (std::getenv("STRATA_VRAM_TRACE")) {
@@ -2212,6 +2245,10 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.nbuf = ggml_backend_alloc_ctx_tensors(c, im.backend);
     if (!im.nbuf) { err = "cannot allocate " + std::to_string(NC) + " state columns"; return false; }
     ggml_backend_buffer_clear(im.nbuf, 0);
+    if (im.abl_v) {
+        ggml_backend_tensor_set(im.abl_v, im.abl_v_h.data(), 0, (size_t) D * 4);
+        ggml_backend_tensor_set(im.abl_rs, im.abl_rs_h.data(), 0, (size_t) D * 4);
+    }
     return true;
 }
 
@@ -2362,6 +2399,24 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     im.OL = G.o_lora; im.OGD = G.n_head * G.d_head / G.o_groups; im.RQ = G.r_q; im.SWA = G.n_swa;
     im.IH = G.idx_heads; im.ID = G.idx_dim; im.ITOP = G.idx_topk; im.NE = G.n_expert; im.NU = G.n_used; im.NFF = G.n_ff;
     im.CB = G.cand_blocks; im.CBS = G.cand_bsize; im.EC = (G.engram_ngram - 1) * G.engram_heads; im.ED = G.engram_dim;
+    if (!cfg.ablate_r.empty() || !cfg.ablate_v.empty()) {
+        if ((int64_t) cfg.ablate_r.size() != im.D || (int64_t) cfg.ablate_v.size() != im.D) {
+            err = "--ablate: r and v need " + std::to_string(im.D) + " floats each (got " + std::to_string(cfg.ablate_r.size()) +
+                  " / " + std::to_string(cfg.ablate_v.size()) + ")";
+            return false;
+        }
+        double vr = 0.0, rr = 0.0, vv = 0.0;
+        for (int64_t i = 0; i < im.D; ++i) {
+            vr += (double) cfg.ablate_v[(size_t) i] * cfg.ablate_r[(size_t) i];
+            rr += (double) cfg.ablate_r[(size_t) i] * cfg.ablate_r[(size_t) i];
+            vv += (double) cfg.ablate_v[(size_t) i] * cfg.ablate_v[(size_t) i];
+        }
+        // v.r near 0 would blow r / (v.r) up: the map is only a projection for directions that are not orthogonal
+        if (!(std::fabs(vr) > 0.1 * std::sqrt(rr * vv))) { err = "--ablate: r and v are (nearly) orthogonal"; return false; }
+        im.abl_v_h = cfg.ablate_v;
+        im.abl_rs_h.resize((size_t) im.D);
+        for (int64_t i = 0; i < im.D; ++i) im.abl_rs_h[(size_t) i] = (float) (cfg.ablate_r[(size_t) i] / vr);
+    }
     // gate-only overrides (the golden takes the same): small top-k / candidate counts make the selection logic bite
     // on a short prompt
     if (const char * e = std::getenv("DS41_TEST_TOPK")) im.ITOP = std::atoi(e);
@@ -2825,6 +2880,7 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         if (tids[t] < 0 || tids[t] >= im.g.vocab) { im.err = "token id out of range"; return false; }
         strata::v41::ds41_embd_row(im.embd, im.embd_type, D, tids[t], im.host_emb.data() + (size_t) (t * D));
     }
+    ablate_rows(im, im.host_emb.data(), n);
     // vision: overwrite the image span positions with the encoder's rows (model.py merge_image_embeddings) and mark
     // them, so the router picks exp_probs_b_vl there and Engram skips them.  vis_pos is ascending, the pass contiguous.
     std::vector<float> img;
@@ -2988,6 +3044,7 @@ bool Ds41Dense::Impl::upload_rows(const Ds41Dense::Row * rows, int n) {
         if (rows[t].tid < 0 || rows[t].tid >= im.g.vocab) { im.err = "token id out of range"; return false; }
         strata::v41::ds41_embd_row(im.embd, im.embd_type, D, rows[t].tid, im.host_emb.data() + (size_t) (t * D));
     }
+    ablate_rows(im, im.host_emb.data(), n);
     ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), 0, im.host_emb.size() * 4);
     if (im.vision && im.i_img) {   // text rows only
         std::vector<float> z((size_t) n, 0.0f);
