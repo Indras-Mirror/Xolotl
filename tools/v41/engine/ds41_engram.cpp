@@ -104,8 +104,6 @@ float fp16_to_f32(uint16_t h) {
 
 // Q6_K (ggml block_q6_K, 210 bytes per 256 weights): Unsloth's / llama.cpp #30817's per_layer_token_embd.weight
 constexpr int kQ6k = 14;
-// Q5_K (ggml block_q5_K, 176 bytes per 256 weights): Unsloth's UD-IQ2_XXS per_layer_token_embd.weight
-constexpr int kQ5k = 13;
 
 // MXFP8 (llama.cpp #30817's GGML_TYPE_MXFP8 = 43, 33 bytes per 32 weights: one E8M0 scale e, then 32 E4M3 (fn) codes,
 // value = e4m3(q) * 2^(e - 127)): Unsloth's UD-Q8_K_XL per_layer_token_embd.weight.  The arithmetic of that branch's
@@ -152,38 +150,6 @@ void q6k_dequant(const uint8_t * x, float * y, int64_t k) {
             ql += 64;
             qh += 32;
             sc += 8;
-        }
-    }
-}
-
-// k Q5_K values (ggml's block_q5_K, 176 bytes per 256: d dmin scales[12] qh[32] qs[128]) -> floats: ggml's
-// dequantize_row_q5_K and get_scale_min_k4, term for term (as q6k_dequant above).
-void q5k_dequant(const uint8_t * x, float * y, int64_t k) {
-    for (int64_t i = 0; i < k / 256; ++i, x += 176) {
-        uint16_t dh, mh;
-        std::memcpy(&dh, x, 2);
-        std::memcpy(&mh, x + 2, 2);
-        const float d = fp16_to_f32(dh), min = fp16_to_f32(mh);
-        const uint8_t * q = x + 4;
-        const uint8_t * qh = x + 16;
-        const uint8_t * ql = x + 48;
-        auto scale_min = [&](int j, uint8_t & sc, uint8_t & m) {
-            if (j < 4) { sc = q[j] & 63; m = q[j + 4] & 63; }
-            else { sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
-        };
-        int is = 0;
-        uint8_t u1 = 1, u2 = 2, sc, m;
-        for (int j = 0; j < 256; j += 64) {
-            scale_min(is + 0, sc, m);
-            const float d1 = d * sc, m1 = min * m;
-            scale_min(is + 1, sc, m);
-            const float d2 = d * sc, m2 = min * m;
-            for (int l = 0; l < 32; ++l) *y++ = d1 * ((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
-            for (int l = 0; l < 32; ++l) *y++ = d2 * ((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
-            ql += 32;
-            is += 2;
-            u1 <<= 2;
-            u2 <<= 2;
         }
     }
 }
@@ -352,7 +318,6 @@ void Ds41Engram::deq_row(const uint8_t * w, const uint8_t * s, float * o) const 
         return;
     }
     if (qtype_ == kQ6k) { q6k_dequant(w, o, dim_); return; }
-    if (qtype_ == kQ5k) { q5k_dequant(w, o, dim_); return; }
     if (qtype_ == kMxfp8) { mxfp8_dequant(w, o, dim_); return; }
     if (qtype_ == kIq4nl) {
         for (int64_t b = 0; b < dim_ / 32; ++b) {
@@ -539,8 +504,7 @@ bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
 // slot 1's (its hash ids are offset by slot 0's rows: llama.cpp's head_offsets run across both), so slot e's table
 // starts at the rows of the slots before it.  Each slot gets its own descriptor (the destructor closes every one).
 bool Ds41Engram::open_q6k(const std::vector<std::string> & paths, std::string & err) {
-    // (the same layout in MXFP8 - Unsloth's UD-Q8_K_XL - and in Q5_K - Unsloth's UD-IQ2_XXS: the row size follows the
-    // file's type)
+    // (the same layout in MXFP8 - Unsloth's UD-Q8_K_XL: the row size follows the file's type)
     const char * name = "per_layer_token_embd.weight";
     int64_t total = 0;
     for (int64_t r : g_->engram_rows) total += r;
@@ -563,13 +527,13 @@ bool Ds41Engram::open_q6k(const std::vector<std::string> & paths, std::string & 
             try { f = std::make_unique<GgufFile>(c); } catch (const std::exception &) { continue; }
             const TensorInfo * t = f->find(name);
             if (!t) continue;
-            if ((t->type != (uint32_t) kQ6k && t->type != (uint32_t) kQ5k && t->type != (uint32_t) kMxfp8) || t->shape.size() != 2 ||
-                t->shape[0] != (uint64_t) dim_ || t->shape[1] != (uint64_t) total) {
-                err = "engram: " + c + ": " + name + " is not Q6_K / Q5_K / MXFP8 [" + std::to_string(dim_) + ", " + std::to_string(total) + "]";
+            if ((t->type != (uint32_t) kQ6k && t->type != (uint32_t) kMxfp8) || t->shape.size() != 2 || t->shape[0] != (uint64_t) dim_ ||
+                t->shape[1] != (uint64_t) total) {
+                err = "engram: " + c + ": " + name + " is not Q6_K / MXFP8 [" + std::to_string(dim_) + ", " + std::to_string(total) + "]";
                 return false;
             }
             qtype_ = (int) t->type;
-            wrow_ = qtype_ == kQ6k ? dim_ / 256 * 210 : qtype_ == kQ5k ? dim_ / 256 * 176 : dim_ / 32 * 33;
+            wrow_ = qtype_ == kQ6k ? dim_ / 256 * 210 : dim_ / 32 * 33;
             path = c;
             off = f->data_start() + t->offset;
             break;
@@ -589,8 +553,7 @@ bool Ds41Engram::open_q6k(const std::vector<std::string> & paths, std::string & 
         row0 += (uint64_t) t.rows;
         tables_.push_back(t);
     }
-    std::fprintf(stderr, "engram: %s tables from %s (%lld rows, %lld bytes each)\n",
-                 qtype_ == kQ6k ? "Q6_K" : qtype_ == kQ5k ? "Q5_K" : "MXFP8",
+    std::fprintf(stderr, "engram: %s tables from %s (%lld rows, %lld bytes each)\n", qtype_ == kQ6k ? "Q6_K" : "MXFP8",
                  path.c_str(), (long long) total, (long long) wrow_);
     return true;
 }
