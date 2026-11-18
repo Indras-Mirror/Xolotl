@@ -826,6 +826,76 @@ The same configuration, Chrome open, rb23b / rb24 + `STRATA_SHORT_MMVQ=1` altern
 Prompt times were the same in all four runs. K:\model\test runs rb24 with the switch since 2026-10-29 late night;
 its config file gave the first rb24 run's 13 answers again.
 
+## The embedding table in RAM, and the vram_lru copies off the host's path (rb30)
+
+Two candidates of the 2026-11-03 rb28 review (Xolotl/docs/reports/2026-11-03-rb28-speed-followup: GPT and Gemini).
+Both switches are opt-in and bit-identical.
+
+Measured on 01's live configuration (rb28 switches on, `--slots 2321`): the one-shot forced decode of `eos-np.bin` (a
+3335-token prompt), then 837 forced tokens. The arms alternate. The PC has a fast state (62-63 tok/s) and a slow
+state (59-60), so compare neighbouring runs.
+
+### `STRATA_EMBD_RAM=1`
+
+`token_embd` (5120 x 129280 Q5_K, 434 MiB on the GSQ files) is the one weight the engine reads on the CPU, one row per
+token. It was read from the GGUF's mapping. After `STRATA_DROP_MMAP` returns those pages, Engram and expert reads cycle
+the OS cache. A row on a page the process has not touched yet then waits for the disk before the token's inputs go up.
+
+The switch copies the table into pinned memory at load (8 threads, 222 ms), before `STRATA_DROP_MMAP`. Rows are read
+from there by the same `ds41_embd_row`.
+
+`STRATA_EMBD_PROF=1` (a diagnostic) times each row read. Rows slower than 0.05 ms:
+
+| | prompt pass (3335 rows) | decode (768 tokens) |
+|---|---|---|
+| off | 645 rows, 132 ms | 177 rows, 264 ms (0.34 ms a token) |
+| on | 0 (all 3335 rows 7.3 ms) | 0 |
+
+- Decode, 3 rounds: 61.52 -> 62.70 tok/s (+1.9 %). Begin went from 0.44 to 0.19 ms a token.
+- Prompt: 6.82 -> 6.69 s.
+- Logits of all 837 steps are byte-identical (sha f371fe3a, the same as rb29).
+- Cost: 434 MiB of pinned (non-pageable) host RAM, and 0.22 s at load.
+
+### `STRATA_LRU_LATE=1` (needs `STRATA_DEMOTE_ASYNC`)
+
+Under `STRATA_HIT_PF`, a graph-hit layer that promotes a prefetched expert into a victim slot (vram_lru) queues two
+copies on the tier's stream: the victim's stage-out and the staging-to-slot copy. The host then waited for them
+("hit pf lru sync") before `gpu_run` returned, so before the layer's finish and the next attention went out.
+
+With the switch, an event marks the copies. `lru_settle` waits for it:
+
+- at the next `gpu_run`'s entry, which is before the next prefetch of that staging and the next arming of that layer;
+- in `dem_drain(-1)`, which the entries outside decode call.
+
+The token's last routed layer still syncs.
+
+- 6 rounds on top of `STRATA_EMBD_RAM`: 61.36 -> 62.72 tok/s (+2.2 %). All 6 neighbouring pairs were faster (+0.1 to
+  +5.4 %). Tier went from 5.59 to 5.49 ms a token, finish from 3.97 to 3.81.
+- Byte-identical logits.
+- A variant also replaced the host's wait for the prefetch batch with a stream wait on the card. It gained only
+  +0.7 %, probably from WDDM's late release of stream waits, and was removed.
+
+### Both, on the final rb30
+
+- 4 rounds: 59.50 -> 60.70 tok/s (+2.0 %). All 4 neighbouring pairs were faster (+1.4 to +2.9 %); 3 of the 4 pairs ran
+  in the slow state.
+- Byte-identical logits with both switches off and with both on.
+
+Serve: srvtest's 11 scenarios, `--slots 2401`, a fresh server each run, in the order off / on / on / off.
+
+| run | slow embedding rows in the prompts | prompts, total | long prompt | decode, all scenarios |
+|---|---|---|---|---|
+| off A | 2414 of 19416 (0.50 s) | 28.98 s | 13.89 s | 62.83 tok/s |
+| on A | 0 | 25.75 s | 10.75 s | 63.11 tok/s |
+| on B | 0 | 25.76 s | 10.76 s | 63.00 tok/s |
+| off B | 0 | 25.79 s | 10.76 s | 64.24 tok/s |
+
+- All 11 answers were the same in all four runs.
+- Only the first run found `token_embd` pages outside the OS cache. The later runs read the same tokens, so their pages
+  were all cached, and the switch had nothing left to save. The first long prompt also met a cold Engram (+3.1 s).
+- Decode differed by no more than the runs' own spread.
+- The embedding switch therefore shows only after a start, or after the OS dropped those pages.
+
 ## Tried and removed
 
 `STRATA_INPUT_ASYNC`: a decode step's ~14 small inputs (embedding row, positions, window rows / mask, compressed-row
@@ -852,3 +922,24 @@ The first `STRATA_GRAPH_CONC=1` forked at the very start of the attention graph 
 `STRATA_GRAPH_CONC` + 8 (rb16): the hits' branch forked right after the router, beside the readback kernel instead of
 behind it. The hits read only the routing and the FFN input on the card, and the arming happens before the graph goes
 out. Bit-identical, but 37.85 -> 37.73 tok/s on top of the two rb16 switches (3 rounds).
+
+rb30 tried four changes to the token's first and last graphs, from the rb28 trace's gaps there (init -> predict(0)
+0.05 ms, predict(0) -> attention(0) 0.06-0.075 ms, finish(39) -> head 0.09-0.1 ms a token):
+
+- `STRATA_INIT_ASYNC`: no host wait after the init graph.
+- `STRATA_PRED0_HOOK`: predict(0) through the readback hook.
+- `STRATA_HEAD_CACHE`: a cached single-token head, with the last finish not waited for.
+- `STRATA_ENG_PACK`: the two Engram rows as one batched copy on a stream of their own.
+
+All four were bit-identical. Together they gave no gain: 61.52 -> 61.12 tok/s (-0.6 %, 3 rounds), and 62.70 -> 62.86
+on top of `STRATA_EMBD_RAM`. The stages only moved time between each other.
+
+`STRATA_SPEC_L1=2` (rb30): one layer of speculative file-tier reads (`SPEC_AHEAD=0`) with `STRATA_ATTN_AHEAD` kept
+(`=1` turns it off). Bit-identical, and the reads did find the misses, but it lost:
+
+| `SPEC_TOP` | reads issued / used, of 3564 file misses | tok/s (vs 62.72 without) | tier ms a token |
+|---|---|---|---|
+| 2 | 1904 / 1163 | 60.16 | +0.6 |
+| 4 | 3519 / 1731 | 59.18 | +0.9 |
+
+The wrong guesses' reads cost more than the hidden waits saved.

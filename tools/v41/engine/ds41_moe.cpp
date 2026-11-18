@@ -723,6 +723,12 @@ struct Gpu {
     cudaEvent_t ev_demq = nullptr;
     cudaEvent_t ev_dem[kDemRing] = {};
     int64_t dem_layer[kDemRing] = {-1, -1};
+    /// STRATA_LRU_LATE (rb30): a graph-hit layer's vram_lru copies (prefetch staging -> victim slot, and the victim's
+    /// demotion stage copy) still on `s` when gpu_run returns; ev_lru marks their end, lru_pend their layer (-1 =
+    /// none).  lru_settle waits for them - at the next gpu_run's entry and in dem_drain(-1), before anything else can
+    /// rewrite that staging, list those slots or touch the cache between tokens.
+    cudaEvent_t ev_lru = nullptr;
+    int64_t lru_pend = -1;
     /// STRATA_D3_DMA_STREAM=1: gpu_run_n_ex's own copy stream for its PCIe site (the arena-miss / FILEG H2D into the
     /// d_stage slots or an LRU victim slot, the LRU demote D2H and the stage->victim D2D), so those copies overlap the
     /// call's resident-expert kernels and each wave's kernel instead of queueing behind them on `s`.  The slots are
@@ -944,6 +950,7 @@ struct Gpu {
         for (void* p : bufs)
             if (p) cudaFree(p);
         if (ev_pf) cudaEventDestroy(ev_pf);
+        if (ev_lru) cudaEventDestroy(ev_lru);
         if (s_pf) cudaStreamDestroy(s_pf);
         if (ev_dc) cudaEventDestroy(ev_dc);
         if (ev_entry) cudaEventDestroy(ev_entry);
@@ -989,6 +996,14 @@ bool demote_async_on() {
     static const bool on = std::getenv("STRATA_DEMOTE_ASYNC") && std::getenv("STRATA_DEMOTE_ASYNC")[0] == '1';
     return on;
 }
+/// STRATA_LRU_LATE=1 (opt-in, rb30; needs STRATA_DEMOTE_ASYNC): a graph-hit layer (STRATA_HIT_PF) that promotes a
+/// prefetched expert into a victim slot no longer waits on the host for those copies before it returns - its finish +
+/// the next attention go out while they run (Gpu::ev_lru, settled at the next gpu_run).  The last routed layer of the
+/// token still waits.  The same copies into the same slots: the same bytes.
+static bool lru_late() {
+    static const bool on = std::getenv("STRATA_LRU_LATE") && std::getenv("STRATA_LRU_LATE")[0] == '1' && demote_async_on();
+    return on;
+}
 /// STRATA_HIT_PF=1 (opt-in, see Gpu::d_pf2): STRATA_HIT_FAST=3's graph hits also take the layer's prefetched experts
 static bool hit_pf_on() {
     static const bool on = std::getenv("STRATA_HIT_PF") && std::getenv("STRATA_HIT_PF")[0] >= '1' &&
@@ -1032,8 +1047,16 @@ static bool hit_part_on() {
 static uint8_t* pf_base(const Gpu& gp, int64_t layer) {
     return (uint8_t*) ((layer & 1) && gp.d_pf2 ? gp.d_pf2 : gp.d_pf);
 }
-/// the demotions in flight into `layer`'s arena slots (layer < 0: all of them) are home when this returns
+/// STRATA_LRU_LATE: the deferred vram_lru copies are home when this returns (Gpu::ev_lru)
+static void lru_settle(Gpu& gp) {
+    if (gp.lru_pend < 0) return;
+    ck(cudaEventSynchronize(gp.ev_lru), "hit pf lru sync (late)");
+    gp.lru_pend = -1;
+}
+/// the demotions in flight into `layer`'s arena slots (layer < 0: all of them, and STRATA_LRU_LATE's copies) are home
+/// when this returns
 void dem_drain(Gpu& gp, int64_t layer) {
+    if (layer < 0) lru_settle(gp);
     for (int r = 0; r < kDemRing; ++r)
         if (gp.dem_layer[r] >= 0 && (layer < 0 || gp.dem_layer[r] == layer)) {
             ck(cudaEventSynchronize(gp.ev_dem[r]), "demote drain");
@@ -3999,6 +4022,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     auto BLX = [&](int32_t e) { return im.bl[(size_t) im.g.cls(layer, e)]; };   // an expert's blob (the bytes a DMA moves)
     const bool lru = im.cfg.vram_lru && gp.cache && !im.cfg.no_cache;   // uniform (DS4) too: every slot fits any blob
     static const bool dem_async = demote_async_on();
+    lru_settle(gp);   // STRATA_LRU_LATE: the previous layer's deferred vram_lru copies
     if (dem_async) dem_drain(gp, layer);   // the last token's demotions into this layer's arena slots
     ++im.run_seq;
     im.run_layer = layer;
@@ -5115,7 +5139,21 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         // STRATA_HIT_PF: vram_lru moved prefetched experts into victim slots above (copies out of the staging on `s`,
         // after the host's wait for the prefetch): done before the next prefetch rewrites that staging and before the
         // next arming of this layer lists those slots - a sum would have waited for them
-        if (n_lru > 0 && npf_hit > 0) ck(cudaStreamSynchronize(gp.s), "hit pf lru sync");
+        if (n_lru > 0 && npf_hit > 0) {
+            // STRATA_LRU_LATE: not here - at the next gpu_run's entry (lru_settle), unless this is the token's last
+            // routed layer (what runs between tokens may touch any slot)
+            bool last_l = true;
+            for (int64_t l = layer + 1; l < im.g.n_layers && last_l; ++l) last_l = !im.g.routed(l);
+            if (lru_late() && !last_l) {
+                if (!gp.ev_lru) ck(cudaEventCreateWithFlags(&gp.ev_lru, cudaEventDisableTiming), "ev_lru");
+                ck(cudaEventRecord(gp.ev_lru, gp.s), "record lru");
+                gp.lru_pend = layer;
+                (void) cudaStreamQuery(gp.s);   // WDDM: hand the copies to the card now, not at the later sync
+                if (cudaPeekAtLastError() == cudaErrorNotReady) (void) cudaGetLastError();
+            } else {
+                ck(cudaStreamSynchronize(gp.s), "hit pf lru sync");
+            }
+        }
     } else if (out_dev) {
         // ---- the weighted sum on the card, straight into the caller's device row (run_to_dev): the pool's rows go
         // up into their routing-index rows of d_parts (beside the card's own), the weights through the metadata

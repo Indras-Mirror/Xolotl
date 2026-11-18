@@ -424,6 +424,8 @@ struct Ds41Dense::Impl {
     double rm_kept = 0;
     const uint8_t * embd = nullptr;       // token_embd rows on the mmap (embd_type: F16 ours, Q5_K ISTA's)
     int embd_type = GGML_TYPE_F16;
+    size_t embd_bytes = 0;                // the table's payload bytes
+    ggml_backend_buffer_t embd_buf = nullptr;   // STRATA_EMBD_RAM: the pinned copy embd points into
     // ---- vision (DeepSeek-V4.1 image input): the request's image span rows, by absolute position.  When enabled,
     // set_vision() swaps in exp_probs_b_vl on those positions and
     // marks them DEAD for Engram.  Empty (n_vis = 0) for a text request.
@@ -471,6 +473,7 @@ struct Ds41Dense::Impl {
         if (ev_pred) ggml_backend_event_free(ev_pred);
         if (ev_route) ggml_backend_event_free(ev_route);
         if (rb_buf) ggml_backend_buffer_free(rb_buf);
+        if (embd_buf) ggml_backend_buffer_free(embd_buf);
         if (nbuf) ggml_backend_buffer_free(nbuf);
         if (nctx) ggml_free(nctx);
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -792,6 +795,7 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
     if (!strata::v41::ds41_embd_type_ok((int) te->type)) { err = "token_embd type has no row reader"; return false; }
     im.embd = model.shard(si).tensor_data(*te);
     im.embd_type = (int) te->type;
+    im.embd_bytes = (size_t) tensor_payload_bytes(*te);
     return true;
 }
 
@@ -2465,6 +2469,36 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     }
     im.cpu = ggml_backend_is_cpu(im.backend);
     if (!load_weights(im, err)) return false;
+#ifdef DS41_HAVE_CUDA
+    // STRATA_EMBD_RAM=1 (opt-in, rb30): token_embd is the one weight read on the CPU from the GGUF's mapping, a row per
+    // token (5120 x 129280 Q5_K = 434 MiB on ISTA's files).  A row on a page the OS no longer holds is a read from the
+    // disk before the token's inputs go up (the rb28 trace: 79 of 80 rows on a page not touched before waited, 1.2 ms
+    // each; Engram / expert reads cycle the OS cache).  This copies the table into pinned memory at load
+    // (cudaMallocHost: never paged out) - before STRATA_DROP_MMAP below gives the source pages back.  The same bytes,
+    // read by the same ds41_embd_row.
+    if (!im.cpu && im.embd && im.embd_bytes > 0 && env_on("STRATA_EMBD_RAM", false)) {
+        const auto t0 = std::chrono::steady_clock::now();
+        im.embd_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), im.embd_bytes);
+        if (im.embd_buf && ggml_backend_buffer_get_type(im.embd_buf) != ggml_backend_cuda_host_buffer_type()) {
+            ggml_backend_buffer_free(im.embd_buf);   // ggml fell back to a plain CPU buffer: no pinned memory
+            im.embd_buf = nullptr;
+        }
+        if (im.embd_buf) {
+            uint8_t * dst = (uint8_t *) ggml_backend_buffer_get_base(im.embd_buf);
+            const uint8_t * src = im.embd;
+            const size_t nb = im.embd_bytes, nt = 8, chunk = (nb / nt + 4095) & ~(size_t) 4095;
+            std::vector<std::thread> th;   // 8 readers: the mapping's page faults in parallel
+            for (size_t o = 0; o < nb; o += chunk)
+                th.emplace_back([=] { std::memcpy(dst + o, src + o, std::min(chunk, nb - o)); });
+            for (auto & t : th) t.join();
+            im.embd = dst;
+        }
+        std::fprintf(stderr, "ds41_dense: STRATA_EMBD_RAM: %s (%.1f MiB, %.0f ms)\n",
+                     im.embd_buf ? "token_embd in pinned memory" : "no pinned memory - rows from the mapping",
+                     im.embd_bytes / 1048576.0,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+#endif
     // STRATA_DROP_MMAP=1 (opt-in): the weights are on the card now - the GGUF pages their copies read (~8 GiB of the
     // engine's working set on the 1017 UD-IQ3_XXS) go back to the OS as standby (available) memory; the per-token
     // token_embd rows fault back in from there.  No byte the model computes with changes.
@@ -2962,9 +2996,26 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0, bool pack
     };
     // embeddings (F16 rows on the mmap)
     im.host_emb.resize((size_t) (D * n));
+    // STRATA_EMBD_PROF=1 (diagnostic, rb30): each row's read time; a row over 50 us waited for a page (a fault that
+    // read the disk) - the count and their time, per decode token and per prompt pass
+    static const bool eprof = env_on("STRATA_EMBD_PROF", false);
+    static long ep_rows = 0, ep_slow = 0, ep_tok = 0;
+    static double ep_ms = 0, ep_slow_ms = 0;
     for (int t = 0; t < n; ++t) {
         if (tids[t] < 0 || tids[t] >= im.g.vocab) { im.err = "token id out of range"; return false; }
+        const auto tr = eprof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         strata::v41::ds41_embd_row(im.embd, im.embd_type, D, tids[t], im.host_emb.data() + (size_t) (t * D));
+        if (eprof) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tr).count();
+            ++ep_rows;
+            ep_ms += ms;
+            if (ms > 0.05) { ++ep_slow; ep_slow_ms += ms; }
+        }
+    }
+    if (eprof && (n > 1 || ++ep_tok % 256 == 0)) {
+        std::fprintf(stderr, "embd rows: %ld rows %.1f ms, %ld over 0.05 ms (%.1f ms)%s\n", ep_rows, ep_ms, ep_slow, ep_slow_ms,
+                     n > 1 ? " (prompt pass)" : "");
+        if (n > 1) { ep_rows = ep_slow = 0; ep_ms = ep_slow_ms = 0; }
     }
     ablate_rows(im, im.host_emb.data(), n);
     // vision: overwrite the image span positions with the encoder's rows (model.py merge_image_embeddings) and mark
