@@ -387,6 +387,42 @@ GSQ, the same run, interleaved, in tok/s. Every arm has the rb13 set (rb12 best 
 Routes and logits were 50c29791 in every arm, and with `DS4_CHECK_LRU=1` too. `FP4_PACK`'s expected +0.3 % is within
 the pairs' spread (+-0.3 %).
 
+## Serve acceptance of the rb14 candidate
+
+The candidate: the rb14 exe, the exact switches since rb8g (`STRATA_INDEXER_NVIS`, `GGML_CUDA_MXFP4_WMMA`,
+`STRATA_KV_GATHER`, `STRATA_WIDE_PROMPT`, the rb10 - rb13 sets, `STRATA_DEMOTE_ASYNC`; not `GGML_CUDA_FP4_PACK`),
+`STRATA_SERVE_STEP_MAX=16` and `--prompt-batch 32768`. The reference: the GSQ test configuration in use (rb5 exe).
+Eleven greedy serve scenarios each (srvtest: reuse, a conversation coming back, a 15.7K prompt, thinking, a cancelled
+stream continued last).
+
+| pair | all-decode tok/s | answers |
+|---|---|---|
+| rb5 config / candidate, as configured | 38.68 / 43.55 (+12.6 %) | all sensible, worded differently |
+| rb14 exe: config / + the switches (1) | 39.28 / 48.32 (+23 %) | 8 of 11 identical (2) |
+| the same with `STRATA_SERVE_KEEP_CACHE=0` (1) | 45.78 / 54.04 (+18 %) | 11 of 11 identical |
+
+(1) Both arms: `--slots 2350`, `STRATA_ARENA_REBAL=0`, `STRATA_PRESTAGE_GIB=0`, the configuration's STEP_MAX 96 and
+batch 12288. The auto seed gave rb5 2396 slots and rb14 2401: another placement, other rounding.
+
+(2) The configuration itself is not reproducible from the first short batch turn on: the same arm run twice differed
+from that turn (631 tokens) on. keep-cache (default on since the 10-26 upstream merge) lends the cache's tail to such
+a turn, and how many slots it takes depends on the free VRAM it measures at that moment: 587 to 649 slots over five
+runs of the same turn. The cache after the turn differs, and so does the placement. rb5 has no keep-cache.
+
+Prompt turns, serve wall as configured (rb5 / candidate): 631 new tokens 18.2 / 6.6 s, the 15.7K first prompt 49.9 /
+23.2 s, 323 new tokens on the 15.7K conversation 18.6 / 7.8 s.
+
+One-shot, the 15.3K prompt + 300 forced tokens (`--slots 1900`):
+
+| | rb5 | rb14, the configuration's settings | the candidate |
+|---|---|---|---|
+| prompt | 33.9 s | 14.9 s | 9.8 s |
+| decode | 32.56 tok/s | 32.39 | 36.90 |
+| routes + logits | 04abb074 | 62281d0f | 62281d0f |
+
+rb5 differs from rb14 by the base changes since rb5 (for example rb8e's tie rule in the prompt top-k). The pairs ran
+one after the other, and the PC moved to a faster state during the runs: compare within a pair only.
+
 ## Tried and removed
 
 `STRATA_INPUT_ASYNC`: a decode step's ~14 small inputs (embedding row, positions, window rows / mask, compressed-row
