@@ -8556,6 +8556,16 @@ int64_t Ds41MoeTier::regrow_cache(std::string& err) {
 #endif
 }
 
+int64_t Ds41MoeTier::cache_bytes() const {
+#if defined(DS4_MOE_CUDA)
+    return im_->gpu && im_->gpu->cache ? im_->gpu->cache->bytes() : 0;
+#else
+    return 0;
+#endif
+}
+
+void Ds41MoeTier::forget_shrunk() { im_->shrunk.clear(); }
+
 bool Ds41MoeTier::release_prestage() {
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu || !im_->gpu->p_buf) return false;

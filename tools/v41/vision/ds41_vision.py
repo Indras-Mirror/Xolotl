@@ -57,6 +57,17 @@ ON THE GPU (--device cuda / --gpu; measured on an RTX 5090)
     re-seed and has no "keep N MiB free" command (the server's elastic mode needs one), so --offload needs a
     --vram-margin that covers the encoder's peak - which costs the same slots as the resident encoder.
   * --tf32: TF32 tensor cores for the f32 matmuls (off by default: the encoder is exact f32 unless asked).
+  * (local, rb21) The ds41 engine sizes its seed from ITS OWN WDDM budget, which does not see a second CUDA process:
+    a resident encoder (~0.72 GiB even between pictures - context 0.43, cuBLAS 0.23, pool) over-committed the card
+    at --vram-margin 2 (serve decode 64 -> 43 tok/s).  So a resident encoder needs its VRAM added to the margin.
+  * (local, rb21) --fast-load: the modules on the meta device (no random init, ~1.1 s) and the mmproj's BF16 bytes
+    widened on the card (no CPU dequantize, ~1.1 s): READY 1.7 s instead of 4.7, the output bit-identical.
+    --standby: READY (1.4 s) without touching the card - torch and the weights in RAM, no CUDA context, no VRAM -
+    the first picture then takes the context and the weights' copy (~0.1 s).  serve_ds41's vision "per_image" /
+    "standby" + "lend_mib" run it once per image turn: the engine's LEND frees the VRAM cache's tail, the encoder
+    starts or wakes, encodes, and stops before the prompt (the next standby starts in the background).
+    RTX 5090, f32, OK-ms 640x480 (206 rows) / 1920x1080 (968): CPU 16 threads 1.9 / 17.5 s; card resident
+    0.06 / 0.48 s; standby first picture 0.37-0.41 / ~0.8 s.  Card vs CPU f32: rel L2 3e-6..1.2e-5.
 """
 
 import argparse
@@ -323,6 +334,7 @@ class MmprojWeights:
             raise ValueError(f"{path}: clip.projector_type {self.kv.get('clip.projector_type')!r}, expected deepseek41v / deepseek4v")
         self.src = {n: (s, t, o) for n, s, t, o in tensors}
         self.fd = _open_ro(path)
+        self._mm = None                                # device_tensor's copy-on-write map of the file
         self.map = {}                                  # checkpoint name -> list of mmproj names (concatenated on dim 0)
         for n in self.src:
             if n in self._SIMPLE:
@@ -357,6 +369,47 @@ class MmprojWeights:
     def torch(self, name, tp, dtype):
         return tp.from_numpy(np.ascontiguousarray(self.get(name))).to(dtype)
 
+    def device_tensor(self, name, tp, dtype, device):
+        """get(name) as a `dtype` tensor on `device` (--fast-load): the file's F32 / F16 / BF16 bytes go to the device as
+        they are (a copy-on-write map of the file, no CPU pass) and widen to float32 there - the same values as get(),
+        whose CPU dequantize of the whole tower was ~1.1 s of a 3.9 s start.  Other types take get()."""
+        dt = {F32: tp.float32, F16: tp.float16, BF16: tp.bfloat16}
+        if any(self.src[n][1] not in dt for n in self.map[name]):
+            return tp.from_numpy(np.ascontiguousarray(self.get(name))).to(device=device, dtype=dtype)
+        if self._mm is None:
+            import mmap
+            self._mm = mmap.mmap(self.fd, 0, access=mmap.ACCESS_COPY)
+        parts = []
+        for n in self.map[name]:
+            shape, ty, off = self.src[n]
+            raw = tp.frombuffer(self._mm, dtype=dt[ty], count=int(np.prod(shape)), offset=self.data_start + off)
+            parts.append(raw.to(device).to(tp.float32).reshape(tuple(shape[::-1])))
+            del raw
+        a = parts[0] if len(parts) == 1 else tp.cat(parts, dim=0)
+        if name == "vision.patch_embed.proj.weight":
+            a = a.reshape(a.shape[0], -1)              # [1024, 3, p, p] conv -> the reference Linear's [1024, 3*p*p]
+        return a.to(dtype)
+
+    def host_tensor(self, name, tp):
+        """get(name)'s tensor as the file stores it (F32 / F16 / BF16, not widened), in this process's RAM (--standby:
+        the weights wait there and meet the card at the first picture); None for other types."""
+        dt = {F32: tp.float32, F16: tp.float16, BF16: tp.bfloat16}
+        if any(self.src[n][1] not in dt for n in self.map[name]):
+            return None
+        if self._mm is None:
+            import mmap
+            self._mm = mmap.mmap(self.fd, 0, access=mmap.ACCESS_COPY)
+        parts = []
+        for n in self.map[name]:
+            shape, ty, off = self.src[n]
+            raw = tp.frombuffer(self._mm, dtype=dt[ty], count=int(np.prod(shape)), offset=self.data_start + off)
+            parts.append(raw.reshape(tuple(shape[::-1])).clone())   # its own pages: the map can close
+            del raw
+        a = parts[0] if len(parts) == 1 else tp.cat(parts, dim=0)
+        if name == "vision.patch_embed.proj.weight":
+            a = a.reshape(a.shape[0], -1)
+        return a
+
     @property
     def vision_config(self):
         k = self.kv
@@ -377,6 +430,12 @@ class MmprojWeights:
         return f"mmproj GGUF {os.path.basename(self.path)} ({len(self.src)} tensors -> {len(self.map)}, {'/'.join(types)})"
 
     def close(self):
+        if self._mm is not None:
+            try:
+                self._mm.close()
+            except BufferError:                        # a tensor still views it: the map goes with that tensor
+                pass
+            self._mm = None
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
@@ -506,7 +565,8 @@ def build_span(embeds, n_llm_h, n_llm_w, image_start, image_newline, image_end):
 
 class Encoder:
     def __init__(self, sidecar, reference_dir=DEFAULT_REFERENCE, device="cpu", threads=0, dtype="f32",
-                 max_n_token=None, fast_attention=True, offload=False, tf32=False, weights=None):
+                 max_n_token=None, fast_attention=True, offload=False, tf32=False, weights=None, fast_load=False,
+                 standby=False):
         """sidecar: the V4.1 sidecar GGUF (vision config + its own Q8_0 tower), may be None when `weights` carries a
         config.  weights: optional full-precision tower (open_weights: safetensors file / checkpoint dir / mmproj
         GGUF) that REPLACES the sidecar's tensors; the sidecar's vision_config then stays the config, cross-checked."""
@@ -538,22 +598,43 @@ class Encoder:
         tid = side.image_token_id if side is not None else w.image_token_id
         self.image_token_id = int(tid or 0)
 
-        self.vit = ViT(self.args).eval()
+        # --fast-load (a card encoder started per picture): the modules are built on the meta device - no random init
+        # of ~0.5 G parameters on the CPU (~1.1 s) - and take the tensors the source puts on the card (assign).
+        # --standby (implies it): the weights are read into RAM as stored and the process does not touch the card -
+        # no CUDA context, no VRAM - until its first picture (_materialize: ~0.1 s to the card, widened there).
+        self.standby = bool(standby) and device == "cuda" and not offload and hasattr(w, "host_tensor")
+        self.fast_load = (bool(fast_load) or self.standby) and device == "cuda" and not offload and hasattr(w, "device_tensor")
+        self._pending = None
+        self.tf32 = bool(tf32)
+        if self.fast_load:
+            with torch.device("meta"):
+                self.vit, self.aligner = ViT(self.args).eval(), Aligner(self.args).eval()
+        else:
+            self.vit, self.aligner = ViT(self.args).eval(), Aligner(self.args).eval()
         if fast_attention:
             fast_forwards(self.vit)
-        self.aligner = Aligner(self.args).eval()
         self.image_start = torch.from_numpy(np.ascontiguousarray(w.get("image_start")))
         self.image_end = torch.from_numpy(np.ascontiguousarray(w.get("image_end")))
         self.image_newline = torch.from_numpy(np.ascontiguousarray(w.get("image_newline")))
 
+        def take(n):
+            if self.standby:                                # as stored, in RAM (other types: f32 in RAM)
+                t = w.host_tensor(n, torch)
+                return t if t is not None else w.torch(n, torch, torch.float32)
+            if self.fast_load:
+                return w.device_tensor(n, torch, self.dtype, "cuda")
+            return w.torch(n, torch, self.dtype)
         vit_sd, al_sd = {}, {}
         for name in w.names():
             if name.startswith("vision."):
-                vit_sd[name[len("vision."):]] = w.torch(name, torch, self.dtype)
+                vit_sd[name[len("vision."):]] = take(name)
             elif name.startswith("aligner."):
-                al_sd[name[len("aligner."):]] = w.torch(name, torch, self.dtype)
-        self.vit.load_state_dict(vit_sd, strict=True)
-        self.aligner.load_state_dict(al_sd, strict=True)
+                al_sd[name[len("aligner."):]] = take(name)
+        if self.standby:
+            self._pending = (vit_sd, al_sd)
+        else:
+            self.vit.load_state_dict(vit_sd, strict=True, assign=self.fast_load)
+            self.aligner.load_state_dict(al_sd, strict=True, assign=self.fast_load)
         for src in {id(x): x for x in (side, w) if x is not None}.values():
             src.close()
         # load_state_dict copies INTO the float32 parameters: the modules themselves must take the dtype (bf16 / f16
@@ -563,7 +644,7 @@ class Encoder:
         self.offload = bool(offload) and device == "cuda"
         self.host = None
         self.load_ms = 0.0
-        if device == "cuda":                                # only if explicitly asked; tests stay on the CPU
+        if device == "cuda" and not self.standby:           # only if explicitly asked; tests stay on the CPU
             torch.backends.cuda.matmul.allow_tf32 = bool(tf32)
             torch.backends.cudnn.allow_tf32 = bool(tf32)
             for n in ("image_start", "image_end", "image_newline"):
@@ -580,8 +661,27 @@ class Encoder:
             return sum(t.numel() * t.element_size() for d in self.host.values() for t in d.values())
         return sum(t.numel() * t.element_size() for m in (self.vit, self.aligner) for t in m.state_dict().values())
 
+    def _materialize(self):
+        """--standby: the first use of the card - the CUDA context, the weights from RAM to the card, widened there
+        (the same values as --fast-load), assigned to the meta modules."""
+        torch = self.torch
+        t0 = time.time()
+        torch.backends.cuda.matmul.allow_tf32 = self.tf32
+        torch.backends.cudnn.allow_tf32 = self.tf32
+        vit_sd, al_sd = self._pending
+        dev = lambda t: t.to("cuda").to(torch.float32).to(self.dtype)  # noqa: E731
+        self.vit.load_state_dict({k: dev(v) for k, v in vit_sd.items()}, strict=True, assign=True)
+        self.aligner.load_state_dict({k: dev(v) for k, v in al_sd.items()}, strict=True, assign=True)
+        for n in ("image_start", "image_end", "image_newline"):
+            setattr(self, n, getattr(self, n).to("cuda"))
+        self._pending = None
+        torch.cuda.synchronize()
+        self.load_ms = (time.time() - t0) * 1e3
+
     def _forward(self, patches, n_vit_h, n_vit_w):
         torch = self.torch
+        if self._pending is not None:
+            self._materialize()
         if self.host is None:
             return self.aligner(self.vit(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
         # --offload: this ENC's copy of the weights, copied from pinned RAM and dropped after
@@ -662,7 +762,7 @@ def read_sve(path):
 # --------------------------------------------------------------------- resident process
 def serve(enc, args):
     n_embd = enc.n_embd
-    if enc.device == "cuda" and not getattr(args, "no_warmup", False):
+    if enc.device == "cuda" and not getattr(args, "no_warmup", False) and not enc.standby:
         s, h, w = enc.warmup(getattr(args, "warmup_tokens", 0) or None)
         r, pk = enc.vram()
         log(f"ds41-vision: warm-up {h}x{w} grid ({num_image_tokens(h, w)} tokens) in {s:.2f} s; torch pool "
@@ -695,8 +795,10 @@ def serve(enc, args):
             if enc.device == "cuda":
                 r, pk = enc.vram()
                 log(f"ds41-vision: ENC {n} tokens in {ms:.0f} ms"
-                    f"{f' (weights in {enc.load_ms:.0f} ms)' if enc.offload else ''}; torch pool {r / 2**20:.0f} MiB "
-                    f"(peak {pk / 2**20:.0f})")
+                    f"{f' (weights in {enc.load_ms:.0f} ms)' if enc.offload or enc.load_ms > 0 else ''}; torch pool "
+                    f"{r / 2**20:.0f} MiB (peak {pk / 2**20:.0f})")
+                if enc.standby:
+                    enc.load_ms = 0.0                       # the weights went to the card once, at this first picture
         except Exception as e:                      # noqa: BLE001 - the protocol wants a line, always
             print(f"ERR {type(e).__name__}: {e}", flush=True)
 
@@ -726,16 +828,27 @@ def main(argv=None):
     ap.add_argument("--warmup-tokens", type=int, default=0,
                     help="cuda: the warm-up image size in LLM tokens (default --max-tokens / the model's 1024)")
     ap.add_argument("--no-warmup", action="store_true", help="cuda: no warm-up before READY")
+    ap.add_argument("--standby", action="store_true",
+                    help="cuda (not with --offload): READY without touching the card - the weights wait in RAM as "
+                         "stored and go to the card at the first picture (~0.1 s); no CUDA context, no VRAM until "
+                         "then (implies --fast-load and --no-warmup; for an encoder that stops after its image turn)")
+    ap.add_argument("--fast-load", action="store_true",
+                    help="cuda (not with --offload): build the modules on the meta device and put the weights' "
+                         "F32/F16/BF16 bytes on the card as they are, widened there - the same values, a ~1.5 s start "
+                         "(for an encoder started per picture)")
     a = ap.parse_args(argv)
 
+    t0 = time.time()
     sidecar = a.sidecar or a.mmproj or (None if a.vision_weights else DEFAULT_SIDECAR)
     device = a.device or ("cuda" if a.gpu else "cpu")
     enc = Encoder(sidecar, reference_dir=a.reference_dir, device=device, threads=a.threads,
                   dtype=a.dtype, max_n_token=a.max_tokens or None, fast_attention=not a.ref_attention,
-                  offload=a.offload, tf32=a.tf32, weights=a.vision_weights)
+                  offload=a.offload, tf32=a.tf32, weights=a.vision_weights, fast_load=a.fast_load,
+                  standby=a.standby)
     log(f"ds41-vision: {len(enc.vit.blocks)} vit layers, n_embd {enc.n_embd}, image_token_id "
         f"{enc.image_token_id}, dtype {a.dtype}, device {device}, threads {enc.torch.get_num_threads()}; "
-        f"weights: {enc.weights_desc}")
+        f"weights: {enc.weights_desc}{'; standby (the card at the first picture)' if enc.standby else '; fast load' if enc.fast_load else ''}, "
+        f"loaded in {time.time() - t0:.2f} s")
     serve(enc, a)
 
 

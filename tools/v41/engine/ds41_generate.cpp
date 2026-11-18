@@ -1994,6 +1994,8 @@ int main(int argc, char ** argv) {
         std::vector<float> park_logits;
         int64_t park_rows = 0;            // positions saved: a request writing past this invalidates the park
         bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
+        std::vector<int64_t> lent;       // rb21 LEND: the VRAM cache bytes each stage lent to the image encoder
+        int64_t lent_n = 0;              // ... and the tail slots that took (0: no lend out)
         // STRATA_SERVE_DSPARK leaves the live state DIRTY when its last verify pass rejected drafts: the ratio-2
         // compressor state ring then holds the rejected positions' states, so a request that continues the live
         // history at an odd position (its group's first half is the last accepted token) must re-feed that token -
@@ -2724,6 +2726,63 @@ int main(int argc, char ** argv) {
                 continue;
             }
 #endif
+            // (local, rb21) LEND <MiB> between requests - serve_ds41's GPU image encoder (vision "lend_mib"), a CUDA
+            // process of its own, is about to run: hand it the VRAM cache's tail now, a part of the slots the next batch
+            // borrow gives back anyway.  A fixed size, no free-VRAM reading.  The next GEN's batch then evicts only the
+            // rest of its own borrow, so the cache it reads with and the regrow after it are the ones it has without a
+            // LEND; a turn without a batch borrow puts the lent tail back before it reads.  Answers LENT <slots> <MiB>
+            // <free MiB> (0 0: nothing lent - no open cache, or a lend is out already), or ERR LEND <why> (unchanged).
+            if (line.rfind("LEND ", 0) == 0) {
+                const double mib = std::atof(line.c_str() + 5);
+                auto free_mib = [&]() -> long long {
+                    if (mc.cpu_only || pipe.n_stages() < 1) return -1;
+#ifdef STRATA_ENABLE_CUDA
+                    cudaSetDevice(pipe.stages[0].cuda_device);
+#endif
+                    size_t fr = 0, tot = 0;
+                    ggml_backend_dev_memory(ggml_backend_get_device(pipe.stages[0].backend), &fr, &tot);
+                    return (long long) (fr >> 20);
+                };
+                if (!(mib > 0) || (NS > 0 && any_active())) {
+                    std::printf("ERR LEND %s\n", mib > 0 ? "slots are decoding" : "expected: LEND <MiB>");
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (mc.cpu_only || !defer_vram || !cache_open || !lent.empty()) {
+                    std::printf("LENT 0 0 %lld\n", free_mib());
+                    std::fflush(stdout);
+                    continue;
+                }
+                std::string lerr;
+                lent.assign((size_t) pipe.n_stages(), 0);
+                int64_t n = 0;
+                int st = 0;
+                for (; st < pipe.n_stages(); ++st) {
+                    std::string sk;
+                    const int64_t b0 = pipe.tier(st).cache_bytes();
+                    const int64_t g = pipe.tier(st).shrink_cache_for((int64_t) (mib * 1048576.0), sk, false, true);
+                    if (g < 0) { lerr = sk; break; }
+                    lent[(size_t) st] = b0 - pipe.tier(st).cache_bytes();
+                    n += g;
+                }
+                if (st < pipe.n_stages()) {   // the stages that lent already take their tail back
+                    for (int k = 0; k < st; ++k) { std::string sk; (void) pipe.tier(k).regrow_cache(sk); }
+                    lent.clear();
+                    std::fprintf(stderr, "serve: LEND %.0f MiB refused: %s\n", mib, lerr.c_str());
+                    std::printf("ERR LEND %s\n", lerr.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
+                lent_n = n;
+                int64_t lb = 0;
+                for (const int64_t x : lent) lb += x;
+                const long long fm = free_mib();
+                std::fprintf(stderr, "serve: LEND: %lld tail slots (%.2f GiB) lent to the image encoder, %lld MiB free\n",
+                             (long long) n, lb / 1073741824.0, fm);
+                std::printf("LENT %lld %lld %lld\n", (long long) n, (long long) (lb >> 20), fm);
+                std::fflush(stdout);
+                continue;
+            }
             // the slot lines: BSTOP ends a slot at its next window; BYIELD for a read that has ended meanwhile; BGEN
             // <slot> <max_new> .. reads the prompt into <slot> as a GEN 1, then the slot decodes on (BADM)
             int admit = -1;
@@ -3353,8 +3412,10 @@ int main(int argc, char ** argv) {
                     int64_t g = 0; bool shrink_ok = true;
                     for (int st = 0; st < pipe.n_stages(); ++st) {
                         std::string sk;
-                        const int64_t gs = keep_fixed ? pipe.tier(st).shrink_cache_for((int64_t) give, sk, false, true)
-                                                      : pipe.tier(st).shrink_cache_for((int64_t) need, sk);
+                        // after a LEND (rb21) the lent tail is a part of this borrow: evict only the rest of it
+                        const int64_t lt = lent.empty() ? 0 : lent[(size_t) st];
+                        const int64_t gs = keep_fixed ? pipe.tier(st).shrink_cache_for((int64_t) give - lt, sk, lt > 0, true)
+                                                      : pipe.tier(st).shrink_cache_for((int64_t) need, sk, lt > 0);
                         if (gs < 0) { shrink_ok = false; kerr = sk.empty() ? kerr : sk; g = -1; break; }
                         g += gs;
                     }
@@ -3369,10 +3430,10 @@ int main(int argc, char ** argv) {
                         kept = true;
                         int64_t stay = 0; for (int st = 0; st < pipe.n_stages(); ++st) stay += pipe.tier(st).resident();
                         std::fprintf(stderr, "serve: cache kept for a %d-token batch (%lld tail slots out, %lld experts stay)\n",
-                                     dh, (long long) (g + g_short), (long long) stay);
+                                     dh, (long long) (g + g_short + lent_n), (long long) stay);
                         if (keep_fixed)
                             std::fprintf(stderr, "serve: keep-cache: fixed borrow %.2f GiB = %lld slots%s\n", give / 1073741824.0,
-                                         (long long) g, g_short > 0 ? " - short of the free VRAM the batch needs, more from the "
+                                         (long long) (g + lent_n), g_short > 0 ? " - short of the free VRAM the batch needs, more from the "
                                                                       "reading (this turn is not reproducible)" : "");
                     } else if (!kerr.empty()) {
                         std::fprintf(stderr, "serve: keep-cache: %s - releasing the cache\n", kerr.c_str());
@@ -3420,6 +3481,31 @@ int main(int argc, char ** argv) {
                 }
                 bias_now = a.bias_prompt > 0;
                 apply_bias();
+            }
+            if (!lent.empty()) {   // rb21: a LEND is out
+                if (kept) {
+                    std::fprintf(stderr, "serve: LEND: the %lld lent slots are a part of this batch's borrow\n", (long long) lent_n);
+                } else if (cache_open) {   // no batch borrow this turn: the lent tail back before the read
+                    int64_t back = 0;
+                    bool bad = false;
+                    for (int st = 0; st < pipe.n_stages(); ++st) {
+                        std::string sk;
+                        const int64_t r = pipe.tier(st).regrow_cache(sk);
+                        if (r < 0) { bad = true; std::fprintf(stderr, "serve: LEND regrow stage %d: %s\n", st, sk.c_str()); }
+                        else back += r;
+                    }
+                    if (bad) {
+                        for (int st = 0; st < pipe.n_stages(); ++st) pipe.tier(st).release_cache();
+                        cache_open = false;
+                        std::fprintf(stderr, "serve: LEND: the regrow failed - the cache re-seeds\n");
+                    } else {
+                        std::fprintf(stderr, "serve: LEND: no batch borrow this turn - %lld lent experts back first\n", (long long) back);
+                    }
+                } else {   // the cache was released whole: nothing to regrow
+                    for (int st = 0; st < pipe.n_stages(); ++st) pipe.tier(st).forget_shrunk();
+                }
+                lent.clear();
+                lent_n = 0;
             }
             tier.rebalance_begin_prompt();
             tier.reset_stats();

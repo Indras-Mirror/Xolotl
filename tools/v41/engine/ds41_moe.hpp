@@ -634,6 +634,10 @@ public:
     /// After that prompt: map the tail back and refill exactly the evicted experts into exactly their slots (from the
     /// RAM arena, else the file).  Returns the number refilled, or -1 with `err`.
     int64_t regrow_cache(std::string& err);
+    /// Local (rb21, the serve loop's LEND): the VRAM cache's live bytes now (0 without a cache).
+    int64_t cache_bytes() const;
+    /// Local (rb21): drop the shrink record without a regrow - the cache was released whole after a LEND.
+    void forget_shrunk();
     static bool keep_cache_mode();
     /// REAP accumulators (Ds41MoeConfig::saliency), [layer * n_experts + expert]; empty when off.
     const std::vector<double>& saliency_sum() const;
