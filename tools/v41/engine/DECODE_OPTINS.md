@@ -1,4 +1,4 @@
-# Decode opt-ins from the DeepInfer review (rb10, rb11)
+# Decode opt-ins from the DeepInfer review (rb10 - rb12)
 
 A decode token runs 40 layers, and each layer makes a round trip:
 
@@ -122,6 +122,57 @@ The launch has to share the dense stream because of the second delay above. Beca
 tail graph, about 36 us) now runs after the hits instead of beside them. That takes back most of what the fast path
 saves.
 
+## Work inside the graphs (rb12)
+
+nsys on the rb11 decode (GSQ, 10 s, about 170 tokens under the profiler) showed a third cost:
+
+- An op queued on its own on the dense stream starts 3-10 us after the op before it ends, even when it was queued long
+  before. Inside a CUDA graph, a node starts 0.1-0.5 us after the one before it.
+- A layer had about 10 such ops: the three routing readbacks (fn, ids, wts), the prediction readback and the six
+  kernels of `STRATA_HIT_FAST`.
+- While a prefetch DMA is in flight, each one costs more. A readback took 3.7-5.7 us instead of 1.1-1.3, and the gap
+  before it was 6-10 us instead of 4-8.
+- Such gaps added up to 0.42 s of the 10 s on the dense stream.
+
+### `GGML_OP_DSV41_HOOK` (vendored ggml)
+
+`ggml_dsv41_hook(ctx, a, b, c, fn, ud)`: at this node the CUDA backend calls `fn(stream, node, ud)`, and `fn` queues
+its own kernels on the graph's stream.
+
+- Under CUDA graphs, `fn` runs when the graph is captured (the warm-up runs call it directly). The kernels it queued
+  are replayed with the graph.
+- The node runs after the ops that write `a`, `b` and `c`. Its result is a view of `a`.
+
+### `STRATA_RB_HOOK=1`
+
+Needs `STRATA_PIN_RB`, `STRATA_DENSE_ASYNC` and `STRATA_ATTN_TAIL`.
+
+- The single-token attention graph ends with a hook node behind the router. Its kernel (`strata::kernels::push_to_host`,
+  one block) writes fn, ids and wts into the pinned packet over the bus, then sets a flag word in the packet after a
+  system-scope fence.
+- The finish + prediction graph writes the 16 predicted ids and a second flag the same way.
+- The host clears a flag before it launches the graph and spins on it. This replaces three D2H copies and an event for
+  the routing, and a D2H copy and an event for the prediction.
+- A flag that is still clear after 2 s gets a full sync, and an error if it is clear after that.
+
+The packet gets the same bytes, so the routes and logits are byte-identical.
+
+### `STRATA_HIT_FAST=3`
+
+Needs `STRATA_RB_HOOK`. The launch of `=1` (dispatch, quantize, grouped launch, sum) becomes a second hook node in the
+attention graph, behind the readback node. The host has the routing as soon as the readback kernel is done, while the
+hits run on in the same graph.
+
+- A node runs on every launch of its graph, so each launch must be armed. Before the graph goes out,
+  `Ds41MoeTier::hit_arm(layer)` rebuilds the layer's table row and sets the layer's armed word in pinned memory. The
+  dispatch reads the word and clears it.
+- An unarmed launch does nothing, except that its quantize writes `d_xq` (the bytes the layer writes there anyway).
+- The decode loop arms a layer before `finish_predict_attn` queues its graph, or before `attn_router` runs it.
+- When a launch is not kept but found all six experts resident, the tier waits for the dense stream (the graph) before
+  it writes the same buffers.
+- The hooks are set up at the first decode step, because the tier opens its VRAM cache after the prompt. Setting them
+  drops the cached graphs once.
+
 ## Measured
 
 GSQ, forced 1093, `--slots 2378`, interleaved pairs (tok/s):
@@ -162,6 +213,26 @@ Routes and logits were 50c29791 in every arm.
 
 The PC itself moved between about 34 and 38.5 tok/s for the same arm during these runs. Only the interleaved pairs
 are comparable. NetEase GameViewerServer was running; that cause is not confirmed.
+
+### rb12
+
+GSQ, the same run, interleaved pairs, in tok/s. Every arm has the rb10 switches, `STRATA_META_PULL` and
+`STRATA_PF_HOSTWAIT`.
+
+| arms | pair 1 | pair 2 | pair 3 | pair 4 | mean |
+|---|---|---|---|---|---|
+| `HIT_FAST=1` / + `STRATA_RB_HOOK` | 38.79 / 39.93 | 39.26 / 39.31 | 38.17 / 38.84 | 40.96 / 41.62 | 39.30 / 39.92 (+1.6 %) |
+| `RB_HOOK` + `HIT_FAST=1` / `=3` | 38.93 / 40.10 | 40.30 / 41.30 | 39.33 / 39.94 | 40.19 / 41.12 | 39.69 / 40.61 (+2.3 %) |
+
+A third set, three arms with the same switches:
+
+| arms | pair 1 | pair 2 | pair 3 | pair 4 | mean |
+|---|---|---|---|---|---|
+| `HIT_FAST=1` | 37.82 | 39.67 | 38.44 | 39.68 | 38.90 |
+| + `STRATA_RB_HOOK` | 38.84 | 40.14 | 40.21 | 39.01 | 39.55 (+1.7 %) |
+| + `STRATA_RB_HOOK` + `HIT_FAST=3` | 41.29 | 40.47 | 41.24 | 41.01 | 41.00 (+5.4 %) |
+
+Routes and logits were 50c29791 in every arm. `=3` kept 19655 of 43680 armed launches (45 %).
 
 ## Tried and removed
 

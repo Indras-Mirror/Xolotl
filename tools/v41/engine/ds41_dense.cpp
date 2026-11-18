@@ -15,10 +15,17 @@
 #endif
 #ifdef DS41_HAVE_CUDA
 #include "ggml-cuda.h"
+#endif
+#ifdef DS41_HAVE_SK
+#include "strata/kernels/iq_kernels.hpp"
+#endif
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
 #endif   // ggml_cgraph::uid (graph reuse)
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -357,6 +364,16 @@ struct Ds41Dense::Impl {
     ggml_backend_buffer_t rb_buf = nullptr;
     float * rb_fn = nullptr, * rb_wts = nullptr;
     int32_t * rb_ids = nullptr, * rb_pred = nullptr;
+    // STRATA_RB_HOOK=1 (opt-in; needs the packet above and STRATA_ATTN_TAIL): the single-token attention graph and the
+    // finish + prediction graph end with a kernel that writes their readbacks into the packet (no copy engine) and then
+    // sets a flag word there; the host spins on the flag instead of a D2H copy per tensor + an event.
+    struct RbHook { void * dst[3]; int cap[3]; int32_t * flag; };   // the packet's device addresses; cap in words
+    bool rb_hook = false;
+    RbHook rb_route_hook {}, rb_pred_hook {};
+    volatile int32_t * rb_flag_route = nullptr, * rb_flag_pred = nullptr;
+    // STRATA_HIT_FAST=3 (set_hit_hook): per layer, the tier's launch behind the routing readback (null: none)
+    struct HitHook { Ds41Dense::HitLaunch launch = nullptr; void * ud = nullptr; Impl * im = nullptr; };
+    std::vector<HitHook> hit_hooks;
     // STRATA_ATTN_AHEAD: finish_predict_attn queued layer ahead_il's attention graph + readbacks (-1 = none); ev_pred
     // marks its prediction readback
     int ahead_il = -1;
@@ -820,6 +837,57 @@ static int attn_tail_mode() {
     return m == 1 || m == 2 ? m : 0;
 }
 static bool attn_tail() { return attn_tail_mode() > 0; }
+
+// STRATA_RB_HOOK=1 (decode, opt-in; needs STRATA_ATTN_TAIL): see Impl::rb_hook
+static bool rb_hook_env() {
+    static const bool on = std::getenv("STRATA_RB_HOOK") && std::getenv("STRATA_RB_HOOK")[0] == '1';
+    return on;
+}
+
+#ifdef DS41_HAVE_SK
+// the hook node's sources (fn / ids / wts, or the predicted ids) to the packet, then its flag
+static void rb_hook_push(void * stream, const ggml_tensor * node, void * ud) {
+    const auto & h = *(const Ds41Dense::Impl::RbHook *) ud;
+    strata::kernels::HostPush p {};
+    for (int i = 0; i < 3 && node->src[i]; ++i) {
+        p.src[p.n] = node->src[i]->data;
+        p.dst[p.n] = h.dst[i];
+        p.words[p.n] = (int) std::min<size_t>(ggml_nbytes(node->src[i]) / 4, (size_t) h.cap[i]);
+        ++p.n;
+    }
+    p.flag = h.flag;
+    strata::kernels::push_to_host(p, stream);
+}
+#endif
+
+// STRATA_HIT_FAST=3: the node's sources are the routing and the MoE input; the routed sum's tensor as it is now
+static void hit_hook_call(void * stream, const ggml_tensor * node, void * ud) {
+    const auto & h = *(const Ds41Dense::Impl::HitHook *) ud;
+    h.launch(h.ud, stream, (const int32_t *) node->src[0]->data, (const float *) node->src[1]->data, node->src[2]->data,
+             h.im->routed->data);
+}
+
+static inline void ds41_spin_pause() {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#endif
+}
+
+// STRATA_RB_HOOK: spin until the graph's readback kernel sets the flag.  After 2 s, a full sync: a graph without the
+// hook never sets it.
+static bool rb_wait(Ds41Dense::Impl & im, volatile int32_t * flag) {
+    const auto t0 = std::chrono::steady_clock::now();
+    for (unsigned i = 1; *flag == 0; ++i) {
+        ds41_spin_pause();
+        if ((i & 4095) == 0 && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(2)) {
+            ggml_backend_synchronize(im.backend);
+            if (*flag == 0) { im.err = "STRATA_RB_HOOK: a readback flag was never set"; return false; }
+            break;
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return true;
+}
 
 bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool async) {
     Allo & a = cached ? allo_dec : allo_pass;
@@ -1583,15 +1651,21 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         cps.emplace_back(ggml_reshape_3d(gc, f_comb, HC, HC, n), b.cols3(im.comb_f, HC, HC, n, col0));
     }
     if (se) cps.emplace_back(se, b.cols2(im.shexp, D, n, col0));
-    cps.emplace_back(fn, b.cols2(im.o_fn, D, n, col0));
+    // fn / ids / wts as their own copies (not batched into COPIES_OP): STRATA_RB_HOOK reads them by tensor
+    ggml_tensor * t_fn = ggml_cpy(gc, fn, b.cols2(im.o_fn, D, n, col0)), * t_ids = nullptr, * t_wts = nullptr;
+    outs.push_back(t_fn);
     // STRATA_ROUTE_FUSE (Keisawaakira rb10): the plain flat-bias selection, its weights and both writes as one op
     // (ggml_dsv41_route); vision rows and the smart / margin bias keep the graph above
     if (route_fuse() && !im.cpu && !route_op && bias_sel == im.BL(il, "exp_probs_b.bias") && !smart_router() && rb_margin < 0.0f) {
-        outs.push_back(ggml_dsv41_route(gc, rl, bias_sel, rb, b.cols2(im.o_ids, im.NU, n, col0),
-                                        b.cols2(im.o_wts, im.NU, n, col0), (int) im.NU, G.norm_topk, (float) G.weights_scale));
+        t_ids = ggml_dsv41_route(gc, rl, bias_sel, rb, b.cols2(im.o_ids, im.NU, n, col0),
+                                 b.cols2(im.o_wts, im.NU, n, col0), (int) im.NU, G.norm_topk, (float) G.weights_scale);
+        t_wts = t_ids->src[4];   // the op's second output
+        outs.push_back(t_ids);
     } else {
-        cps.emplace_back(ids, b.cols2(im.o_ids, im.NU, n, col0));
-        cps.emplace_back(wts, b.cols2(im.o_wts, im.NU, n, col0));
+        t_ids = ggml_cpy(gc, ids, b.cols2(im.o_ids, im.NU, n, col0));
+        t_wts = ggml_cpy(gc, wts, b.cols2(im.o_wts, im.NU, n, col0));
+        outs.push_back(t_ids);
+        outs.push_back(t_wts);
     }
     // STRATA_LOOKAHEAD=1 (after Project Maya's ds4 lookahead; ported from c7896e3d9): the NEXT layer's router on THIS
     // layer's FFN input (its own ffn_norm, score + bias + the selection rbias, as the next layer will select) - a guess
@@ -1604,6 +1678,13 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                                      ggml_reshape_2d(gc, im.ly[(size_t) nl].rbias, im.NE, 1));
         outs.push_back(ggml_cpy(gc, ggml_argsort_top_k(gc, sc2, 16), b.cols2(im.o_la, 16, n, col0)));
     }
+#ifdef DS41_HAVE_SK
+    if (tail && im.rb_hook) {
+        outs.push_back(ggml_dsv41_hook(gc, t_fn, t_ids, t_wts, rb_hook_push, &im.rb_route_hook));
+        if ((size_t) il < im.hit_hooks.size() && im.hit_hooks[(size_t) il].launch)   // STRATA_HIT_FAST=3
+            outs.push_back(ggml_dsv41_hook(gc, t_ids, t_wts, t_fn, hit_hook_call, &im.hit_hooks[(size_t) il]));
+    }
+#endif
     if (xids) {   // route meter: the exact top-NU and their normalized weights
         ggml_tensor * xw = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), xids), im.NU, n);
         xw = ggml_div(gc, xw, ggml_scale_bias(gc, ggml_sum_rows(gc, xw), 1.0f, 1e-20f));
@@ -1787,11 +1868,19 @@ static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * g
     ggml_tensor * xp = ggml_dsv4_hc_pre(gc, st, b.cols2(im.pre_state, HC, 1));
     ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(next_il), b.rms_w(xp, im.BL(next_il, "ffn_norm.weight")));
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
+    // STRATA_RB_HOOK: a one-layer prediction writes itself into the packet
+    auto pred_hook = [&]() {
+#ifdef DS41_HAVE_SK
+        if (im.rb_hook && !(ahead > 0 && aout))
+            ggml_build_forward_expand(gf, ggml_dsv41_hook(gc, *pout, nullptr, nullptr, rb_hook_push, &im.rb_pred_hook));
+#endif
+    };
     if (route_fuse() && !im.cpu && !(ahead > 0 && aout)) {   // the same top 16 in one op (build_predict)
         *pout = ggml_dsv41_route(gc, rl, im.BL(next_il, "exp_probs_b.bias"),
                                  ggml_reshape_2d(gc, im.ly[(size_t) next_il].rbias, im.NE, 1), nullptr, nullptr, 16, false, 1.0f);
         ggml_set_output(*pout);
         ggml_build_forward_expand(gf, *pout);
+        pred_hook();
         return gf;
     }
     ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(next_il, "exp_probs_b.bias")),
@@ -1811,6 +1900,7 @@ static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * g
     *pout = ggml_argsort_top_k(gc, sc, 16);
     ggml_set_output(*pout);
     ggml_build_forward_expand(gf, *pout);
+    pred_hook();
     return gf;
 }
 
@@ -2363,7 +2453,8 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         if (!im.cpu && pin_rb()) {   // fn | ids | wts | 16 predicted ids, 256-byte aligned
             auto up = [](size_t b) { return (b + 255) & ~(size_t) 255; };
             const size_t o_ids = up((size_t) D * 4), o_wts = o_ids + up((size_t) im.NU * 4), o_pred = o_wts + up((size_t) im.NU * 4);
-            im.rb_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), o_pred + up(16 * 4));
+            const size_t o_flag = o_pred + up(16 * 4);   // STRATA_RB_HOOK: the route flag, then the prediction's at +128
+            im.rb_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), o_flag + 256);
             if (im.rb_buf && ggml_backend_buffer_get_type(im.rb_buf) != ggml_backend_cuda_host_buffer_type()) {
                 ggml_backend_buffer_free(im.rb_buf);   // ggml fell back to a plain CPU buffer: no pinned memory
                 im.rb_buf = nullptr;
@@ -2374,6 +2465,9 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
                 im.rb_ids = (int32_t *) (b + o_ids);
                 im.rb_wts = (float *) (b + o_wts);
                 im.rb_pred = (int32_t *) (b + o_pred);
+                im.rb_flag_route = (int32_t *) (b + o_flag);
+                im.rb_flag_pred = (int32_t *) (b + o_flag + 128);
+                *im.rb_flag_route = *im.rb_flag_pred = 0;
             }
             std::fprintf(stderr, "ds41_dense: STRATA_PIN_RB: %s\n", im.rb_buf ? "single-token readbacks into pinned memory"
                                                                               : "no pinned memory - pageable readbacks");
@@ -2384,6 +2478,21 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
             std::fprintf(stderr, "ds41_dense: STRATA_ATTN_TAIL: %s\n",
                          im.tail_on ? "shared expert + FFN hc mixes behind the routing readback"
                                     : "OFF (needs STRATA_PIN_RB=1 and STRATA_DENSE_ASYNC=1, no route meter)");
+        if (rb_hook_env()) {   // STRATA_RB_HOOK: the packet's device address for the readback kernel
+#ifdef DS41_HAVE_SK
+            char * hb = im.tail_on ? (char *) ggml_backend_buffer_get_base(im.rb_buf) : nullptr;
+            char * db = hb ? (char *) strata::kernels::host_dev_ptr(hb) : nullptr;
+            if (db) {
+                auto dev = [&](const volatile void * h) { return (void *) (db + ((const volatile char *) h - hb)); };
+                im.rb_route_hook = { { dev(im.rb_fn), dev(im.rb_ids), dev(im.rb_wts) }, { (int) D, (int) im.NU, (int) im.NU },
+                                     (int32_t *) dev(im.rb_flag_route) };
+                im.rb_pred_hook = { { dev(im.rb_pred), nullptr, nullptr }, { 16, 0, 0 }, (int32_t *) dev(im.rb_flag_pred) };
+                im.rb_hook = true;
+            }
+#endif
+            std::fprintf(stderr, "ds41_dense: STRATA_RB_HOOK: %s\n", im.rb_hook ? "the graphs write their readbacks, the host spins on a flag"
+                                                                                : "OFF (needs STRATA_ATTN_TAIL and the CUDA kernels)");
+        }
 #endif
     }
     return true;
@@ -3142,7 +3251,8 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
         if (a == il && n == 1 && im.tail_on) {   // STRATA_ATTN_TAIL: its tail goes behind them; wait the readbacks only
             if (attn_tail_mode() == 2) im.tail_need = il;   // the tier queues it (queue_tail) after its card side
             else if (!attn_tail_queue(im, il)) return false;
-            ggml_backend_event_synchronize(im.ev_route);
+            if (im.rb_hook) { if (!rb_wait(im, im.rb_flag_route)) return false; }   // STRATA_RB_HOOK
+            else ggml_backend_event_synchronize(im.ev_route);
         } else {
             ggml_backend_synchronize(im.backend);
         }
@@ -3192,6 +3302,8 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     }
     // STRATA_DENSE_ASYNC: the readbacks below queue behind the graph and their sync covers both (a per-pass graph keeps
     // the old sync: its node structs are freed right after)
+    const bool hooked = tail && im.rb_hook;   // STRATA_RB_HOOK: the graph writes the readbacks and the flag
+    if (hooked) *im.rb_flag_route = 0;
     const bool ok = im.compute(gf, cached || mcached, dense_async() && (cached || mcached));
     if (gc) ggml_free(gc);
     if (!ok) return false;
@@ -3199,9 +3311,11 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     const bool pin = im.rb_fn && n == 1 && !im.o_xids;   // STRATA_PIN_RB (the route meter reads the vectors)
     float * h_fn = pin ? im.rb_fn : im.host_fn.data(), * h_wts = pin ? im.rb_wts : im.host_wts.data();
     int32_t * h_ids = pin ? im.rb_ids : im.host_ids.data();
-    ggml_backend_tensor_get_async(im.backend, im.o_fn, h_fn, 0, (size_t) (im.D * n) * 4);
-    ggml_backend_tensor_get_async(im.backend, im.o_ids, h_ids, 0, (size_t) (im.NU * n) * 4);
-    ggml_backend_tensor_get_async(im.backend, im.o_wts, h_wts, 0, (size_t) (im.NU * n) * 4);
+    if (!hooked) {
+        ggml_backend_tensor_get_async(im.backend, im.o_fn, h_fn, 0, (size_t) (im.D * n) * 4);
+        ggml_backend_tensor_get_async(im.backend, im.o_ids, h_ids, 0, (size_t) (im.NU * n) * 4);
+        ggml_backend_tensor_get_async(im.backend, im.o_wts, h_wts, 0, (size_t) (im.NU * n) * 4);
+    }
     im.la_ok = im.o_la && n <= kLaMaxCols && la_next_ok(im, il);
     if (im.la_ok) ggml_backend_tensor_get_async(im.backend, im.o_la, im.host_la.data(), 0, (size_t) (16 * n) * 4);
     if (im.o_xids) {
@@ -3209,10 +3323,11 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
         ggml_backend_tensor_get_async(im.backend, im.o_xwts, im.host_xwts.data(), 0, (size_t) (im.NU * n) * 4);
     }
     if (tail) {   // STRATA_ATTN_TAIL: mark the readbacks, queue the tail behind them, wait the readbacks only
-        if (!route_event(im)) return false;
+        if (!hooked && !route_event(im)) return false;
         if (attn_tail_mode() == 2) im.tail_need = il;   // the tier queues it (queue_tail) after its card side
         else if (!attn_tail_queue(im, il)) return false;
-        ggml_backend_event_synchronize(im.ev_route);
+        if (hooked) { if (!rb_wait(im, im.rb_flag_route)) return false; }
+        else ggml_backend_event_synchronize(im.ev_route);
     } else {
         ggml_backend_synchronize(im.backend);
         ggml_backend_synchronize(im.backend);
@@ -3343,6 +3458,18 @@ bool Ds41Dense::can_attn_ahead() const {
 }
 
 int Ds41Dense::ahead_layer() const { return p_->ahead_il; }
+bool Ds41Dense::rb_hook_on() const { return p_->rb_hook; }
+
+bool Ds41Dense::set_hit_hook(int il, HitLaunch launch, void * ud) {
+    Impl & im = *p_;
+    if (!im.rb_hook || !im.routed || il < 0 || il >= (int) im.ly.size()) return false;
+    if (im.hit_hooks.size() != im.ly.size()) im.hit_hooks.resize(im.ly.size());   // (once: the nodes hold these)
+    Impl::HitHook & h = im.hit_hooks[(size_t) il];
+    if (h.launch == launch && h.ud == ud) return true;
+    h = Impl::HitHook { launch, ud, &im };
+    im.reset_graphs();   // (the cached graphs were built without the node)
+    return true;
+}
 const int32_t * Ds41Dense::ids_dev() const { return p_->cpu || !p_->o_ids ? nullptr : (const int32_t *) p_->o_ids->data; }
 const float * Ds41Dense::wts_dev() const { return p_->cpu || !p_->o_wts ? nullptr : (const float *) p_->o_wts->data; }
 void * Ds41Dense::cuda_stream() const {
@@ -3366,21 +3493,30 @@ bool Ds41Dense::finish_predict_attn(int il, const float * routed_sum, int next_i
     if (ga == im.graphs.end() || gp == im.graphs.end() || (im.tail_on && !im.graphs.count(Impl::GKey { next_il, 11, 0, 1 })))
         return finish_predict(il, routed_sum, next_il, top_ids, n_top);
     if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) im.D * 4);
+    const bool hooked = im.rb_hook;   // STRATA_RB_HOOK: both graphs write their readbacks and flags
+    if (hooked) *im.rb_flag_pred = 0;
     if (!im.compute(gp->second, true, true)) return false;
-    ggml_backend_tensor_get_async(im.backend, im.fpredict_out[next_il], im.rb_pred, 0, 16 * 4);
-    if (!im.ev_pred) im.ev_pred = ggml_backend_event_new(ggml_backend_get_device(im.backend));
-    if (!im.ev_pred) { im.err = "finish_predict_attn: no backend event"; return false; }
-    ggml_backend_event_record(im.ev_pred, im.backend);
+    if (!hooked) {
+        ggml_backend_tensor_get_async(im.backend, im.fpredict_out[next_il], im.rb_pred, 0, 16 * 4);
+        if (!im.ev_pred) im.ev_pred = ggml_backend_event_new(ggml_backend_get_device(im.backend));
+        if (!im.ev_pred) { im.err = "finish_predict_attn: no backend event"; return false; }
+        ggml_backend_event_record(im.ev_pred, im.backend);
+    }
     // the next layer, queued behind it (an Engram layer's rows are uploaded first, as attn_router does)
     if (im.ly[(size_t) next_il].eslot >= 0 && !engram_ready(im)) return false;
+    if (hooked) *im.rb_flag_route = 0;
     if (!im.compute(ga->second, true, true)) return false;
-    ggml_backend_tensor_get_async(im.backend, im.o_fn, im.rb_fn, 0, (size_t) im.D * 4);
-    ggml_backend_tensor_get_async(im.backend, im.o_ids, im.rb_ids, 0, (size_t) im.NU * 4);
-    ggml_backend_tensor_get_async(im.backend, im.o_wts, im.rb_wts, 0, (size_t) im.NU * 4);
-    // STRATA_ATTN_TAIL: next_il's graph has no tail; attn_router queues it behind these readbacks and waits ev_route
-    if (im.tail_on && !route_event(im)) return false;
+    if (!hooked) {
+        ggml_backend_tensor_get_async(im.backend, im.o_fn, im.rb_fn, 0, (size_t) im.D * 4);
+        ggml_backend_tensor_get_async(im.backend, im.o_ids, im.rb_ids, 0, (size_t) im.NU * 4);
+        ggml_backend_tensor_get_async(im.backend, im.o_wts, im.rb_wts, 0, (size_t) im.NU * 4);
+        // STRATA_ATTN_TAIL: next_il's graph has no tail; attn_router queues it behind these readbacks and waits ev_route
+        if (im.tail_on && !route_event(im)) return false;
+    }
     im.ahead_il = next_il;
-    ggml_backend_event_synchronize(im.ev_pred);   // the prediction has landed; next_il's attention runs on
+    // the prediction has landed; next_il's attention runs on
+    if (hooked) { if (!rb_wait(im, im.rb_flag_pred)) return false; }
+    else ggml_backend_event_synchronize(im.ev_pred);
     for (int i = 0; i < n_top; ++i) top_ids[i] = im.rb_pred[i];
     return true;
 }

@@ -108,11 +108,26 @@ void pull_from_host(void* dst, const void* src, size_t bytes, void* stream);
 /// STRATA_HIT_FAST (ds41 decode): the routed hits' grouped-launch addresses from the routing on the card.  row[e]: expert
 /// e's VRAM slot address, 0 = not resident.  All K of ids resident -> grp_ptr[k] = row[ids[k]], *n_groups = K; else
 /// *n_groups = 0 (then the grouped kernels and decode_rows_sum_gated do nothing).  All pointers are device memory.
+/// armed (STRATA_HIT_FAST=3; null = always): a word in mapped pinned memory; 0 -> *n_groups = 0; the dispatch clears it.
 void decode_hit_dispatch(const int32_t* ids, const unsigned long long* row, int K, int n_experts,
-                         unsigned long long* grp_ptr, int32_t* n_groups, void* stream);
+                         unsigned long long* grp_ptr, int32_t* n_groups, void* stream, int32_t* armed = nullptr);
 /// decode_rows_sum_sel without pool rows, the weights in device memory, and only when *gate != 0: the same bits.
 void decode_rows_sum_gated(const float* parts, const float* w, const int32_t* gate, int K, int64_t H, float* out,
                            void* stream);
+/// STRATA_RB_HOOK (ds41 decode): a readback queued inside a captured graph.  Up to kHostPushMax arrays of 4-byte words
+/// go from device memory to mapped pinned host memory (its device address) by one block, not through the copy engine;
+/// then *flag = 1 (mapped pinned memory; null = no flag) once the words are visible to the host.
+constexpr int kHostPushMax = 4;
+struct HostPush {
+    const void* src[kHostPushMax];
+    void* dst[kHostPushMax];
+    int words[kHostPushMax];
+    int n;
+    int32_t* flag;
+};
+void push_to_host(const HostPush& p, void* stream);
+/// The device address of pinned host memory (cudaHostGetDevicePointer), or nullptr.
+void* host_dev_ptr(void* host);
 
 /// A770 port (STRATA_PF_XMX=2): up to kXmxGroupMax experts' products in one XMX launch, the weights decoded from the
 /// quantized rows into local memory.  Expert i: Y_i[cnt[i]][N] = X_i . W_i^T (X FP16, Y FP32, rows back to back).

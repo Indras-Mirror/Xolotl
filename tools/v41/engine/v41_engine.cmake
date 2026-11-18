@@ -34,6 +34,10 @@ if(TARGET ggml-cpu)
     if(TARGET ggml-cuda)
         target_link_libraries(ds41_dense PUBLIC ggml-cuda)
         target_compile_definitions(ds41_dense PRIVATE DS41_HAVE_CUDA)
+        if(TARGET strata_kernels)   # STRATA_RB_HOOK: the decode readback kernel (strata::kernels::push_to_host)
+            target_link_libraries(ds41_dense PUBLIC strata_kernels)
+            target_compile_definitions(ds41_dense PRIVATE DS41_HAVE_SK)
+        endif()
     endif()
     # opt-in: the activation rounding as ONE ggml op (GGML_OP_DSV41_FAKE_QUANT) instead of ds41_ops.hpp's stock-op
     # composite.  Needs the llama.cpp tree patched with tools/v41/ggml/dsv41-fake-quant.patch (the tree is not tracked

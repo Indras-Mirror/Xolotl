@@ -935,6 +935,23 @@ int main(int argc, char ** argv) {
     // The same kernels on the same values: the same bits.  =2: only for a layer whose predicted top-k (the prefetch's
     // prediction) is all resident - the others skip the launch, which does nothing there.
     const int hit_fast = attn_ahead && std::getenv("STRATA_HIT_FAST") ? std::atoi(std::getenv("STRATA_HIT_FAST")) : 0;
+    // =3 (needs STRATA_RB_HOOK=1): the same launch as a node of each layer's attention graph, behind the routing
+    // readback (Ds41MoeTier::hit_hook / hit_arm): no launch of its own; armed before each launch of the graph
+    // (set up at the first decode step: the tier opens its VRAM cache after the prompt)
+    bool hit_graph = false, hit_graph_tried = hit_fast != 3 || mc.cpu_only || std::getenv("STRATA_DEC_HOSTSUM");
+    auto hit_graph_setup = [&]() {
+        hit_graph_tried = true;
+        int n_hooked = 0;
+        for (int l = 0; l < n_layer; ++l) {
+            Ds41Dense & d = ds41_dense_for(pipe, l);
+            if (!d.rb_hook_on()) continue;
+            void * ud = ds41_tier_for(pipe, l).hit_hook(l, d.cuda_stream());
+            if (ud && d.set_hit_hook(l, &Ds41MoeTier::hit_launch, ud)) ++n_hooked;
+        }
+        hit_graph = n_hooked > 0;
+        std::fprintf(stderr, "ds41_generate: STRATA_HIT_FAST=3: %d layers launch their hits from the attention graph%s\n",
+                     n_hooked, hit_graph ? "" : " (needs STRATA_RB_HOOK=1)");
+    };
     // STRATA_DEC_ROUTE_LOG=F (diagnostic, off by default): the decode steps' routing in token order, for offline
     // cache-policy simulation (the batch passes' STRATA_ROUTE_LOG has no token order).  Before the first step one
     // "S <layer> <expert> <where>" line per cached expert (1 VRAM, 2 RAM arena, 3 both); then per step "T <pos>" and
@@ -970,6 +987,7 @@ int main(int argc, char ** argv) {
             }
             std::fprintf(dec_rlog, "T %d\n", pos);
         }
+        if (!hit_graph_tried) hit_graph_setup();   // STRATA_HIT_FAST=3
         if (!pipe.dense(0).begin(&tok, 1, pos)) { ferr = pipe.dense(0).last_error(); return false; }
         if (dprof) { const double t = dp_now(); dp[0] += t - ta; ta = t; }
         int32_t top16[16];
@@ -1002,7 +1020,8 @@ int main(int argc, char ** argv) {
                 }
                 have_pred = false;
             }
-            if (hit_fast > 0 && rdev && d.ahead_layer() == l) {
+            if (hit_graph && rdev && d.ahead_layer() != l) t.hit_arm(l, rdev);   // =3: the graph attn_router launches
+            if (hit_fast > 0 && hit_fast < 3 && rdev && d.ahead_layer() == l) {
                 bool want = true;
                 for (int j = 0; hit_fast == 2 && want && j < top_k; ++j) want = top16[j] >= 0 && t.resident(l, top16[j]);
                 if (want) t.spec_hits(l, d.ids_dev(), d.wts_dev(), d.batch_fn_dev(), rdev, d.cuda_stream());
@@ -1059,6 +1078,7 @@ int main(int argc, char ** argv) {
                     if (dprof) { const double t1 = dp_now(); dp[5] += t1 - ta; ta = t1; }
                 } else {
                     const bool ahead = attn_ahead && !spec_l1 && d.can_attn_ahead();
+                    if (hit_graph && ahead && rdev) t.hit_arm(l + 1, rdev);   // =3: before the graph goes out
                     if (!(ahead ? d.finish_predict_attn(l, rsum, l + 1, t16, 16) : d.finish_predict(l, rsum, l + 1, t16, 16))) {
                         ferr = d.last_error();
                         return false;

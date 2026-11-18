@@ -526,6 +526,15 @@ public:
     /// the setup has no such path.
     bool spec_hits(int64_t layer, const int32_t* ids_dev, const float* w_dev, const void* x_dev, void* out_dev,
                    void* dense_stream);
+    /// STRATA_HIT_FAST=3: the same launch as a node of the dense half's attention graph, behind the routing readback
+    /// (Ds41Dense::set_hit_hook).  hit_hook(layer, dense_stream): the node's user data, null when the layer has no such
+    /// path; hit_launch is the node's function (it queues the kernels when the graph is captured).  The dispatch runs
+    /// the hits only when hit_arm(layer, out_dev) was called before the graph's launch (the table row as the cache has
+    /// it then); each arming is used by one launch, and the next run_to_dev(layer, ..., out_dev) keeps it as above.
+    void* hit_hook(int64_t layer, void* dense_stream);
+    static void hit_launch(void* ud, void* stream, const int32_t* ids_dev, const float* w_dev, const void* x_dev,
+                           void* out_dev);
+    bool hit_arm(int64_t layer, void* out_dev);
     /// The same with `x` already on the device (the engine's attention output).  CUDA modes only.
     bool run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out);
 

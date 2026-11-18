@@ -87,10 +87,14 @@ void pull_from_host(void* dst, const void* src, size_t bytes, void* stream) {
 // else *n_groups = 0, and the grouped kernels and decode_rows_sum_gated that read it do nothing.
 __global__ void decode_hit_dispatch_kernel(const int32_t* __restrict__ ids, const unsigned long long* __restrict__ row,
                                            int K, int n_experts, unsigned long long* __restrict__ grp_ptr,
-                                           int32_t* __restrict__ n_groups) {
+                                           int32_t* __restrict__ n_groups, int32_t* armed) {
     if (threadIdx.x != 0) return;
     bool all = true;
-    for (int k = 0; k < K; ++k) {
+    if (armed) {   // STRATA_HIT_FAST=3: one launch per arming
+        all = *(volatile int32_t*) armed != 0;
+        *(volatile int32_t*) armed = 0;
+    }
+    for (int k = 0; k < K && (all || !armed); ++k) {
         const int32_t e = ids[k];
         const unsigned long long p = (e >= 0 && e < n_experts) ? row[e] : 0ull;
         grp_ptr[k] = p;
@@ -100,8 +104,8 @@ __global__ void decode_hit_dispatch_kernel(const int32_t* __restrict__ ids, cons
 }
 
 void decode_hit_dispatch(const int32_t* ids, const unsigned long long* row, int K, int n_experts,
-                         unsigned long long* grp_ptr, int32_t* n_groups, void* stream) {
-    decode_hit_dispatch_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, row, K, n_experts, grp_ptr, n_groups);
+                         unsigned long long* grp_ptr, int32_t* n_groups, void* stream, int32_t* armed) {
+    decode_hit_dispatch_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, row, K, n_experts, grp_ptr, n_groups, armed);
     check("decode_hit_dispatch");
 }
 
@@ -127,4 +131,36 @@ void decode_rows_sum_gated(const float* parts, const float* w, const int32_t* ga
     const unsigned blocks = (unsigned) std::min<int64_t>((H + 255) / 256, 1024);
     decode_rows_sum_gated_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(parts, w, gate, K, H, out);
     check("decode_rows_sum_gated");
+}
+
+// STRATA_RB_HOOK (ds41 decode): the words go to the host first; every thread's writes are fenced at system scope before
+// the barrier, and thread 0 fences again before the flag, so the host sees the flag only after the words.
+__global__ void push_to_host_kernel(const HostPush p) {
+    for (int s = 0; s < p.n; ++s) {
+        const uint32_t* __restrict__ a = (const uint32_t*) p.src[s];
+        uint32_t* __restrict__ b = (uint32_t*) p.dst[s];
+        for (int i = threadIdx.x; i < p.words[s]; i += blockDim.x) b[i] = a[i];
+    }
+    if (!p.flag) return;
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        *(volatile int32_t*) p.flag = 1;
+    }
+}
+
+void push_to_host(const HostPush& p, void* stream) {
+    if (p.n < 0 || p.n > kHostPushMax) return;
+    push_to_host_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(p);
+    check("push_to_host");
+}
+
+void* host_dev_ptr(void* host) {
+    void* d = nullptr;
+    if (cudaHostGetDevicePointer(&d, host, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return d;
 }

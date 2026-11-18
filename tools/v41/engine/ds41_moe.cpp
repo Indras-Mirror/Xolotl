@@ -753,6 +753,18 @@ struct Gpu {
     int64_t hit_layer = -1;        ///< the layer the pending spec_hits launch is for (-1: none)
     void* hit_out = nullptr;       ///< its out_dev
     int64_t hit_n = 0, hit_kept = 0, hit_up = 0;   ///< launches, launches kept, launches whose table row had changed
+    /// STRATA_HIT_FAST=3 (hit_hook / hit_arm): the launch is a node of the attention graph.  h_armed / d_armed: one word
+    /// per layer after the table's metadata (hit_arm sets it, the dispatch clears it); hit_ud: the nodes' user data
+    /// (sized once); hit_ds: the dense stream (the graph's) for the wait on a launch that is not kept.
+    bool hit_graph = false;
+    int32_t* h_armed = nullptr;
+    int32_t* d_armed = nullptr;
+    struct HitUd {
+        void* im = nullptr;   ///< the Ds41MoeImpl
+        int64_t layer = -1;
+    };
+    std::vector<HitUd> hit_ud;
+    void* hit_ds = nullptr;
 
     /// run_chunk (prompt chunks, MiMo prefill): allocated on first use, for up to `c_tok` tokens.  The streamed
     /// experts go through two device halves of `c_half` bytes (copy stream `s_cp` fills one while `s` computes
@@ -3769,7 +3781,9 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             hit_kept = dev_all && nh == K && npf_hit == 0;
             for (int64_t k = 0; k < K && hit_kept; ++k)
                 hit_kept = row[ids6[k]] == (unsigned long long) gp.cache->device_slot(slot_i[k]);
-            if (dev_all && !hit_kept) ck(cudaEventSynchronize(gp.ev_hit_out), "hit launch wait");
+            if (dev_all && !hit_kept)   // (STRATA_HIT_FAST=3: the launch is in the graph the dense stream holds)
+                ck(gp.hit_graph ? cudaStreamSynchronize((cudaStream_t) gp.hit_ds) : cudaEventSynchronize(gp.ev_hit_out),
+                   "hit launch wait");
         }
         gp.hit_layer = -1;
     }
@@ -7485,16 +7499,13 @@ bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6
 #endif
 }
 
-bool Ds41MoeTier::spec_hits(int64_t layer, const int32_t* ids_dev, const float* w_dev, const void* x_dev, void* out_dev,
-                            void* dense_stream) {
 #if defined(DS4_MOE_CUDA)
-    Ds41MoeImpl& im = *im_;
-    if (!im.inited || !im.gpu || im.cfg.cpu_only || im.cfg.no_cache || im.remote || !ids_dev || !w_dev || !x_dev ||
-        !out_dev || !dense_stream || !im.g.routed(layer))
-        return false;
+// STRATA_HIT_FAST: the setup spec_hits / hit_hook share - the per-layer class and, on first use, the table, the armed
+// words and the constant metadata (queued on the dense stream ds)
+static bool hit_setup(Ds41MoeImpl& im, cudaStream_t ds) {
+    if (!im.inited || !im.gpu || im.cfg.cpu_only || im.cfg.no_cache || im.remote || !ds) return false;
     Gpu& gp = *im.gpu;
-    gp.hit_layer = -1;
-    const int64_t K = im.g.top_k, NX = im.g.n_experts, H = im.g.n_embd;
+    const int64_t K = im.g.top_k, NX = im.g.n_experts;
     if (!gp.cache || !gp.cache->valid() || gp.remote || gp.tier_graph_ready || K > kMaxParts || !gp.d_xq ||
         !gp.d_scratch || !gp.d_parts)
         return false;
@@ -7508,12 +7519,10 @@ bool Ds41MoeTier::spec_hits(int64_t layer, const int32_t* ids_dev, const float* 
             gp.hit_cls[(size_t) l] = one ? c0 : -1;
         }
     }
-    const int c = gp.hit_cls[(size_t) layer];
-    if (c < 0) return false;
-    const cudaStream_t ds = (cudaStream_t) dense_stream;
     const size_t tb = (size_t) im.g.n_layers * (size_t) NX * sizeof(unsigned long long);
+    const size_t ab = ((size_t) im.g.n_layers * 4 + 255) & ~(size_t) 255;   // the armed words
     if (!gp.h_rtab) {   // first use: the table (no layer launched yet: all zero) and the constant metadata
-        ck(cudaMallocHost((void**) &gp.h_rtab, tb + kHitMetaBytes), "hit table");
+        ck(cudaMallocHost((void**) &gp.h_rtab, tb + kHitMetaBytes + ab), "hit table");
         void* dp = nullptr;
         if (cudaHostGetDevicePointer(&dp, gp.h_rtab, 0) != cudaSuccess || !dp) {
             (void) cudaGetLastError();
@@ -7522,17 +7531,25 @@ bool Ds41MoeTier::spec_hits(int64_t layer, const int32_t* ids_dev, const float* 
             return false;
         }
         gp.d_rtab = (unsigned long long*) dp;
+        gp.h_armed = (int32_t*) ((uint8_t*) gp.h_rtab + tb + kHitMetaBytes);
+        gp.d_armed = (int32_t*) ((uint8_t*) dp + tb + kHitMetaBytes);
         ck(cudaMalloc(&gp.d_hit, kHitMetaBytes), "hit meta");
         ck(cudaEventCreateWithFlags(&gp.ev_hit_out, cudaEventDisableTiming), "ev_hit_out");
-        std::memset(gp.h_rtab, 0, tb + kHitMetaBytes);
+        std::memset(gp.h_rtab, 0, tb + kHitMetaBytes + ab);
         uint8_t* hm = (uint8_t*) gp.h_rtab + tb;
         for (int i = 0; i <= kMaxParts; ++i) ((int32_t*) (hm + kHitStart))[i] = i;   // one entry per group
         for (int i = 0; i < kMaxParts; ++i) ((int32_t*) (hm + kHitDst))[i] = i;      // routing index k -> row k
         ck(cudaMemcpyAsync(gp.d_hit, hm, kHitMetaBytes, cudaMemcpyHostToDevice, ds), "hit meta");
     }
-    // the layer's row as the cache has it now, written in place: the dispatch reads it from this pinned table over the
-    // bus (no copy to queue behind the prefetch DMAs).  A row is rewritten only by a later call for its layer, after the
-    // host waited for this one's work (its sum sync, or the prediction readback behind the finish behind it).
+    return true;
+}
+
+// the layer's row as the cache has it now, written in place: the dispatch reads it from this pinned table over the
+// bus (no copy to queue behind the prefetch DMAs).  A row is rewritten only by a later call for its layer, after the
+// host waited for this one's work (its sum sync, or the prediction readback behind the finish behind it).
+static void hit_row(Ds41MoeImpl& im, int64_t layer) {
+    Gpu& gp = *im.gpu;
+    const int64_t NX = im.g.n_experts;
     unsigned long long* row = gp.h_rtab + (size_t) layer * (size_t) NX;
     bool changed = false;
     for (int64_t e = 0; e < NX; ++e) {
@@ -7544,14 +7561,21 @@ bool Ds41MoeTier::spec_hits(int64_t layer, const int32_t* ids_dev, const float* 
         }
     }
     gp.hit_up += changed;
-    // on the dense stream itself, behind the attention graph and its readbacks (a wait on another stream's event costs
-    // 0.1-0.3 ms here, WDDM): the dispatch, the activation as gpu_run quantizes it, the hits' grouped launch as gpu_run
-    // issues it for an all-hit layer (cap kMaxParts groups, K entries, K block rows) and the sum - the last two do
-    // nothing unless the dispatch found all K resident.  gpu_run then has no card work left for a kept layer, and the
-    // finish queued behind on this stream reads the sum in order.
+}
+
+// on the dense stream itself, behind the attention graph and its readbacks (a wait on another stream's event costs
+// 0.1-0.3 ms here, WDDM): the dispatch, the activation as gpu_run quantizes it, the hits' grouped launch as gpu_run
+// issues it for an all-hit layer (cap kMaxParts groups, K entries, K block rows) and the sum - the last two do
+// nothing unless the dispatch found all K resident.  gpu_run then has no card work left for a kept layer, and the
+// finish queued behind on this stream reads the sum in order.
+static void hit_kernels(Ds41MoeImpl& im, int64_t layer, const int32_t* ids_dev, const float* w_dev, const void* x_dev,
+                        void* out_dev, cudaStream_t ds, int32_t* armed) {
+    Gpu& gp = *im.gpu;
+    const int64_t K = im.g.top_k, NX = im.g.n_experts, H = im.g.n_embd;
+    const int c = gp.hit_cls[(size_t) layer];
     uint8_t* dm = (uint8_t*) gp.d_hit;
     strata::kernels::decode_hit_dispatch(ids_dev, gp.d_rtab + (size_t) layer * (size_t) NX, (int) K, (int) NX,
-                                         (unsigned long long*) (dm + kHitPtr), (int32_t*) (dm + kHitNg), ds);
+                                         (unsigned long long*) (dm + kHitPtr), (int32_t*) (dm + kHitNg), ds, armed);
     strata::kernels::native_quantize_q8_1((const float*) x_dev, gp.d_xq, (int) H, 1, ds);
     strata::kernels::native_expert_grouped(gp.gll[(size_t) c], (const unsigned long long*) (dm + kHitPtr),
                                           (const int32_t*) (dm + kHitStart), (const int32_t*) (dm + kHitNg),
@@ -7559,6 +7583,21 @@ bool Ds41MoeTier::spec_hits(int64_t layer, const int32_t* ids_dev, const float* 
                                           K, gp.d_xq, gp.d_scratch, (float*) gp.d_parts, ds, K);
     strata::kernels::decode_rows_sum_gated((const float*) gp.d_parts, w_dev, (const int32_t*) (dm + kHitNg), (int) K, H,
                                            (float*) out_dev, ds);
+}
+#endif
+
+bool Ds41MoeTier::spec_hits(int64_t layer, const int32_t* ids_dev, const float* w_dev, const void* x_dev, void* out_dev,
+                            void* dense_stream) {
+#if defined(DS4_MOE_CUDA)
+    Ds41MoeImpl& im = *im_;
+    if (!ids_dev || !w_dev || !x_dev || !out_dev || !dense_stream || !im.g.routed(layer)) return false;
+    if (im.gpu) im.gpu->hit_layer = -1;
+    const cudaStream_t ds = (cudaStream_t) dense_stream;
+    if (!hit_setup(im, ds)) return false;
+    Gpu& gp = *im.gpu;
+    if (gp.hit_cls[(size_t) layer] < 0) return false;
+    hit_row(im, layer);
+    hit_kernels(im, layer, ids_dev, w_dev, x_dev, out_dev, ds, nullptr);
     ck(cudaEventRecord(gp.ev_hit_out, ds), "hit out record");
     (void) cudaStreamQuery(ds);   // hand the launch to the card now (WDDM batches a stream's work until a submit)
     if (cudaPeekAtLastError() == cudaErrorNotReady) (void) cudaGetLastError();   // "not ready" is no launch error
@@ -7568,6 +7607,54 @@ bool Ds41MoeTier::spec_hits(int64_t layer, const int32_t* ids_dev, const float* 
     return true;
 #else
     (void) layer; (void) ids_dev; (void) w_dev; (void) x_dev; (void) out_dev; (void) dense_stream;
+    return false;
+#endif
+}
+
+void* Ds41MoeTier::hit_hook(int64_t layer, void* dense_stream) {
+#if defined(DS4_MOE_CUDA)
+    Ds41MoeImpl& im = *im_;
+    if (!im.g.routed(layer) || !hit_setup(im, (cudaStream_t) dense_stream)) return nullptr;
+    Gpu& gp = *im.gpu;
+    if (gp.hit_cls[(size_t) layer] < 0) return nullptr;
+    if (gp.hit_ud.empty()) gp.hit_ud.resize((size_t) im.g.n_layers);   // (never resized again: the nodes hold these)
+    gp.hit_ud[(size_t) layer] = Gpu::HitUd { &im, layer };
+    gp.hit_graph = true;
+    gp.hit_ds = dense_stream;
+    return &gp.hit_ud[(size_t) layer];
+#else
+    (void) layer; (void) dense_stream;
+    return nullptr;
+#endif
+}
+
+void Ds41MoeTier::hit_launch(void* ud, void* stream, const int32_t* ids_dev, const float* w_dev, const void* x_dev,
+                             void* out_dev) {
+#if defined(DS4_MOE_CUDA)
+    const auto& u = *(const Gpu::HitUd*) ud;
+    Ds41MoeImpl& im = *(Ds41MoeImpl*) u.im;
+    hit_kernels(im, u.layer, ids_dev, w_dev, x_dev, out_dev, (cudaStream_t) stream, im.gpu->d_armed + u.layer);
+#else
+    (void) ud; (void) stream; (void) ids_dev; (void) w_dev; (void) x_dev; (void) out_dev;
+#endif
+}
+
+bool Ds41MoeTier::hit_arm(int64_t layer, void* out_dev) {
+#if defined(DS4_MOE_CUDA)
+    Ds41MoeImpl& im = *im_;
+    if (!im.gpu || !out_dev) return false;
+    Gpu& gp = *im.gpu;
+    if (!gp.hit_graph || layer < 0 || (size_t) layer >= gp.hit_ud.size() || !gp.hit_ud[(size_t) layer].im) return false;
+    if (!gp.cache || !gp.cache->valid() || gp.remote || gp.tier_graph_ready) return false;   // (unarmed: no hits)
+    if (gp.hit_layer == layer) return true;   // armed already (its launch is still to come)
+    hit_row(im, layer);
+    *(volatile int32_t*) (gp.h_armed + layer) = 1;
+    gp.hit_layer = layer;
+    gp.hit_out = out_dev;
+    ++gp.hit_n;
+    return true;
+#else
+    (void) layer; (void) out_dev;
     return false;
 #endif
 }

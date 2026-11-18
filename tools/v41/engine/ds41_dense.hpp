@@ -227,6 +227,13 @@ public:
     const int32_t * ids_dev() const;
     const float * wts_dev() const;
     void * cuda_stream() const;
+    /// STRATA_HIT_FAST=3: layer il's single-token attention graph gets a node behind its routing readback that calls
+    /// launch(ud, stream, ids, wts, x, routed) on the card's routing, the MoE input and the routed sum's tensor (when the
+    /// graph is captured: the work it queues is part of the graph).  Needs STRATA_RB_HOOK (rb_hook_on): the host then
+    /// has the routing before that work runs.  Drops the cached graphs.
+    using HitLaunch = void (*)(void * ud, void * stream, const int32_t * ids, const float * wts, const void * x, void * routed);
+    bool set_hit_hook(int il, HitLaunch launch, void * ud);
+    bool rb_hook_on() const;
     /// STRATA_ATTN_TAIL=2: queue layer il's tail graph (the FFN hc mixes + the shared expert that attn_router left
     /// out) if it is still owed; the decode loop calls it from the tier's after-card-side hook.  finish / predict
     /// queue an owed tail themselves, so a missed call only costs the overlap.  True when there is nothing to do.
