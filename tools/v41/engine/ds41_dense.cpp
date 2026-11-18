@@ -79,6 +79,14 @@ bool route_fuse() {
     return on;
 }
 
+// STRATA_ROUTE_FUSE=2: also a --vision engine's router (every row of it: the image-position mask is a graph input), its
+// bias mix (exp_probs_b_vl - exp_probs_b) * mask + exp_probs_b inside the op (ggml_dsv41_route_vl) - the same bits.
+// With =1 a --vision engine keeps the stock chain (the mix is a computed tensor): the mix's 4 ops and the 10 kernels.
+static bool route_fuse_vl() {
+    static const bool on = route_fuse() && std::atoi(std::getenv("STRATA_ROUTE_FUSE")) >= 2;
+    return on;
+}
+
 // The decode graphs are built once and reused; stamping a uid lets ggml-cuda reuse its captured CUDA graph.  One
 // allocator serves every cached graph (they run one at a time); when it has to grow, every graph allocated before
 // is re-allocated on its next use (the epoch), as tools/ds4/ds4_dense.cpp alloc_graph does.
@@ -1778,11 +1786,16 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     // fn / ids / wts as their own copies (not batched into COPIES_OP): STRATA_RB_HOOK reads them by tensor
     ggml_tensor * t_fn = ggml_cpy(gc, fn, b.cols2(im.o_fn, D, n, col0)), * t_ids = nullptr, * t_wts = nullptr;
     outs.push_back(t_fn);
-    // STRATA_ROUTE_FUSE (Keisawaakira rb10): the plain flat-bias selection, its weights and both writes as one op
-    // (ggml_dsv41_route); vision rows and the smart / margin bias keep the graph above
-    if (route_fuse() && !im.cpu && !route_op && bias_sel == im.BL(il, "exp_probs_b.bias") && !smart_router() && rb_margin < 0.0f) {
-        t_ids = ggml_dsv41_route(gc, rl, bias_sel, rb, b.cols2(im.o_ids, im.NU, n, col0),
-                                 b.cols2(im.o_wts, im.NU, n, col0), (int) im.NU, G.norm_topk, (float) G.weights_scale);
+    // STRATA_ROUTE_FUSE: the plain flat-bias selection only (vision rows and the smart / margin bias build theirs above;
+    // =2 takes the vision rows' mix into the op)
+    const bool plain_bias = bias_sel == im.BL(il, "exp_probs_b.bias");
+    if (route_fuse() && !im.cpu && !route_op && (plain_bias || route_fuse_vl()) && !smart_router() && rb_margin < 0.0f) {
+        t_ids = plain_bias
+            ? ggml_dsv41_route(gc, rl, bias_sel, rb, b.cols2(im.o_ids, im.NU, n, col0),
+                               b.cols2(im.o_wts, im.NU, n, col0), (int) im.NU, G.norm_topk, (float) G.weights_scale)
+            : ggml_dsv41_route_vl(gc, rl, im.BL(il, "exp_probs_b.bias"), im.BL(il, "exp_probs_b_vl.bias"),
+                                  b.v1(im.i_img, n, (size_t) col0 * 4), rb, b.cols2(im.o_ids, im.NU, n, col0),
+                                  b.cols2(im.o_wts, im.NU, n, col0), (int) im.NU, G.norm_topk, (float) G.weights_scale);
         t_wts = t_ids->src[4];   // the op's second output
         outs.push_back(t_ids);
     } else {

@@ -7662,8 +7662,9 @@ static void hit_kernels(Ds41MoeImpl& im, int64_t layer, const int32_t* ids_dev, 
     const int64_t K = im.g.top_k, NX = im.g.n_experts, H = im.g.n_embd;
     const int c = gp.hit_cls[(size_t) layer];
     uint8_t* dm = (uint8_t*) gp.d_hit;
+    static const bool par = std::getenv("STRATA_HIT_PAR") && std::getenv("STRATA_HIT_PAR")[0] == '1';
     strata::kernels::decode_hit_dispatch(ids_dev, gp.d_rtab + (size_t) layer * (size_t) NX, (int) K, (int) NX,
-                                         (unsigned long long*) (dm + kHitPtr), (int32_t*) (dm + kHitNg), ds, armed);
+                                         (unsigned long long*) (dm + kHitPtr), (int32_t*) (dm + kHitNg), ds, armed, par);
     strata::kernels::native_quantize_q8_1((const float*) x_dev, gp.d_xq, (int) H, 1, ds);
     strata::kernels::native_expert_grouped(gp.gll[(size_t) c], (const unsigned long long*) (dm + kHitPtr),
                                           (const int32_t*) (dm + kHitStart), (const int32_t*) (dm + kHitNg),

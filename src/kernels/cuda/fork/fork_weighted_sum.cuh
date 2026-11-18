@@ -103,9 +103,35 @@ __global__ void decode_hit_dispatch_kernel(const int32_t* __restrict__ ids, cons
     *n_groups = all ? K : 0;
 }
 
+// STRATA_HIT_PAR: the same decision with lane k < K looking up routing k.  The row table and armed live in mapped pinned
+// memory, so the loop above waits one bus round trip per read (K + 1 in a row); here they are all in flight at once.
+// grp_ptr is written only when all K are resident (with *n_groups = 0 nothing reads it).
+__global__ void decode_hit_dispatch_par_kernel(const int32_t* __restrict__ ids, const unsigned long long* __restrict__ row,
+                                               int K, int n_experts, unsigned long long* __restrict__ grp_ptr,
+                                               int32_t* __restrict__ n_groups, int32_t* armed) {
+    const int lane = threadIdx.x;
+    unsigned long long p = 0ull;
+    if (lane < K) {
+        const int32_t e = ids[lane];
+        p = (e >= 0 && e < n_experts) ? row[e] : 0ull;
+    }
+    int32_t go = 1;
+    if (armed && lane == 0) {
+        go = *(volatile int32_t*) armed;
+        *(volatile int32_t*) armed = 0;
+    }
+    go = __shfl_sync(0xFFFFFFFFu, go, 0);
+    const bool all = go != 0 && __all_sync(0xFFFFFFFFu, lane >= K || p != 0ull);
+    if (all && lane < K) grp_ptr[lane] = p;
+    if (lane == 0) *n_groups = all ? K : 0;
+}
+
 void decode_hit_dispatch(const int32_t* ids, const unsigned long long* row, int K, int n_experts,
-                         unsigned long long* grp_ptr, int32_t* n_groups, void* stream, int32_t* armed) {
-    decode_hit_dispatch_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, row, K, n_experts, grp_ptr, n_groups, armed);
+                         unsigned long long* grp_ptr, int32_t* n_groups, void* stream, int32_t* armed, bool par) {
+    if (par && K <= 32)
+        decode_hit_dispatch_par_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, row, K, n_experts, grp_ptr, n_groups, armed);
+    else
+        decode_hit_dispatch_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(ids, row, K, n_experts, grp_ptr, n_groups, armed);
     check("decode_hit_dispatch");
 }
 

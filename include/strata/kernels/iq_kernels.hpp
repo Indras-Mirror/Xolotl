@@ -109,8 +109,11 @@ void pull_from_host(void* dst, const void* src, size_t bytes, void* stream);
 /// e's VRAM slot address, 0 = not resident.  All K of ids resident -> grp_ptr[k] = row[ids[k]], *n_groups = K; else
 /// *n_groups = 0 (then the grouped kernels and decode_rows_sum_gated do nothing).  All pointers are device memory.
 /// armed (STRATA_HIT_FAST=3; null = always): a word in mapped pinned memory; 0 -> *n_groups = 0; the dispatch clears it.
+/// par (STRATA_HIT_PAR): one lane per lookup, all reads in flight at once - one bus round trip for a mapped row table and
+/// armed word instead of K + 1; the same *n_groups and (when it is K) grp_ptr.
 void decode_hit_dispatch(const int32_t* ids, const unsigned long long* row, int K, int n_experts,
-                         unsigned long long* grp_ptr, int32_t* n_groups, void* stream, int32_t* armed = nullptr);
+                         unsigned long long* grp_ptr, int32_t* n_groups, void* stream, int32_t* armed = nullptr,
+                         bool par = false);
 /// decode_rows_sum_sel without pool rows, the weights in device memory, and only when *gate != 0: the same bits.
 void decode_rows_sum_gated(const float* parts, const float* w, const int32_t* gate, int K, int64_t H, float* out,
                            void* stream);

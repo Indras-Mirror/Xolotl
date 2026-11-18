@@ -1462,6 +1462,12 @@ int main(int argc, char ** argv) {
     // decode biases (route bias + file penalty) switch on.  Returns the free GiB measured (for the log).
     double seed_free = 0, seed_gib = 0, seed_s = 0;
     double seed_budget = -1, seed_used = 0;   // stage 0's WDDM local-memory budget / this process's use (GiB; -1 = unknown)
+    // STRATA_SERVE_RESEED_FIXED=1 (opt-in, --serve): a seed after the first (the re-seed after a prompt that released the
+    // cache) opens the cache at the first seed's slot GiB minus STRATA_SERVE_RESEED_PAD_GIB (default 0.5: the process
+    // grows ~0.32 GiB at its first long prompt and then stays), rounded down to 1/16 GiB - not at the free VRAM measured
+    // then, which moves by a few slots with the idle time before it.  The measured free VRAM minus the margin still caps
+    // it; a seed under the target says so (that seed is not reproducible).
+    std::vector<double> first_seed_gib;   // per stage; -1 = no seed yet
     // STRATA_DSPARK=<sidecar> (one-shot, greedy): DSpark speculative decoding - the checkpoint's mtp.0-2 draft stack
     // (ds41_dspark) drafts STRATA_DSPARK_DEPTH (default 4, <= 5) tokens, one dense pass verifies them (pass_v).  The
     // drafter loads here, before the VRAM expert cache measures the free memory, so the cache sizes around it.
@@ -1512,6 +1518,9 @@ int main(int argc, char ** argv) {
 #endif
         const double min_gib = 0.25;
         const bool explicit_slots = a.slots > 0;
+        static const bool reseed_fixed = a.serve && std::getenv("STRATA_SERVE_RESEED_FIXED") &&
+                                         std::getenv("STRATA_SERVE_RESEED_FIXED")[0] == '1';
+        static const double reseed_pad = std::getenv("STRATA_SERVE_RESEED_PAD_GIB") ? std::atof(std::getenv("STRATA_SERVE_RESEED_PAD_GIB")) : 0.5;
         const double ts = now_ms();
         for (int st = 0; st < pipe.n_stages(); ++st) {
             ggml_backend_t st_be = pipe.stages[(size_t) st].backend;
@@ -1523,6 +1532,18 @@ int main(int argc, char ** argv) {
             const double free_gib = fr / 1073741824.0;
             seed_gib = std::max(0.0, ((double) fr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
             if (st == 0) seed_free = free_gib;
+            if (reseed_fixed && !explicit_slots) {
+                if ((int) first_seed_gib.size() <= st) first_seed_gib.resize((size_t) st + 1, -1.0);
+                double & f0 = first_seed_gib[(size_t) st];
+                if (f0 < 0) {
+                    f0 = seed_gib;
+                } else {
+                    const double want = std::max(0.0, std::floor((f0 - reseed_pad) * 16.0) / 16.0);
+                    if (seed_gib >= want) seed_gib = want;
+                    else std::fprintf(stderr, "serve: re-seed: stage %d has %.3f GiB for slots, under the fixed %.3f GiB - "
+                                      "this seed follows the free VRAM (not reproducible)\n", st, seed_gib, want);
+                }
+            }
 #ifdef STRATA_ENABLE_CUDA
             // Windows, STRATA_SEED_LOG: also the budget WDDM gives this process (DXGI, local segment).  It is NOT a safe
             // cap: 2026-10-22 (RTX 5090, desktop apps holding ~2 GiB) it read 30.68 GiB with 9.18 GiB used, and a margin-1

@@ -1,4 +1,4 @@
-# Decode opt-ins from the DeepInfer review (rb10 - rb15)
+# Decode opt-ins from the DeepInfer review (rb10 - rb16)
 
 A decode token runs 40 layers, and each layer makes a round trip:
 
@@ -52,7 +52,7 @@ The kernel reproduces the stock chain's values bit for bit:
 
 It is off under `GGML_CUDA_RANK_ARGSORT=0`, because the bitonic kernel orders equal scores by its wiring. It falls
 back to the stock chain for vision rows and the smart / margin route bias, and when the prediction graph also
-predicts further layers.
+predicts further layers. `=2` (rb16, below) takes the vision rows as well.
 
 Effect: the attention graph is 133 -> 125 us and the finish + prediction graph 19 -> 15.5 us a layer.
 
@@ -447,10 +447,92 @@ The new GSQ configuration (the rb14 candidate + this), srvtest, 11 scenarios:
 - With the rebalance on, the arena's background swaps finish at times that depend on the gaps between requests, and
   an expert's tier changes CPU vs GPU rounding (known since 2026-10-22).
 - With the 8 s gaps, the cache's re-seed after the 15.7K prompt took 2367 slots instead of 2364. The re-seed is sized
-  from the free VRAM at that moment (23.31 to 23.34 GiB over six runs). Not fixed yet.
+  from the free VRAM at that moment (23.31 to 23.34 GiB over six runs). rb16's `STRATA_SERVE_RESEED_FIXED` (below)
+  sizes it from the first seed instead.
 - The rebalance did not change the speed here. All-decode, back to back: 48.03 / 47.58 tok/s on, 49.05 / 49.73 off.
   With the 8 s gaps, when all 3,385 planned swaps were done: 48.05 on, 47.73 off. Prompt phases matched to 0.05 s.
 - The K:\model\test configuration runs with `STRATA_SERVE_KEEP_FIXED=1` and `STRATA_ARENA_REBAL=0` since 2026-10-28.
+
+## The --vision router, the hit lookups and the re-seed (rb16)
+
+A review of the rb15 setup (2026-10-28) found two places that the one-shot runs above did not cover. The server adds
+`--vision` to the engine whenever its config has a "vision" section, and the K:\model\test configuration has one.
+
+### `STRATA_ROUTE_FUSE=2`
+
+With `--vision`, the router's selection bias is the image-position mix
+`(exp_probs_b_vl - exp_probs_b) * mask + exp_probs_b`, a computed tensor. So `=1` fell back to the stock chain on
+every layer of every token: the mix's 4 ops and the 10 kernels instead of one.
+
+`=2` hands `exp_probs_b_vl` and the mask to `ggml_dsv41_route_vl`, which forms the mix in the kernel:
+
+- It uses `__fsub_rn` / `__fmul_rn` / `__fadd_rn`, the stock sub, mul and add.
+- The mask is 0 or 1, so the product is exact.
+- It covers every row: decode tokens and image prompts.
+
+### `STRATA_HIT_PAR=1`
+
+`decode_hit_dispatch` (`STRATA_HIT_FAST`) looked up the six experts' VRAM addresses one after the other. The table and
+the armed word live in mapped pinned memory, so that was 7 bus round trips in a row (p50 9.9 us a layer in the GH26R
+trace).
+
+With this switch, lane k looks up routing k while lane 0 reads the armed word: one round trip.
+
+- `grp_ptr` is written only when all six are resident.
+- With `n_groups` 0, nothing reads it.
+
+Forced 1093, `--slots 2378`, the rb13 set + `STRATA_DEMOTE_ASYNC`, route bias 0.25 / 0.15, 3 rounds interleaved
+(tok/s):
+
+| arm | runs | mean |
+|---|---|---|
+| no `--vision` | 38.10 / 38.05 / 37.41 | 37.85 |
+| `--vision`, `ROUTE_FUSE=1` (as in rb15 production) | 37.99 / 37.14 / 37.14 | 37.42 |
+| `--vision`, `ROUTE_FUSE=2` | 37.70 / 37.46 / 37.77 | 37.64 |
+| `--vision`, `ROUTE_FUSE=2` + `HIT_PAR=1` | 38.15 / 37.72 / 37.67 | 37.85 |
+
+- Routes (50c29791) and token ids (558cec61) were the same in all arms, with `--vision` or without. The final build
+  gave the same.
+- `--vision` cost about 1 %, less than the extra kernels suggested.
+- Each switch alone is within the noise. The two together are +1.1 %, faster in all three rounds.
+
+### `STRATA_SERVE_RESEED_FIXED=1`
+
+A prompt of more than 4096 new tokens releases the VRAM cache, and the decode after it re-seeds the cache. The
+re-seed was sized from the free VRAM at that moment, so it took 2364 to 2367 slots, depending on how long the card had
+been idle before.
+
+With this switch, every seed after the first asks for the first seed's GiB minus `STRATA_SERVE_RESEED_PAD_GIB`
+(default 0.5), rounded down to 1/16 GiB.
+
+- The pad covers the ~0.32 GiB the process grows at its first long prompt (7.05 -> 7.37 GiB, the same for 16K to
+  274K prompts).
+- The free VRAM minus the margin still caps the seed. A seed under the target is logged as not reproducible.
+- On GSQ, the first seed is 21.63 GiB (2401 experts), and the re-seed 21.12 GiB (2344) instead of 21.31 GiB
+  (2364-2365). That is 21 fewer experts, after long prompts only.
+
+### Serve, the live K:\model\test configuration
+
+Route bias 0.5 / 0.3, srvtest with the image probe first, 12 scenarios. rb16 = the rb15 configuration + the three
+switches above.
+
+| run | answers | decode, the first 6 scenarios | decode, all |
+|---|---|---|---|
+| rb15 (production) | reference | 50.99 tok/s | 51.23 |
+| rb16 | the first 6 the same as rb15, image answer included; then not (the re-seed) | 52.67 | 51.57 |
+| rb16, 8 s idle before each request | all 12 the same as the run above, the cancelled stream too | 51.11 | 51.14 |
+| rb16, second start | all 12 the same | 53.30 | 53.42 |
+| rb15, second start | the first 6 the same | 52.02 | 52.37 |
+
+- Over the first 6 scenarios (the same answers in all runs), rb16 was +3.3 % and +2.5 % in the two pairs.
+- The image answer was the same in all runs, and its 232-token prompt took 3.42 -> 3.22 s.
+- The runs with 8 s gaps decode slower, rb15's too (47.73 against 49.05 / 49.73). The cause was not traced.
+
+Checked, no change: `STRATA_SERVE_STEP_MAX=48` against 16, on the rb16 configuration.
+
+- A 21 / 34 / 45-token turn as passes took 1.07 / 1.67 / 2.15 s, and as one batch 0.90 / 1.31 / 1.53 s.
+- A 31-token turn took 0.97 s both ways.
+- 16 stays.
 
 ## Tried and removed
 
@@ -474,3 +556,7 @@ order, its own tensors).
 
 The first `STRATA_GRAPH_CONC=1` forked at the very start of the attention graph (two root nodes): -4.9 % (39.27 ->
 37.36 tok/s, 4 pairs, bit-identical). Forked behind `xin` it gains (above).
+
+`STRATA_GRAPH_CONC` + 8 (rb16): the hits' branch forked right after the router, beside the readback kernel instead of
+behind it. The hits read only the routing and the FFN input on the card, and the arming happens before the graph goes
+out. Bit-identical, but 37.85 -> 37.73 tok/s on top of the two rb16 switches (3 rounds).
