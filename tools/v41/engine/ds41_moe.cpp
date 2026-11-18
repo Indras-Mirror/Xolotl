@@ -3814,7 +3814,10 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     const bool defer_gpu = read_first && im.cfg.arena_adapt && nk > 0;
     bool x_wait = false;   // STRATA_READ_FIRST: h_x's D2H is in flight (ev_x)
     auto activation = [&]() {
-        if (x_dev && nk == 0 && !x_host_always) {
+        if (x_dev && x_host && !x_host_always) {   // run_to_dev with both copies (STRATA_X_DEV): no copy either way
+            if (nk > 0) std::memcpy(gp.h_x, x_host, (size_t) H * 4);
+            strata::kernels::native_quantize_q8_1((const float*) x_dev, gp.d_xq, (int) H, 1, gp.s);
+        } else if (x_dev && nk == 0 && !x_host_always) {
             strata::kernels::native_quantize_q8_1((const float*) x_dev, gp.d_xq, (int) H, 1, gp.s);
         } else if (read_first && x_dev && !x_host_always) {
             if (!gp.ev_x) ck(cudaEventCreateWithFlags(&gp.ev_x, cudaEventDisableTiming), "ev_x");
@@ -7401,14 +7404,15 @@ bool Ds41MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const
 #endif
 }
 
-bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev) {
+bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev,
+                             const void* x_dev) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids6 || !w6 || !x || !out_dev) return false;
     RemoteScope rs(*im_, layer, 1, ids6, w6, x, nullptr, nullptr, out_dev);
     rebal_count(*im_, layer, ids6, im_->g.top_k);
     if (!im_->g.routed(layer) || im_->cfg.cpu_only) return false;
 #if defined(DS4_MOE_CUDA)
-    return gpu_run(*im_, layer, ids6, w6, x, nullptr, nullptr, out_dev);
+    return gpu_run(*im_, layer, ids6, w6, x, x_dev, nullptr, out_dev);
 #else
     return false;
 #endif

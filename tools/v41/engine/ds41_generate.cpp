@@ -924,6 +924,11 @@ int main(int argc, char ** argv) {
                             !file_pred && advise_ahead <= 0 && !dump_main && !pipe.enabled() && !mc.cpu_only;
     // STRATA_ATTN_TAIL=2 (Ds41Dense::queue_tail): the tail graph queued by the tier's after-card-side hook
     const bool attn_tail2 = std::getenv("STRATA_ATTN_TAIL") && std::string(std::getenv("STRATA_ATTN_TAIL")) == "2";
+    // STRATA_X_DEV=1 (decode, opt-in): the tier quantizes the MoE input where the attention graph left it (o_fn on the
+    // card) and the pool takes the routing readback's host copy - the same bytes without the per-layer host-to-device
+    // copy.  One GPU stage only (o_fn must be on the tier's card).
+    const bool x_dev_dec = std::getenv("STRATA_X_DEV") && std::getenv("STRATA_X_DEV")[0] == '1' && !pipe.enabled() &&
+                           !mc.cpu_only;
     // STRATA_DEC_ROUTE_LOG=F (diagnostic, off by default): the decode steps' routing in token order, for offline
     // cache-policy simulation (the batch passes' STRATA_ROUTE_LOG has no token order).  Before the first step one
     // "S <layer> <expert> <where>" line per cached expert (1 VRAM, 2 RAM arena, 3 both); then per step "T <pos>" and
@@ -1024,7 +1029,7 @@ int main(int argc, char ** argv) {
             if (g_imat.on()) g_imat.add(l, 1, top_k, n_embd, fn, ids1.data(), TG);   // STRATA_IMATRIX_OUT
             // STRATA_ATTN_TAIL=2: the dense half's tail graph goes out from inside the tier, right after its card side
             if (attn_tail2 && rdev) t.set_after_gpu([&d, l] { d.queue_tail(l); });
-            const bool tok_ok = rdev ? t.run_to_dev(l, ids1.data(), w1.data(), fn, rdev)
+            const bool tok_ok = rdev ? t.run_to_dev(l, ids1.data(), w1.data(), fn, rdev, x_dev_dec ? d.batch_fn_dev() : nullptr)
                                      : t.run(l, ids1.data(), w1.data(), fn, routed1.data());
             if (attn_tail2 && rdev) t.set_after_gpu(nullptr);
             if (!tok_ok) { ferr = "tier.run failed"; return false; }

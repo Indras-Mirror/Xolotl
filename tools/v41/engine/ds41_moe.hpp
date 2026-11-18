@@ -507,7 +507,10 @@ public:
     /// `run` with the weighted sum computed on the card and written to the device row `out_dev` (n_embd floats, e.g.
     /// the dense half's routed tensor): the same bits as `run`'s host sum, without its parts readback and upload.
     /// GPU tier only (false in cpu_only).
-    bool run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev);
+    /// x_dev (optional): the same activation on the card (the dense half's o_fn).  The card then quantizes it there and
+    /// the pool takes x - no host-to-device copy of the activation (STRATA_X_DEV).
+    bool run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev,
+                    const void* x_dev = nullptr);
     /// STRATA_ATTN_TAIL=2: `f` runs once, inside the next GPU-path layer call, right after that call has launched its
     /// card-side work (hits, PCIe share, vram_lru copies) - the dense half queues its tail graph there, behind the
     /// tier's kernels.  Cleared when it runs; a call that never gets there leaves it set (clear it with nullptr).
