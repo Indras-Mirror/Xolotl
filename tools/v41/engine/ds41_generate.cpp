@@ -922,8 +922,10 @@ int main(int argc, char ** argv) {
     // object between finish(l) and attn_router(l+1): no diagnostic predictions, state dumps or stage handoffs.
     const bool attn_ahead = std::getenv("STRATA_ATTN_AHEAD") && std::getenv("STRATA_ATTN_AHEAD")[0] == '1' &&
                             !file_pred && advise_ahead <= 0 && !dump_main && !pipe.enabled() && !mc.cpu_only;
-    // STRATA_ATTN_TAIL=2 (Ds41Dense::queue_tail): the tail graph queued by the tier's after-card-side hook
-    const bool attn_tail2 = std::getenv("STRATA_ATTN_TAIL") && std::string(std::getenv("STRATA_ATTN_TAIL")) == "2";
+    // STRATA_ATTN_TAIL=2 (Ds41Dense::queue_tail): the tail graph queued by the tier's after-card-side hook (=3 without
+    // STRATA_RB_HOOK runs as =2; with it queue_tail has nothing to queue)
+    const bool attn_tail2 = std::getenv("STRATA_ATTN_TAIL") && (std::string(std::getenv("STRATA_ATTN_TAIL")) == "2" ||
+                                                                std::string(std::getenv("STRATA_ATTN_TAIL")) == "3");
     // STRATA_X_DEV=1 (decode, opt-in): the tier quantizes the MoE input where the attention graph left it (o_fn on the
     // card) and the pool takes the routing readback's host copy - the same bytes without the per-layer host-to-device
     // copy.  One GPU stage only (o_fn must be on the tier's card).

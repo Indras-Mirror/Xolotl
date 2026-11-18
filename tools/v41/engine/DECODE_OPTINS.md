@@ -1,4 +1,4 @@
-# Decode opt-ins from the DeepInfer review (rb10 - rb12)
+# Decode opt-ins from the DeepInfer review (rb10 - rb13)
 
 A decode token runs 40 layers, and each layer makes a round trip:
 
@@ -173,6 +173,59 @@ hits run on in the same graph.
 - The hooks are set up at the first decode step, because the tier opens its VRAM cache after the prompt. Setting them
   drops the cached graphs once.
 
+## Fewer launches, branches inside the graphs (rb13)
+
+nsys on the rb11 decode, per graph launch (medians, under the profiler):
+
+- `cudaGraphLaunch` took 31 us for the attention graph (about 59 kernels) and 15 us for a small graph (about 13).
+- The attention graph's first kernel started 5 us after its launch call returned: the card waited for the launch. A
+  small graph's started 36 us after: it was queued behind earlier work.
+- Inside the attention graph, the hc mixes of the block input (rms norm 4.9 us, the 24-row product 8.5 us, mixes 0.8,
+  comb 1.8) ran between the output projection and `hc_post`, although only the block input feeds them.
+
+### `STRATA_ATTN_TAIL=3`
+
+Needs `STRATA_RB_HOOK` (without it, it runs as `=2`). The tail's ops (the FFN hc mixes and the shared expert) are the
+end of the attention graph itself: after the readback and hit hooks and the ring writes, the order they ran in as a
+graph of their own, without that graph's launch.
+
+### `GGML_OP_DSV41_STREAM` (vendored ggml)
+
+`ggml_dsv41_stream(ctx, a, mode, k, keep, n)` runs part of a graph on another stream of the CUDA backend:
+
+- mode 0 (fork): the nodes after it run on stream k, after the work queued before it.
+- mode 1 (end): the nodes after it run on the main stream again.
+- mode 2 (join): the main stream waits for stream k's work up to its last end node.
+
+Inside a CUDA graph a fork and a join are edges, the mechanism of ggml-cuda's own Q/K/V concurrency. The result is a
+view of `a`. The `keep` tensors stay allocated up to the node, so a join keeps a branch's graph tensors alive and the
+allocator gives none of their memory to a node that runs beside the branch.
+
+### `STRATA_GRAPH_CONC=7`
+
+Needs `STRATA_ATTN_TAIL` and the fused hc mix op. A sum of:
+
+- 1: the attention's hc mixes of the block input on stream 1, beside the attention. Forked behind the attention's
+  input (`xin`), joined before `hc_post`.
+- 2: `STRATA_HIT_FAST=3`'s hits on stream 1, behind the routing readback, joined at the graph's end.
+- 4: with `STRATA_ATTN_TAIL=3`, the FFN hc mixes and their writes on stream 2, beside the shared expert, joined at the
+  end.
+
+The same kernels run on the same inputs. In nsys, `=6` took the attention graph from 224.5 to 202.6 us.
+
+A fork as the graph's first operation (two root nodes) was slower: `=1` lost 4.9 %, and nsys's node tracing crashed
+on that graph. Behind `xin` the graph has one root.
+
+### `STRATA_QKV_FUSE=1`
+
+A layer's `attn_q_a` (5120 -> 1280) and `attn_kv` (5120 -> 512) both multiply `xn`, and both are Q8_0 here. With
+this switch they are two views of one [5120, 1792] tensor in VRAM. The upload writes each through its view, so it
+takes no extra memory.
+
+A one-token graph multiplies them as one matrix and splits the result. mmvq's launch shape depends on the type, K and
+the token count, not on the row count, so each row's dot product is the same. The prompt keeps two products (MMQ's
+stream-k split can depend on the row count).
+
 ## Measured
 
 GSQ, forced 1093, `--slots 2378`, interleaved pairs (tok/s):
@@ -234,6 +287,45 @@ A third set, three arms with the same switches:
 
 Routes and logits were 50c29791 in every arm. `=3` kept 19655 of 43680 armed launches (45 %).
 
+### rb13
+
+GSQ, the same run, interleaved, in tok/s. Every arm has the rb12 best set: the rb10 switches, `STRATA_META_PULL`,
+`STRATA_PF_HOSTWAIT`, `STRATA_RB_HOOK` and `STRATA_HIT_FAST=3` (`STRATA_ATTN_TAIL=2` from the configuration).
+
+| arms | pair 1 | pair 2 | pair 3 | pair 4 | mean |
+|---|---|---|---|---|---|
+| rb12 best | 41.22 | 41.24 | 41.26 | 41.25 | 41.24 |
+| + `ATTN_TAIL=3` | 41.48 | 41.45 | 41.48 | 41.47 | 41.47 (+0.55 %) |
+
+Each set below starts from rb12 best + `ATTN_TAIL=3`. The PC was in its slower state (about 39 tok/s for it).
+
+| arms | pair 1 | pair 2 | pair 3 | mean |
+|---|---|---|---|---|
+| + nothing | 39.39 | 39.29 | 39.26 | 39.31 |
+| + `GRAPH_CONC=2` | 40.02 | 39.94 | 39.99 | 39.98 (+1.70 %) |
+| + `GRAPH_CONC=4` | 39.67 | 39.70 | 39.74 | 39.70 (+0.99 %) |
+| + `GRAPH_CONC=6` | 40.19 | 40.20 | 40.19 | 40.19 (+2.24 %) |
+
+| arms | pair 1 | pair 2 | pair 3 | mean |
+|---|---|---|---|---|
+| + nothing | 39.18 | 39.24 | 39.32 | 39.25 |
+| + `GRAPH_CONC=6` | 40.22 | 40.13 | 40.20 | 40.18 (+2.39 %) |
+| + `GRAPH_CONC=7` | 40.59 | 40.62 | 40.56 | 40.59 (+3.42 %) |
+
+| arms | pair 1 | pair 2 | pair 3 | pair 4 | mean |
+|---|---|---|---|---|---|
+| + `GRAPH_CONC=7` | 40.32 | 40.61 | 40.62 | 40.50 | 40.51 |
+| + `GRAPH_CONC=7` + `QKV_FUSE` | 40.63 | 40.74 | 40.72 | 40.62 | 40.68 (+0.41 %) |
+
+The whole rb13 set against rb12 best, on the same build:
+
+| arms | pair 1 | pair 2 | pair 3 | pair 4 | mean |
+|---|---|---|---|---|---|
+| rb12 best | 38.32 | 39.10 | 38.99 | 42.57 | 39.75 |
+| + `ATTN_TAIL=3` + `GRAPH_CONC=7` + `QKV_FUSE` | 39.47 | 40.74 | 40.64 | 44.32 | 41.29 (+3.9 %) |
+
+The PC moved to its fast state for pair 4. Routes and logits were 50c29791 in every arm.
+
 ## Tried and removed
 
 `STRATA_INPUT_ASYNC`: a decode step's ~14 small inputs (embedding row, positions, window rows / mask, compressed-row
@@ -246,3 +338,13 @@ The first `STRATA_HIT_FAST` ran its launch on the tier's stream:
 
 - The tier's stream waited for the attention graph's event, and the dense stream waited for the launch's sum.
 - Both waits were released 0.2-0.3 ms late (nsys). It was slower than off (33.74 vs 34.24 tok/s, bit-identical).
+
+`STRATA_ATTN_AHEAD=2`: `finish_predict_attn`'s two graphs, built once more as one graph (the same nodes in the same
+order, its own tensors).
+
+- It saves a launch, but -0.45 % against `ATTN_TAIL=3` (41.47 -> 41.28 tok/s, 4 pairs, bit-identical).
+- The one launch call has to go out before any of it runs. The small finish + prediction part then waits for the
+  attention graph's launch call (the 31 us above), and the prediction lands later.
+
+The first `STRATA_GRAPH_CONC=1` forked at the very start of the attention graph (two root nodes): -4.9 % (39.27 ->
+37.36 tok/s, 4 pairs, bit-identical). Forked behind `xin` it gains (above).
