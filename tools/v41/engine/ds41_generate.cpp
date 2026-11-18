@@ -104,14 +104,18 @@ struct Args {
     double mirror_gib = 85.0;
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
     float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
-    float route_bias_file = 0.6f;    // --route-bias-file X: selection penalty -X on file-tier experts (neither VRAM nor RAM arena);
-                                     // DEFAULT 0.6 (Mal: max decode w/o too much loss): 21.1 vs 15.1 tok/s, code ppl 2.67->2.87, agentic 6.88->6.39
+    float route_bias_file = 0.0f;    // --route-bias-file X: selection penalty -X on file-tier experts (neither VRAM nor RAM arena);
+                                     // DEFAULT 0 = exact (local rb25; upstream 3d4328cd made it 0.6, Mal: max decode w/o too much
+                                     // loss: 21.1 vs 15.1 tok/s, code ppl 2.67->2.87, agentic 6.88->6.39)
     int   bias_prompt = 0;          // --bias-prompt N: quality proxy - apply route bias during the prompt, treating the first N
                                     // ranked experts as VRAM-resident (what the deferred seed will cache)
     float route_bias_remote = 0.0f;  // --route-bias-remote X: selection bonus +X on the experts the remote card (--remote-device)
                                      // holds - computed there beside the main card, off the decode's critical path (0 = as before)
-    float route_bias = 1.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed (DEFAULT 1.0, Mal 2026-10-11:
-                                  // ~4x decode; 4096-tok ppl code 2.38 -> 2.67, agentic 15.1 -> 6.9; --route-bias 0 = exact routing)
+    float route_bias = 0.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed (DEFAULT 0 = exact
+                                  // routing, local rb25: upstream 3532f148 made it 1.0, Mal 2026-10-11: ~4x decode; 4096-tok ppl code
+                                  // 2.38 -> 2.67, agentic 15.1 -> 6.9 - so a config that left the two flags out decoded on 1.0 / 0.6,
+                                  // the strongest nudge, without a word; --route-bias 1.0 --route-bias-file 0.6 = upstream's default)
+    bool route_bias_given = false;   // a --route-bias* flag was given (the load line says where the routing came from)
     std::vector<std::string> engram;
     std::string engram_hot;
     int n_predict = 64;
@@ -292,10 +296,10 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--serve") a.serve = true;
         else if (k == "--prune") a.prune = next();
         else if (k == "--prune-penalty") a.prune_penalty = (float) std::atof(next().c_str());
-        else if (k == "--route-bias") a.route_bias = (float) std::atof(next().c_str());
+        else if (k == "--route-bias") { a.route_bias = (float) std::atof(next().c_str()); a.route_bias_given = true; }
         else if (k == "--bias-prompt") a.bias_prompt = std::atoi(next().c_str());
-        else if (k == "--route-bias-file") a.route_bias_file = (float) std::atof(next().c_str());
-        else if (k == "--route-bias-remote") a.route_bias_remote = (float) std::atof(next().c_str());
+        else if (k == "--route-bias-file") { a.route_bias_file = (float) std::atof(next().c_str()); a.route_bias_given = true; }
+        else if (k == "--route-bias-remote") { a.route_bias_remote = (float) std::atof(next().c_str()); a.route_bias_given = true; }
         else if (k == "--quiet") a.quiet = true;
         else if (k == "--dump-logits") a.dump_logits = next();
         else if (k == "--dump-last") a.dump_last = next();
@@ -870,6 +874,12 @@ int main(int argc, char ** argv) {
     apply_bias();   // the prune part now (the prompt routes with it); route_bias again once the VRAM cache is seeded
     std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, experts %s, %zu classes\n",
                  (now_ms() - t_load) / 1000.0, n_layer, (long long) ctx, a.prefill_chunk, tier.mode(), TG.cls_gu.size());
+    // the decode routing this run starts on (a request's route_bias= keys change it), in the engine's own log: the server's
+    // "engine started" line with the flags can be written over by another process sharing the log
+    const bool exact_routing = a.route_bias == 0.0f && a.route_bias_file == 0.0f && a.route_bias_remote == 0.0f;
+    std::fprintf(stderr, "route bias: VRAM bonus %.2f, file penalty %.2f, remote bonus %.2f (%s)\n", a.route_bias,
+                 a.route_bias_file, a.route_bias_remote,
+                 exact_routing ? (a.route_bias_given ? "exact routing" : "exact routing, the default") : "decode routes are biased");
 
     // ---- the forward pieces
     std::vector<int> ids1((size_t) top_k);
@@ -2828,6 +2838,8 @@ int main(int argc, char ** argv) {
             std::string grammar_path, grammar_prefix, grammar_after;
             Q36Grammar grammar;
             float temp = a.temp, top_p = 1.0f, min_p = 0.0f;
+            bool req_seeded = false;   // seed=N: the generator restarts at N (else it goes on from the last request's draws)
+            uint64_t req_seed = 0;
             float req_rb = cfg_route_bias, req_rbf = cfg_route_bias_file, req_rbr = cfg_route_bias_remote;
             int req_rprot = cfg_rprot, req_rpool = cfg_rpool;
             std::vector<uint64_t> req_img_keys;   // img_keys=<hex>,<hex>.. (GENI): the server's key per picture, in prompt order
@@ -2846,7 +2858,7 @@ int main(int argc, char ** argv) {
                 else if (k == "top_p") top_p = (float) std::atof(v.c_str());
                 else if (k == "top_k") tk = std::atoi(v.c_str());
                 else if (k == "min_p") min_p = (float) std::atof(v.c_str());
-                else if (k == "seed") rng.seed((uint64_t) std::atoll(v.c_str()));
+                else if (k == "seed") { req_seed = (uint64_t) std::atoll(v.c_str()); rng.seed(req_seed); req_seeded = true; }
                 else if (k == "route_bias") req_rb = std::max(0.0f, (float) std::atof(v.c_str()));
                 else if (k == "route_bias_file") req_rbf = std::max(0.0f, (float) std::atof(v.c_str()));
                 else if (k == "route_bias_remote") req_rbr = std::max(0.0f, (float) std::atof(v.c_str()));
@@ -2879,6 +2891,13 @@ int main(int argc, char ** argv) {
                 cur_rpool = req_rpool;
                 std::fprintf(stderr, "serve: smart routing: exact top %d always kept, picks inside the exact top %d%s\n",
                              req_rprot, req_rpool, (req_rprot == 0 && req_rpool == 0) ? " (off: the flat bias)" : "");
+            }
+            // a sampled request's settings and seed in the log (the server sends a seed with every request, a new one when
+            // the client gives none: "seed": N repeats a turn on the same build, prompt and routing)
+            if (temp > 0.0f) {
+                const std::string seed_s = req_seeded ? std::to_string((unsigned long long) req_seed) : "none (the running generator)";
+                std::fprintf(stderr, "serve: sampling temperature %.2f, top_k %d, top_p %.2f, min_p %.2f, seed %s\n", temp, tk,
+                             top_p, min_p, seed_s.c_str());
             }
             std::vector<int> ids = csv.empty() ? std::vector<int>() : parse_csv(csv);
             if (ids.empty()) { std::printf("ERR empty prompt\n"); std::fflush(stdout); continue; }
