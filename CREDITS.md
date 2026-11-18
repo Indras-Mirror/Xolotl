@@ -48,6 +48,16 @@
   - the uniform expert cache reopen after an explicit-slot release (#130); explicit CPU worker and host placement for native
     DeepSeek (#131); DeepSeek-V4.1 predictor IDs read at their row stride (#132); the upstream CUDA radix top-k cutoff-tie fix
     backport (#133)
+- **[Keisawaakira](https://github.com/Keisawaakira)** (from their fork, ported 2026-11-19 on `field-ports-20261119`):
+  the DeepSeek-V4.1 decode switches rb10-rb18 and rb28/rb30 (ROUTE_FUSE, X_DEV, META_PULL, PF_HOSTWAIT, HIT_FAST,
+  RB_HOOK, ATTN_TAIL, GRAPH_CONC, QKV_FUSE, DEMOTE_ASYNC, HIT_PF, ROUTER_BF16, INPUT_PACK, EMBD_RAM, LRU_LATE, each
+  measured bit-identical in `tools/v41/engine/DECODE_OPTINS.md`), the build54 opt-ins (AA_EVENT, ENG_ASYNC, DEC_SPLIT,
+  CPU_OVERLAP, DENSE_ASYNC, PIN_RB, ATTN_AHEAD and more), disk sessions (SAVE / RESTORE), `--ablate` at run time,
+  STRATA_WIDE_PROMPT, STRATA_KV_GATHER, the Engram hot set for GGUF tables, the image encoder's LEND, Q6_K / Q5_K dense
+  matrices, MXFP8 Engram tables and the Windows RTX 5090 guide (`docs/WINDOWS_RTX5090.md`)
+- **[bnkaiteam / Juud_engine](https://github.com/bnkaiteam/Juud_engine)**: the adaptive pool spin and the skipped
+  activation quantization for card-only tokens (`STRATA_POOL_ADAPTIVE_SPIN`, `STRATA_SKIP_UNUSED_ACTQ`), measured on an
+  RTX 4090
 - **[Xiaomi2008](https://github.com/Xiaomi2008)**: IQ1_S routed experts for Unsloth's DeepSeek-V4.1 UD-IQ1_M (#86); ds41
   fused router ops and batched state copies (#87); DSML tool-call fixes and the opt-in keep_cut_tool_calls (#106,
   #109, #110)
