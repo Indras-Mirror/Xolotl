@@ -6664,6 +6664,21 @@ int chunk_pstage_min() {
     static const int pmin = std::getenv("STRATA_PRESTAGE_MIN") ? std::atoi(std::getenv("STRATA_PRESTAGE_MIN")) : 4096;
     return pmin;
 }
+/// STRATA_PSTAGE_MMQ_RPE (rows an expert, default 8): a call below it is "short" - its prestage keeps the old layout
+/// (chunk_pstage_fill) and, with STRATA_SHORT_MMVQ, every expert of it runs on MMVQ
+static double pstage_rpe_min() {
+    static const double r = std::getenv("STRATA_PSTAGE_MMQ_RPE") ? std::atof(std::getenv("STRATA_PSTAGE_MMQ_RPE")) : 8.0;
+    return r;
+}
+/// STRATA_SHORT_MMVQ=1 (opt-in; NOT the same bits as the default): a short call runs every expert on the grouped MMVQ.
+/// By default a short call's prestaged arena experts run on MMVQ and the ones past the region's end on MMQ, and the
+/// region is sized at each prompt from the free VRAM (min(STRATA_PRESTAGE_GIB, free - STRATA_PRESTAGE_KEEP_GIB)), so
+/// another process's VRAM moved experts between the two kernels and the same requests rounded differently (2026-10-29:
+/// Chrome's VRAM, regions 1.02-1.50 GiB).  With it the region and the keep-cache borrow only change the speed.
+static bool short_mmvq_on() {
+    static const bool on = std::getenv("STRATA_SHORT_MMVQ") && std::getenv("STRATA_SHORT_MMVQ")[0] == '1';
+    return on;
+}
 
 /// The prestage region, allocated once (false = prestage off for good: STRATA_PRESTAGE_GIB=0 or no room).
 bool chunk_pstage_alloc(Ds41MoeImpl& im) {
@@ -6679,6 +6694,8 @@ bool chunk_pstage_alloc(Ds41MoeImpl& im) {
         const char* kenv = std::getenv("STRATA_PRESTAGE_KEEP_GIB");
         const size_t want = (size_t) (gib * 1073741824.0), keep = (size_t) ((kenv ? std::atof(kenv) : 3.0) * 1073741824.0);
         gp.p_cap = fr > want + keep ? want : (fr > keep ? fr - keep : 0);
+        if (std::getenv("STRATA_PSTAGE_TRACE"))   // diagnostic: every prompt's region (release_chunk frees it)
+            std::fprintf(stderr, "pstage region: %.3f GiB (%.3f GiB free)\n", gp.p_cap / 1073741824.0, fr / 1073741824.0);
         if (gib <= 0 || gp.p_cap < ((size_t) 256 << 20) || cudaMalloc(&gp.p_buf, gp.p_cap) != cudaSuccess) {
             (void) cudaGetLastError();
             gp.p_buf = nullptr;
@@ -6722,7 +6739,7 @@ int chunk_pstage_fill(Ds41MoeImpl& im, int64_t layer, const int32_t* routed, int
     // 6.4K prompt's columns, ~44 rows an expert) packs only its routed experts, still at the stride (runs stay
     // strided).  STRATA_PSTAGE_PACK=0: the old layout for every fill.
     static const bool pack_env = !(std::getenv("STRATA_PSTAGE_PACK") && std::atoi(std::getenv("STRATA_PSTAGE_PACK")) == 0);
-    static const double rpe_min = std::getenv("STRATA_PSTAGE_MMQ_RPE") ? std::atof(std::getenv("STRATA_PSTAGE_MMQ_RPE")) : 8.0;
+    const double rpe_min = pstage_rpe_min();
     const bool by_class = pack_env && (double) rows * (double) im.g.top_k >= rpe_min * (double) NX;
     gp.p_packed = by_class;
     const size_t tail = (size_t) 1 << 20;   // MMQ reads up to 4 KiB past a matrix: never against the region's end
@@ -7284,6 +7301,9 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                                   (long long) layer, GL.gu_type, GL.up_type >= 0 ? GL.up_type : GL.gu_type, GL.d_type);
         }
         use_mmq = ok > 0 && MP.ok;
+        // STRATA_SHORT_MMVQ: a short call on MMVQ throughout (resident, prestaged and streamed experts alike)
+        if (use_mmq && short_mmvq_on() && (double) n * (double) im.g.top_k < pstage_rpe_min() * (double) im.g.n_experts)
+            use_mmq = false;
     }
     const int gt = MP.gt, ut = MP.ut, dt = MP.dt;   // the types MMQ multiplies (PTQ1_0 -> its Q2_0 copy)
     if (use_mmq) {
