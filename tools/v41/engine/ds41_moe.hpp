@@ -625,8 +625,9 @@ public:
     /// `need_bytes` are free, remembering slot -> expert; returns the number evicted (0: it already fits), or -1 when
     /// the cache is not segmented (the caller then falls back to release_cache).  `more`: the cache may already be
     /// shrunk for this batch - evict further tail slots (the batch's width came up short of the turn), regrow_cache
-    /// then refills both rounds.
-    int64_t shrink_cache_for(int64_t need_bytes, std::string& err, bool more = false);
+    /// then refills both rounds.  `fixed` (STRATA_SERVE_KEEP_FIXED): evict the tail slots that hold `need_bytes`,
+    /// whatever is free now - the evicted set then follows from the batch alone, not from a free-VRAM reading.
+    int64_t shrink_cache_for(int64_t need_bytes, std::string& err, bool more = false, bool fixed = false);
     /// After that prompt: map the tail back and refill exactly the evicted experts into exactly their slots (from the
     /// RAM arena, else the file).  Returns the number refilled, or -1 with `err`.
     int64_t regrow_cache(std::string& err);

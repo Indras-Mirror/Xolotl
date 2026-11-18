@@ -7877,7 +7877,7 @@ bool Ds41MoeTier::keep_cache_mode() {
     return on;
 }
 
-int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err, bool more) {
+int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err, bool more, bool fixed) {
 #if defined(DS4_MOE_CUDA)
     // every refusal says why (s6: the first A/B never kept the cache and logged nothing)
     if (!im_->gpu || !im_->gpu->cache) { err = "no VRAM cache"; return -1; }
@@ -7903,8 +7903,8 @@ int64_t Ds41MoeTier::shrink_cache_for(int64_t need_bytes, std::string& err, bool
     strata::core::ExpertCache& c = *im_->gpu->cache;
     if (cudaDeviceSynchronize() != cudaSuccess) { err = "shrink_cache_for: device failed"; return -1; }
     size_t fr = 0, tot = 0;
-    if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) { err = "shrink_cache_for: cudaMemGetInfo failed"; return -1; }
-    const int64_t deficit = need_bytes - (int64_t) fr;
+    if (!fixed && cudaMemGetInfo(&fr, &tot) != cudaSuccess) { err = "shrink_cache_for: cudaMemGetInfo failed"; return -1; }
+    const int64_t deficit = fixed ? need_bytes : need_bytes - (int64_t) fr;
     if (deficit <= 0) return 0;
     const int64_t keep_bytes = c.bytes() - deficit;
     if (keep_bytes <= 0) {   // the whole cache would go: release_cache is the same thing, done properly

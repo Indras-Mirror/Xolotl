@@ -3284,6 +3284,7 @@ int main(int argc, char ** argv) {
             // the decode after it skips the re-seed (regrow_cache refills just the tail).  The prompt still routes exactly.
             // s6 A/B: it never engages with the default --vram-lru (the LRU reorders slots, so "the tail" is not the
             // coldest experts and a batch-time admission could duplicate a saved one) - it needs --no-vram-lru for now.
+            static const bool pb_graph = !(std::getenv("STRATA_PB_GRAPH") && std::atoi(std::getenv("STRATA_PB_GRAPH")) == 0);
             bool kept = false;
             if (Ds41MoeTier::keep_cache_mode() && !by_step && dh >= 2 && !(defer_vram && cache_open))
                 std::fprintf(stderr, "serve: keep-cache: not applicable (deferred VRAM %d, cache open %d)\n", (int) defer_vram,
@@ -3295,19 +3296,46 @@ int main(int argc, char ** argv) {
                     static const double keep_short = std::getenv("STRATA_SERVE_KEEP_SHORT_MIB") ? std::atof(std::getenv("STRATA_SERVE_KEEP_SHORT_MIB")) : 0.0;
                     const double need = (4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
                                         a.vram_margin_gib * 1073741824.0 - keep_short * 1048576.0;
+                    // STRATA_SERVE_KEEP_FIXED=1 (opt-in): the borrow follows from the batch alone - the width's need below
+                    // (both terms + one segment) less the margin, plus STRATA_SERVE_KEEP_PAD_GIB (default 1.5) for what
+                    // the decode's own buffers took of the margin since the seed (0.5-1.3 GiB on GSQ, 2026-10-28).  Sized
+                    // from a free-VRAM reading, one 631-token turn of one config took 587-649 tail slots over five runs,
+                    // and the batch's placement (so its rounding and the answers after it) moved with them.  `need`
+                    // stays the floor: a fixed borrow that leaves less free is topped up from the reading (logged).
+                    static const bool keep_fixed = std::getenv("STRATA_SERVE_KEEP_FIXED") && std::getenv("STRATA_SERVE_KEEP_FIXED")[0] == '1';
+                    static const double keep_pad = std::getenv("STRATA_SERVE_KEEP_PAD_GIB") ? std::atof(std::getenv("STRATA_SERVE_KEEP_PAD_GIB")) : 1.5;
+                    double give = 0.0;
+                    if (keep_fixed) {
+                        const double g_need = pb_graph ? (double) dense.span_graph_bytes(total, SB) : 0.0;
+                        give = 64.0 * 1048576.0 + keep_pad * 1073741824.0 +
+                               std::max(4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) dh,
+                                        2.5 * 1073741824.0 + 0.78 * 1048576.0 * (double) dh + g_need);
+                    }
                     std::string kerr;
                     int64_t g = 0; bool shrink_ok = true;
                     for (int st = 0; st < pipe.n_stages(); ++st) {
                         std::string sk;
-                        const int64_t gs = pipe.tier(st).shrink_cache_for((int64_t) need, sk);
+                        const int64_t gs = keep_fixed ? pipe.tier(st).shrink_cache_for((int64_t) give, sk, false, true)
+                                                      : pipe.tier(st).shrink_cache_for((int64_t) need, sk);
                         if (gs < 0) { shrink_ok = false; kerr = sk.empty() ? kerr : sk; g = -1; break; }
                         g += gs;
                     }
+                    int64_t g_short = 0;
+                    if (shrink_ok && g >= 0 && keep_fixed)
+                        for (int st = 0; st < pipe.n_stages(); ++st) {
+                            std::string sk;
+                            const int64_t gs = pipe.tier(st).shrink_cache_for((int64_t) need, sk, true);
+                            if (gs > 0) g_short += gs;
+                        }
                     if (shrink_ok && g >= 0) {
                         kept = true;
                         int64_t stay = 0; for (int st = 0; st < pipe.n_stages(); ++st) stay += pipe.tier(st).resident();
                         std::fprintf(stderr, "serve: cache kept for a %d-token batch (%lld tail slots out, %lld experts stay)\n",
-                                     dh, (long long) g, (long long) stay);
+                                     dh, (long long) (g + g_short), (long long) stay);
+                        if (keep_fixed)
+                            std::fprintf(stderr, "serve: keep-cache: fixed borrow %.2f GiB = %lld slots%s\n", give / 1073741824.0,
+                                         (long long) g, g_short > 0 ? " - short of the free VRAM the batch needs, more from the "
+                                                                      "reading (this turn is not reproducible)" : "");
                     } else if (!kerr.empty()) {
                         std::fprintf(stderr, "serve: keep-cache: %s - releasing the cache\n", kerr.c_str());
                     }
@@ -3491,8 +3519,7 @@ int main(int argc, char ** argv) {
                 // prompt's batches took 13.01 GiB with a 1.16 GiB graph - 11.85 GiB besides it = 2.5 GiB + run20's
                 // 0.78 MiB a column - and its last batch's 4.56 GiB graph left 2.33 GiB free, as the term says.  Up to
                 // the allowance (here every context up to 512K at the full width) the cap is the one it was.
-                // STRATA_PB_GRAPH=0: the line alone (diagnostics).
-                static const bool pb_graph = !(std::getenv("STRATA_PB_GRAPH") && std::atoi(std::getenv("STRATA_PB_GRAPH")) == 0);
+                // STRATA_PB_GRAPH=0 (pb_graph, above the keep-cache block): the line alone (diagnostics).
                 const double g_need = pb_graph ? (double) dense.span_graph_bytes(total, SB) : 0.0;   // memoized per row count
                 double room = 0;
                 int fit_line = 0, fit_g = 0;

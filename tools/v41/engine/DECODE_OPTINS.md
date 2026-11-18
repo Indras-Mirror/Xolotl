@@ -1,4 +1,4 @@
-# Decode opt-ins from the DeepInfer review (rb10 - rb14)
+# Decode opt-ins from the DeepInfer review (rb10 - rb15)
 
 A decode token runs 40 layers, and each layer makes a round trip:
 
@@ -422,6 +422,35 @@ One-shot, the 15.3K prompt + 300 forced tokens (`--slots 1900`):
 
 rb5 differs from rb14 by the base changes since rb5 (for example rb8e's tie rule in the prompt top-k). The pairs ran
 one after the other, and the PC moved to a faster state during the runs: compare within a pair only.
+
+## Keep-cache's fixed borrow (rb15)
+
+`STRATA_SERVE_KEEP_FIXED=1` (opt-in): for a short batch turn, keep-cache gives back a fixed part of the VRAM cache,
+worked out from the batch alone. Before, it gave back what a free-VRAM reading said was missing.
+
+- The part: what the batch needs by the width check below it (both terms, plus one 64 MiB segment), plus
+  `STRATA_SERVE_KEEP_PAD_GIB` (default 1.5). The pad stands for what the decode's own buffers took of the 2 GiB margin
+  since the seed: 0.5 to 1.3 GiB on GSQ.
+- The old target stays as a floor. If the free VRAM after the fixed part is still short of it, the rest comes from
+  the reading as before, and the log says that the turn is not reproducible.
+- Cost: 30 to 140 more slots out than the reading asked for. Refilling 656 to 728 slots took 205 to 319 ms, so about
+  10 to 40 ms more per batch turn.
+
+The new GSQ configuration (the rb14 candidate + this), srvtest, 11 scenarios:
+
+| runs | slots out per batch turn | answers |
+|---|---|---|
+| twice, back to back | the same in both: 665 (21-80 tokens), 728 (631), 656-684 after the 15.7K prompt | differ from the 2nd request on |
+| twice, `STRATA_ARENA_REBAL=0` | the same | 11 of 11 identical, the cancelled stream too |
+| `STRATA_ARENA_REBAL=0`, 8 s idle before each request | the same | identical up to the 15.7K prompt, then not |
+
+- With the rebalance on, the arena's background swaps finish at times that depend on the gaps between requests, and
+  an expert's tier changes CPU vs GPU rounding (known since 2026-10-22).
+- With the 8 s gaps, the cache's re-seed after the 15.7K prompt took 2367 slots instead of 2364. The re-seed is sized
+  from the free VRAM at that moment (23.31 to 23.34 GiB over six runs). Not fixed yet.
+- The rebalance did not change the speed here. All-decode, back to back: 48.03 / 47.58 tok/s on, 49.05 / 49.73 off.
+  With the 8 s gaps, when all 3,385 planned swaps were done: 48.05 on, 47.73 off. Prompt phases matched to 0.05 s.
+- The K:\model\test configuration runs with `STRATA_SERVE_KEEP_FIXED=1` and `STRATA_ARENA_REBAL=0` since 2026-10-28.
 
 ## Tried and removed
 
