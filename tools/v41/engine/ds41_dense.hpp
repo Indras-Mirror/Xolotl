@@ -220,6 +220,13 @@ public:
     /// no pinned readbacks (can_attn_ahead) or a graph is not cached yet.
     bool finish_predict_attn(int il, const float * routed_sum, int next_il, int * top_ids, int n_top);
     bool can_attn_ahead() const;   // STRATA_PIN_RB's pinned packet + STRATA_DENSE_ASYNC, a one-token pass
+    /// STRATA_HIT_FAST (decode): the layer whose attention graph finish_predict_attn queued (-1 = none), the routing
+    /// that graph writes on the card (o_ids / o_wts, n_used each; null on the CPU backend), and the backend's CUDA
+    /// stream (null when it is not CUDA) - the tier queues that layer's hits behind the graph before the readback lands.
+    int ahead_layer() const;
+    const int32_t * ids_dev() const;
+    const float * wts_dev() const;
+    void * cuda_stream() const;
     /// STRATA_ATTN_TAIL=2: queue layer il's tail graph (the FFN hc mixes + the shared expert that attn_router left
     /// out) if it is still owed; the decode loop calls it from the tier's after-card-side hook.  finish / predict
     /// queue an owed tail themselves, so a missed call only costs the overlap.  True when there is nothing to do.

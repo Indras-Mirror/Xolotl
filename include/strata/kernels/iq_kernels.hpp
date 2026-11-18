@@ -101,6 +101,18 @@ struct RowsSumSel {
 };
 void decode_rows_sum_sel(const float* parts, const float* host_rows, const RowsSumSel& ws, int K, int64_t H, float* out,
                          void* stream);
+/// STRATA_META_PULL (ds41 decode): copy `bytes` (a multiple of 4) from mapped pinned host memory `src` (its device
+/// address) to device memory `dst` with a kernel, on `stream` - not through the copy engine, where a small copy waits
+/// behind every bulk DMA queued before it.
+void pull_from_host(void* dst, const void* src, size_t bytes, void* stream);
+/// STRATA_HIT_FAST (ds41 decode): the routed hits' grouped-launch addresses from the routing on the card.  row[e]: expert
+/// e's VRAM slot address, 0 = not resident.  All K of ids resident -> grp_ptr[k] = row[ids[k]], *n_groups = K; else
+/// *n_groups = 0 (then the grouped kernels and decode_rows_sum_gated do nothing).  All pointers are device memory.
+void decode_hit_dispatch(const int32_t* ids, const unsigned long long* row, int K, int n_experts,
+                         unsigned long long* grp_ptr, int32_t* n_groups, void* stream);
+/// decode_rows_sum_sel without pool rows, the weights in device memory, and only when *gate != 0: the same bits.
+void decode_rows_sum_gated(const float* parts, const float* w, const int32_t* gate, int K, int64_t H, float* out,
+                           void* stream);
 
 /// A770 port (STRATA_PF_XMX=2): up to kXmxGroupMax experts' products in one XMX launch, the weights decoded from the
 /// quantized rows into local memory.  Expert i: Y_i[cnt[i]][N] = X_i . W_i^T (X FP16, Y FP32, rows back to back).

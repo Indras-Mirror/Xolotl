@@ -929,6 +929,12 @@ int main(int argc, char ** argv) {
     // copy.  One GPU stage only (o_fn must be on the tier's card).
     const bool x_dev_dec = std::getenv("STRATA_X_DEV") && std::getenv("STRATA_X_DEV")[0] == '1' && !pipe.enabled() &&
                            !mc.cpu_only;
+    // STRATA_HIT_FAST=1 (decode, opt-in; needs STRATA_ATTN_AHEAD's queued attention graphs): the tier queues each layer's
+    // hits behind its attention graph, from the routing on the card (Ds41MoeTier::spec_hits).  A layer whose experts are
+    // all VRAM-resident then has no host trip between the router and the hits, or between their sum and the finish.
+    // The same kernels on the same values: the same bits.  =2: only for a layer whose predicted top-k (the prefetch's
+    // prediction) is all resident - the others skip the launch, which does nothing there.
+    const int hit_fast = attn_ahead && std::getenv("STRATA_HIT_FAST") ? std::atoi(std::getenv("STRATA_HIT_FAST")) : 0;
     // STRATA_DEC_ROUTE_LOG=F (diagnostic, off by default): the decode steps' routing in token order, for offline
     // cache-policy simulation (the batch passes' STRATA_ROUTE_LOG has no token order).  Before the first step one
     // "S <layer> <expert> <where>" line per cached expert (1 VRAM, 2 RAM arena, 3 both); then per step "T <pos>" and
@@ -995,6 +1001,11 @@ int main(int argc, char ** argv) {
                     t.prefetch(l, top16, 16);
                 }
                 have_pred = false;
+            }
+            if (hit_fast > 0 && rdev && d.ahead_layer() == l) {
+                bool want = true;
+                for (int j = 0; hit_fast == 2 && want && j < top_k; ++j) want = top16[j] >= 0 && t.resident(l, top16[j]);
+                if (want) t.spec_hits(l, d.ids_dev(), d.wts_dev(), d.batch_fn_dev(), rdev, d.cuda_stream());
             }
             if (dprof) { const double t1 = dp_now(); dp[1] += t1 - ta; ta = t1; }
             const float * fn = nullptr;

@@ -515,6 +515,17 @@ public:
     /// card-side work (hits, PCIe share, vram_lru copies) - the dense half queues its tail graph there, behind the
     /// tier's kernels.  Cleared when it runs; a call that never gets there leaves it set (clear it with nullptr).
     void set_after_gpu(std::function<void()> f);
+    /// STRATA_HIT_FAST (decode, opt-in): queue `layer`'s routed hits ON `dense_stream` (a cudaStream_t), behind what it
+    /// holds now - the attention graph that writes the routing (ids_dev / w_dev, top_k each) and the MoE input (x_dev)
+    /// on the card - before the host has the routing.  A one-thread dispatch looks the routed experts up in a pinned
+    /// table of VRAM slot addresses; when all top_k are resident, the hits' grouped launch and the weighted sum into
+    /// out_dev run from it, the kernels and values the layer's run_to_dev would launch.  Otherwise they do nothing.
+    /// The next run_to_dev(layer, ..., out_dev) keeps the launch when the routing it gets is all resident in the slots
+    /// the table had (then that call has no card work, and what the dense stream queues next reads the sum in order);
+    /// every other call runs as before.  False (no launch) when the layer's experts do not share one format class or
+    /// the setup has no such path.
+    bool spec_hits(int64_t layer, const int32_t* ids_dev, const float* w_dev, const void* x_dev, void* out_dev,
+                   void* dense_stream);
     /// The same with `x` already on the device (the engine's attention output).  CUDA modes only.
     bool run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out);
 

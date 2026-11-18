@@ -3342,6 +3342,17 @@ bool Ds41Dense::can_attn_ahead() const {
     return im.rb_fn && dense_async() && im.n == 1 && !im.rows_mode && !im.o_xids;
 }
 
+int Ds41Dense::ahead_layer() const { return p_->ahead_il; }
+const int32_t * Ds41Dense::ids_dev() const { return p_->cpu || !p_->o_ids ? nullptr : (const int32_t *) p_->o_ids->data; }
+const float * Ds41Dense::wts_dev() const { return p_->cpu || !p_->o_wts ? nullptr : (const float *) p_->o_wts->data; }
+void * Ds41Dense::cuda_stream() const {
+#ifdef DS41_HAVE_CUDA
+    return p_->cpu ? nullptr : ggml_backend_cuda_get_stream(p_->backend);
+#else
+    return nullptr;
+#endif
+}
+
 bool Ds41Dense::finish_predict_attn(int il, const float * routed_sum, int next_il, int * top_ids, int n_top) {
     Impl & im = *p_;
     if (!tail_flush(im)) return false;   // STRATA_ATTN_TAIL=2: the layer's tail first (it writes what this reads)
