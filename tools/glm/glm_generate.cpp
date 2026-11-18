@@ -195,7 +195,8 @@ int main(int argc, char ** argv) {
                              "       [--lora adapter.gguf] [--prefill-chunk N [--chunk-mmq] [--chunk-prestage]] [--allow-long-ctx]\n"
                              "       [--prune f [--prune-penalty X]] [--arena-adapt [--arena-admit HALF_LIFE_TOKENS]]\n"
                              "       [--skip-miss T] [--skip-file T] [--skip-file-prefill T] [--renorm-skip] [--arena-lazy] [--vram-grow KEEP_GIB]\n"
-                             "       [--lora-exps] (with --lora: also apply the routed-expert ffn_*_exps deltas)\n");
+                             "       [--lora-exps] (with --lora: also apply the routed-expert ffn_*_exps deltas)\n"
+                             "       [--remote-device N [--remote-gib G]] (a second card computes a static set of experts)\n");
         return 2;
     }
     std::vector<int> prompt = a.ids_csv.empty() ? std::vector<int>() : parse_csv(a.ids_csv);
