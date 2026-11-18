@@ -4065,9 +4065,9 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     if (dem_async) dem_drain(gp, layer);   // the last token's demotions into this layer's arena slots
     ++im.run_seq;
     im.run_layer = layer;
-    // spec_read's stash: this call's routing is known now, so its wrong guesses stop reading (STRATA_SPEC_CANCEL=0 =
-    // let them finish, the old behaviour)
-    static const bool spec_cancel = !(std::getenv("STRATA_SPEC_CANCEL") && std::getenv("STRATA_SPEC_CANCEL")[0] == '0');
+    // spec_read's stash: this call's routing is known now, so its wrong guesses stop reading.  STRATA_SPEC_CANCEL=1
+    // (opt-in in Xolotl until it is measured on this box; Keisawaakira's build54 has it on): the same outputs, fewer reads
+    static const bool spec_cancel = std::getenv("STRATA_SPEC_CANCEL") && std::getenv("STRATA_SPEC_CANCEL")[0] == '1';
     if (gp.spec && spec_cancel) gp.spec->cancel_unrouted(layer, im.run_seq, ids6, (int) K);
     if (lru && !im.cfg.arena_adapt) ++im.tick;   // (arena_adapt bumps it below)
     if (im.cfg.arena_adapt) {   // every lookup of this layer is a use (the LRU the arena swaps below evict by)
