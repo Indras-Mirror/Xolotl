@@ -15,6 +15,9 @@
 #endif
 #ifdef DS41_HAVE_CUDA
 #include "ggml-cuda.h"
+#if !defined(STRATA_ENABLE_CUDA)
+#include <cuda_runtime.h>   // (STRATA_INPUT_PACK's batched copy; this target is built without STRATA_ENABLE_CUDA)
+#endif
 #endif
 #ifdef DS41_HAVE_SK
 #include "strata/kernels/iq_kernels.hpp"
@@ -85,6 +88,21 @@ bool route_fuse() {
 static bool route_fuse_vl() {
     static const bool on = route_fuse() && std::atoi(std::getenv("STRATA_ROUTE_FUSE")) >= 2;
     return on;
+}
+
+// STRATA_ROUTER_BF16=1 (opt-in, rb28; a llama.cpp GGUF's BF16 router, ISTA's): the router stays BF16 on the card
+// instead of the F32 the loader widens it to (150 instead of 300 MiB for V4.1-Flash).  A single-token router or
+// prediction multiplies it directly (mul_mat_vec_f's BF16 path: the same values, the same FMAs and block shape as the
+// F32 path, half the bytes read); a multi-token one widens it to F32 in the graph first (router_w) - the same F32
+// matrix as before for every other kernel.
+static bool router_bf16() {
+    static const bool on = env_on("STRATA_ROUTER_BF16", false);
+    return on;
+}
+
+// the router matrix a graph multiplies `n` columns by (STRATA_ROUTER_BF16: F32 again for n > 1)
+static ggml_tensor * router_w(ggml_context * gc, ggml_tensor * w, int64_t n) {
+    return w->type == GGML_TYPE_BF16 && n > 1 ? ggml_cast(gc, w, GGML_TYPE_F32) : w;
 }
 
 // The decode graphs are built once and reused; stamping a uid lets ggml-cuda reuse its captured CUDA graph.  One
@@ -321,6 +339,10 @@ struct Ds41Dense::Impl {
     // tensors (upload_inputs) or their reallocation (alloc_state) resets it.
     int64_t span_memo_pos0 = -1;
     int span_memo_col0 = -1, span_memo_n = -1;
+    // STRATA_INPUT_PACK: a single-token pass's inputs as one batched copy (upload_inputs / flush_pack)
+    std::vector<uint8_t> pack_host;
+    std::vector<void *> pack_dst;
+    std::vector<size_t> pack_off, pack_sz;
     ggml_tensor * i_lastblk = nullptr;    // F32 [NC]   (nvis - 1) / block size: the pinned candidate block (ratio 1)
     ggml_tensor * i_eng[2] = {};          // F32 [EC * ED, NC]  Engram rows
     ggml_tensor * neg_ramp = nullptr;     // F32 [cmax1]  -i     (constant)
@@ -479,7 +501,7 @@ struct Ds41Dense::Impl {
         tail_need = -1;   // a layer abandoned between attn_router and finish: its tail would only feed that finish
         if (ahead_il >= 0 || tail_pending) { ggml_backend_synchronize(backend); ahead_il = -1; tail_pending = false; }
     }
-    bool upload_inputs(const int * tids, int n, int pos0);
+    bool upload_inputs(const int * tids, int n, int pos0, bool pack = false);
 };
 
 // ================================================================== weights
@@ -502,6 +524,7 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
         // upstream's engram_gate is an operand of an F32 multiply like the q_norm / k_norm it replaces: F32 whatever the
         // quantizer stored
         if (ends("engram_gate.weight")) return (ggml_type) ti.type == GGML_TYPE_F32 ? -1 : GGML_TYPE_F32;
+        if (router_bf16() && ends("ffn_gate_inp.weight")) return -1;   // STRATA_ROUTER_BF16: kept as the file has it
         if ((ggml_type) ti.type != GGML_TYPE_BF16) return -1;
         return ends("ffn_gate_inp.weight") || ends("engram_q_norm.weight") || ends("engram_k_norm.weight") ? GGML_TYPE_F32 : GGML_TYPE_F16;
     };
@@ -1705,7 +1728,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * fn = b.rms_w(xffn, im.BL(il, "ffn_norm.weight"));                             // [D, n]
 
     // ---- router (model.py Gate): sqrt(softplus), top-k on score + bias, weights from the raw scores
-    ggml_tensor * rl = ggml_mul_mat(gc, im.BL(il, "ffn_gate_inp.weight"), fn);
+    ggml_tensor * rl = ggml_mul_mat(gc, router_w(gc, im.BL(il, "ffn_gate_inp.weight"), fn->ne[1]), fn);
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
     static const float rb_margin = std::getenv("STRATA_RB_MARGIN") ? (float) std::atof(std::getenv("STRATA_RB_MARGIN")) : -1.0f;
 #if defined(STRATA_DSV41_ROUTE_OP)
@@ -2004,7 +2027,7 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
     ggml_tensor * x = ggml_dsv4_hc_pre(gc, b.cols3(im.x_state, D, HC, n), b.cols2(im.pre_state, HC, n));
-    ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(il), b.rms_w(x, im.BL(il, "ffn_norm.weight")));
+    ggml_tensor * rl = ggml_mul_mat(gc, router_w(gc, im.BLpred(il), n), b.rms_w(x, im.BL(il, "ffn_norm.weight")));
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
     ggml_tensor * rb = ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1);
     if (route_fuse() && !im.cpu) {   // STRATA_ROUTE_FUSE: the same top 16 in one op
@@ -2870,10 +2893,73 @@ static bool engram_ahead_take(Ds41Dense::Impl & im, int64_t pos0, int n, bool & 
 
 // Per-token inputs of n tokens at positions pos0.. (embeddings, positions, the window / compressed / indexer index
 // maps, the Engram rows and the per-pass ring slots).  Shared by begin() and begin_batch().
-bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
+// STRATA_INPUT_PACK=1 (opt-in, rb28; CUDA 12.8+): a single-token pass's ~15 small inputs (21.5 KB; embeddings, positions,
+// window rows / mask, compressed slots, ratio-2 state rows) as ONE cudaMemcpyBatchAsync on the backend's stream instead
+// of 15 cudaMemcpyAsync + cudaStreamSynchronize pairs on cudaStreamPerThread (~0.24 ms a token).  The driver reads the
+// host bytes during the call (cudaMemcpySrcAccessOrderDuringApiCall), the graphs that read them run after them on the
+// same stream: the same bytes.  Only begin()'s single-token pass: the batch path's upload_span writes some of the same
+// tensors synchronously afterwards.
+static bool input_pack(const Ds41Dense::Impl & im) {
+#if defined(DS41_HAVE_CUDA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+    static const bool on = env_on("STRATA_INPUT_PACK", false);
+    return on && !im.cpu;
+#else
+    (void) im;
+    return false;
+#endif
+}
+
+static bool flush_pack(Ds41Dense::Impl & im) {
+#if defined(DS41_HAVE_CUDA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+    const size_t k = im.pack_dst.size();
+    if (k == 0) return true;
+    std::vector<const void *> src(k);
+    for (size_t i = 0; i < k; ++i) src[i] = im.pack_host.data() + im.pack_off[i];
+    cudaMemcpyAttributes at = {};
+    at.srcAccessOrder = cudaMemcpySrcAccessOrderDuringApiCall;
+    size_t ai = 0;
+    const cudaStream_t st = (cudaStream_t) ggml_backend_cuda_get_stream(im.backend);
+    const cudaError_t e = cudaMemcpyBatchAsync(im.pack_dst.data(), src.data(), im.pack_sz.data(), k, &at, &ai, 1, st);
+    if (e == cudaSuccess) return true;
+    // (a driver without it: the same copies one by one, synchronously, as before)
+    static bool said = false;
+    if (!said) std::fprintf(stderr, "ds41_dense: STRATA_INPUT_PACK: cudaMemcpyBatchAsync failed (%s) - copying one by one\n",
+                            cudaGetErrorString(e));
+    said = true;
+    (void) cudaGetLastError();
+    for (size_t i = 0; i < k; ++i)
+        if (cudaMemcpyAsync(im.pack_dst[i], src[i], im.pack_sz[i], cudaMemcpyHostToDevice, st) != cudaSuccess) {
+            im.err = "input upload failed";
+            return false;
+        }
+    if (cudaStreamSynchronize(st) != cudaSuccess) { im.err = "input upload failed"; return false; }
+    return true;
+#else
+    (void) im;
+    return true;
+#endif
+}
+
+bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0, bool pack) {
     Impl & im = *this;
     im.span_memo_pos0 = -1;   // this writes i_widx / i_wslot / i_sidx / i_sslot: upload_span's memo is stale
     const int64_t D = im.D, SWA = im.SWA, RAW = im.RAW;
+    // STRATA_INPUT_PACK (pack: begin()'s single-token pass): the inputs below are gathered and go out as ONE batched
+    // copy at the end (flush_pack), not one synchronous ggml_backend_tensor_set each
+    const bool pk = pack && input_pack(im);
+    im.pack_host.clear();
+    im.pack_dst.clear();
+    im.pack_off.clear();
+    im.pack_sz.clear();
+    auto put = [&](ggml_tensor * t, const void * d, size_t sz) {
+        if (!pk) { ggml_backend_tensor_set(t, d, 0, sz); return; }
+        const size_t off = im.pack_host.size();
+        im.pack_host.resize(off + ((sz + 15) & ~(size_t) 15));
+        std::memcpy(im.pack_host.data() + off, d, sz);
+        im.pack_dst.push_back(t->data);
+        im.pack_off.push_back(off);
+        im.pack_sz.push_back(sz);
+    };
     // embeddings (F16 rows on the mmap)
     im.host_emb.resize((size_t) (D * n));
     for (int t = 0; t < n; ++t) {
@@ -2893,12 +2979,12 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             std::memcpy(im.host_emb.data() + (size_t) t * D, im.vis_rows + (size_t) v * D, (size_t) D * 4);
             img[(size_t) t] = 1.0f;
         }
-        ggml_backend_tensor_set(im.i_img, img.data(), 0, (size_t) n * 4);
+        put(im.i_img, img.data(), (size_t) n * 4);
     }
-    ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), 0, im.host_emb.size() * 4);
+    put(im.i_emb, im.host_emb.data(), im.host_emb.size() * 4);
     std::vector<int32_t> pos(n);
     for (int t = 0; t < n; ++t) pos[t] = pos0 + t;
-    ggml_backend_tensor_set(im.i_pos, pos.data(), 0, (size_t) n * 4);
+    put(im.i_pos, pos.data(), (size_t) n * 4);
     // window: per query the SWA positions [p - SWA + 1, p] as rows of [ring (RAW) | pass rows]
     std::vector<int32_t> widx((size_t) (SWA * n));
     std::vector<float> wm((size_t) (SWA * n));
@@ -2915,13 +3001,13 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             wm[(size_t) (t * SWA + j)] = m;
         }
     }
-    ggml_backend_tensor_set(im.i_widx, widx.data(), 0, widx.size() * 4);
-    ggml_backend_tensor_set(im.i_wmask, wm.data(), 0, wm.size() * 4);
+    put(im.i_widx, widx.data(), widx.size() * 4);
+    put(im.i_wmask, wm.data(), wm.size() * 4);
     {
         const int64_t k = std::min<int64_t>(n, RAW);
         std::vector<int32_t> ws((size_t) k);
         for (int64_t j = 0; j < k; ++j) ws[(size_t) j] = (int32_t) ((pos0 + n - k + j) % RAW);
-        ggml_backend_tensor_set(im.i_wslot, ws.data(), 0, ws.size() * 4);
+        put(im.i_wslot, ws.data(), ws.size() * 4);
     }
     // compressed rows per ratio
     for (int r = 1; r <= 2; ++r) {
@@ -2934,13 +3020,13 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             cs[t] = (int32_t) (done ? p / r : im.cmax[r]);   // an open group writes the spare row
             cp[t] = (int32_t) ((p / r) * r);
         }
-        ggml_backend_tensor_set(im.i_nvis[r], nv.data(), 0, (size_t) n * 4);
-        ggml_backend_tensor_set(im.i_cslot[r], cs.data(), 0, (size_t) n * 4);
-        ggml_backend_tensor_set(im.i_cpos[r], cp.data(), 0, (size_t) n * 4);
+        put(im.i_nvis[r], nv.data(), (size_t) n * 4);
+        put(im.i_cslot[r], cs.data(), (size_t) n * 4);
+        put(im.i_cpos[r], cp.data(), (size_t) n * 4);
         if (r == 1) {
             std::vector<float> lb(n);
             for (int t = 0; t < n; ++t) lb[t] = (float) ((nv[t] - 1) >= 0 ? (int64_t) (nv[t] - 1) / im.CBS : -1);
-            ggml_backend_tensor_set(im.i_lastblk, lb.data(), 0, (size_t) n * 4);
+            put(im.i_lastblk, lb.data(), (size_t) n * 4);
         }
     }
     {   // ratio-2 state: rows of [ring (2) | pass states] for each token's group (2g, 2g+1); open groups repeat 2g
@@ -2953,9 +3039,10 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         }
         const int64_t k = std::min<int64_t>(n, 2);
         for (int64_t j = 0; j < k; ++j) ss.push_back((int32_t) ((pos0 + n - k + j) % 2));
-        ggml_backend_tensor_set(im.i_sidx, si.data(), 0, si.size() * 4);
-        ggml_backend_tensor_set(im.i_sslot, ss.data(), 0, ss.size() * 4);
+        put(im.i_sidx, si.data(), si.size() * 4);
+        put(im.i_sslot, ss.data(), ss.size() * 4);
     }
+    if (pk && !flush_pack(im)) return false;
     // Engram rows: hash the whole pass now and START the (dedup/sort/coalesce) reads; they are waited - and the rows
     // moved to the state tensor - by the first Engram layer's span (engram_ready), so the disk read overlaps the
     // embeddings upload, the init graph and the layers below it.  A tiny batch (decode) still runs on the caller.
@@ -3006,7 +3093,7 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     im.pos0 = pos0;
     im.n = n;
     im.rows_mode = false;
-    if (!im.upload_inputs(tids, n, pos0)) return false;
+    if (!im.upload_inputs(tids, n, pos0, n == 1)) return false;
     span_pass_caps(im, pos0, n, im.pass_cap);
     // embeddings -> state
     ggml_context * gc = nullptr;
