@@ -1211,7 +1211,8 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         ggml_tensor * wsrc = ggml_concat(gc, SL.raw->type == GGML_TYPE_F32 ? SL.raw : ggml_cast(gc, SL.raw, GGML_TYPE_F32), gkv2, 1);     // [DH, RAW + k]
         // F16 key path for this graph only when the zero index covers its padding (255 pad rows x k queries at most)
         const bool f16 = im.f16_gather && 255 * gk <= im.zidx->ne[0];
-        ggml_tensor * Kw = ggml_reshape_3d(gc, rows_as(gc, wsrc, b.v1(im.i_widx, SWA * gk, (size_t) gc0 * SWA * 4), f16), DH, SWA, gk);
+        ggml_tensor * widx = b.v1(im.i_widx, SWA * gk, (size_t) gc0 * SWA * 4);
+        ggml_tensor * Kw = ggml_reshape_3d(gc, rows_as(gc, wsrc, widx, f16), DH, SWA, gk);
         ggml_tensor * Mw = b.cols2(im.i_wmask, SWA, gk, gc0);
         {
             const int64_t k = std::min<int64_t>(gk, RAW);
@@ -1221,6 +1222,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
 
         // ---- compressed KV (kv sources write it; every ratio > 0 layer reads its source's)
         ggml_tensor * Kc = nullptr, * Mc = nullptr;
+        ggml_tensor * kc_src = nullptr, * kc_idx = nullptr;   // Kc's source rows / indices (STRATA_KV_GATHER)
         ggml_tensor * comp_w = nullptr, * idxk_w = nullptr;   // this group's writes (later reads depend on them)
         const int64_t gcap = gp.cap;
         if (r) {
@@ -1351,13 +1353,34 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                     sel = ggml_view_2d(gc, IS.sel, K, gk, IS.sel->nb[1], (size_t) gc0 * IS.sel->nb[1]);
                     selm = ggml_view_2d(gc, IS.selm, K, gk, IS.selm->nb[1], (size_t) gc0 * IS.selm->nb[1]);
                 }
-                Kc = ggml_reshape_3d(gc, rows_as(gc, comp, ggml_cont(gc, ggml_reshape_1d(gc, ggml_cont(gc, sel), K * gk)), f16), DH, K, gk);
+                kc_idx = ggml_cont(gc, ggml_reshape_1d(gc, ggml_cont(gc, sel), K * gk));
+                kc_src = comp;
+                Kc = ggml_reshape_3d(gc, rows_as(gc, comp, kc_idx, f16), DH, K, gk);
                 Mc = ggml_cont(gc, selm);
                 // the source's rows must be read AFTER this pass wrote its own (a kv source attends to its new row)
             }
         }
 
         // ---- attention: per query its window rows + its top-k compressed rows, one flash-attn with the query as batch
+        // STRATA_KV_GATHER=1: the F16 key block [window | top-k | zero pad] is written by ONE op instead of three
+        // gathers and two concats (the same bytes, see ggml_dsv41_kv_gather)
+        static const bool kv_gather = env_on("STRATA_KV_GATHER", false);
+        if (kv_gather && f16 && Kc && !merge_fa && !im.cpu) {
+            const int64_t M0 = SWA + Kc->ne[1], pad = M0 % 256 ? 256 - M0 % 256 : 0;
+            ggml_tensor * Kall = ggml_dsv41_kv_gather(gc, wsrc, ggml_reshape_2d(gc, widx, SWA, gk), kc_src,
+                                                      ggml_reshape_2d(gc, kc_idx, Kc->ne[1], gk), (int) pad);
+            ggml_tensor * Mall = ggml_concat(gc, Mw, Mc, 0);
+            if (pad) Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, gk), NEG_INF), 0);
+            const int64_t M = M0 + pad;
+            ggml_tensor * gq = whole ? q : ggml_cont(gc, ggml_view_3d(gc, q, DH, NH, gk, q->nb[1], q->nb[2], (size_t) rel * q->nb[2]));
+            ggml_tensor * k4 = ggml_reshape_4d(gc, Kall, DH, M, 1, gk);
+            ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, gq, DH, NH, 1, gk), 0, 2, 1, 3);    // [DH, 1, NH, k]
+            ggml_tensor * m4 = ggml_cast(gc, ggml_reshape_4d(gc, Mall, M, 1, 1, gk), GGML_TYPE_F16);
+            ggml_tensor * og = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
+            ggml_flash_attn_ext_add_sinks(og, im.BL(il, "attn_sinks.weight"));
+            o_parts.push_back(ggml_reshape_3d(gc, og, DH, NH, gk));
+            continue;
+        }
         ggml_tensor * Kall = Kc ? ggml_concat(gc, Kw, Kc, 1) : Kw;                                 // [DH, M, k]
         ggml_tensor * Mall = Mc ? ggml_concat(gc, Mw, Mc, 0) : Mw;                                 // [M, k]
         if (merge_fa) { k_parts.push_back(KPart { Kall, Mall, gk, f16 }); continue; }
