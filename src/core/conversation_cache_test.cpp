@@ -153,6 +153,33 @@ int main() {
         check(!cache.evict_oldest(), "the gate's loop can reach an empty cache: false");
         check(cache.size() == 0 && cache.evictions() == 2, "evict_oldest on an empty cache is a no-op");
     }
+    {
+        // xolotl --conversation-cache-exchange (generate.cpp park_source): two clients whose conversations fit the
+        // budget one at a time but not together (measured 2026-11-17: 3.52 + 5.04 GiB against 8 GiB).  On a switch the
+        // incoming one is take()n but still alive (`held`); charging it refuses the outgoing park every turn, so one
+        // conversation is re-read from scratch on each of its turns.  The exchange path retries with held = 0.
+        auto sized = [](std::initializer_list<int32_t> ids, size_t floats) {
+            SavedConversation s = image(ids);
+            s.live.gdn.assign(floats, 7);
+            return s;
+        };
+        const size_t A = sized({1, 2, 3}, 3520).bytes(), B = sized({9, 8, 7}, 5040).bytes();
+        ConversationCache cache(A + B - 512 * sizeof(float), 4);   // either fits alone, both together do not
+        // A is live; the first switch to B parks A (nothing held)
+        check(cache.make_room(A, 0) && cache.put(sized({1, 2, 3}, 3520), 0), "exchange: A parks on the first switch");
+        for (int turn = 0; turn < 4; ++turn) {
+            const bool to_a = turn % 2 == 0;                     // B live -> A, then A live -> B, ...
+            const std::vector<int64_t>& want = to_a ? a : b;
+            auto m = cache.best(want, {}, true);
+            check(m.tokens == 3, "exchange: the incoming conversation is parked");
+            SavedConversation incoming = cache.take(m.index);
+            const size_t held = incoming.bytes(), out = to_a ? B : A;
+            check(!cache.make_room(out, held), "exchange: charging the held image refuses the park (the old thrash)");
+            check(cache.make_room(out, 0), "exchange: without it the outgoing conversation fits");
+            check(cache.put(to_a ? sized({9, 8, 7}, 5040) : sized({1, 2, 3}, 3520), 0), "exchange: outgoing parked");
+            check(cache.size() == 1 && cache.evictions() == 0, "exchange: one parked, nothing evicted");
+        }
+    }
     {   // the RAM gate's eviction skips a conversation that holds a pinned shared prefix, and says so (false)
         ConversationCache cache(1 << 20, 4);
         auto pinned = image({1, 2, 3});

@@ -12,6 +12,9 @@
 
 ## Latest
 
+- **18 Nov** - The dense engine runs looped transformers: SenseNova-Loop-9B (layers 4-27 twice, two mHC streams) at
+  Q8_0 matches the reference within Q8_0 error, prompt 3,027 tok/s and decode 45 tok/s on a 4090. Opt-in FP32
+  activations halve its KL against FP32. [CHANGELOG](docs/xolotl/CHANGELOG.md#looped-transformers-in-the-dense-engine-sensenova-loop-9b-18-nov).
 - **17 Nov** - Keenable joins the web search choices in Settings > Tools and is the first that works with no key (its
   public endpoint; an optional key lifts the rate limits). DuckDuckGo stays the default. Proposed by KGKallasmaa (#139).
   [CHANGELOG](docs/xolotl/CHANGELOG.md#keenable-as-a-web-search-choice-with-or-without-a-key-17-nov).

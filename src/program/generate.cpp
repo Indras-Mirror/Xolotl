@@ -833,6 +833,14 @@ struct Options {
     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
     /// whole-snapshot copy for nothing.  0 = park every turn, as before.
     int64_t conversation_cache_park_gain = 0;
+    /// xolotl: --conversation-cache-exchange.  On a switch the incoming conversation is taken out of the cache but is
+    /// still alive while the outgoing one parks, so the park is charged for both (`held`).  Two conversations that
+    /// together exceed the budget then never both park: the outgoing one is dropped every turn and its next turn
+    /// re-reads the whole prompt (measured 2026-11-17: 3.52 + 5.04 GiB against 8 GiB, 77 s of prefill per turn).
+    /// With this on, a park that fits the budget once the incoming image is gone goes ahead: the cache runs over its
+    /// budget by at most that image for the length of the exchange.  The physical-RAM gate (MemAvailable, the floor)
+    /// still decides whether the RAM is there.  Off = the old accounting.
+    bool conversation_cache_exchange = false;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -999,6 +1007,10 @@ void usage() {
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
                  "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
+                 "  --conversation-cache-exchange  --serve: on a switch, park the outgoing conversation when it fits\n"
+                 "                       once the incoming one is restored, instead of charging both against the budget\n"
+                 "                       (two conversations bigger than the budget together then both stay parked;\n"
+                 "                       the RAM floor still applies; default off)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
@@ -3200,6 +3212,7 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = true;
         else if (a == "--audio-pad") o.audio_pad = std::atoll(next("--audio-pad"));
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
+        else if (a == "--conversation-cache-exchange") o.conversation_cache_exchange = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
@@ -10761,10 +10774,21 @@ int main(int argc, char** argv) {
             // estimate must stay uncapped: it counts the retained buffers'
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
+            // --conversation-cache-exchange: `held` is the incoming image, freed as soon as it is restored.  When the
+            // park fits only without it, charge the budget for the steady state (the RAM gate below still sees the
+            // held image in MemAvailable, so real memory stays guarded).  A guarded donor's refusal is not retried.
             if (!conversations.make_room(estimate, held)) {
-                std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
-                             estimate >> 20);
-                return true;
+                if (o.conversation_cache_exchange && held > 0 && !conversations.guard_blocked() &&
+                    conversations.make_room(estimate, 0)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: exchange: parking %zu MiB beside the incoming %zu MiB "
+                                         "(over budget until it is restored)\n", estimate >> 20, held >> 20);
+                    held = 0;
+                } else {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget"
+                                         "%s)\n", estimate >> 20,
+                                 held > 0 ? (" with the incoming " + std::to_string(held >> 20) + " MiB held").c_str() : "");
+                    return true;
+                }
             }
             const auto t0 = Clock::now();
             try {

@@ -8,6 +8,47 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Looped transformers in the dense engine: SenseNova-Loop-9B (18 Nov)
+
+`xolotl-dense` runs models that repeat a block of layers per token. SenseNova-Loop-9B (a Qwen3.5-9B body) runs layers
+4-27 twice, so 32 layers make 56 executions, and inside that block it carries two residual streams mixed by Sinkhorn
+routers (mHC). The engine keeps one execution slot per run of a layer: a repeat shares the weights (no second copy in
+VRAM) and owns its own KV cache or GDN state, as the reference does. The file's loop and mHC settings come from the
+GGUF (arch `qwen35loop`, converter `tools/sensenova/convert_sensenova_loop.py`). `--layer-schedule 0-3,4-27,4-27,28-31`
+loops any dense file the same way, without copying weights. The file's YaRN is applied only with
+`STRATA_DENSE_FILE_ROPE=1`.
+
+Measured on an RTX 4090, Q8_0, 768 tokens of code, prose and agent text, against the Hugging Face model in FP32 (no
+YaRN on either side; `tools/sensenova/hf_ref_logits.py`):
+
+| run | top-1 | KL mean |
+| --- | ---: | ---: |
+| xolotl-dense, Q8_0 | 95.96 % | 0.0289 |
+| xolotl-dense, Q8_0, `STRATA_DENSE_ACT_F32=1` | 97.14 % | 0.0146 |
+| Hugging Face with Q8_0 weights (rounded in FP32), for reference | 97.27 % | 0.0168 |
+
+- **The prompt goes through the batched MMQ prefill** with the mHC block in it (same kernels as decode, a chunk of
+  tokens at a time): 318 -> 3,027 tok/s on a 2K prompt (decode 41.5 -> 45.4 tok/s, run-to-run noise). `--check` passes
+  (MMQ prefill vs one token at a time: 1.28 %, the usual MMQ figure; the 27B is unchanged at 1.12 %).
+  `STRATA_DENSE_MHC_PREFILL=0` returns to the old path.
+- **`STRATA_DENSE_ACT_F32=1` (opt-in):** Q8_0 projections multiply the FP32 activation instead of its q8_1 copy. It halves
+  the KL above and matches the Hugging Face Q8_0-weights run (KL 0.002 between them). It costs decode speed (45.4 ->
+  37.7 tok/s) and sends the prompt through the one-token path (275 tok/s), so it stays off by default.
+- **`STRATA_DENSE_PROF=1`** has an `mhc` bucket: on this model the mHC steps take 4.9 of 24.5 ms per token.
+- **`xolotl-dense --logits`** writes teacher-forced log-probabilities for parity checks; `XOLOTL_LOGITS_PREFILL=N` takes
+  every N-th position through the batched prefill.
+
+The reference implementation is SenseTime's (the model's `modeling_sensenova_loop.py`).
+
+### `--conversation-cache-exchange`: two big conversations stop evicting each other (18 Nov, opt-in, not yet measured)
+
+When the server switches between two conversations that each fit the conversation cache but not together, the
+incoming one was counted against the budget while the outgoing one was parked, so the park was refused and the bigger
+conversation re-read its whole prompt on every turn (seen on Qwen3.8-Flash-Next: ~76 s per turn on a 300K
+conversation). With `--conversation-cache-exchange` the park is retried without counting the incoming image, which is
+freed moments later; the physical-RAM check still applies. A unit test replays the measured sequence on the real cache
+class. It has not yet been measured with two live clients, so it is off by default.
+
 ### Keenable as a web search choice, with or without a key (17 Nov)
 
 Settings > Tools > Web search has a fifth choice beside the keyed services: Keenable (no key needed). Chosen, the agent's

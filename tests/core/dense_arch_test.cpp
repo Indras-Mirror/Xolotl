@@ -12,6 +12,9 @@
 using strata::core::DenseArchProbe;
 using strata::core::dense_arch_refusal;
 using strata::core::dense_hc_refusal;
+using strata::core::dense_loop_plan;
+using strata::core::dense_parse_schedule;
+using strata::core::dense_mhc_plan_refusal;
 
 static int failures = 0;
 
@@ -91,6 +94,34 @@ int main() {
     {
         const std::string r = dense_hc_refusal(4, 320, 5120, /*with_mtp=*/true);
         check(!r.empty() && names(r, "nextn_hc_head"), "hyper-connections + MTP is refused, naming what is missing");
+    }
+
+    // ---- xolotl: layer schedules (looped files, --layer-schedule) and the mHC block rule
+    {
+        std::string e;
+        const std::vector<int> p = dense_loop_plan(32, 4, 28, 2, e);
+        check(e.empty() && p.size() == 56, "SenseNova-Loop-9B: 32 layers, [4, 28) twice -> 56 executions");
+        check(p[3] == 3 && p[4] == 4 && p[27] == 27 && p[28] == 4 && p[51] == 27 && p[52] == 28 && p[55] == 31,
+              "the loop plan runs 0-3, 4-27, 4-27, 28-31 in order");
+        check(dense_loop_plan(32, 4, 28, 1, e).empty() && e.empty(), "count 1 is the plain model (empty plan, no error)");
+        check(dense_loop_plan(32, 4, 40, 2, e).empty() && !e.empty(), "a loop past the last layer is refused");
+        std::vector<int> q;
+        check(dense_parse_schedule("0-3,4-27,4-27,28-31", 32, q).empty() && q == p,
+              "--layer-schedule spelling the same loop gives the same plan");
+        check(dense_parse_schedule("", 32, q).empty() && q == p, "an empty --layer-schedule leaves the plan alone");
+        check(dense_parse_schedule("0-63,10-20,64-79", 80, q).empty() && q.size() == 91, "an RYS-style repeat on 80 layers");
+        check(!dense_parse_schedule("0-3,,5", 32, q).empty(), "an empty item is refused");
+        check(!dense_parse_schedule("0-32", 32, q).empty(), "a layer past the trunk is refused");
+        check(!dense_parse_schedule("5-3", 32, q).empty(), "a backwards range is refused");
+        check(!dense_parse_schedule("1x", 32, q).empty(), "trailing junk is refused");
+        check(dense_mhc_plan_refusal(p, 32, 4, 28).empty(), "each loop pass covers the whole mHC block: ok");
+        check(dense_mhc_plan_refusal({}, 32, 4, 28).empty(), "the plain order covers it: ok");
+        std::vector<int> half;
+        dense_parse_schedule("0-15,4-27,28-31", 32, half);
+        check(!dense_mhc_plan_refusal(half, 32, 4, 28).empty(), "leaving the mHC block early is refused");
+        std::vector<int> mid;
+        dense_parse_schedule("0-27,10-27,28-31", 32, mid);
+        check(!dense_mhc_plan_refusal(mid, 32, 4, 28).empty(), "entering the mHC block in the middle is refused");
     }
 
     if (failures == 0) {

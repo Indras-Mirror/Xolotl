@@ -121,6 +121,8 @@ void dense_attn_chunk_fmt(const float* q, const void* k_cache, const void* v_cac
 
 /// y[r, :] = W x[r, :] for r in [0, rows): the batched form of dense_gemv_f32 (one warp per output row per input row).
 void dense_gemv_f32_rows(const float* W, const float* X, float* y, int n_in, int n_out, int rows, void* stream);
+/// xolotl: y = W x, W in Q8_0 blocks, x FP32 (no q8_1 activation rounding); n = 1..8 columns, y [n][n_out].
+void dense_gemv_q80_f32(const void* W, const float* X, float* y, int n_in, int n_out, int n, void* stream);
 
 /// The 4-tap causal conv + SiLU over a chunk: history is [channels, 3] (oldest first, updated in place to the
 /// chunk's last three inputs), qkv and h are [T, channels].  Only the SiLU output is written (the decode path keeps
@@ -158,5 +160,14 @@ void dense_gdn_gates(const float* alpha, const float* dt, const float* ssm_a, fl
 void dense_gdn_rec_chunk(float* state, const float* h, const float* gate, const float* beta, const float* z,
                          const float* gamma, float eps, float* y, int k_heads, int v_heads, int T,
                          const DenseGdnSnap& snap = {}, void* stream = nullptr);
+
+/// xolotl mHC (SenseNova-Loop), see dense_kernels.cu: R is [n][S][E] streams, W [rows][S*E], b [rows] (F32),
+/// coef [n][2S + S*S] (pre, post, mix).  read: router + branch (= pre_scale * pre . R); write: R = mix R + post y;
+/// enter: R[j] = x for every stream; leave: x = mean_j R[j].  S <= 4.
+void dense_mhc_read(const float* R, const float* W, const float* b, int S, int E, int iters, bool fixed_identity,
+                    float pre_scale, float* branch, float* coef, int n, void* stream);
+void dense_mhc_write(float* R, const float* coef, const float* y, int S, int E, int n, void* stream);
+void dense_mhc_enter(const float* x, float* R, int S, int E, int n, void* stream);
+void dense_mhc_leave(const float* R, float* x, int S, int E, int n, void* stream);
 
 }  // namespace strata::kernels

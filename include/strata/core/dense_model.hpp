@@ -54,6 +54,22 @@ namespace strata::core
         /// Hyper-connections (the Flash-Next / Qwen4 gated residual): `hc` residual streams of `n_embd` and the
         /// rank of their down/up bottleneck. 0 = the plain pre-norm residual (Qwen3.8-27B, architecture qwen35).
         int hc = 0, hc_lr = 0;
+        /// xolotl: the layer schedule.  plan[s] is the physical layer execution slot s runs; every slot has its own
+        /// KV cache / GDN state and shares its physical layer's weights.  A looped file (`<arch>.loop.{start,end,
+        /// count}`, SenseNova-Loop) runs [start, end) `count` times; --layer-schedule overrides it for any file.
+        /// Empty plan = 0..n_layer-1, the plain model.
+        std::vector<int> plan;
+        int n_slot() const { return plan.empty() ? n_layer : (int) plan.size(); }
+        int phys(int slot) const { return plan.empty() ? slot : plan[(size_t) slot]; }
+        /// xolotl: manifold-constrained hyper-connections (SenseNova-Loop): `mhc_streams` residual streams on the
+        /// physical layers [mhc_start, mhc_end).  Each visit of mhc_start expands the hidden state into the streams and
+        /// each visit of mhc_end - 1 averages them back, so a loop pass starts and ends with one vector.  0 = none.
+        int mhc_streams = 0, mhc_start = 0, mhc_end = 0, mhc_iters = 20;
+        bool mhc_fixed_identity = false;
+        float mhc_pre_scale = 1.0f;
+        bool has_mhc() const { return mhc_streams > 0; }
+        int mhc_rows() const { return 2 * mhc_streams + (mhc_fixed_identity ? 0 : mhc_streams * mhc_streams); }
+        bool mhc_layer(int physical) const { return has_mhc() && physical >= mhc_start && physical < mhc_end; }
         float rms_eps = 1e-6f, rope_base = 1e7f;
         int32_t eos_id = -1; ///< tokenizer.ggml.eos_token_id: the id that ends an answer
         int conv_channels() const { return 2 * ssm_state * ssm_k_heads + ssm_state * ssm_v_heads; }
@@ -91,6 +107,10 @@ namespace strata::core
         int draft_vocab_extra = 16384;  ///< rows kept free after the shortlist for draft_vocab_extend()
         int64_t kv_resident = 0;        ///< cells per KV head kept in VRAM, the rest in host RAM (0 = all in VRAM, -1 = auto: what fits)
         int vram_reserve_mib = 0;       ///< VRAM left free for another program (the vision encoder) when budgeting
+        /// xolotl: --layer-schedule "0-3,4-27,4-27,28-31": the physical layers to run, in order, overriding the file's
+        /// own loop.  Repeated layers share weights (no extra VRAM for them) and get their own KV / GDN state.  Lets
+        /// any dense file run a repeated-layer schedule without a merged copy.  Empty = the file's schedule.
+        std::string layer_schedule;
     };
 
     class DenseModel

@@ -12,7 +12,10 @@
 // Header-only and GPU-free: the loader (src/core/dense_model.cpp) and tests/core/dense_arch_test.cpp share it.
 #pragma once
 
+#include <algorithm>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace strata::core {
 
@@ -67,4 +70,71 @@ inline std::string dense_hc_refusal(int hc, int hc_lr, int n_embd, bool with_mtp
     return {};
 }
 
+/// xolotl: the execution plan of a looped file: [0, start), then [start, end) `count` times, then [end, n_layer).
+/// Empty when the loop keys describe no loop (count <= 1) or are out of range; `err` says which.
+inline std::vector<int> dense_loop_plan(int n_layer, int start, int end, int count, std::string& err) {
+    std::vector<int> plan;
+    if (!(0 <= start && start < end && end <= n_layer) || count < 1) {
+        err = "dense model: loop [" + std::to_string(start) + ", " + std::to_string(end) + ") x" + std::to_string(count) +
+              " does not fit " + std::to_string(n_layer) + " layers";
+        return plan;
+    }
+    if (count == 1) return plan;
+    for (int l = 0; l < start; ++l) plan.push_back(l);
+    for (int c = 0; c < count; ++c)
+        for (int l = start; l < end; ++l) plan.push_back(l);
+    for (int l = end; l < n_layer; ++l) plan.push_back(l);
+    return plan;
+}
+/// xolotl: --layer-schedule "0-3,4-27,4-27,28-31" (comma-separated layers or inclusive ranges) -> the plan.  Empty
+/// string = ok and the plan untouched.  Every layer has to be a trunk layer; the schedule must run at least one.
+inline std::string dense_parse_schedule(const std::string& s, int n_layer, std::vector<int>& plan) {
+    if (s.empty()) return {};
+    std::vector<int> out;
+    size_t at = 0;
+    while (at <= s.size()) {
+        const size_t comma = std::min(s.find(',', at), s.size());
+        const std::string item = s.substr(at, comma - at);
+        at = comma + 1;
+        if (item.empty()) return "dense model: --layer-schedule has an empty item in '" + s + "'";
+        const size_t dash = item.find('-');
+        int a = -1, b = -1;
+        try {
+            size_t used = 0;
+            a = std::stoi(item.substr(0, dash), &used);
+            if (used != (dash == std::string::npos ? item.size() : dash)) a = -1;
+            b = a;
+            if (dash != std::string::npos) {
+                b = std::stoi(item.substr(dash + 1), &used);
+                if (used != item.size() - dash - 1) b = -1;
+            }
+        } catch (const std::exception&) {
+            a = b = -1;
+        }
+        if (a < 0 || b < 0 || a >= n_layer || b >= n_layer || b < a)
+            return "dense model: --layer-schedule item '" + item + "' is not a layer or range inside 0.." +
+                   std::to_string(n_layer - 1);
+        for (int l = a; l <= b; ++l) out.push_back(l);
+        if (comma == s.size()) break;
+    }
+    plan = std::move(out);
+    return {};
+}
+/// xolotl: mHC streams exist only inside [mhc_start, mhc_end): the visit of mhc_start creates them and the visit of
+/// mhc_end - 1 averages them away.  So every run of mHC layers in the plan has to be exactly mhc_start .. mhc_end - 1,
+/// in order.  Empty when the plan keeps that.
+inline std::string dense_mhc_plan_refusal(const std::vector<int>& plan, int n_layer, int mhc_start, int mhc_end) {
+    std::vector<int> p = plan;
+    if (p.empty())
+        for (int l = 0; l < n_layer; ++l) p.push_back(l);
+    for (size_t i = 0; i < p.size();) {
+        if (p[i] < mhc_start || p[i] >= mhc_end) { ++i; continue; }
+        for (int l = mhc_start; l < mhc_end; ++l, ++i)
+            if (i >= p.size() || p[i] != l)
+                return "dense model: the layer schedule enters the mHC block [" + std::to_string(mhc_start) + ", " +
+                       std::to_string(mhc_end) + ") somewhere other than its start or leaves it early (slot " +
+                       std::to_string(i) + "); the streams only exist across the whole block";
+    }
+    return {};
+}
 }  // namespace strata::core

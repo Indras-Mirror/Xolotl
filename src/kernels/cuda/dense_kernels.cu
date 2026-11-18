@@ -948,6 +948,48 @@ __global__ void gemv_f32_rows_kernel(const float* __restrict__ W, const float* _
     if (lane == 0) y[(size_t) col * n_out + row] = acc;
 }
 
+// xolotl: y = W x with W in Q8_0 GGUF blocks (f16 scale + 32 int8) and x in FP32 - no q8_1 rounding of the activation.
+// For files whose error is dominated by the activation rounding (SenseNova-Loop: q8_1 activations cost ~4x the Q8_0
+// weights, 18 Nov parity).  One warp per output row, every column in the same pass so the row is read once; eight
+// lanes per block (lane k of the eight takes values 4k..4k+3: two 2-byte loads, the block's int8s start at byte 2) so a
+// warp walks four consecutive blocks per step.  Accumulation in FP32, the dequantized weight times the FP32 input:
+// the same product the reference computes from a dequantized Q8_0 file.
+constexpr int kQ80F32MaxCols = 8;
+__global__ void gemv_q80_f32_kernel(const uint8_t* __restrict__ W, const float* __restrict__ X, float* __restrict__ y,
+                                    int n_in, int n_out, int n) {
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= n_out) return;
+    const int lane = threadIdx.x & 31, k = lane & 7;
+    const int nb = n_in >> 5;
+    const uint8_t* wr = W + (size_t) row * nb * 34;
+    float acc[kQ80F32MaxCols];
+#pragma unroll
+    for (int c = 0; c < kQ80F32MaxCols; ++c) acc[c] = 0.0f;
+    for (int b = lane >> 3; b < nb; b += 4) {
+        const uint8_t* blk = wr + (size_t) b * 34;
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const uint16_t u0 = *reinterpret_cast<const uint16_t*>(blk + 2 + 4 * k);
+        const uint16_t u1 = *reinterpret_cast<const uint16_t*>(blk + 4 + 4 * k);
+        const float q0 = (float) (int8_t) (u0 & 0xff), q1 = (float) (int8_t) (u0 >> 8);
+        const float q2 = (float) (int8_t) (u1 & 0xff), q3 = (float) (int8_t) (u1 >> 8);
+        const size_t xo = (size_t) b * 32 + 4 * k;
+#pragma unroll
+        for (int c = 0; c < kQ80F32MaxCols; ++c) {
+            if (c < n) {
+                const float4 xv = *reinterpret_cast<const float4*>(X + (size_t) c * n_in + xo);
+                acc[c] += d * (q0 * xv.x + q1 * xv.y + q2 * xv.z + q3 * xv.w);
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < kQ80F32MaxCols; ++c) {
+        if (c < n) {
+            const float v = warp_sum(acc[c]);
+            if (lane == 0) y[(size_t) c * n_out + row] = v;
+        }
+    }
+}
+
 // One thread per conv channel, walking the chunk inside the launch (the decode path's conv_silu with a token loop).
 // The thread owns its channel's whole 4-tap window, so a snapshot of the history after column j is three stores from
 // registers it already has: that is how a speculative pass gets its rollback points without a copy per column.
@@ -1389,6 +1431,15 @@ void dense_gemv_f32_rows(const float* W, const float* X, float* y, int n_in, int
     check("dense_gemv_f32_rows");
 }
 
+void dense_gemv_q80_f32(const void* W, const float* X, float* y, int n_in, int n_out, int n, void* stream) {
+    if (n < 1) return;
+    if (n > kQ80F32MaxCols || (n_in & 31)) throw std::runtime_error("dense_gemv_q80_f32: 1..8 columns, n_in a multiple of 32");
+    const int warps = 4;
+    gemv_q80_f32_kernel<<<(n_out + warps - 1) / warps, warps * 32, 0, (cudaStream_t) stream>>>(
+        (const uint8_t*) W, X, y, n_in, n_out, n);
+    check("dense_gemv_q80_f32");
+}
+
 void dense_gdn_conv_chunk(float* history, const float* qkv, const float* conv_w, float* h, int channels, int T,
                           const DenseGdnSnap& snap, void* stream) {
     if (T < 1) return;
@@ -1434,6 +1485,147 @@ void dense_gdn_rec_chunk(float* state, const float* h, const float* gate, const 
     gdn_rec_chunk_kernel<<<v_heads, block, 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y,
                                                                        k_heads, v_heads, T, snap);
     check("dense_gdn_rec_chunk");
+}
+
+// ============================================================================ xolotl: mHC (SenseNova-Loop)
+//
+// The reference is modeling_sensenova_loop.py MHCRouter.  One column holds S residual streams of E floats, stream-major
+// ([S][E], the reference's flatten(-2) order, which the router weight's columns follow).  Per column:
+//   rsq     = rsqrt(mean(R^2) + 1e-6)                    (over all S*E values, no weight)
+//   logits  = rsq * (W . R) + b                           W [rows][S*E], rows = 2S (+ S*S unless fixed_identity)
+//   pre     = sigmoid(logits[0:S])          branch = pre_scale * sum_j pre[j] * R[j]
+//   post    = 2 * sigmoid(logits[S:2S])
+//   mix     = sinkhorn(logits[2S:], iters)  (log space: rows, then columns; identity when fixed)
+// and the write is R'[i] = sum_j mix[i][j] R[j] + post[i] * y.  coef holds pre[S], post[S], mix[S*S] per column.
+namespace {
+constexpr int kMhcMaxS = 4, kMhcMaxRows = 2 * kMhcMaxS + kMhcMaxS * kMhcMaxS, kMhcThreads = 512;
+
+__global__ void mhc_read_kernel(const float* __restrict__ R, const float* __restrict__ W, const float* __restrict__ b,
+                                int S, int E, int rows, int iters, bool fixed_identity, float pre_scale,
+                                float* __restrict__ branch, float* __restrict__ coef) {
+    const int c = blockIdx.x, SE = S * E;
+    const float* r = R + (size_t) c * SE;
+    float acc[kMhcMaxRows + 1];
+    #pragma unroll
+    for (int k = 0; k <= kMhcMaxRows; ++k) acc[k] = 0.f;
+    for (int i = threadIdx.x; i < SE; i += blockDim.x) {
+        const float v = r[i];
+        acc[kMhcMaxRows] += v * v;
+        #pragma unroll
+        for (int k = 0; k < kMhcMaxRows; ++k)
+            if (k < rows) acc[k] += W[(size_t) k * SE + i] * v;
+    }
+    __shared__ float red[kMhcThreads / 32][kMhcMaxRows + 1];
+    __shared__ float cf[2 * kMhcMaxS + kMhcMaxS * kMhcMaxS];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    #pragma unroll
+    for (int k = 0; k <= kMhcMaxRows; ++k) {
+        float v = acc[k];
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (lane == 0) red[warp][k] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tot[kMhcMaxRows + 1];
+        for (int k = 0; k <= kMhcMaxRows; ++k) {
+            tot[k] = 0.f;
+            for (int w = 0; w < nw; ++w) tot[k] += red[w][k];
+        }
+        const float rsq = rsqrtf(tot[kMhcMaxRows] / (float) SE + 1e-6f);
+        float lg[kMhcMaxRows];
+        for (int k = 0; k < rows; ++k) lg[k] = tot[k] * rsq + b[k];
+        for (int j = 0; j < S; ++j) {
+            cf[j] = 1.f / (1.f + expf(-lg[j]));
+            cf[S + j] = 2.f / (1.f + expf(-lg[S + j]));
+        }
+        float* mix = cf + 2 * S;
+        if (fixed_identity) {
+            for (int i = 0; i < S; ++i)
+                for (int j = 0; j < S; ++j) mix[i * S + j] = i == j ? 1.f : 0.f;
+        } else {
+            float m[kMhcMaxS * kMhcMaxS];
+            for (int k = 0; k < S * S; ++k) m[k] = lg[2 * S + k];
+            for (int it = 0; it < iters; ++it) {
+                for (int i = 0; i < S; ++i) {          // logsumexp over the last dim (each row)
+                    float mx = -FLT_MAX, sum = 0.f;
+                    for (int j = 0; j < S; ++j) mx = fmaxf(mx, m[i * S + j]);
+                    for (int j = 0; j < S; ++j) sum += expf(m[i * S + j] - mx);
+                    const float lse = mx + logf(sum);
+                    for (int j = 0; j < S; ++j) m[i * S + j] -= lse;
+                }
+                for (int j = 0; j < S; ++j) {          // then over dim -2 (each column)
+                    float mx = -FLT_MAX, sum = 0.f;
+                    for (int i = 0; i < S; ++i) mx = fmaxf(mx, m[i * S + j]);
+                    for (int i = 0; i < S; ++i) sum += expf(m[i * S + j] - mx);
+                    const float lse = mx + logf(sum);
+                    for (int i = 0; i < S; ++i) m[i * S + j] -= lse;
+                }
+            }
+            for (int k = 0; k < S * S; ++k) mix[k] = expf(m[k]);
+        }
+        float* out = coef + (size_t) c * (2 * S + S * S);
+        for (int k = 0; k < 2 * S + S * S; ++k) out[k] = cf[k];
+    }
+    __syncthreads();
+    float* br = branch + (size_t) c * E;
+    for (int e = threadIdx.x; e < E; e += blockDim.x) {
+        float v = 0.f;
+        for (int j = 0; j < S; ++j) v += cf[j] * r[(size_t) j * E + e];
+        br[e] = v * pre_scale;
+    }
+}
+
+__global__ void mhc_write_kernel(float* __restrict__ R, const float* __restrict__ coef, const float* __restrict__ y,
+                                 int S, int E) {
+    const int c = blockIdx.y, e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= E) return;
+    const float* cf = coef + (size_t) c * (2 * S + S * S);
+    float* r = R + (size_t) c * S * E;
+    float in[kMhcMaxS];
+    for (int j = 0; j < S; ++j) in[j] = r[(size_t) j * E + e];
+    const float yv = y[(size_t) c * E + e];
+    for (int i = 0; i < S; ++i) {
+        float v = cf[S + i] * yv;
+        for (int j = 0; j < S; ++j) v += cf[2 * S + i * S + j] * in[j];
+        r[(size_t) i * E + e] = v;
+    }
+}
+
+__global__ void mhc_enter_kernel(const float* __restrict__ x, float* __restrict__ R, int S, int E) {
+    const int c = blockIdx.y, e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= E) return;
+    const float v = x[(size_t) c * E + e];
+    for (int j = 0; j < S; ++j) R[((size_t) c * S + j) * E + e] = v;
+}
+
+__global__ void mhc_leave_kernel(const float* __restrict__ R, float* __restrict__ x, int S, int E) {
+    const int c = blockIdx.y, e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= E) return;
+    float v = 0.f;
+    for (int j = 0; j < S; ++j) v += R[((size_t) c * S + j) * E + e];
+    x[(size_t) c * E + e] = v / (float) S;
+}
+}  // namespace
+
+void dense_mhc_read(const float* R, const float* W, const float* b, int S, int E, int iters, bool fixed_identity,
+                    float pre_scale, float* branch, float* coef, int n, void* stream) {
+    if (S < 1 || S > kMhcMaxS) throw std::runtime_error("dense_mhc_read: streams must be 1..4");
+    const int rows = 2 * S + (fixed_identity ? 0 : S * S);
+    mhc_read_kernel<<<n, kMhcThreads, 0, (cudaStream_t) stream>>>(R, W, b, S, E, rows, iters, fixed_identity,
+                                                                   pre_scale, branch, coef);
+    check("dense_mhc_read");
+}
+void dense_mhc_write(float* R, const float* coef, const float* y, int S, int E, int n, void* stream) {
+    mhc_write_kernel<<<dim3((E + 255) / 256, n), 256, 0, (cudaStream_t) stream>>>(R, coef, y, S, E);
+    check("dense_mhc_write");
+}
+void dense_mhc_enter(const float* x, float* R, int S, int E, int n, void* stream) {
+    mhc_enter_kernel<<<dim3((E + 255) / 256, n), 256, 0, (cudaStream_t) stream>>>(x, R, S, E);
+    check("dense_mhc_enter");
+}
+void dense_mhc_leave(const float* R, float* x, int S, int E, int n, void* stream) {
+    mhc_leave_kernel<<<dim3((E + 255) / 256, n), 256, 0, (cudaStream_t) stream>>>(R, x, S, E);
+    check("dense_mhc_leave");
 }
 
 }  // namespace strata::kernels

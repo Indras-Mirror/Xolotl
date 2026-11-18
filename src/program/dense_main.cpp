@@ -119,6 +119,8 @@ void usage() {
                  "  --draft-vocab FILE: MTP drafts score only these token ids (int32 LE, a frequency shortlist such as\n"
                  "                  data/packs/qwen3.8-27b/draft-vocab-65536.i32); verification keeps the full head (same output).\n"
                  "  --vision: --serve takes GENI requests too (images; embeddings from strata-vision, the model's mmproj).\n"
+                 "  --layer-schedule S: run the physical layers in this order, e.g. 0-3,4-27,4-27,28-31 (repeats share\n"
+                 "                    weights, each gets its own KV / GDN state); default = the file's own loop, if any\n"
                  "  --kv-resident N|auto: keep N KV cells per head of every attention layer in VRAM and the rest in pinned\n"
                  "                  host RAM (one address range, read over PCIe only once the context passes N); auto = every\n"
                  "                  cell that fits beside the weights.  Full attention reads every cell, so past N each token\n"
@@ -693,6 +695,71 @@ std::vector<float> read_logits(strata::core::DenseModel& m, int col) {
 
 int argmax_of(const std::vector<float>& v) { return (int) (std::max_element(v.begin(), v.end()) - v.begin()); }
 
+// ---- xolotl `xolotl-dense --logits <model.gguf> <ids.txt> <out.tsv> [--kv K]`: teacher-forced log-probabilities for
+// a parity check against a reference (tools/sensenova/hf_ref_logits.py writes the same format).  ids.txt: whitespace-
+// separated token ids.  Every position goes through run() in kMaxCols columns with all logits; out.tsv has one row per
+// position: pos, argmax, then the 64 most likely `id:logp` (natural log).  Honours --layer-schedule via
+// XOLOTL_LAYER_SCHEDULE.
+int logits_model(const std::string& gguf, const std::string& ids_path, const std::string& out_path, const std::string& kv) {
+    using strata::core::Logits;
+    std::vector<int32_t> ids;
+    {
+        std::FILE* f = std::fopen(ids_path.c_str(), "r");
+        if (!f) { std::fprintf(stderr, "logits: cannot read %s\n", ids_path.c_str()); return 2; }
+        long long v = 0;
+        while (std::fscanf(f, "%lld", &v) == 1) ids.push_back((int32_t) v);
+        std::fclose(f);
+    }
+    if (ids.empty()) { std::fprintf(stderr, "logits: no ids\n"); return 2; }
+    strata::core::DenseModel m;
+    std::string err;
+    strata::core::DenseOptions opt;
+    opt.kv = kv;
+    if (!m.load(gguf, (int64_t) ids.size() + 64, err, opt)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    std::FILE* out = std::fopen(out_path.c_str(), "w");
+    if (!out) { std::fprintf(stderr, "logits: cannot write %s\n", out_path.c_str()); return 2; }
+    const int NC = strata::core::DenseModel::kMaxCols;
+    auto write_row = [&](size_t pos, const std::vector<float>& lg) {
+        double mx = -1e30;
+        for (float v : lg) mx = std::max(mx, (double) v);
+        double z = 0;
+        for (float v : lg) z += std::exp((double) v - mx);
+        const double lz = mx + std::log(z);
+        std::vector<int> idx(lg.size());
+        for (size_t k = 0; k < idx.size(); ++k) idx[k] = (int) k;
+        std::partial_sort(idx.begin(), idx.begin() + 64, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
+        std::fprintf(out, "%zu\t%d", pos, idx[0]);
+        for (int k = 0; k < 64; ++k) std::fprintf(out, "\t%d:%.6f", idx[k], (double) lg[idx[k]] - lz);
+        std::fprintf(out, "\n");
+    };
+    // XOLOTL_LOGITS_PREFILL=N: the batched MMQ prompt path instead of run().  Every N-th position p (p = N-1, 2N-1, ...)
+    // is a fresh prefill of ids[0..p] with Logits::Last, so the row is the prefill's own last hidden through the head
+    // (chunks of prefill_chunk() tokens, as served).  Compare against the reference by position (hf_ref_logits compare).
+    if (const char* ps = std::getenv("XOLOTL_LOGITS_PREFILL"); ps && std::atoi(ps) > 0) {
+        const size_t stride = (size_t) std::atoi(ps);
+        if (!m.prefill_setup(0, err)) { std::fprintf(stderr, "prefill_setup: %s\n", err.c_str()); return 1; }
+        size_t rows = 0;
+        for (size_t p = stride - 1; p < ids.size(); p += stride) {
+            m.reset();
+            if (!m.prefill(ids.data(), (int64_t) p + 1, Logits::Last, err)) { std::fprintf(stderr, "prefill: %s\n", err.c_str()); return 1; }
+            write_row(p, read_logits(m, 0));
+            ++rows;
+        }
+        std::fclose(out);
+        std::fprintf(stderr, "logits: %zu prefill positions (every %zu, chunk %lld) -> %s\n", rows, stride,
+                     (long long) m.prefill_chunk(), out_path.c_str());
+        return 0;
+    }
+    for (size_t at = 0; at < ids.size(); at += NC) {
+        const int n = (int) std::min<size_t>(NC, ids.size() - at);
+        if (!m.run(ids.data() + at, n, Logits::All, false, false, err)) { std::fprintf(stderr, "run: %s\n", err.c_str()); return 1; }
+        for (int j = 0; j < n; ++j) write_row(at + j, read_logits(m, j));
+    }
+    std::fclose(out);
+    std::fprintf(stderr, "logits: %zu positions -> %s\n", ids.size(), out_path.c_str());
+    return 0;
+}
+
 int check_model(const std::string& gguf, bool with_mtp, const std::string& kv) {
     using strata::core::Logits;
     strata::core::DenseModel m;
@@ -884,6 +951,12 @@ int main(int argc, char** argv) {
     dense_nv_defaults();
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") return selftest();
+        if (std::string(argv[i]) == "--logits") {
+            if (i + 3 >= argc) { std::fprintf(stderr, "usage: xolotl-dense --logits <model.gguf> <ids.txt> <out.tsv> [--kv K]\n"); return 2; }
+            std::string kv = "fp16";
+            for (int j = i + 4; j + 1 < argc; ++j) if (std::string(argv[j]) == "--kv") kv = argv[j + 1];
+            return logits_model(argv[i + 1], argv[i + 2], argv[i + 3], kv);
+        }
         if (std::string(argv[i]) == "--check") {
             bool mtp = false;
             std::string path, kv = "fp16";
@@ -913,6 +986,7 @@ int main(int argc, char** argv) {
     bool draft_max_set = false;
     bool vision = false;                               // --vision: GENI requests (image embeddings + M-RoPE table)
     long long kv_resident = 0;                         // --kv-resident N|auto: KV cells per head in VRAM (0 = all, -1 = auto)
+    std::string layer_schedule;                        // xolotl --layer-schedule "0-3,4-27,4-27,28-31" (empty = the file's)
     int vram_reserve_mib = 0;                          // --vram-reserve-mib N: VRAM left for another program (the encoder)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -933,6 +1007,7 @@ int main(int argc, char** argv) {
             kv_resident = v == "auto" ? -1 : std::atoll(v.c_str());
             if (kv_resident == 0 && v != "0") { std::fprintf(stderr, "xolotl-dense: --kv-resident takes a cell count or auto\n"); return 2; }
         }
+        else if (a == "--layer-schedule") layer_schedule = next("--layer-schedule");
         else if (a == "--vram-reserve-mib") vram_reserve_mib = std::max(0, std::atoi(next("--vram-reserve-mib")));
         else if (a == "--draft-vocab") draft_vocab = next("--draft-vocab");
         else if (a == "--ngram-n") ngram_n = std::atoi(next("--ngram-n"));
@@ -990,6 +1065,7 @@ int main(int argc, char** argv) {
     opt.kv = kv_type;
     opt.kv_resident = kv_resident;
     opt.vram_reserve_mib = vram_reserve_mib;
+    opt.layer_schedule = layer_schedule;
     if (use_df2) { opt.spec_snapshots = true; opt.taps = df2.tap_layers(); }
     // XOLOTL_TAP_DUMP=<file> (research only, off by default): every request appends its prompt's tap rows (the residual
     // after each XOLOTL_TAP_LAYERS layer, e.g. 1,16,31,46,61) to the file, for offline drafter acceptance runs

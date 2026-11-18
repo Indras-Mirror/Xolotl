@@ -168,6 +168,9 @@ def run_once(exe: Path, args: list[str], prompt: list[int], max_new: int, env: d
     prof = [l for l in err if "speculative cycles" in l]
     if prof:
         rec["cycle_line"] = prof[-1]
+    pl = [l for l in err if "xolotl-dense prof:" in l]   # STRATA_DENSE_PROF=1: the last 8-pass breakdown
+    if pl:
+        rec["prof_line"] = pl[-1].strip()
     proc.stdin.write("QUIT\n")
     proc.stdin.flush()
     try:
@@ -243,6 +246,8 @@ def main() -> int:
               f"{rec['decode_ms'] / 1000:5.1f} s){acc}", flush=True)
         if "cycle_line" in rec:
             print(f"    {rec['cycle_line']}", flush=True)
+        if "prof_line" in rec:
+            print(f"    {rec['prof_line']}", flush=True)
 
     decodes = [r["decode_tok_s"] for r in records]
     pps = [r["pp_tok_s"] for r in records]
