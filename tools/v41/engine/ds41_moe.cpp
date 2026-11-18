@@ -728,6 +728,7 @@ struct Gpu {
     /// none).  lru_settle waits for them - at the next gpu_run's entry and in dem_drain(-1), before anything else can
     /// rewrite that staging, list those slots or touch the cache between tokens.
     cudaEvent_t ev_lru = nullptr;
+    cudaEvent_t ev_pfe[Ds41MoeConfig::kMaxPf] = {};   ///< STRATA_LRU_STAT: behind list entry j's DMA when another follows
     int64_t lru_pend = -1;
     /// STRATA_D3_DMA_STREAM=1: gpu_run_n_ex's own copy stream for its PCIe site (the arena-miss / FILEG H2D into the
     /// d_stage slots or an LRU victim slot, the LRU demote D2H and the stage->victim D2D), so those copies overlap the
@@ -951,6 +952,8 @@ struct Gpu {
             if (p) cudaFree(p);
         if (ev_pf) cudaEventDestroy(ev_pf);
         if (ev_lru) cudaEventDestroy(ev_lru);
+        for (cudaEvent_t e : ev_pfe)
+            if (e) cudaEventDestroy(e);
         if (s_pf) cudaStreamDestroy(s_pf);
         if (ev_dc) cudaEventDestroy(ev_dc);
         if (ev_entry) cudaEventDestroy(ev_entry);
@@ -1004,6 +1007,20 @@ static bool lru_late() {
     static const bool on = std::getenv("STRATA_LRU_LATE") && std::getenv("STRATA_LRU_LATE")[0] == '1' && demote_async_on();
     return on;
 }
+/// STRATA_LRU_STAT=1 (diagnostic, rb31): the vram_lru promotions' host waits - the list wait (and how much of it was
+/// for later entries than the promoted one: Gpu::ev_pfe, recorded behind an entry that another DMA follows), the copies,
+/// the tail syncs and STRATA_LRU_LATE's settles.  Printed and reset by Ds41MoeTier::lru_stat_report.  It adds no device
+/// sync; it splits the list wait in two host waits.
+static bool lru_stat_on() {
+    static const bool on = std::getenv("STRATA_LRU_STAT") && std::getenv("STRATA_LRU_STAT")[0] == '1';
+    return on;
+}
+struct LruStat {
+    int64_t pf_waits = 0, pf_nonlast = 0, copies = 0, copy_bytes = 0, tail_syncs = 0, deferred = 0, settles = 0,
+            settled_done = 0;
+    double pf_ms = 0, pf_own_ms = 0, pf_rest_ms = 0, tail_ms = 0, settle_ms = 0;
+};
+LruStat g_lst;
 /// STRATA_HIT_PF=1 (opt-in, see Gpu::d_pf2): STRATA_HIT_FAST=3's graph hits also take the layer's prefetched experts
 static bool hit_pf_on() {
     static const bool on = std::getenv("STRATA_HIT_PF") && std::getenv("STRATA_HIT_PF")[0] >= '1' &&
@@ -1050,7 +1067,17 @@ static uint8_t* pf_base(const Gpu& gp, int64_t layer) {
 /// STRATA_LRU_LATE: the deferred vram_lru copies are home when this returns (Gpu::ev_lru)
 static void lru_settle(Gpu& gp) {
     if (gp.lru_pend < 0) return;
-    ck(cudaEventSynchronize(gp.ev_lru), "hit pf lru sync (late)");
+    if (lru_stat_on()) {
+        ++g_lst.settles;
+        const cudaError_t q = cudaEventQuery(gp.ev_lru);
+        if (q == cudaSuccess) ++g_lst.settled_done;
+        else if (q == cudaErrorNotReady && cudaPeekAtLastError() == cudaErrorNotReady) (void) cudaGetLastError();
+        const double t = now_ms();
+        ck(cudaEventSynchronize(gp.ev_lru), "hit pf lru sync (late)");
+        g_lst.settle_ms += now_ms() - t;
+    } else {
+        ck(cudaEventSynchronize(gp.ev_lru), "hit pf lru sync (late)");
+    }
     gp.lru_pend = -1;
 }
 /// the demotions in flight into `layer`'s arena slots (layer < 0: all of them, and STRATA_LRU_LATE's copies) are home
@@ -1271,6 +1298,7 @@ struct Ds41MoeImpl {
     double pcie_carry = 0.0, pf_carry = 0.0;
     int32_t pf_e[Ds41MoeConfig::kMaxPf] = {};
     int pf_n = 0;                     ///< staging slots the last prefetch() filled
+    bool pf_own[Ds41MoeConfig::kMaxPf] = {};   ///< the last prefetch() recorded Gpu::ev_pfe[j] behind entry j
     std::unique_ptr<Gpu> gpu;         ///< null in a CPU-only tier
     std::unique_ptr<RemoteTier> remote;   ///< Ds41MoeConfig::remote_device (null = off)
     std::vector<int64_t> last_use;    ///< arena_adapt: (layer, expert) -> the run() call that last used it
@@ -3550,6 +3578,7 @@ static void pf_publish(Ds41MoeImpl& im, int64_t layer, bool no_ready) {
 
 void Ds41MoeTier::prefetch_multi(int64_t layer, const int32_t* ids, int n, int max_slots) {
     im_->pf_n = 0;
+    for (bool& o : im_->pf_own) o = false;
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu || im_->cfg.cpu_only || im_->cfg.no_cache || !im_->gpu->cache) return;
     if (!ids || n <= 0 || max_slots <= 0 || !im_->g.routed(layer)) return;
@@ -3579,6 +3608,7 @@ void Ds41MoeTier::prefetch_multi(int64_t layer, const int32_t* ids, int n, int m
 
 void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
     im_->pf_n = 0;
+    for (bool& o : im_->pf_own) o = false;
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu || im_->cfg.cpu_only || im_->cfg.pf_b <= 0 || im_->cfg.no_cache || !im_->gpu->cache) return;
     if (!top16 || n <= 0 || !im_->g.routed(layer)) return;
@@ -3643,6 +3673,7 @@ void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
         item_src = gp.h_rdy_src + (s & 63);
         *item_src = s;
     }
+    int last_dma = -1;   // the list index of the last DMA issued
     for (int i = 0; i < n && im_->pf_n < nb; ++i) {
         const int32_t e = top16[ord[i]];
         if (e < 0 || e >= im_->g.n_experts) continue;
@@ -3663,9 +3694,17 @@ void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
         // H2D bus saturated by prefetch, so the skip is now the default; STRATA_PF_NO_DUMMY=0 restores the old
         // replay-exact timing (246 of 2,874 prefetches were dummies on that run).
         static const bool no_dummy = !(std::getenv("STRATA_PF_NO_DUMMY") && std::getenv("STRATA_PF_NO_DUMMY")[0] == '0');
-        if (!(dummy && no_dummy))
+        if (!(dummy && no_dummy)) {
+            // STRATA_LRU_STAT: the previous entry's own event, behind its DMA and ready word (the list's last entry has ev_pf)
+            if (last_dma >= 0 && lru_stat_on()) {
+                if (!gp.ev_pfe[last_dma]) ck(cudaEventCreateWithFlags(&gp.ev_pfe[last_dma], cudaEventDisableTiming), "ev_pfe");
+                ck(cudaEventRecord(gp.ev_pfe[last_dma], gp.s_pf), "record prefetch item");
+                im_->pf_own[last_dma] = true;
+            }
             ck(cudaMemcpyAsync(pf_base(gp, layer) + (size_t) im_->pf_n * (size_t) im_->blob, src,
                                (size_t) im_->bl[(size_t) im_->g.cls(layer, e)], cudaMemcpyHostToDevice, gp.s_pf), "prefetch dma");
+            last_dma = im_->pf_n;
+        }
         if (item_src && !dummy && n_item < strata::kernels::kHitPfMax)   // (pf_publish lists the non-dummy entries in order)
             ck(cudaMemcpyAsync(gp.d_rdy + 2 + (layer & 1) * strata::kernels::kHitPfMax + n_item++, item_src,
                                sizeof(int32_t), cudaMemcpyHostToDevice, gp.s_pf), "pf item ready");
@@ -4056,6 +4095,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     // ---- split the routed experts: resident, prefetched (also computed on the GPU), CPU, PCIe ----
     int32_t hit_i[kMaxParts], cpu_i[kMaxParts], pcie_i[kMaxParts], slot_i[kMaxParts] = {};
     unsigned long long pf_ptr[kMaxParts] = {};
+    int pf_j[kMaxParts] = {};   // a prefetched hit's list index (its Gpu::ev_pfe)
     int nh = 0, nc = 0, np = 0, npf_hit = 0;
     for (int64_t k = 0; k < K; ++k) {
         const int32_t e = ids6[k];
@@ -4068,6 +4108,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             hit_i[nh++] = (int32_t) k;
         } else if (pf_at >= 0) {
             pf_ptr[k] = (unsigned long long) pf_base(gp, layer) + (size_t) pf_at * (size_t) B;
+            pf_j[k] = pf_at;
             hit_i[nh++] = (int32_t) k;
             ++npf_hit;
         } else {
@@ -4560,8 +4601,21 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
                 const int32_t v = lru_victim(ids6[k]);
                 if (v < 0) continue;
                 if (!pf_home) {   // STRATA_HIT_PF: the graph took it (it waits for the DMA itself): this copy reads it too
+                    // STRATA_LRU_STAT: first this entry's own DMA (when a later entry has one), then the list
+                    const bool own = im.pf_own[pf_j[k]];
+                    const double tw0 = lru_stat_on() ? now_ms() : 0.0;
+                    if (own && lru_stat_on()) ck(cudaEventSynchronize(gp.ev_pfe[pf_j[k]]), "prefetch item wait");
+                    const double tw1 = lru_stat_on() ? now_ms() : 0.0;
                     ck(cudaEventSynchronize(gp.ev_pf), "prefetch host wait");
                     pf_home = true;
+                    if (lru_stat_on()) {
+                        const double tw2 = now_ms();
+                        ++g_lst.pf_waits;
+                        g_lst.pf_ms += tw2 - tw0;
+                        g_lst.pf_own_ms += tw1 - tw0;
+                        g_lst.pf_rest_ms += tw2 - tw1;
+                        if (own) ++g_lst.pf_nonlast;
+                    }
                 }
                 const int32_t sl = gp.cache->slot_of(layer, v);
                 int32_t dem = -1;
@@ -4572,6 +4626,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
                 }
                 ck(cudaMemcpyAsync(gp.cache->device_slot(sl), (const void*) pf_ptr[k], (size_t) BLX(ids6[k]), cudaMemcpyDeviceToDevice,
                                    gp.s), "lru pf copy");
+                if (lru_stat_on()) { ++g_lst.copies; g_lst.copy_bytes += BLX(ids6[k]); }
                 im.vlast[(size_t) (layer * NXL + v)] = im.tick;   // not again in this call
                 lru_old[n_lru] = v;
                 lru_dem[n_lru] = dem;
@@ -5150,8 +5205,11 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
                 gp.lru_pend = layer;
                 (void) cudaStreamQuery(gp.s);   // WDDM: hand the copies to the card now, not at the later sync
                 if (cudaPeekAtLastError() == cudaErrorNotReady) (void) cudaGetLastError();
+                if (lru_stat_on()) ++g_lst.deferred;
             } else {
+                const double ts = lru_stat_on() ? now_ms() : 0.0;
                 ck(cudaStreamSynchronize(gp.s), "hit pf lru sync");
+                if (lru_stat_on()) { ++g_lst.tail_syncs; g_lst.tail_ms += now_ms() - ts; }
             }
         }
     } else if (out_dev) {
@@ -9077,6 +9135,21 @@ void Ds41MoeTier::rebalance_plan() {
         r.pause = false;
     }
     r.cv.notify_all();
+#endif
+}
+
+void Ds41MoeTier::lru_stat_report(const char* tag) {
+#if defined(DS4_MOE_CUDA)
+    if (!lru_stat_on()) return;
+    const LruStat& s = g_lst;
+    std::fprintf(stderr, "lru stat %s: list waits %lld (%.1f ms; own %.1f, later entries %.1f over %lld with one), copies %lld "
+                 "(%.0f MB), tail syncs %lld (%.1f ms), deferred %lld, settles %lld (%.1f ms, %lld already done)\n", tag,
+                 (long long) s.pf_waits, s.pf_ms, s.pf_own_ms, s.pf_rest_ms, (long long) s.pf_nonlast, (long long) s.copies,
+                 s.copy_bytes / 1e6, (long long) s.tail_syncs, s.tail_ms, (long long) s.deferred, (long long) s.settles,
+                 s.settle_ms, (long long) s.settled_done);
+    g_lst = LruStat{};
+#else
+    (void) tag;
 #endif
 }
 

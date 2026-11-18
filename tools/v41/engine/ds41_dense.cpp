@@ -897,6 +897,17 @@ static double g_dprof[8] = {};   // build, alloc, compute, engram, readback, fin
 static double dprof_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 static int g_dprof_slot = -1;    // which of build/alloc/compute buckets compute() charges: set by the span callers
 
+// STRATA_EMBD_PROF=1 (diagnostic): the embedding rows read since the last embd_prof_report - calls of several rows (0)
+// and of one row (1) apart
+static bool embd_prof_on() {
+    static const bool on = env_on("STRATA_EMBD_PROF", false);
+    return on;
+}
+struct EmbdProf {
+    struct Sum { long rows = 0, slow = 0; double ms = 0, slow_ms = 0; } s[2];
+};
+static EmbdProf g_embd_prof;
+
 // STRATA_DENSE_ASYNC=1 (decode, opt-in): attn_router / predict / finish_predict launch their graph without the
 // stream sync ggml_backend_graph_compute ends with and queue the readbacks on the same stream behind it, so ONE sync
 // covers the graph and its readbacks (it was two: the graph's, then the readback's - and ggml_backend_tensor_get
@@ -2996,26 +3007,20 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0, bool pack
     };
     // embeddings (F16 rows on the mmap)
     im.host_emb.resize((size_t) (D * n));
-    // STRATA_EMBD_PROF=1 (diagnostic, rb30): each row's read time; a row over 50 us waited for a page (a fault that
-    // read the disk) - the count and their time, per decode token and per prompt pass
-    static const bool eprof = env_on("STRATA_EMBD_PROF", false);
-    static long ep_rows = 0, ep_slow = 0, ep_tok = 0;
-    static double ep_ms = 0, ep_slow_ms = 0;
+    // STRATA_EMBD_PROF=1 (diagnostic, rb30): each row's read time; a row over 50 us waited (for a page, mostly - not a
+    // fault count).  Summed apart for calls of several rows and of one, printed and reset by embd_prof_report.
+    const bool eprof = embd_prof_on();
+    EmbdProf::Sum & es = g_embd_prof.s[n > 1 ? 0 : 1];
     for (int t = 0; t < n; ++t) {
         if (tids[t] < 0 || tids[t] >= im.g.vocab) { im.err = "token id out of range"; return false; }
         const auto tr = eprof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         strata::v41::ds41_embd_row(im.embd, im.embd_type, D, tids[t], im.host_emb.data() + (size_t) (t * D));
         if (eprof) {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tr).count();
-            ++ep_rows;
-            ep_ms += ms;
-            if (ms > 0.05) { ++ep_slow; ep_slow_ms += ms; }
+            ++es.rows;
+            es.ms += ms;
+            if (ms > 0.05) { ++es.slow; es.slow_ms += ms; }
         }
-    }
-    if (eprof && (n > 1 || ++ep_tok % 256 == 0)) {
-        std::fprintf(stderr, "embd rows: %ld rows %.1f ms, %ld over 0.05 ms (%.1f ms)%s\n", ep_rows, ep_ms, ep_slow, ep_slow_ms,
-                     n > 1 ? " (prompt pass)" : "");
-        if (n > 1) { ep_rows = ep_slow = 0; ep_ms = ep_slow_ms = 0; }
     }
     ablate_rows(im, im.host_emb.data(), n);
     // vision: overwrite the image span positions with the encoder's rows (model.py merge_image_embeddings) and mark
@@ -3553,6 +3558,15 @@ void Ds41Dense::prof_report(const char * tag) {
                  "readback %.0f, upload %.0f, finish build %.0f\n", tag, (int) g_dprof[7], g_dprof[0], g_dprof[1], g_dprof[2],
                  g_dprof[3], g_dprof[4], g_dprof[6], g_dprof[5]);
     for (double & v : g_dprof) v = 0;
+}
+
+void Ds41Dense::embd_prof_report(const char * tag) {
+    if (!embd_prof_on()) return;
+    const EmbdProf::Sum * s = g_embd_prof.s;
+    std::fprintf(stderr, "embd rows %s: multi-row calls %ld rows %.1f ms, %ld over 0.05 ms (%.1f ms) | one-row calls %ld rows "
+                 "%.1f ms, %ld over 0.05 ms (%.1f ms)\n", tag, s[0].rows, s[0].ms, s[0].slow, s[0].slow_ms, s[1].rows, s[1].ms,
+                 s[1].slow, s[1].slow_ms);
+    g_embd_prof = EmbdProf{};
 }
 
 int Ds41Dense::batch_size() const { return (int) p_->batch; }

@@ -171,6 +171,8 @@ public:
     bool finish_span(int il, int col0, int n);
     /// STRATA_DENSE_PROF=1: print + reset the batch dense split (build / alloc / compute / Engram / readback) - diagnostic
     void prof_report(const char * tag);
+    /// STRATA_EMBD_PROF=1: print + reset the embedding row reads since the last report - diagnostic
+    void embd_prof_report(const char * tag);
     /// Give the prompt passes' compute buffer back to the device (rebuilt by the next multi-token pass): the deferred
     /// VRAM expert cache opens into it after the prompt.
     void release_pass();

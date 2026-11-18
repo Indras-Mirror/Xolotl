@@ -545,6 +545,8 @@ public:
 
     const Ds41MoeStats& stats() const;
     void reset_stats();
+    /// STRATA_LRU_STAT=1 (diagnostic): print the vram_lru promotions' host waits since the last report, then reset
+    void lru_stat_report(const char* tag);
     void add_stats(const Ds41MoeStats& s);
 
     const Ds41MoeGeom& geom() const;

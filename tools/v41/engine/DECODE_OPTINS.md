@@ -896,6 +896,105 @@ Serve: srvtest's 11 scenarios, `--slots 2401`, a fresh server each run, in the o
 - Decode differed by no more than the runs' own spread.
 - The embedding switch therefore shows only after a start, or after the OS dropped those pages.
 
+Corrections (rb31, after GPT's review in Xolotl/docs/reports/2026-11-03-rb30-service-followup):
+
+- The "slow embedding rows in the prompts" column above is wrong. rb30's `STRATA_EMBD_PROF` never reset its count of
+  single-row calls, so each "prompt pass" line in serve also held the previous request's decode rows: 19416 rows =
+  16992 prompt rows + 2424 decode rows. rb31 counts each phase apart (below).
+- `STRATA_LRU_LATE`'s own gain is ~0.27 %, not +2.2 %. rb31's `STRATA_LRU_STAT` shows the sync it moves cost 37 ms in
+  837 tokens. The +2.2 % came with a change of the PC's state between the arms.
+
+## Diagnostics, and an old switch that pays now (rb31)
+
+GPT's review of rb30 found that the serve check could not tell the two rb30 switches apart, and that
+`STRATA_EMBD_PROF` mixed the phases. rb31 adds diagnostics only. The default path is unchanged. The 837-step logits
+are byte-identical (f371fe3a) with no switch, with rb30's two, and with `STRATA_SHEXP_GLU` on top.
+
+### Diagnostics
+
+- `STRATA_EMBD_PROF=1`: calls of several rows and of one row are summed apart. They print only when the caller asks
+  (`Ds41Dense::embd_prof_report`): serve at the end of each request's prompt and decode, one-shot once each.
+- `STRATA_LRU_STAT=1`: the vram_lru promotions' host waits, printed at the same points
+  (`Ds41MoeTier::lru_stat_report`). It shows the wait for the prefetch list, and how much of it was for list entries
+  after the promoted one (an event behind each entry that another DMA follows). It also shows the copies, the tail
+  syncs, and `STRATA_LRU_LATE`'s deferred copies and settles. It adds no device sync. It splits the list wait into
+  two host waits.
+- `STRATA_VRAM_LEDGER=1` (serve): at each request's start and decode end, the dense ledger, the card's free memory,
+  and WDDM's view of this process (DXGI: local and shared use against their budgets).
+
+Forced, 837 tokens, `STRATA_EMBD_RAM` on:
+
+| | `LRU_LATE` off | `LRU_LATE` on |
+|---|---|---|
+| host waits for the prefetch list | 1599, 176.4 ms | 1600, 175.5 ms |
+| of them, for entries after the promoted one | 151.8 ms (406 waits) | 151.3 ms (406 waits) |
+| tail syncs | 1094, 37.1 ms | 33, 1.0 ms |
+| deferred copies / settles | - | 1062 / 1062 (0.3 ms; all were done already) |
+| embedding rows, decode | 836 rows, 2.3 ms, none slow | the same |
+
+### `STRATA_SHEXP_GLU=1` (rb7) now gains
+
+The shared expert's gate and up go out as one MMVQ launch with the clamped SwiGLU fused (`ggml_swiglu_clamp`). rb7
+(2026-10-27) measured no gain at 17 tok/s on the Unsloth model, where the drives set the pace. On GSQ the card does,
+in the layers whose experts are all in VRAM.
+
+On top of rb30's two switches, 2 batches of 4 rounds (neighbouring runs):
+
+| batch | off | on | rounds |
+|---|---|---|---|
+| rb31a | 59.66 | 60.08 (+0.71 %) | +0.02 / +0.79 / +0.58 / +1.45 % |
+| rb31b | 59.89 | 60.23 (+0.56 %) | +0.45 / +0.47 / +0.79 / +0.55 % |
+
+- Finish went from 4.10 to 4.00 ms a token.
+- Byte-identical logits.
+- The production exe (rb28, which has the switch since rb7) as 01 runs it: the same logits with it on and off
+  (f371fe3a), +0.53 % over 4 rounds (+0.27 / +0.94 / +0.43 / +0.48 %), finish 4.49 -> 4.39 ms. These rounds ran in the
+  slow state (56.3 tok/s, a remote viewer connected).
+
+Serve, the same harness as below, rb30's two switches on in both arms, order on off off on off on on off:
+
+| | runs | decode, all | the first five | the long prompt and after |
+|---|---|---|---|---|
+| off | 60.23 / 60.03 / 60.26 / 59.98 | 60.13 | 59.46 | 60.86 |
+| on | 60.71 / 60.74 / 60.88 / 60.31 | 60.66 (+0.89 %) | 60.02 | 61.37 |
+
+- Every run with the switch was faster than every run without it.
+- The 10 scenarios that run to their end gave the same answers in all 16 serve runs of rb31. One run with the switch
+  had a different `ja4_continue`: its cancelled stream stopped at 63 tokens instead of 64 (the stop point is timing-
+  dependent, as before).
+
+### Serve: `STRATA_LRU_LATE` alone, `STRATA_EMBD_RAM` on in both arms
+
+GPT's design: srvtest's 11 scenarios, `--slots 2401`, a fresh server each run, the three diagnostics in both arms.
+Order L0 L1 L1 L0 L1 L0 L0 L1. A remote viewer (GameViewerServer) was connected the whole time (16-17 % GPU load at
+idle).
+
+| run | decode, all | the first five scenarios | the long prompt and after |
+|---|---|---|---|
+| L0 a | 56.56 | 55.92 | 57.28 |
+| L1 a | 58.18 | 57.49 | 58.96 |
+| L1 b | 58.43 | 57.62 | 59.33 |
+| L0 b | 58.76 | 57.54 | 60.14 |
+| L1 c | 60.12 | 59.41 | 60.91 |
+| L0 c | 59.89 | 59.42 | 60.42 |
+| L0 d | 60.01 | 59.17 | 60.95 |
+| L1 d | 60.04 | 59.38 | 60.77 |
+
+- All 11 answers were the same in all 8 runs.
+- The session sped up from 56.6 to 60 tok/s (the first runs of a sequence are slow, as seen before). The card's
+  clocks while busy (SM ~3120 MHz, memory 15801 MHz) and its power (306-318 W) were the same in every run.
+- The last four runs, in the steady state: L1 +0.2 % overall, +0.17 % in the first five, +0.25 % from the long prompt
+  on. rb30's reversal after the long prompt did not come back.
+- What the switch moves, per run (`STRATA_LRU_STAT`): L0 4291-4295 tail syncs, 204-258 ms; L1 116 syncs, 6-8 ms, and
+  4175-4182 settles, 1.4 ms, all done already.
+- No slow embedding row in any run (16992 prompt rows and 2643 decode rows a run).
+
+The 0.4 GiB (`STRATA_VRAM_LEDGER`): this process's WDDM local use was the same at every request of every run (28.54
+GiB at the first request, 28.96 at the last). WDDM's local budget for it moved between 29.6-29.8 and 30.13-30.14 GiB,
+a step of 0.42 GiB, in both arms, and the card's free memory moved with it. rb30's "0.4 GiB less free after the long
+prompt with the switches on" was this budget, not the engine. In the steady runs, requests that started with the
+higher budget were not faster (-0.95 %).
+
 ## Tried and removed
 
 `STRATA_INPUT_ASYNC`: a decode step's ~14 small inputs (embedding row, positions, window rows / mask, compressed-row
@@ -943,3 +1042,27 @@ on top of `STRATA_EMBD_RAM`. The stages only moved time between each other.
 | 4 | 3519 / 1731 | 59.18 | +0.9 |
 
 The wrong guesses' reads cost more than the hidden waits saved.
+
+rb31 tried three more, all bit-identical, each over 4 rounds on top of rb30's two switches:
+
+- `STRATA_PF_ITEM_EV` (Gemini's rb30 review): a promoted prefetched expert's copy waited on the host for its own DMA
+  only, not for the whole list. -0.45 % (-0.60 / +0.32 / -0.18 / -1.33 %). The 151 ms of waits for later entries
+  (`STRATA_LRU_STAT` above) are not on the token's critical path: the card is still busy while the host waits.
+- `GGML_CUDA_MMVQ_R4` (vendored ggml): the small-K launch (4 rows a block with the same 4 warps and K split, so each
+  row's sum is the same) for every one-column Q4_K / Q5_K / Q6_K / Q8_0 matrix up to 32768 rows. +0.17 % (-0.22 /
+  +0.39 / -0.17 / +0.69 %): noise. With the output head too (`=1`), no better.
+- `STRATA_ENG_BATCH` (GPT's rb30 review, the version it asked for): the two Engram row uploads as one
+  `cudaMemcpyBatchAsync` on the backend's stream, with no copy stream or event. -0.06 % (-0.03 / -0.50 / +0.08 /
+  +0.22 %).
+
+Old opt-ins, measured again on top of `STRATA_SHEXP_GLU` (4 rounds, all bit-identical): no gain.
+
+| switch | against `SHEXP_GLU` alone |
+|---|---|
+| `GGML_CUDA_FP4_PACK=1` | -0.16 % |
+| `STRATA_DEC_PARTS` / `STRATA_DEC_READERS` = 12 / 12 | -0.50 % |
+| the same = 16 / 16 | +0.06 % |
+| `STRATA_HOST_PIN=2` | slower (one run: 56.6 vs 58.8 tok/s with the dump) |
+
+That batch ran while a remote viewer (GameViewerServer) was connected. Every arm was ~6 % slower, and the rounds
+spread +-2.7 %.

@@ -1681,6 +1681,32 @@ int main(int argc, char ** argv) {
         ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
         std::fprintf(stderr, "vram trace: %s %d free %.2f GiB\n", where, a, tf / 1073741824.0);
     };
+    // STRATA_VRAM_LEDGER=1 (diagnostic): at a request's start and its decode's end, the dense ledger, the card's free memory
+    // and (Windows) WDDM's view of this process - its local and shared use against their budgets (DXGI)
+    const bool vram_ledger_on = std::getenv("STRATA_VRAM_LEDGER") != nullptr;
+    auto vram_ledger_log = [&](const char * when) {
+        if (!vram_ledger_on) return;
+        size_t tf = 0, tt = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
+        std::string wddm;
+#ifdef STRATA_ENABLE_CUDA
+        cudaDeviceProp dp{};
+        uint64_t lb = 0, lu = 0, sb = 0, su = 0;
+        std::string why;
+        if (cudaGetDeviceProperties(&dp, pipe.stages[0].cuda_device) == cudaSuccess &&
+            strata::platform::gpu_local_memory_budget(dp.luid, lb, lu, why) &&
+            strata::platform::gpu_shared_memory_budget(dp.luid, sb, su, why)) {
+            char b[160];
+            std::snprintf(b, sizeof b, "; WDDM local %.2f of %.2f GiB, shared %.2f of %.2f GiB", lu / 1073741824.0,
+                          lb / 1073741824.0, su / 1073741824.0, sb / 1073741824.0);
+            wddm = b;
+        } else {
+            (void) cudaGetLastError();
+        }
+#endif
+        std::fprintf(stderr, "vram ledger %s: %s; free %.2f of %.2f GiB%s\n", when, dense.vram_ledger().c_str(),
+                     tf / 1073741824.0, tt / 1073741824.0, wddm.c_str());
+    };
     // --batch-slots' BYIELD: asked before each layer-major batch of a read (c0, its width B) whether that batch is the
     // read's last one; then its enc-skip cut ends at the batch's own end (the replay window before it is computed in
     // full, so the read can go on from there) and feed() stops after it with feed_stopped = the tokens fed.
@@ -3330,6 +3356,7 @@ int main(int argc, char ** argv) {
             else
             std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
                          park_hist.size(), lp_show, hist.size(), snap_len, ids.size(), reused);
+            vram_ledger_log("request start");
             if (reused > 0) {
                 // the Engram hashes of the first new positions read the 3 tokens before `reused` from the history, which
                 // is kept by position: an unrelated request since (a parked conversation's side request) wrote its own
@@ -3981,6 +4008,8 @@ int main(int argc, char ** argv) {
             }
 #endif
             dense.prof_report("turn");
+            dense.embd_prof_report("prompt");
+            tier.lru_stat_report("prompt");
             std::fprintf(stderr, "serve: prompt phases: %d new = %d %s (%.2f s: dense %.2f, experts %.2f, logits %.2f) + DSpark tail %d%s "
                          "(cache open %.2f s, seed %.2f s)\n", delta, dh, by_step ? "passes" : "batch", ph_feed / 1000.0,
                          (fd_dense - fd0[0]) / 1000.0, (fd_tier - fd0[1]) / 1000.0, (fd_logits - fd0[2]) / 1000.0,
@@ -4385,6 +4414,9 @@ int main(int argc, char ** argv) {
                              100.0 * (double) st.fileg_recurring / (double) st.fileg, st.fwait_ms, st.file_ms);
             std::fprintf(stderr, " (read wall %.2f s, spec %lld issued / %lld used)\n", st.file_ms / 1000.0,
                          (long long) st.spec_issued, (long long) st.spec_hits);
+            dense.embd_prof_report("decode");
+            tier.lru_stat_report("decode");
+            vram_ledger_log("decode end");
             if (file_pred) {   // STRATA_FILE_PRED's totals so far (a served engine is killed, never reaches the end)
                 std::fprintf(stderr, "file-pred: %lld file-tier routes", fp_miss[0]);
                 for (int k = 1; k <= kFP; ++k)
@@ -4585,6 +4617,8 @@ int main(int argc, char ** argv) {
                  (long long) pst.cpu, (long long) pst.pcie, (long long) pst.file_tier);
     std::fprintf(stderr, "prompt split: dense %.1f s, experts %.1f s (file wait %.1f s), logits %.1f s\n", fd_dense / 1000.0,
                  fd_tier / 1000.0, pst.file_ms / 1000.0, fd_logits / 1000.0);
+    dense.embd_prof_report("prompt");
+    tier.lru_stat_report("prompt");
     if (a.ppl) {
         double nll = 0;
         int n = 0, top1 = 0;
@@ -4881,6 +4915,8 @@ int main(int argc, char ** argv) {
                  100.0 * st.hits / std::max<int64_t>(1, st.lookups()), st.cpu_ms, st.file_ms,
                  (long long) st.spec_issued, (long long) st.spec_hits, (long long) st.prefetch_issued,
                  (long long) st.prefetch_dummy, (long long) st.prefetched_useful);
+    dense.embd_prof_report("decode");
+    tier.lru_stat_report("decode");
     if (dprof && !spec)
         std::fprintf(stderr, "decode head: %.2f ms/token (%.0f ms over %d tokens)\n", dec_head_ms / std::max(1, gen - 1),
                      dec_head_ms, gen);
