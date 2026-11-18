@@ -769,6 +769,9 @@ struct Gpu {
     void *c_w = nullptr, *c_out = nullptr;   ///< run_chunk: the top-k weights and the summed rows on the card
     void *c_x = nullptr, *c_xq = nullptr, *c_parts = nullptr, *c_scratch = nullptr, *c_ptr = nullptr,
          *c_start = nullptr, *c_ng = nullptr, *c_dst = nullptr, *c_tokv = nullptr, *c_stage[2] = {};
+    /// run_chunk_xdev (STRATA_WIDE_PROMPT): c_x / c_out are not allocated (null) and c_xq / c_scratch only on a call's
+    /// first MMVQ launch - each either null or at c_tok tokens.  c_xq_ok: c_xq holds this call's activations.
+    bool c_xq_ok = false;
     uint8_t* c_bounce[2] = {};
     /// layer read-ahead (STRATA_LAYER_RA, default on; layer_ra_start): a prompt layer's WHOLE file tier - every format
     /// class - read into the bounce halves when the layer's first class pass starts, so the reads run back to back
@@ -6573,9 +6576,14 @@ static bool layer_ra_start(Ds41MoeImpl& im, int64_t layer, int n, const int32_t*
     return true;
 }
 
+// x_dev (run_chunk_xdev, a "wide" call): the n input rows are already on the card and the sums go to out_dev - no c_x,
+// no c_out, no pinned landing pad, and the MMVQ buffers only when a launch needs them (the MMQ path never does).
+// Same kernels on the same rows: the sums are the classic call's bits.
 bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x_host,
-                   float* out, void* out_dev = nullptr, int cf = -1, bool first_pass = true, bool last_pass = true) {
+                   float* out, void* out_dev = nullptr, int cf = -1, bool first_pass = true, bool last_pass = true,
+                   const float* x_dev = nullptr) {
     Gpu& gp = *im.gpu;
+    const bool wide = x_dev != nullptr && out_dev != nullptr;
     const bool prof = chunk_prof();
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> kev;   // prof: one pair per grouped launch
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> tcev;  // prof: one pair per MMQ sub-run's PTQ1_0 transcode (inside kev)
@@ -6594,12 +6602,13 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
 
     if (n > gp.c_tok) {   // (re)allocate the DEVICE buffers for n tokens (release_chunk gives them back)
         for (void* p : {gp.c_x, gp.c_xq, gp.c_parts, gp.c_scratch, gp.c_dst, gp.c_tokv, gp.c_w, gp.c_out}) if (p) cudaFree(p);
+        gp.c_x = gp.c_xq = gp.c_scratch = gp.c_out = nullptr;
         gp.c_tok = n;
         const int64_t ne = (int64_t) n * K;
-        ck(cudaMalloc(&gp.c_x, (size_t) n * (size_t) H * 4), "c_x");
-        ck(cudaMalloc(&gp.c_xq, (size_t) n * strata::kernels::native_q8_1_bytes((int) H, 1)), "c_xq");   // its ncols <= 8
+        if (!wide) ck(cudaMalloc(&gp.c_x, (size_t) n * (size_t) H * 4), "c_x");
+        if (!wide) ck(cudaMalloc(&gp.c_xq, (size_t) n * strata::kernels::native_q8_1_bytes((int) H, 1)), "c_xq");   // its ncols <= 8
         ck(cudaMalloc(&gp.c_parts, (size_t) ne * (size_t) H * 4), "c_parts");
-        ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(ne, im.g.n_ff)), "c_scratch");
+        if (!wide) ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(ne, im.g.n_ff)), "c_scratch");
         // c_dst + r0 is the MMQ down product's `ids`, and MMQ reads up to 127 ids past a run's last entry: for the run
         // ending at entry ne that read went past the allocation - an MMU fault ("chunk sync: an illegal memory access",
         // Xid 31 on a 2 MiB page boundary) whenever the driver had placed c_dst at the end of a mapped page.  c_tokv
@@ -6608,9 +6617,15 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         ck(cudaMalloc(&gp.c_dst, sizeof(int32_t) * (size_t) (ne + ids_slack)), "c_dst");
         ck(cudaMalloc(&gp.c_tokv, sizeof(int32_t) * (size_t) (ne + ids_slack)), "c_tok");
         ck(cudaMalloc(&gp.c_w, sizeof(float) * (size_t) ne), "c_w");
-        ck(cudaMalloc(&gp.c_out, (size_t) n * (size_t) H * 4), "c_out");
+        if (!wide) ck(cudaMalloc(&gp.c_out, (size_t) n * (size_t) H * 4), "c_out");
+    } else if (!wide) {   // a classic call after wide ones: the buffers they left out, at the c_tok capacity
+        const int64_t T = gp.c_tok;
+        if (!gp.c_x) ck(cudaMalloc(&gp.c_x, (size_t) T * (size_t) H * 4), "c_x");
+        if (!gp.c_xq) ck(cudaMalloc(&gp.c_xq, (size_t) T * strata::kernels::native_q8_1_bytes((int) H, 1)), "c_xq");
+        if (!gp.c_scratch) ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(T * K, im.g.n_ff)), "c_scratch");
+        if (!gp.c_out) ck(cudaMalloc(&gp.c_out, (size_t) T * (size_t) H * 4), "c_out");
     }
-    if (n > gp.c_pin_tok) {   // the PINNED landing pad persists across prompts (see Gpu::c_pin_tok)
+    if (n > gp.c_pin_tok && !wide) {   // the PINNED landing pad persists across prompts (see Gpu::c_pin_tok)
         if (gp.c_hparts) cudaFreeHost(gp.c_hparts);
         gp.c_hparts = nullptr;
         gp.c_pin_tok = n;
@@ -6685,7 +6700,14 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     const int gt = MP.gt, ut = MP.ut, dt = MP.dt;   // the types MMQ multiplies (PTQ1_0 -> its Q2_0 copy)
     if (use_mmq) {
         SL = MP.SL;
-        const int64_t cap = std::max<int64_t>(16384, n);
+        int64_t cap = std::max<int64_t>(16384, n);
+        if (wide) {   // a sub-run's rows are bounded by the call's largest expert run, not by its token count
+            std::vector<int32_t> c((size_t) im.g.n_experts, 0);
+            int32_t mx = 0;
+            for (int64_t j = 0; j < NE; ++j)
+                if (ids[j] >= 0 && ids[j] < im.g.n_experts) mx = std::max(mx, ++c[(size_t) ids[j]]);
+            cap = std::max<int64_t>(16384, mx);
+        }
         if (use_mmq && gp.m_rows < cap) {
             gp.free_mmq();
             gp.m_rows = cap;
@@ -6756,17 +6778,31 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     ck(cudaMemcpyAsync(gp.c_tokv, tok.data(), sizeof(int32_t) * (size_t) NEP, cudaMemcpyHostToDevice, gp.s), "c_tok");
 
     // ---- activations (the first class pass only) ----
-    if (first_pass) ck(cudaMemcpyAsync(gp.c_x, x_host, (size_t) n * (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "c_x h2d");
-    if (first_pass) {   // the MMVQ quantizer takes <= 8 columns per call; columns are contiguous per token, so step through them
-        const size_t col = strata::kernels::native_q8_1_bytes((int) H, 1);
-        if (strata::kernels::native_q8_1_bytes((int) H, 8) != 8 * col) {
-            std::fprintf(stderr, "ds4_moe: run_chunk: q8_1 layout is not per-column contiguous\n");
-            return false;
-        }
-        for (int c0 = 0; c0 < n; c0 += 8)
-            strata::kernels::native_quantize_q8_1((const float*) gp.c_x + (size_t) c0 * (size_t) H,
-                                                  (uint8_t*) gp.c_xq + (size_t) c0 * col, (int) H, std::min(8, n - c0), gp.s);
+    const float* XD = wide ? x_dev : (const float*) gp.c_x;   // the input rows on the card
+    if (first_pass && !wide) ck(cudaMemcpyAsync(gp.c_x, x_host, (size_t) n * (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "c_x h2d");
+    const size_t xq_col = strata::kernels::native_q8_1_bytes((int) H, 1);
+    if (first_pass && strata::kernels::native_q8_1_bytes((int) H, 8) != 8 * xq_col) {
+        std::fprintf(stderr, "ds4_moe: run_chunk: q8_1 layout is not per-column contiguous\n");
+        return false;
     }
+    auto quantize_xq = [&]() {   // the MMVQ quantizer takes <= 8 columns per call; columns are contiguous per token, so step through them
+        for (int c0 = 0; c0 < n; c0 += 8)
+            strata::kernels::native_quantize_q8_1(XD + (size_t) c0 * (size_t) H, (uint8_t*) gp.c_xq + (size_t) c0 * xq_col,
+                                                  (int) H, std::min(8, n - c0), gp.s);
+    };
+    if (first_pass) gp.c_xq_ok = false;
+    if (first_pass && !wide) {
+        quantize_xq();
+        gp.c_xq_ok = true;
+    }
+    // a wide call's MMVQ inputs, on its first MMVQ launch (VRAM-resident experts, a layer MMQ does not cover)
+    auto ensure_mmvq = [&]() {
+        if (gp.c_xq_ok) return;
+        if (!gp.c_xq) ck(cudaMalloc(&gp.c_xq, (size_t) gp.c_tok * xq_col), "c_xq");
+        if (!gp.c_scratch) ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(gp.c_tok * K, im.g.n_ff)), "c_scratch");
+        quantize_xq();
+        gp.c_xq_ok = true;
+    };
 
     // a launch over groups `es` (expert ids) whose blobs are at `ptrs`: grp_start are offsets into the sorted entries
     std::vector<int32_t> lstart;
@@ -6787,8 +6823,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         mbnd.push_back((int32_t) R);
         ck(cudaMemcpyAsync(gp.m_bnd, mbnd.data(), sizeof(int32_t) * mbnd.size(), cudaMemcpyHostToDevice, gp.s), "m_bnd");
         const int32_t* tokr = (const int32_t*) gp.c_tokv + r0;
-        mmq::quantize((const float*) gp.c_x, tokr, gp.m_xg, gt, H, H, R, gp.s);
-        if (ut != gt) mmq::quantize((const float*) gp.c_x, tokr, gp.m_xu, ut, H, H, R, gp.s);
+        mmq::quantize(XD, tokr, gp.m_xg, gt, H, H, R, gp.s);
+        if (ut != gt) mmq::quantize(XD, tokr, gp.m_xu, ut, H, H, R, gp.s);
         const uint8_t* base = (const uint8_t*) ptrs[q0];
         // PTQ1_0 matrices of the run -> their Q2_0 copies in m_tc (one launch per transcoded role; the staged blobs
         // are SL apart, the copies SL2 apart; same stream, so the copies are done before the products read them)
@@ -6889,6 +6925,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             return;
         }
 #endif
+        ensure_mmvq();
         lstart.clear();
         // cap_entries = NE, not this launch's count: the kernel's scratch regions are laid out by it and entries are
         // indexed absolutely (grp_start); its SwiGLU pass visits only [grp_start[0], grp_start[ng]).
@@ -7230,10 +7267,10 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     // ---- outputs: the top-k mix on the card, n rows back ----
     ck(cudaMemcpyAsync(gp.c_w, w, sizeof(float) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_w");
     strata::kernels::weighted_rows_sum((const float*) gp.c_parts, (const float*) gp.c_w, (int) K, H, n,
-                                       (float*) gp.c_out, gp.s);
-    if (out_dev)   // straight into the caller's device tensor (no host round trip)
+                                       wide ? (float*) out_dev : (float*) gp.c_out, gp.s);   // wide: the sums in place
+    if (out_dev && !wide)   // straight into the caller's device tensor (no host round trip)
         ck(cudaMemcpyAsync(out_dev, gp.c_out, (size_t) n * (size_t) H * 4, cudaMemcpyDeviceToDevice, gp.s), "out d2d");
-    else
+    else if (!out_dev)
         ck(cudaMemcpyAsync(gp.c_hparts, gp.c_out, (size_t) n * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "out d2h");
     const double ts = now_ms();
     ck(cudaStreamSynchronize(gp.s), "chunk sync");
@@ -7315,12 +7352,12 @@ void chunk_pstage_next(Ds41MoeImpl& im, int64_t layer, int n) {
 }
 
 bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out,
-                   void* out_dev) {
+                   void* out_dev, const float* x_dev = nullptr) {
     // chunk_prefetch: make this layer's file-tier experts available in a slab (and start the next layer's read), so
     // the passes below DMA out of pinned memory instead of reading NVMe on their critical path (a no-op when off).
     chunk_pf_prepare(im, layer, n);
     if (!im.g.per_expert()) {
-        if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev)) return false;
+        if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev, -1, true, true, x_dev)) return false;
         chunk_pstage_next(im, layer, n);
         return true;
     }
@@ -7339,7 +7376,7 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     if (layer_ra_on() && !im.cstage)
         layer_ra_start(im, layer, n, ids, skip);
     for (size_t i = 0; i < cl.size(); ++i)
-        if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev, cl[i], i == 0, i + 1 == cl.size())) {
+        if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev, cl[i], i == 0, i + 1 == cl.size(), x_dev)) {
             layer_ra_stop(*im.gpu);
             chunk_cpu_drop(*im.gpu);
             return false;
@@ -7796,6 +7833,25 @@ bool Ds41MoeTier::run_chunk_dev(int64_t layer, int n, const int32_t* ids, const 
     if (im_->gpu && !im_->cfg.cpu_only) return chunk_classes(*im_, layer, n, ids, w, x, nullptr, out_dev);
 #endif
     return false;
+}
+
+bool Ds41MoeTier::run_chunk_xdev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x_dev, void* out_dev) {
+    if (!im_->inited || !ids || !w || !x_dev || !out_dev || n < 1) return false;
+    if (!im_->g.routed(layer) || !chunk_xdev_ok()) return false;
+#if defined(DS4_MOE_CUDA)
+    return chunk_classes(*im_, layer, n, ids, w, nullptr, nullptr, out_dev, x_dev);
+#else
+    return false;
+#endif
+}
+
+bool Ds41MoeTier::chunk_xdev_ok() const {
+#if defined(DS4_MOE_CUDA)
+    // the remote helper cards (RemoteScope, STRATA_DS41_REMOTE) take host rows: those runs keep run_chunk_dev
+    return im_->inited && im_->gpu && !im_->cfg.cpu_only && !im_->remote && !im_->gpu->remote && !im_->gpu->rchunk;
+#else
+    return false;
+#endif
 }
 
 bool Ds41MoeTier::run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out) {

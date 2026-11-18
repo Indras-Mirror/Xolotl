@@ -54,6 +54,14 @@ bool env_on(const char * k, bool dflt) {
     return e ? std::atoi(e) != 0 : dflt;
 }
 
+// STRATA_WIDE_PROMPT=1 (opt-in; ds41_generate's wide prompt batches): fewer bytes per state column.  The FFN's hc
+// state (hap) lives in the x_state columns it replaces - x_state is dead from the attention's hc_post until finish
+// writes the new state back - and the MoE input stays on the card (the tier reads o_fn; no host_fn copy).
+bool wide_prompt() {
+    static const bool on = env_on("STRATA_WIDE_PROMPT", false);
+    return on;
+}
+
 // The decode graphs are built once and reused; stamping a uid lets ggml-cuda reuse its captured CUDA graph.  One
 // allocator serves every cached graph (they run one at a time); when it has to grow, every graph allocated before
 // is re-allocated on its next use (the epoch), as tools/ds4/ds4_dense.cpp alloc_graph does.
@@ -1886,7 +1894,10 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     const int64_t D = im.D, HC = im.HC;
     im.x_state = ggml_new_tensor_3d(c, GGML_TYPE_F32, D, HC, NC);
     im.pre_state = ggml_new_tensor_2d(c, GGML_TYPE_F32, HC, NC);
-    im.hap = ggml_new_tensor_3d(c, GGML_TYPE_F32, D, HC, NC);
+    // wide: every reader of a column's x_state (the Engram add, the hc mixes, hc_pre, hc_post) feeds h, so the write of
+    // h over it comes after them in the graph's order; finish reads it and writes the new state over it
+    im.hap = wide_prompt() ? ggml_view_3d(c, im.x_state, D, HC, NC, im.x_state->nb[1], im.x_state->nb[2], 0)
+                           : ggml_new_tensor_3d(c, GGML_TYPE_F32, D, HC, NC);
     im.post_f = ggml_new_tensor_2d(c, GGML_TYPE_F32, HC, NC);
     im.comb_f = ggml_new_tensor_3d(c, GGML_TYPE_F32, HC, HC, NC);
     im.shexp = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
@@ -1929,7 +1940,7 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     // a 2193.81 MiB allocation later failed with 6.83 GiB "free" - name the owner before sizing anything).
     if (std::getenv("STRATA_VRAM_TRACE")) {
         double tot = 0;
-        for (ggml_tensor * t = ggml_get_first_tensor(c); t; t = ggml_get_next_tensor(c, t)) tot += (double) ggml_nbytes(t);
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t; t = ggml_get_next_tensor(c, t)) tot += t->view_src ? 0.0 : (double) ggml_nbytes(t);
         std::fprintf(stderr, "vram trace: state NC=%d wants %.2f GiB (i_eng %lld x %d = %.2f GiB each, i_wmask %.1f MiB, "
                              "i_widx %.1f MiB)\n", NC, tot / 1073741824.0, (long long) im.EC, (int) im.ED,
                      (double) ggml_nbytes(im.i_eng[0]) / 1073741824.0, (double) ggml_nbytes(im.i_wmask) / 1048576.0,
@@ -2299,7 +2310,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     if (!alloc_cols(im, im.NC, err)) return false;
     if (!cfg.head_only) {
         const int64_t D = im.D, NCM = im.NCmax;
-        im.host_fn.resize((size_t) (D * NCM));
+        im.host_fn.resize((size_t) (D * (wide_prompt() ? im.S : NCM)));   // wide: the batch's fn rows stay on the card
 #ifdef DS41_HAVE_CUDA
         if (!im.cpu && !im.host_fn.empty()) ggml_backend_cuda_register_host_buffer(im.host_fn.data(), im.host_fn.size() * 4);
 #endif
@@ -3006,8 +3017,10 @@ static bool span_attn_one(Ds41Dense::Impl & im, int il, int col0, int n) {
     if (g_dprof_on) { tp = dprof_now(); g_dprof[7] += 1; }
     ggml_free(gc);
     if (!ok) return false;
-    // the sub-batch's ids / wts / fn land at its own batch columns (token-major: token col0+t at t * NU / t * D)
-    ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data() + (size_t) col0 * im.D, (size_t) col0 * im.D * 4, (size_t) n * im.D * 4);
+    // the sub-batch's ids / wts / fn land at its own batch columns (token-major: token col0+t at t * NU / t * D); wide:
+    // fn stays on the card (batch_fn_dev)
+    if (!wide_prompt())
+        ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data() + (size_t) col0 * im.D, (size_t) col0 * im.D * 4, (size_t) n * im.D * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
     if (im.o_xids) {
@@ -3058,6 +3071,7 @@ int Ds41Dense::batch_size() const { return (int) p_->batch; }
 const int32_t * Ds41Dense::batch_ids() const { return p_->host_ids.data(); }
 const float * Ds41Dense::batch_wts() const { return p_->host_wts.data(); }
 const float * Ds41Dense::batch_fn() const { return p_->host_fn.data(); }
+const float * Ds41Dense::batch_fn_dev() const { return p_->cpu || !p_->o_fn ? nullptr : (const float *) p_->o_fn->data; }
 
 // STRATA_ATTN_TAIL: ev_route recorded behind the routing readbacks (the event made on first use)
 static bool route_event(Ds41Dense::Impl & im) {

@@ -1394,15 +1394,30 @@ int main(int argc, char ** argv) {
     std::vector<int> cids((size_t) NP * top_k);
     std::vector<float> cw((size_t) NP * top_k), crouted((size_t) NP * n_embd), clog;
     const bool routed_host = std::getenv("STRATA_ROUTED_HOST") != nullptr;
+    // STRATA_WIDE_PROMPT=1 (opt-in): wide layer-major prompt batches.  A batch column costs ~0.36 MiB of VRAM instead of
+    // ~0.72 (the dense half keeps the FFN's hc state in x_state and the MoE input on the card; the tier reads it there
+    // and holds only the buffers it uses: Ds41MoeTier::run_chunk_xdev), so --prompt-batch can be ~2x wider, and every
+    // batch is one tier call per layer (each call sweeps the layer's experts once).  Batches are whole sub-batches and
+    // never end inside the enc-skip replay window (either would run layers 20-39 for an extra batch).  Same kernels and
+    // sums per token: the last logits are the narrow batch's bits.
+    const bool wide = std::getenv("STRATA_WIDE_PROMPT") && std::atoi(std::getenv("STRATA_WIDE_PROMPT")) != 0;
+    if (wide && (routed_host || mc.cpu_only || pipe.enabled() || !tier.chunk_xdev_ok())) {
+        // the dense half no longer copies the MoE input to the host, so a host-row tier call would read stale rows
+        std::fprintf(stderr, "ds41_generate: STRATA_WIDE_PROMPT needs one GPU stage with a GPU tier, no remote helper "
+                             "card and no STRATA_ROUTED_HOST\n");
+        return 2;
+    }
+    if (wide && PB > 1) std::fprintf(stderr, "wide prompt: on (batch columns ~0.36 MiB, one tier call per layer and batch)\n");
     std::vector<float> brouted;                    // the layer-major path's routed sums (n_embd * B)
-    if (PB > 0) brouted.resize((size_t) n_embd * (size_t) PB);
+    if (PB > 0 && !wide) brouted.resize((size_t) n_embd * (size_t) PB);
     // a single run_chunk call streams layer l's experts once for its n tokens; the card's chunk buffers (dominated by
     // c_parts = n * top_k * n_embd * 4) must fit ~1 GiB, so a larger batch is run in pieces (each streams once again)
     // budget 3 GB by default (STRATA_CHUNK_BUDGET_GB): at B=8192 the old 1 GB cap split every layer into 2 pieces and each
     // piece re-uploaded the whole layer over PCIe (1.97M vs 0.98M expert copies); the prompt has ~12 GiB of VRAM free
     // (the VRAM expert cache is only seeded after the prompt, from the memory measured then)
     const double chunk_budget = std::getenv("STRATA_CHUNK_BUDGET_GB") ? std::atof(std::getenv("STRATA_CHUNK_BUDGET_GB")) * 1e9 : 3.0e9;
-    const int piece = (int) std::max<int64_t>(1, (int64_t) chunk_budget / std::max<int64_t>(1, (int64_t) n_embd * 4 * (top_k + 3)));
+    const int piece = wide ? std::max(1, PB)   // wide: the batch width was sized for its whole tier call
+                           : (int) std::max<int64_t>(1, (int64_t) chunk_budget / std::max<int64_t>(1, (int64_t) n_embd * 4 * (top_k + 3)));
     // the prompt ids[0, n) at positions pos0..: last_logits = the last row; all_logits (if given) every row
     std::vector<float> last_logits((size_t) nv);
     // the deferred VRAM seed after a prompt: the prompt's buffers go back, the cache opens into the free space, and the
@@ -1595,6 +1610,17 @@ int main(int argc, char ** argv) {
                 // makes a prompt slower instead of failing the request (s13 run8: "prefill failed: graph allocation
                 // failed" on a 21K prompt with Whisper's 2.5 GB resident).
                 Ds41Dense & batch_dense = pipe.enabled() ? pipe.dense(0) : dense;
+                // wide: a batch that is not the last ends on a sub-batch boundary (its last columns would otherwise be
+                // past the enc-skip cut, which rounds down to one, and run layers 20-39 - another sweep of their experts)
+                // and before the replay window (else this batch and the last both run layers 20-39)
+                auto halve = [&](int b) { return wide ? std::max(SB, b / 2 / SB * SB) : std::max(SB, b / 2); };
+                if (wide && B < n - c0) {
+                    B = std::max(SB, B / SB * SB);
+                    if (enc_skip && n - c0 - B < ER && pb_cap >= ER + SB) {
+                        const int b2 = (int) ((n - c0 - ER) / SB * SB);
+                        if (b2 >= SB) B = b2;
+                    }
+                }
                 for (;;) {
                     // a DSpark batch seed is read off the final layer-major batch; a 1-token remainder would run on the
                     // chunk path and capture nothing (prompt = batch + 1: "DSpark batch seed captured nothing", #53)
@@ -1619,8 +1645,8 @@ int main(int argc, char ** argv) {
                     if (!set_cols(B)) {
                         if (B > SB) {
                             std::fprintf(stderr, "ds41_generate: %d state columns did not fit (%s) - retrying at %d\n",
-                                         B, ferr.c_str(), std::max(SB, B / 2));
-                            B = std::max(SB, B / 2);
+                                         B, ferr.c_str(), halve(B));
+                            B = halve(B);
                             continue;
                         }
                         return false;
@@ -1631,8 +1657,8 @@ int main(int argc, char ** argv) {
                     }
                     if (B > SB) {
                         std::fprintf(stderr, "ds41_generate: batch of %d did not fit (%s) - retrying at %d\n",
-                                     B, dense.last_error().c_str(), std::max(SB, B / 2));
-                        B = std::max(SB, B / 2);
+                                     B, dense.last_error().c_str(), halve(B));
+                        B = halve(B);
                         continue;
                     }
                     ferr = dense.last_error();
@@ -1688,7 +1714,11 @@ int main(int argc, char ** argv) {
                     if (l < 2) vram_log("pre-tier", l);
                     for (int s = d0; s < B; s += piece) {   // the experts for the dense rows (in pieces if the buffers cap)
                         const int pn = std::min(piece, B - s);
-                        const bool ok = rdev ? cur_tier->run_chunk_dev(l, pn, cur_dense->batch_ids() + (size_t) s * top_k,
+                        const bool ok = wide ? cur_tier->run_chunk_xdev(l, pn, cur_dense->batch_ids() + (size_t) s * top_k,
+                                                                        cur_dense->batch_wts() + (size_t) s * top_k,
+                                                                        cur_dense->batch_fn_dev() + (size_t) s * n_embd,
+                                                                        rdev + (size_t) s * n_embd)
+                                      : rdev ? cur_tier->run_chunk_dev(l, pn, cur_dense->batch_ids() + (size_t) s * top_k,
                                                                   cur_dense->batch_wts() + (size_t) s * top_k,
                                                                   cur_dense->batch_fn() + (size_t) s * n_embd,
                                                                   rdev + (size_t) s * n_embd)
@@ -3428,11 +3458,18 @@ int main(int argc, char ** argv) {
                 const double g_need = pb_graph ? (double) dense.span_graph_bytes(total, SB) : 0.0;   // memoized per row count
                 double room = 0;
                 int fit_line = 0, fit_g = 0;
+                // STRATA_WIDE_PROMPT with the cache released: a column is the state's ~0.24 MiB + the tier's parts ~0.12
+                // (no MMVQ scratch: nothing is VRAM-resident).  2026-10-27, 60K one-shot at 30720 columns: state 7.30 +
+                // tier 7.09 GiB, + the 1.5 GiB lazy prestage in the batch that runs layers 20-39 = 4.75 GiB + 0.352 MiB
+                // a column, so the graph term's fixed part is the line's 4.3 here, not 2.5.  A kept cache's batch keeps
+                // the calibrated constants.
+                const bool wide_cols = wide && !kept;
+                const double mib_line = wide_cols ? 0.44 : 0.95, mib_g = wide_cols ? 0.38 : 0.78, gib_g = wide_cols ? 4.3 : 2.5;
                 auto fit_cap = [&](size_t fb) {
                     room = (double) fb - a.vram_margin_gib * 1073741824.0 - 4.3 * 1073741824.0;
-                    const double room_g = (double) fb - a.vram_margin_gib * 1073741824.0 - 2.5 * 1073741824.0 - g_need;
-                    fit_line = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
-                    fit_g = pb_graph ? (int) std::max<int64_t>(2, (int64_t) (room_g / (0.78 * 1048576.0))) : fit_line;
+                    const double room_g = (double) fb - a.vram_margin_gib * 1073741824.0 - gib_g * 1073741824.0 - g_need;
+                    fit_line = (int) std::max<int64_t>(2, (int64_t) (room / (mib_line * 1048576.0)));
+                    fit_g = pb_graph ? (int) std::max<int64_t>(2, (int64_t) (room_g / (mib_g * 1048576.0))) : fit_line;
                     return std::min(PB, std::max(SB, std::min(fit_line, fit_g)));
                 };
                 pb_cap = fit_cap(frb);

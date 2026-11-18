@@ -566,6 +566,13 @@ public:
     /// run_chunk writing the n * n_embd sums to device memory `out_dev` (same device, e.g. the dense half's chunk
     /// tensor) instead of the host.  GPU tier only.
     bool run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// STRATA_WIDE_PROMPT: run_chunk_dev with the n input rows on the card too (`x_dev`, e.g. the dense half's MoE-input
+    /// tensor).  No host copy of them, and the call holds only the buffers it uses (no c_x / c_out / landing pad; the
+    /// MMVQ scratch only for a call with VRAM-resident experts), so a wide prompt batch costs ~0.12 MiB a token here
+    /// instead of ~0.37.  Same kernels and sums.  False when chunk_xdev_ok() is not.
+    bool run_chunk_xdev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x_dev, void* out_dev);
+    /// run_chunk_xdev can run: a GPU tier without a remote helper card.
+    bool chunk_xdev_ok() const;
     /// The arena alone from a routing profile (the order `seed_from_routes` would give it, incl. arena_skip_resident),
     /// WITHOUT opening the VRAM cache - so prompt chunks can run first and `release_chunk` can give their buffers back
     /// before the cache takes the VRAM.  A later `seed_from_routes` keeps this arena and only seeds the cache.

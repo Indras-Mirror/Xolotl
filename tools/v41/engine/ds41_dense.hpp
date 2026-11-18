@@ -152,6 +152,9 @@ public:
     const int32_t * batch_ids() const;
     const float * batch_wts() const;
     const float * batch_fn() const;
+    /// the MoE-input rows on the card (o_fn, [n_embd, columns]; null on the CPU backend).  STRATA_WIDE_PROMPT: batch_fn
+    /// is not filled by the spans - the tier reads these instead (Ds41MoeTier::run_chunk_xdev).
+    const float * batch_fn_dev() const;
     int batch_size() const;
     /// finish for the batch's sub-batch at column col0: x_state[.., col0+n) = hc_post(shexp + routed, hap, post_f,
     /// comb_f).  `routed_host` is n_embd * B (token-major); call once per layer, before the sub-batches' finishes.
