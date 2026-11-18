@@ -296,11 +296,31 @@ def t_parallel():
         check("engine_args: parallel reaches the ds41 engine", args[-2:] == ["--batch", "2"] or "--batch" in args, args)
 
 
+def t_routing():
+    """(local rb25) A config without --route-bias / --route-bias-file routes exactly (upstream's engine defaults were the
+    -max nudge 1.0 / 0.6); the config's own values are kept, never doubled."""
+    S = D.S
+    val = lambda a, f: a[a.index(f) + 1] if f in a else None  # noqa: E731
+    a = S.engine_args({"args": ["-m", "x.gguf"]})
+    check("routing: no flags -> both at 0 (exact)", (val(a, "--route-bias"), val(a, "--route-bias-file")) == ("0", "0"), a)
+    a = S.engine_args({"args": ["-m", "x.gguf", "--route-bias", "0.5", "--route-bias-file", "0.3"]})
+    check("routing: the config's flags kept, not doubled",
+          (val(a, "--route-bias"), val(a, "--route-bias-file")) == ("0.5", "0.3") and a.count("--route-bias") == 1 and
+          a.count("--route-bias-file") == 1, a)
+    a = S.engine_args({"args": ["-m", "x.gguf", "--route-bias", "0.5"]})
+    check("routing: only the missing flag at 0", (val(a, "--route-bias"), val(a, "--route-bias-file")) == ("0.5", "0"), a)
+    cfg = {"args": ["-m", "x.gguf"]}
+    S.engine_args(cfg)
+    check("routing: a second call adds nothing", S.engine_args(cfg).count("--route-bias") == 1, cfg)
+    check("routing: the dashboard note of no flags is exact", D._routing_note(0.0, 0.0, 0, 0) == "exact routing")
+
+
 if __name__ == "__main__":
     t_template()
     t_effort_kwargs()
     t_parser()
     t_parallel()
+    t_routing()
     if len(sys.argv) > 1:
         t_tokenizer(Path(sys.argv[1]))
         t_http(Path(sys.argv[1]))

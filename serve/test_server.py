@@ -3407,6 +3407,26 @@ class SharedSettings(unittest.TestCase):
         self.assertEqual(self.svc.with_shared({"reasoning_effort": "high"}, "openai")["reasoning_effort"], "high")
         self.assertEqual(self.svc.with_shared({}, "anthropic")["output_config"], {"effort": "low"})
 
+    def test_a_new_seed_for_each_request_without_one(self):
+        """(local rb25) No seed from the request, the config or the shared settings: every request gets a new one (the
+        engine's generator, seeded once at its start, made the first sampled reply after each start the same); a
+        request's own seed wins."""
+        seeds = []
+        for _ in range(3):
+            code, _ = self.chat(temperature=0.8)
+            self.assertEqual(code, 200)
+            s = self.engine.last_sampling.get("seed")
+            self.assertIsInstance(s, int)
+            self.assertTrue(0 < s < 2 ** 31, s)
+            seeds.append(s)
+        self.assertEqual(len(set(seeds)), 3, seeds)                    # one fixed seed would repeat
+        code, _ = self.chat(temperature=0.8, seed=12345)
+        self.assertEqual(code, 200)
+        self.assertEqual(self.engine.last_sampling["seed"], 12345)
+        code, _ = self.chat(temperature=0.8, seed=None)                # null = not given
+        self.assertEqual(code, 200)
+        self.assertNotEqual(self.engine.last_sampling["seed"], 12345)
+
     def test_off_again(self):
         self.req("/settings", {"defaults": {"temperature": 0.3}})
         code, b = self.req("/settings", {"defaults": None})

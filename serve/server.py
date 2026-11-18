@@ -40,6 +40,7 @@ import math
 import os
 import queue
 import re
+import secrets
 import select
 import signal
 import socket
@@ -6819,6 +6820,19 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        # (local rb25) A request without a seed - OpenAI clients send none - gets a new one, as with OpenAI, llama.cpp
+        # and vLLM.  The engine seeds its generator once at its start and otherwise goes on from the previous request's
+        # draws, so the first sampled reply after every start was the same reply, however often it was tried.  A seed
+        # from the request, the config's sampling.seed or the shared settings still wins (one seed for every request
+        # keeps A/B runs deterministic); a random one is printed, and "seed": N repeats that reply on the same build,
+        # prompt and routing.  Every pass of this request (a budget's continuation, a retry) uses the same seed.
+        seed = (sampling or {}).get("seed")
+        if not (isinstance(seed, int) and not isinstance(seed, bool) and seed > 0):
+            sampling = {**(sampling or {}), "seed": secrets.randbelow(2 ** 31 - 1) + 1}
+            t = sampling.get("temperature")
+            if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) > 0.0:
+                print(f"[strata] seed {sampling['seed']} (random; send \"seed\": {sampling['seed']} to repeat this reply)",
+                      flush=True)
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
