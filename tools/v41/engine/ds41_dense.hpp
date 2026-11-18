@@ -64,6 +64,13 @@ struct Ds41DenseConfig {
     /// on those weights.  Image rows are the encoder's (Orca's mmproj carries its own); DSpark's draft layers are not
     /// mapped (drafts only - the verify is).  Both empty = off: no graph node and no input byte changes.
     std::vector<float> ablate_r, ablate_v;
+    /// --ablate-scale S / --ablate-sites LIST (local rb32): x - S r (v.x) / (v.r) on the writes in ablate_sites
+    /// (kAbl* bits, default all = the rb26 map).  S = 2 with v = r is a reflection - the r-part of a write changes sign,
+    /// its norm stays: Atomic's DeepSeek-V4.1-Flash-1017 edit (W - 2 r r^T W on the attention output, the shared and
+    /// routed experts' down and the Engram value, no embeddings; their GSQ build leaves the routed experts out).
+    enum { kAblEmbd = 1, kAblEngram = 2, kAblAttn = 4, kAblShexp = 8, kAblRouted = 16, kAblAll = 31 };
+    float ablate_scale = 1.0f;
+    int   ablate_sites = kAblAll;
 
     /// Batch slots (--batch-slots N): conversation states held at once, each of the full ctx_max - its window rings,
     /// ratio-2 compressor states, compressed KV + indexer keys, snapshot, park and Engram history.  Slot 0 is the one

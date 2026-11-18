@@ -237,11 +237,12 @@ struct Ds41Dense::Impl {
     ggml_tensor * rknob = nullptr;        // F32 [kRK + 1, 2] smart router: protect / pool rank selectors (set_route_select)
     ggml_tensor * routed = nullptr;       // [D, NC]
     ggml_tensor * cand = nullptr;         // I32 [CB, NC]  candidate blocks of cand_layer
-    // --ablate (cfg.ablate_r / ablate_v): v [D, 1] and r / (v.r) [1, D] on the backend (nctx), the same on the host for
-    // the embedding rows.  abl_v null = off.
+    // --ablate (cfg.ablate_r / ablate_v): v [D, 1] and S r / (v.r) [1, D] on the backend (nctx), the same on the host for
+    // the embedding rows.  abl_v null = off; abl_sites = cfg.ablate_sites (the writes that take the map).
     ggml_tensor * abl_v = nullptr;
     ggml_tensor * abl_rs = nullptr;
     std::vector<float> abl_v_h, abl_rs_h;
+    int abl_sites = Ds41DenseConfig::kAblAll;
     struct Layer {
         int64_t ratio = 0;
         bool kv_src = false, idx_src = false, cand_src = false, uses_cand = false;
@@ -1347,11 +1348,12 @@ static void attn_tail_ops(Ds41Dense::Impl & im, ggml_context * gc, int il, std::
     outs.push_back(c_pre);
 }
 
-// --ablate: x - r (v.x) / (v.r) per column of x ([D, ...], contiguous result of x's shape); x itself when off, so a
-// graph without the flag has no extra node.  Every residual write goes through it: the Engram value, the attention
-// output and the FFN output (the embeddings get the same map on the host, ablate_rows).
-static ggml_tensor * ablate(const Ds41Dense::Impl & im, ggml_context * gc, ggml_tensor * x) {
-    if (!im.abl_v) return x;
+// --ablate: x - S r (v.x) / (v.r) per column of x ([D, ...], contiguous result of x's shape); x itself when off or when
+// `site` (Ds41DenseConfig::kAbl* bits) is not in --ablate-sites, so a graph without the flag has no extra node.  Every
+// residual write goes through it: the Engram value, the attention output and the FFN output (the embeddings get the
+// same map on the host, ablate_rows).
+static ggml_tensor * ablate(const Ds41Dense::Impl & im, ggml_context * gc, ggml_tensor * x, int site) {
+    if (!im.abl_v || !(im.abl_sites & site)) return x;
     const int64_t D = x->ne[0], n = ggml_nelements(x) / D;
     ggml_tensor * x2 = ggml_reshape_2d(gc, ggml_is_contiguous(x) ? x : ggml_cont(gc, x), D, n);
     ggml_tensor * s = ggml_mul_mat(gc, im.abl_v, x2);                       // [1, n]  v.x
@@ -1362,7 +1364,7 @@ static ggml_tensor * ablate(const Ds41Dense::Impl & im, ggml_context * gc, ggml_
 
 // The embedding rows' share of --ablate (host, n rows of D floats; text rows only - image rows are the encoder's)
 static void ablate_rows(const Ds41Dense::Impl & im, float * rows, int64_t n) {
-    if (im.abl_v_h.empty()) return;
+    if (im.abl_v_h.empty() || !(im.abl_sites & Ds41DenseConfig::kAblEmbd)) return;
     const int64_t D = im.D;
     for (int64_t t = 0; t < n; ++t) {
         float * x = rows + t * D;
@@ -1370,6 +1372,13 @@ static void ablate_rows(const Ds41Dense::Impl & im, float * rows, int64_t n) {
         for (int64_t i = 0; i < D; ++i) s += (double) im.abl_v_h[(size_t) i] * x[i];
         for (int64_t i = 0; i < D; ++i) x[i] -= (float) (s * im.abl_rs_h[(size_t) i]);
     }
+}
+
+// The FFN write (shexp + routed): one map on the sum when both parts take it (the rb26 graph), else each part on its own
+static ggml_tensor * ffn_write(const Ds41Dense::Impl & im, ggml_context * gc, ggml_tensor * se, ggml_tensor * ro) {
+    constexpr int both = Ds41DenseConfig::kAblShexp | Ds41DenseConfig::kAblRouted;
+    if ((im.abl_sites & both) == both) return ablate(im, gc, ggml_add(gc, se, ro), both);
+    return ggml_add(gc, ablate(im, gc, se, Ds41DenseConfig::kAblShexp), ablate(im, gc, ro, Ds41DenseConfig::kAblRouted));
 }
 
 // tail: build_attn without the FFN hc mixes, the shared expert and their writes (post_f / comb_f / shexp / pre_state)
@@ -1412,7 +1421,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
             ggml_tensor * m = ggml_reshape_3d(gc, b.v1(im.i_img, n, (size_t) col0 * 4), 1, 1, n);
             gate = ggml_mul(gc, gate, ggml_scale_bias(gc, m, -1.0f, 1.0f));   // gate * (1 - image)
         }
-        ggml_tensor * gv = ggml_mul(gc, ggml_repeat(gc, ablate(im, gc, ggml_cont(gc, val)), x), gate);
+        ggml_tensor * gv = ggml_mul(gc, ggml_repeat(gc, ablate(im, gc, ggml_cont(gc, val), Ds41DenseConfig::kAblEngram), x), gate);
         x = ggml_add(gc, x, gv);
         outs.push_back(ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n, col0)));   // the block input (residual) = state + Engram
     }
@@ -1731,7 +1740,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * wo_a = ggml_reshape_3d(gc, im.BL(il, "attn_output_a.weight"), im.OGD, im.OL, im.OG);
     ggml_tensor * oa = ggml_permute(gc, ggml_mul_mat(gc, wo_a, o), 0, 2, 1, 3);              // [OL, OG, n]
     ggml_tensor * attn = ggml_mul_mat(gc, im.BL(il, "attn_output_b.weight"), b.flat2(oa, im.OL * im.OG, n));   // [D, n]
-    attn = ablate(im, gc, attn);
+    attn = ablate(im, gc, attn, Ds41DenseConfig::kAblAttn);
 
     // ---- hc_post(attention) -> FFN hc: its mixes give the next layer's pre-mix; its input uses the attention's
     ggml_tensor * h = ggml_dsv4_hc_post(gc, attn, x, a_post, a_join ? a_join : a_comb);     // [D, HC, n]
@@ -1979,7 +1988,7 @@ static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc,
             ggml_tensor * m = ggml_reshape_3d(gc, b.v1(im.i_img, n, (size_t) col0 * 4), 1, 1, n);
             gate = ggml_mul(gc, gate, ggml_scale_bias(gc, m, -1.0f, 1.0f));
         }
-        x = ggml_add(gc, x, ggml_mul(gc, ggml_repeat(gc, ablate(im, gc, ggml_cont(gc, val)), x), gate));
+        x = ggml_add(gc, x, ggml_mul(gc, ggml_repeat(gc, ablate(im, gc, ggml_cont(gc, val), Ds41DenseConfig::kAblEngram), x), gate));
         outs.push_back(ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n, col0)));
     }
     ggml_tensor * xin = ggml_dsv4_hc_pre(gc, x, b.cols2(im.pre_state, HC, n, col0));
@@ -2061,7 +2070,7 @@ static ggml_cgraph * build_finish(Ds41Dense::Impl & im, ggml_context * gc, int64
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
-    ggml_tensor * out = ablate(im, gc, ggml_add(gc, b.cols2(im.shexp, D, n, col0), b.cols2(im.routed, D, n, col0)));
+    ggml_tensor * out = ffn_write(im, gc, b.cols2(im.shexp, D, n, col0), b.cols2(im.routed, D, n, col0));
     ggml_tensor * x = ggml_dsv4_hc_post(gc, out, b.cols3(im.hap, D, HC, n, col0), b.cols2(im.post_f, HC, n, col0),
                                         b.cols3(im.comb_f, HC, HC, n, col0));
     ggml_build_forward_expand(gf, ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n, col0)));
@@ -2074,7 +2083,7 @@ static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * g
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 128, false);
     const int64_t D = im.D, HC = im.HC;
-    ggml_tensor * out = ablate(im, gc, ggml_add(gc, b.cols2(im.shexp, D, 1, 0), b.cols2(im.routed, D, 1, 0)));
+    ggml_tensor * out = ffn_write(im, gc, b.cols2(im.shexp, D, 1, 0), b.cols2(im.routed, D, 1, 0));
     ggml_tensor * x = ggml_dsv4_hc_post(gc, out, b.cols3(im.hap, D, HC, 1, 0), b.cols2(im.post_f, HC, 1, 0),
                                         b.cols3(im.comb_f, HC, HC, 1, 0));
     ggml_tensor * st = ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, 1, 0));
@@ -2453,7 +2462,9 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         if (!(std::fabs(vr) > 0.1 * std::sqrt(rr * vv))) { err = "--ablate: r and v are (nearly) orthogonal"; return false; }
         im.abl_v_h = cfg.ablate_v;
         im.abl_rs_h.resize((size_t) im.D);
-        for (int64_t i = 0; i < im.D; ++i) im.abl_rs_h[(size_t) i] = (float) (cfg.ablate_r[(size_t) i] / vr);
+        const double sc = cfg.ablate_scale;   // 1 = rb26's map (x 1.0 is exact)
+        for (int64_t i = 0; i < im.D; ++i) im.abl_rs_h[(size_t) i] = (float) (sc * cfg.ablate_r[(size_t) i] / vr);
+        im.abl_sites = cfg.ablate_sites;
     }
     // gate-only overrides (the golden takes the same): small top-k / candidate counts make the selection logic bite
     // on a short prompt

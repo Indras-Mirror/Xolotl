@@ -143,6 +143,8 @@ struct Args {
     bool vision = false;
     std::string ablate;           // --ablate FILE: 2 x n_embd float32 (r, then v) - x - r (v.x) / (v.r) on every residual write
                                   // (Ds41DenseConfig::ablate_r; local rb26, Orca's abliteration without its weights)
+    float ablate_scale = 1.0f;    // --ablate-scale S: x - S r (v.x) / (v.r) (2 with v = r: a reflection, Atomic's edit; local rb32)
+    std::string ablate_sites;     // --ablate-sites LIST: embd,engram,attn,shexp,routed (or all) - the writes that take it
     // --serve's conversation pool: --conversation-cache-mib N (default 8192; 0 = the single park of STRATA_SERVE_PARK)
     // of host memory for conversations saved at their turn boundary, at most --conversation-cache-slots of them
     int conv_mib = 8192, conv_slots = 64;
@@ -311,6 +313,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--image-token") a.image_token = std::atoi(next().c_str());
         else if (k == "--vision") a.vision = true;
         else if (k == "--ablate") a.ablate = next();
+        else if (k == "--ablate-scale") a.ablate_scale = (float) std::atof(next().c_str());
+        else if (k == "--ablate-sites") a.ablate_sites = next();
         else if (k == "--conversation-cache-mib") a.conv_mib = std::max(0, std::atoi(next().c_str()));
         else if (k == "--conversation-cache-slots") a.conv_slots = std::max(1, std::atoi(next().c_str()));
         else if (k == "--batch-slots" || k == "--batch") { const std::string v = next(); a.batch_slots = v == "auto" ? 0 : std::max(1, std::atoi(v.c_str())); }
@@ -627,8 +631,41 @@ int main(int argc, char ** argv) {
             rr += (double) dc.ablate_r[i] * dc.ablate_r[i];
             vv += (double) dc.ablate_v[i] * dc.ablate_v[i];
         }
-        std::fprintf(stderr, "ablate: %s (%zu dims, cos(r, v) %.4f): x - r (v.x) / (v.r) on every residual write\n", a.ablate.c_str(),
-                     n, vr / std::sqrt(rr * vv));
+        // --ablate-sites: a comma list of these (Ds41DenseConfig::kAbl* bits); --ablate-scale: S in x - S r (v.x) / (v.r)
+        static const std::pair<const char *, int> sites[] = {
+            { "embd", Ds41DenseConfig::kAblEmbd }, { "engram", Ds41DenseConfig::kAblEngram }, { "attn", Ds41DenseConfig::kAblAttn },
+            { "shexp", Ds41DenseConfig::kAblShexp }, { "routed", Ds41DenseConfig::kAblRouted }, { "all", Ds41DenseConfig::kAblAll } };
+        if (!a.ablate_sites.empty()) {
+            int bits = 0;
+            for (size_t p = 0; p <= a.ablate_sites.size();) {
+                const size_t q = std::min(a.ablate_sites.find(',', p), a.ablate_sites.size());
+                const std::string w = a.ablate_sites.substr(p, q - p);
+                int b = -1;
+                for (const auto & s : sites) if (w == s.first) b = s.second;
+                if (b < 0) {
+                    std::fprintf(stderr, "ds41_generate: --ablate-sites: unknown write '%s' (embd, engram, attn, shexp, routed, all)\n",
+                                 w.c_str());
+                    return 2;
+                }
+                bits |= b;
+                p = q + 1;
+            }
+            dc.ablate_sites = bits;
+        }
+        dc.ablate_scale = a.ablate_scale;
+        if (dc.ablate_scale == 1.0f && dc.ablate_sites == Ds41DenseConfig::kAblAll) {
+            std::fprintf(stderr, "ablate: %s (%zu dims, cos(r, v) %.4f): x - r (v.x) / (v.r) on every residual write\n", a.ablate.c_str(),
+                         n, vr / std::sqrt(rr * vv));
+        } else {
+            std::string on;
+            for (const auto & s : sites)
+                if (s.second != Ds41DenseConfig::kAblAll && (dc.ablate_sites & s.second)) on += std::string(on.empty() ? "" : ", ") + s.first;
+            std::fprintf(stderr, "ablate: %s (%zu dims, cos(r, v) %.4f): x - %g r (v.x) / (v.r) on %s\n", a.ablate.c_str(), n,
+                         vr / std::sqrt(rr * vv), (double) dc.ablate_scale, on.empty() ? "no write" : on.c_str());
+        }
+    } else if (a.ablate_scale != 1.0f || !a.ablate_sites.empty()) {
+        std::fprintf(stderr, "ds41_generate: --ablate-scale / --ablate-sites need --ablate\n");
+        return 2;
     }
     dc.engram_hot = a.engram_hot;
     dc.act_quant = a.act_quant;

@@ -143,6 +143,13 @@ Top-1 agreement 0.674 vs 0.701. In the engine: 4096-token code prompt ppl 2.380,
   its mmproj changes only the four tensors that write the LM's space (x - v (v.x)), so image rows come from the encoder
   as they are. On GSQ IQ2_XS: the same decode speed, normal answers stay normal, the canned refusals go. Without the
   flag no graph node or input byte changes.
+  `--ablate-scale S` and `--ablate-sites LIST` (local rb32; LIST = a comma list of embd, engram, attn, shexp, routed,
+  default all) make it x -> x - S r (v.x) / (v.r) on the listed writes only. A pair file with v = r and S = 2 is a
+  reflection: the r-part of each write changes sign and its norm stays. AtomicChat's DeepSeek-V4.1-Flash-1017 LoRA
+  (rank 1, alpha 1, used at `--lora-scaled 2.0`) is exactly that on the original weights: every lora_b is the same unit
+  r and lora_a = -(r^T W) on the attention output, the shared and routed experts' down and the Engram value, with no
+  embeddings, so `--ablate-scale 2 --ablate-sites engram,attn,shexp,routed` applies it to the weights the engine runs.
+  Their GSQ build re-quantizes only the dense writers and leaves the routed experts as ISTA shipped them (`engram,attn,shexp`).
 - **A pool boundary at the end of the system prompt** (opt-in, local rb27): `STRATA_SERVE_PREFIX_SAVE=1`. Subagents
   send one system prompt + tools and each its own task, and a pool record resumes only at a saved boundary (a prompt's
   end) or up to 16 tokens below one, so every new conversation re-read the shared system prompt. With the switch a
