@@ -747,6 +747,9 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     layout_ = logical_cpu_layout();   // now, before anything pins the caller (Linux reads the calling thread's allowed CPUs)
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
+    else if (const char* e2 = std::getenv("STRATA_POOL_ADAPTIVE_SPIN") ? std::getenv("STRATA_POOL_ADAPTIVE_SPIN")
+                                                                       : std::getenv("JUUD_POOL_ADAPTIVE_SPIN"))
+        adaptive_spin_ = std::atoi(e2) != 0;   // see kAdaptiveFinalPhaseSpin
     // STRATA_NUMA_SPLIT, read here for the worker count (the split itself is decided below, once the count is known).
     // 0.2.2: with 2 or more NUMA nodes and neither variable set the split is tried by itself, and STRATA_NUMA_POOL=0 turns that
     // off (numa_pool.hpp).  One node: pick_numa_pool says Unchanged and nothing below differs from the pool before the split.
@@ -973,6 +976,7 @@ void ExpertPool::publish() {
 
 void ExpertPool::worker(int id) {
     uint32_t seen = 0;
+    std::chrono::microseconds park_spin = spin_before_sleep_;   // STRATA_POOL_ADAPTIVE_SPIN: the last batch's spin
     // ARRIVE at the park before the first wait, so `parked_ == n_` is true from construction.  Counting only
     // on the RETURN from a drain leaves `parked_` at 0 until each worker has finished one batch, and the first
     // `run()` - which waits for `parked_ == n_` before publishing - then deadlocks.  It deadlocks on the very
@@ -1013,7 +1017,7 @@ void ExpertPool::worker(int id) {
                 strata_cpu_pause();
                 if ((++spins & 1023u) != 0) continue;
             }
-            if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
+            if (std::chrono::steady_clock::now() - parked_at < park_spin) continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
@@ -1033,6 +1037,12 @@ void ExpertPool::worker(int id) {
         // this epoch's jobs: if the host has already moved on, the claims fail and the worker parks again.
         wstate_[(size_t) id].store(kBetween, std::memory_order_relaxed);
         drain(id, scratch_[(size_t) id], seen);
+        // STRATA_POOL_ADAPTIVE_SPIN: the host cannot change mode_ until every worker is parked - read it before the add
+        if (adaptive_spin_) {
+            const int m = mode_;
+            park_spin = (m == 0 || m == 2 || m == 4 || m == 6) ? std::chrono::microseconds(kAdaptiveFinalPhaseSpin)
+                                                               : spin_before_sleep_;
+        }
         wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
         parked_of(id).fetch_add(1, std::memory_order_acq_rel);   // back at the park
     }

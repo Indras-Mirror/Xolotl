@@ -303,6 +303,11 @@ public:
     /// also sleep mid-request - which the claim protocol above must survive (issue #29).
     /// `STRATA_POOL_SPIN_US` overrides it (a test knob: a short spin makes the workers sleep constantly).
     static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
+    /// STRATA_POOL_ADAPTIVE_SPIN=1 (opt-in; Juud_engine's JUUD_POOL_ADAPTIVE_SPIN): after a batch that ends the CPU's
+    /// work for a layer (modes 0, 2, 4, 6 - a whole expert, or a down phase) a worker parks after this short spin
+    /// instead of kSpinBeforeSleep; between a gate/up phase and its down phase it keeps the normal spin.  The jobs and
+    /// their bits are unchanged.  An explicit STRATA_POOL_SPIN_US wins.
+    static constexpr std::chrono::microseconds kAdaptiveFinalPhaseSpin{100};
     /// A pool wait that sees no completion for this long is a bug; the engine stops with a message instead of
     /// spinning forever, and the server starts it again (issue #29).
     static constexpr std::chrono::seconds kStall{60};
@@ -370,6 +375,7 @@ private:
     std::mutex sleep_mu_;
     std::condition_variable sleep_cv_;
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
+    bool adaptive_spin_ = false;   // STRATA_POOL_ADAPTIVE_SPIN
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts

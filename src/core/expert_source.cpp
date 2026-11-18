@@ -5058,8 +5058,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
         const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
+        // STRATA_SKIP_UNUSED_ACTQ=1 (opt-in; Juud_engine's JUUD_SKIP_UNUSED_ACTQ, bnkaiteam/Juud_engine 22157c1e5): on one
+        // GPU, a token whose experts are all on the card (>= 0) or skipped by STRATA_ROUTE_TAIL_SKIP (-2) has no CPU job,
+        // so nothing reads its act_multi / nact_multi row - its quantization is skipped.  The jobs and their bits are
+        // unchanged.  Juud measured +3.1 to +9.1 % decode on an RTX 4090 with STRATA_POOL_ADAPTIVE_SPIN (v0.1.39).
+        static const bool skip_unused_actq = [] {
+            const char* v = std::getenv("STRATA_SKIP_UNUSED_ACTQ");
+            if (!v) v = std::getenv("JUUD_SKIP_UNUSED_ACTQ");
+            return v != nullptr && std::strcmp(v, "1") == 0;
+        }();
+        const bool single_gpu_skip = skip_unused_actq && d.remote_count == 0 && d.peer == nullptr;
         for (int64_t t = 0; t < n_tok; ++t) {
             if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
+            if (single_gpu_skip && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0 || v == -2; }))
+                continue;
             if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
                 act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
             else if (native)
