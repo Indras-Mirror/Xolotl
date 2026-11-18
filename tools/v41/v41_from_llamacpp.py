@@ -36,10 +36,10 @@ ALIGN = MD.GGUF_ALIGNMENT
 F32, F16, Q8_0, Q6_K, BF16, I32 = 0, 1, 8, 14, 30, 26
 # bytes per block, elements per block
 BLOCK = {0: (4, 1), 1: (2, 1), 30: (2, 1), 8: (34, 32), 14: (210, 256), 39: (17, 32), 10: (84, 256), 11: (110, 256),
-         12: (144, 256), 13: (176, 256), 16: (66, 256), 17: (74, 256), 18: (98, 256), 21: (110, 256), 22: (82, 256),
+         12: (144, 256), 13: (176, 256), 16: (66, 256), 17: (74, 256), 18: (98, 256), 19: (50, 256), 21: (110, 256), 22: (82, 256),
          23: (136, 256), 26: (4, 1), 43: (33, 32)}
 TYPE_NAME = {0: "F32", 1: "F16", 30: "BF16", 8: "Q8_0", 14: "Q6_K", 39: "MXFP4", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K",
-             13: "Q5_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 26: "I32",
+             13: "Q5_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S", 21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 26: "I32",
              43: "MXFP8"}
 SCALAR = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
 
@@ -403,8 +403,9 @@ def build(args):
     if len(token_map) != text["vocab_size"] or max(token_map) + 1 != cvocab:
         raise SystemExit("engram.token_map does not cover the vocabulary / compressed vocabulary")
     pet = src_t["per_layer_token_embd.weight"]
-    if pet[2] not in (Q6_K, 43) or pet[1] != [text["engram_head_dim"], sum(rows)]:   # 43: MXFP8 (UD-Q8_K_XL)
-        raise SystemExit(f"per_layer_token_embd.weight is {TYPE_NAME.get(pet[2])} {pet[1]}, the reader takes Q6_K / MXFP8 "
+    # 43: MXFP8 (UD-Q8_K_XL), 13: Q5_K (UD-IQ2_XXS)
+    if pet[2] not in (Q6_K, 13, 43) or pet[1] != [text["engram_head_dim"], sum(rows)]:
+        raise SystemExit(f"per_layer_token_embd.weight is {TYPE_NAME.get(pet[2])} {pet[1]}, the reader takes Q6_K / Q5_K / MXFP8 "
                          f"[{text['engram_head_dim']}, {sum(rows)}]")
 
     plan = plan_tensors(src_t, text)
