@@ -767,6 +767,53 @@ Serve, the K:\model\test config with `STRATA_ENGRAM_NOCACHE=1`, order no hot / h
   overlap other work, and this SSD is fast.  So a hot set can win at most that, on text the cache does not hold.
 - The 0.22 GiB set takes back the long prompt's cold cost and +0.2 % decode.
 
+## Short prompt calls on one kernel (rb24)
+
+With another program holding VRAM (Chrome, a YouTube video), the same serve requests gave other answers, in rb22 and
+rb23b alike. The cause was not timing. The prompt (batch) path sizes three things from the VRAM free at each prompt:
+
+- The prestage region, re-allocated at every prompt (`release_chunk` frees it):
+  min(`STRATA_PRESTAGE_GIB` 1.5, free - `STRATA_PRESTAGE_KEEP_GIB` 3). Only the first is logged.
+- Keep-cache's top-up, when the fixed borrow leaves less free than the batch needs (logged "this turn is not
+  reproducible").
+- The prompt batch width.
+
+A short call has fewer than `STRATA_PSTAGE_MMQ_RPE` (8) rows an expert, i.e. fewer than 512 new tokens here. In such a
+call:
+
+- The experts in the region run on the grouped MMVQ.
+- The experts past the region's end are streamed and run on MMQ. MMQ's stream-k rounding also depends on which experts
+  share a launch.
+
+So the free VRAM moved experts from one kernel to the other.
+
+### `STRATA_SHORT_MMVQ=1`
+
+A short call runs every expert on MMVQ: resident, prestaged and streamed alike. The region and the borrow then change
+only the speed.
+
+- Not the same bits as the default: the streamed experts of short calls change kernel.
+- `STRATA_PSTAGE_TRACE=1` (a diagnostic) now also prints every prompt's region.
+
+### Measured
+
+The serve scenarios on the K:\model\test configuration (rb23b), with the image probe first:
+
+| run | state | first region / top-ups | answers |
+|---|---|---|---|
+| rb23b, 5 runs | quiet, or Chrome open and idle | 1.47-1.50 GiB / 0 | all the same |
+| rb22 Q22k, Q22l | YouTube playing | 0.40-0.42 GiB / 5-6 | differ from the quiet rb22 from the 2nd scenario |
+| rb23b R23g, R23h | YouTube playing | 0.34-0.42 GiB / 5 | differ from the quiet rb23b from the 1st or 2nd |
+| rb24 + `STRATA_SHORT_MMVQ=1` V1, V2 | YouTube playing | regions 1.02-1.33 / 5-6 | the 5 short turns the same in both |
+| rb24 + `STRATA_SHORT_MMVQ=1` V0 | quiet | regions 1.50 / 0 | the 5 short turns the same as V1 and V2 |
+
+- Prompt times of the short turns are unchanged: 21 tokens 0.90 / 0.92 s (rb24 / rb23b), 55 tokens 1.69 / 1.68 s,
+  45 tokens 1.51 / 1.50 s.
+- Not covered: calls of 512 or more tokens. In those calls every non-resident expert runs on MMQ, but which experts
+  share a launch still follows the region, the residency and the waves. The 631-token turn and all turns after it
+  still differed under YouTube.
+- Not covered: prompts longer than the batch width, which is sized from the free VRAM.
+
 ## Tried and removed
 
 `STRATA_INPUT_ASYNC`: a decode step's ~14 small inputs (embedding row, positions, window rows / mask, compressed-row
