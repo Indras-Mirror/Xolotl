@@ -814,6 +814,18 @@ The serve scenarios on the K:\model\test configuration (rb23b), with the image p
   still differed under YouTube.
 - Not covered: prompts longer than the batch width, which is sized from the free VRAM.
 
+The same configuration, Chrome open, rb23b / rb24 + `STRATA_SHORT_MMVQ=1` alternated twice:
+
+| run | decode, all | answers |
+|---|---|---|
+| rb23b | 57.99 tok/s | reference |
+| rb24 | 57.61 | |
+| rb24, second start | 58.94 | 13 / 13 the same as the first rb24 run |
+| rb23b, second start | 57.41 | differ from the first rb23b run from the 3rd scenario on |
+
+Prompt times were the same in all four runs. K:\model\test runs rb24 with the switch since 2026-10-29 late night;
+its config file gave the first rb24 run's 13 answers again.
+
 ## Tried and removed
 
 `STRATA_INPUT_ASYNC`: a decode step's ~14 small inputs (embedding row, positions, window rows / mask, compressed-row
