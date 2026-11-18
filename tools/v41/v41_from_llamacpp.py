@@ -303,6 +303,10 @@ def plan_tensors(src_t, text):
         _, sdims, st, _, _ = s
         if sdims != dims:
             raise SystemExit(f"{src_name or name}: shape {sdims}, expected {dims}")
+        if want == Q8_0 and st in (Q6_K, 13):
+            # Unsloth's Dynamic V3.1 GGUFs (UD-IQ2_XXS) keep the head and 13 layers' dense matrices in Q6_K / Q5_K:
+            # copied as they are (ds41_check_tensors takes Q8_0 / Q6_K / Q5_K there; the graphs run any ggml type)
+            want = st
         if kind is None:
             kind = "copy" if st == want else {(Q8_0, F16): "q8_0>f16", (Q6_K, F16): "q6_k>f16", (F32, F16): "f32>f16",
                                               (BF16, F16): "bf16>f16", (BF16, Q8_0): "bf16>q8_0"}.get((st, want))
