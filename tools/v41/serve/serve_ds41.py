@@ -227,12 +227,12 @@ S.Service.__init__ = _svc_init_ds41
 
 # ---- the dashboard's routing note (Service.mode_note): the config's decode biases until a request names its own
 def _config_routing():
-    """(route_bias, route_bias_file, protect, pool) from the --config the server was started with; exact routing (0 / 0,
-    no smart router) for what it doesn't set - engine_args_ds41 gives the engine the two flags at 0 then."""
+    """(route_bias, route_bias_file, protect, pool) from the --config the server was started with; the engine's
+    defaults (1.0 / 0.6, no smart router) for what it doesn't set."""
     try:
         cfg = json.load(open(sys.argv[sys.argv.index("--config") + 1], encoding="utf-8"))
     except (ValueError, IndexError, OSError):
-        return 0.0, 0.0, 0, 0
+        return 1.0, 0.6, 0, 0
     args, env = [str(x) for x in cfg.get("args", [])], cfg.get("env") or {}
     def flag(name, dflt):
         try:
@@ -244,7 +244,7 @@ def _config_routing():
             return max(0, int(env.get(name, 0)))
         except (TypeError, ValueError):
             return 0
-    return flag("--route-bias", 0.0), flag("--route-bias-file", 0.0), rank("STRATA_RB_PROTECT"), rank("STRATA_RB_POOL")
+    return flag("--route-bias", 1.0), flag("--route-bias-file", 0.6), rank("STRATA_RB_PROTECT"), rank("STRATA_RB_POOL")
 
 
 _ROUTING = _config_routing()
@@ -690,9 +690,9 @@ def _note_ds41(self, n, evs, st=None, rate=None):
 
 # a model name ending in one of these (a config alias) = that routing for the request, for the strata_tune keys the
 # request doesn't name: -exact = no decode biases (quality mode), -light = the 0.25 / 0.15 nudge (V41_START_HERE.md
-# section 5c: ~1 pt API top-1 under exact), -fast = the stronger 0.5 / 0.3 nudge (speed mode), -max = upstream's engine
+# section 5c: ~1 pt API top-1 under exact), -fast = the stronger 0.5 / 0.3 nudge (speed mode), -max = the engine's own
 # default 1.0 / 0.6 nudge (strongest; local 1093-token forced test: top-1 868/1093 vs exact); the plain name gets the
-# config's --route-bias / --route-bias-file (exact routing for a flag the config leaves out: engine_args_ds41)
+# config's --route-bias / --route-bias-file
 ROUTE_SUFFIXES = {"-exact": {"route_bias": 0.0, "route_bias_file": 0.0, "route_bias_remote": 0.0},
                   "-light": {"route_bias": 0.25, "route_bias_file": 0.15},
                   "-fast": {"route_bias": 0.5, "route_bias_file": 0.3},
@@ -767,24 +767,11 @@ def expand_ds41_config_cache(cfg: dict) -> None:
         cfg["args"] = args
 
 
-def exact_routing_unless_set(cfg: dict) -> None:
-    """(local rb25) A config without --route-bias / --route-bias-file routes exactly: the missing flag is given at 0.
-    Upstream's engine defaults are 1.0 / 0.6 (the -max nudge, 3532f148 / 3d4328cd), so a config that left them out
-    decoded on the strongest bias without a word; rb25's own defaults are 0, and older pinned builds get the flags
-    here."""
-    args = list(cfg.get("args") or [])
-    have = {str(x) for x in args}
-    add = [x for f in ("--route-bias", "--route-bias-file") if f not in have for x in (f, "0")]
-    if add:
-        cfg["args"] = args + add
-
-
 _engine_args = S.engine_args
 
 
 def engine_args_ds41(cfg: dict) -> list[str]:
     expand_ds41_config_cache(cfg)
-    exact_routing_unless_set(cfg)
     return _engine_args(cfg)
 
 

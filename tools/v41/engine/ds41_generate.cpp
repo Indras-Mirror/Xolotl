@@ -104,17 +104,16 @@ struct Args {
     double mirror_gib = 85.0;
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
     float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
-    float route_bias_file = 0.0f;    // --route-bias-file X: selection penalty -X on file-tier experts (neither VRAM nor RAM arena);
-                                     // DEFAULT 0 = exact (local rb25; upstream 3d4328cd made it 0.6, Mal: max decode w/o too much
-                                     // loss: 21.1 vs 15.1 tok/s, code ppl 2.67->2.87, agentic 6.88->6.39)
+    float route_bias_file = 0.6f;    // --route-bias-file X: selection penalty -X on file-tier experts (neither VRAM nor RAM arena);
+                                     // DEFAULT 0.6 (Mal: max decode w/o too much loss): 21.1 vs 15.1 tok/s, code ppl 2.67->2.87, agentic 6.88->6.39
+                                     // (Keisawaakira's fork defaults it to 0 = exact; Xolotl keeps 0.6 - the load line says which applies)
     int   bias_prompt = 0;          // --bias-prompt N: quality proxy - apply route bias during the prompt, treating the first N
                                     // ranked experts as VRAM-resident (what the deferred seed will cache)
     float route_bias_remote = 0.0f;  // --route-bias-remote X: selection bonus +X on the experts the remote card (--remote-device)
                                      // holds - computed there beside the main card, off the decode's critical path (0 = as before)
-    float route_bias = 0.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed (DEFAULT 0 = exact
-                                  // routing, local rb25: upstream 3532f148 made it 1.0, Mal 2026-10-11: ~4x decode; 4096-tok ppl code
-                                  // 2.38 -> 2.67, agentic 15.1 -> 6.9 - so a config that left the two flags out decoded on 1.0 / 0.6,
-                                  // the strongest nudge, without a word; --route-bias 1.0 --route-bias-file 0.6 = upstream's default)
+    float route_bias = 1.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed (DEFAULT 1.0, Mal 2026-10-11:
+                                  // ~4x decode; 4096-tok ppl code 2.38 -> 2.67, agentic 15.1 -> 6.9; --route-bias 0 = exact routing).
+                                  // Keisawaakira's fork defaults both to 0; Xolotl keeps 1.0 / 0.6 and the load line now names them.
     bool route_bias_given = false;   // a --route-bias* flag was given (the load line says where the routing came from)
     std::vector<std::string> engram;
     std::string engram_hot;
