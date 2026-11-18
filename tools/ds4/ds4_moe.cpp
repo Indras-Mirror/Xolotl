@@ -1282,7 +1282,11 @@ bool remote_build(Ds4MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>
     int prev = 0, ndev = 0;
     ck(cudaGetDevice(&prev), "remote: current device");
     ck(cudaGetDeviceCount(&ndev), "remote: device count");
-    if (im.cfg.remote_device == prev || im.cfg.remote_device >= ndev) {
+    // STRATA_REMOTE_SAME_DEVICE=1 (tests only): the "second card" may be the tier's own card, so one GPU can check the
+    // remote path (substitutes, per-token sums, the add-back) against the plain tier.
+    const char* same = std::getenv("STRATA_REMOTE_SAME_DEVICE");
+    const bool allow_same = same && same[0] == '1';
+    if ((im.cfg.remote_device == prev && !allow_same) || im.cfg.remote_device >= ndev) {
         err = "remote device " + std::to_string(im.cfg.remote_device) + " is not a second card (" + std::to_string(ndev) +
               " visible, the tier runs on " + std::to_string(prev) + ")";
         return false;
