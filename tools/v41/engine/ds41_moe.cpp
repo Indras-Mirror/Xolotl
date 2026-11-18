@@ -91,6 +91,10 @@ constexpr int kMaxEnt = kMaxTok * 8;   ///< (expert, token) entries and distinct
 /// pass was two calls - and the blobs h_fstage holds (gpu_run uses the first kMaxParts)
 constexpr int kMaxFg = kMaxParts * kJobSplit;
 constexpr int kMaxDefer = kMaxParts;   ///< STRATA_FILE_DEFER: file-tier experts one layer may defer (d_stage slots)
+/// STRATA_DEMOTE_ASYNC: the d_stage slots a demotion stages its victim through - the top ones (gpu_run fills d_stage
+/// from the bottom: the PCIe share, then the file-tier blobs; with top-k 6 they never reach slots 6 and 7)
+constexpr int kDemRing = 2;
+static_assert(kDemRing == 2 && kDemRing < kMaxParts, "demote ring");
 constexpr size_t kMetaBytes = 65536;   ///< one call's grouped-launch metadata (gpu_run: <= 12 launches x ~200 B; gpu_run_n_ex: <= ~20 x ~1 KB)
 /// STRATA_HIT_FAST: Gpu::d_hit's layout (grp_ptr, grp_start, n_groups, ent_dst, ent_tok)
 constexpr size_t kHitPtr = 0, kHitStart = 8 * kMaxParts, kHitNg = kHitStart + 4 * (kMaxParts + 1), kHitDst = kHitNg + 4,
@@ -708,6 +712,14 @@ struct Gpu {
     cudaEvent_t ev_x = nullptr;   ///< STRATA_READ_FIRST: the pool's copy of x is home (h_x)
     cudaStream_t s_fg = nullptr;   ///< STRATA_AA_FILEG: the readers' per-part H2D of file-tier blobs (arena slot -> d_stage)
     cudaEvent_t ev_fg = nullptr;
+    /// STRATA_DEMOTE_ASYNC=1: a vram_lru demotion copies its victim into d_stage slot kMaxParts - 1 - r (device to
+    /// device, on the call's stream) and the D2H from there into the arena slot runs on s_dem, so the layer's sum no
+    /// longer waits behind it.  dem_layer[r]: the layer whose arena slot ring entry r's D2H writes (-1 = none in
+    /// flight); dem_drain waits for them before anything reads or writes that layer's arena slots.
+    cudaStream_t s_dem = nullptr;
+    cudaEvent_t ev_demq = nullptr;
+    cudaEvent_t ev_dem[kDemRing] = {};
+    int64_t dem_layer[kDemRing] = {-1, -1};
     /// STRATA_D3_DMA_STREAM=1: gpu_run_n_ex's own copy stream for its PCIe site (the arena-miss / FILEG H2D into the
     /// d_stage slots or an LRU victim slot, the LRU demote D2H and the stage->victim D2D), so those copies overlap the
     /// call's resident-expert kernels and each wave's kernel instead of queueing behind them on `s`.  The slots are
@@ -848,6 +860,7 @@ struct Gpu {
     }
 
     void close() {
+        if (s_dem) cudaStreamSynchronize(s_dem);   // its D2H reads d_stage and writes the arena
         for (auto& e : ev)
             if (e) cudaEventDestroy(e);
         for (cudaGraphExec_t g : tier_g)
@@ -871,6 +884,10 @@ struct Gpu {
         if (ev_x) cudaEventDestroy(ev_x);
         if (ev_fg) cudaEventDestroy(ev_fg);
         if (s_fg) cudaStreamDestroy(s_fg);
+        if (ev_demq) cudaEventDestroy(ev_demq);
+        for (cudaEvent_t& e : ev_dem)
+            if (e) cudaEventDestroy(e);
+        if (s_dem) cudaStreamDestroy(s_dem);
         if (s_dc) cudaStreamDestroy(s_dc);
         for (cudaEvent_t& e : dn_ev)
             if (e) cudaEventDestroy(e);
@@ -899,6 +916,43 @@ struct Gpu {
         *this = Gpu();
     }
 };
+
+/// STRATA_DEMOTE_ASYNC=1 (opt-in, see Gpu::s_dem): the same bytes reach the same arena slot, off the sum's path
+bool demote_async_on() {
+    static const bool on = std::getenv("STRATA_DEMOTE_ASYNC") && std::getenv("STRATA_DEMOTE_ASYNC")[0] == '1';
+    return on;
+}
+/// the demotions in flight into `layer`'s arena slots (layer < 0: all of them) are home when this returns
+void dem_drain(Gpu& gp, int64_t layer) {
+    for (int r = 0; r < kDemRing; ++r)
+        if (gp.dem_layer[r] >= 0 && (layer < 0 || gp.dem_layer[r] == layer)) {
+            ck(cudaEventSynchronize(gp.ev_dem[r]), "demote drain");
+            gp.dem_layer[r] = -1;
+        }
+}
+/// a free ring entry whose d_stage slot is at or above `lo` (the call's own staging fills the slots below), or -1
+int dem_take(Gpu& gp, int lo) {
+    if (!gp.s_dem) {
+        ck(cudaStreamCreateWithFlags(&gp.s_dem, cudaStreamNonBlocking), "demote stream");
+        ck(cudaEventCreateWithFlags(&gp.ev_demq, cudaEventDisableTiming), "ev_demq");
+        for (cudaEvent_t& e : gp.ev_dem) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "ev_dem");
+        std::fprintf(stderr, "ds41_moe: STRATA_DEMOTE_ASYNC: demotions stage through d_stage slots %d-%d, their D2H on "
+                     "a stream of its own\n", kMaxParts - kDemRing, kMaxParts - 1);
+    }
+    for (int r = 0; r < kDemRing && kMaxParts - 1 - r >= lo; ++r) {
+        if (gp.dem_layer[r] >= 0) {
+            const cudaError_t q = cudaEventQuery(gp.ev_dem[r]);
+            if (q == cudaErrorNotReady) {   // still copying: "not ready" is no error
+                if (cudaPeekAtLastError() == cudaErrorNotReady) (void) cudaGetLastError();
+                continue;
+            }
+            ck(q, "demote query");
+            gp.dem_layer[r] = -1;
+        }
+        return r;
+    }
+    return -1;
+}
 
 /// Ds41MoeConfig::remote_device: a second card that holds a STATIC set of experts and computes them itself (llm-server:
 /// a V100 32 GB beside the 3090, behind a gen3 x4 link with no P2P - too slow to feed the main card blobs, fast enough
@@ -3336,6 +3390,7 @@ void Ds41MoeTier::prefetch_multi(int64_t layer, const int32_t* ids, int n, int m
     if (!ids || n <= 0 || max_slots <= 0 || !im_->g.routed(layer)) return;
     Gpu& gp = *im_->gpu;
     if (!gp.s_pf || !gp.d_pf) return;   // allocated with pf_b > 0 (the decode default)
+    if (demote_async_on()) dem_drain(gp, layer);   // the DMAs read this layer's arena slots
     const int nb = std::min(max_slots, (int) Ds41MoeConfig::kMaxPf);
     for (int i = 0; i < n && im_->pf_n < nb; ++i) {
         const int32_t e = ids[i];
@@ -3363,6 +3418,7 @@ void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
     if (!im_->gpu || im_->cfg.cpu_only || im_->cfg.pf_b <= 0 || im_->cfg.no_cache || !im_->gpu->cache) return;
     if (!top16 || n <= 0 || !im_->g.routed(layer)) return;
     Gpu& gp = *im_->gpu;
+    if (demote_async_on()) dem_drain(gp, layer);   // the DMAs read this layer's arena slots
     n = std::min(n, (int) Ds41MoeConfig::kPredW);
     int nb;
     if (im_->cfg.dither) {
@@ -3714,6 +3770,8 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     const int64_t B = im.blob;                        // staging STRIDE (the largest blob)
     auto BLX = [&](int32_t e) { return im.bl[(size_t) im.g.cls(layer, e)]; };   // an expert's blob (the bytes a DMA moves)
     const bool lru = im.cfg.vram_lru && gp.cache && !im.cfg.no_cache;   // uniform (DS4) too: every slot fits any blob
+    static const bool dem_async = demote_async_on();
+    if (dem_async) dem_drain(gp, layer);   // the last token's demotions into this layer's arena slots
     ++im.run_seq;
     im.run_layer = layer;
     // spec_read's stash: this call's routing is known now, so its wrong guesses stop reading (STRATA_SPEC_CANCEL=0 =
@@ -4064,11 +4122,27 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     // the slot write after the D2H.
     auto arena_slot = [&](int32_t e) { return gp.arena.base ? gp.arena.slot_of[(size_t) (layer * NXL + e)] : -1; };
     int n_dem_call = 0;   // DS4_TIER_PROF: this call's demotions (the sum-sync split)
+    int stage_lo = 0;     // STRATA_DEMOTE_ASYNC: the bottom d_stage slots this call's file-tier blobs fill (np + FILEG)
     auto demote = [&](int32_t victim_slot, int32_t into_arena, int64_t bytes, cudaStream_t st) {
         // reads the victim cache slot: it MUST be on the same stream as whoever overwrites that slot afterwards (the
         // lru pf copy, or the pcie group's stage copy under STRATA_DMA_OVERLAP), or the demoted blob is corrupted.
-        ck(cudaMemcpyAsync((uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) into_arena],
-                           gp.cache->device_slot(victim_slot), (size_t) bytes, cudaMemcpyDeviceToHost, st), "lru demote");
+        uint8_t* to = (uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) into_arena];
+        const int r = dem_async ? dem_take(gp, std::max(np, stage_lo)) : -1;
+        if (r >= 0) {   // STRATA_DEMOTE_ASYNC: the victim into a spare d_stage slot now, the D2H from there on s_dem
+            uint8_t* stg = (uint8_t*) gp.d_stage + (size_t) (kMaxParts - 1 - r) * (size_t) B;
+            ck(cudaMemcpyAsync(stg, gp.cache->device_slot(victim_slot), (size_t) bytes, cudaMemcpyDeviceToDevice, st),
+               "lru demote stage");
+            ck(cudaEventRecord(gp.ev_demq, st), "record demote stage");
+            ck(cudaStreamWaitEvent(gp.s_dem, gp.ev_demq, 0), "wait demote stage");
+            ck(cudaMemcpyAsync(to, stg, (size_t) bytes, cudaMemcpyDeviceToHost, gp.s_dem), "lru demote");
+            ck(cudaEventRecord(gp.ev_dem[r], gp.s_dem), "record demote");
+            gp.dem_layer[r] = layer;
+            (void) cudaStreamQuery(gp.s_dem);   // WDDM: hand the D2H to the card now, not at a later sync
+            if (cudaPeekAtLastError() == cudaErrorNotReady) (void) cudaGetLastError();
+        } else {
+            ck(cudaMemcpyAsync(to, gp.cache->device_slot(victim_slot), (size_t) bytes, cudaMemcpyDeviceToHost, st),
+               "lru demote");
+        }
         ++n_dem_call;
     };
     auto lru_victim = [&](int32_t incoming) -> int32_t {
@@ -4147,6 +4221,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             }
         }
         if (np > 0) {
+            if (dem_async && np > kMaxParts - kDemRing) dem_drain(gp, -1);   // (a top-k > 6: the share reaches the ring)
             // STRATA_DMA_OVERLAP (see the Gpu::s_dc comment): the copies go on the demand-copy stream so they overlap the
             // resident-expert kernels already launched on gp.s, then ONE event orders gp.s before this group's kernels.
             // Sources are this call's arena experts and destinations are d_stage (or their own victim slot); the pool's
@@ -4238,6 +4313,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             }
         }
         nk = keep;
+        stage_lo = std::max(stage_lo, np + nfg);
     }
     std::vector<std::thread> frd;
     std::atomic<size_t> fnx{0};
@@ -4361,6 +4437,8 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
                 for (size_t q = 0; q < fi.size(); ++q)
                     if (fvic[q] >= 0 && np + ngf < kMaxParts)
                         gdst[q] = (uint8_t*) gp.d_stage + (size_t) (np + ngf++) * (size_t) B;
+                stage_lo = std::max(stage_lo, np + ngf);
+                if (dem_async && np + ngf > kMaxParts - kDemRing) dem_drain(gp, -1);   // the readers write those slots
             }
             ovl = ngf == 0 ? cpu_overlap : 0;
             mark(9);
@@ -4621,6 +4699,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
 
     if (nfg > 0) {   // the file-tier blobs are home: up to the card, one grouped launch behind the hits / PCIe share
         for (auto& t : frd) t.join();
+        if (dem_async && np + nfg > kMaxParts - kDemRing) dem_drain(gp, -1);   // the DMAs below write those slots
         im.st.file_tier += nfg;
         im.st.file_ms += now_ms() - tfg;
         std::vector<unsigned long long> ptr((size_t) nfg);
@@ -4651,6 +4730,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         for (int64_t k = 0; k < K; ++k)
             if (slot_i[k] < 0) im.vmiss[(size_t) (layer * NXL + ids6[k])] = lc;
     static const bool check_lru = std::getenv("DS4_CHECK_LRU") != nullptr;
+    if (dem_async && check_lru) dem_drain(gp, layer);   // the check reads the demoted arena copies
     for (int i = 0; i < n_lru; ++i) {   // vram_lru: the copies are done - the slots now hold the new experts
         gp.cache->replace(layer, lru_old[i], lru_new[i]);
         if (lru_dem[i] >= 0) {   // the arena slot changed hands: the demoted expert in, the promoted one out
@@ -4840,6 +4920,11 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     st.wall_ms = now_ms() - t0;
     im.st.add(st);
     im.pf_n = 0;   // the staging is per layer; the caller must run(l) before prefetch(l+1)
+    if (dem_async) {   // STRATA_DEMOTE_ASYNC: no demotion stays in flight past the token's last routed layer (what runs
+        bool last = true;   // between tokens - a prompt, a cache resize, a rebalance - may touch any layer's arena)
+        for (int64_t l = layer + 1; l < im.g.n_layers && last; ++l) last = !im.g.routed(l);
+        if (last) dem_drain(gp, -1);
+    }
     return true;
 }
 
@@ -4863,6 +4948,7 @@ void quantize_rows_q8_1(const float* x, void* xq, int64_t H, int nt, cudaStream_
 bool gpu_run_n(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const float* w, const float* x_host,
                float* out) {
     Gpu& gp = *im.gpu;
+    if (demote_async_on()) dem_drain(gp, -1);   // (STRATA_DEMOTE_ASYNC: none is in flight past a decode token)
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
     const int64_t B = im.blob;                        // staging stride
@@ -5055,6 +5141,7 @@ bool gpu_run_n(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const
 bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const float* w,
                   const float* x_host, float* out, void* out_dev) {
     Gpu& gp = *im.gpu;
+    if (demote_async_on()) dem_drain(gp, -1);   // (STRATA_DEMOTE_ASYNC: none is in flight past a decode token)
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
     const int64_t B = im.blob;                        // staging stride
@@ -6667,6 +6754,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                    float* out, void* out_dev = nullptr, int cf = -1, bool first_pass = true, bool last_pass = true,
                    const float* x_dev = nullptr) {
     Gpu& gp = *im.gpu;
+    if (demote_async_on()) dem_drain(gp, -1);   // (STRATA_DEMOTE_ASYNC: none is in flight past a decode token)
     const bool wide = x_dev != nullptr && out_dev != nullptr;
     const bool prof = chunk_prof();
     std::vector<std::pair<cudaEvent_t, cudaEvent_t>> kev;   // prof: one pair per grouped launch

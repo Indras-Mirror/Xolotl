@@ -1,4 +1,4 @@
-# Decode opt-ins from the DeepInfer review (rb10 - rb13)
+# Decode opt-ins from the DeepInfer review (rb10 - rb14)
 
 A decode token runs 40 layers, and each layer makes a round trip:
 
@@ -226,6 +226,53 @@ A one-token graph multiplies them as one matrix and splits the result. mmvq's la
 the token count, not on the row count, so each row's dot product is the same. The prompt keeps two products (MMQ's
 stream-k split can depend on the row count).
 
+## Two copies the sum waited for (rb14)
+
+### `STRATA_DEMOTE_ASYNC=1`
+
+When vram_lru gives an expert from the arena a VRAM slot, the slot's old expert (the victim) moves into the arena slot
+the new one leaves: a demotion. Its D2H (about 9 MB) ran on the tier's stream ahead of the layer's sum, so the sum's
+sync waited for it. In the profile below, a layer call without PCIe or file-tier experts spent 0.100 ms in the sum's
+sync, and 0.348 ms when it demoted (2170 of 43680 calls, about 2 a token).
+
+With this switch the victim is first copied inside VRAM, into one of two spare d_stage slots, and the D2H from there
+runs on a stream of its own. The sum waits only for the copy inside VRAM.
+
+- The spare slots are d_stage 6 and 7. A call fills d_stage from the bottom (the PCIe share, then file-tier blobs);
+  with top-k 6 that never reaches slot 6. A call whose staging would reach them waits for their D2H first.
+- The arena slot gets its bytes later than before, so what reads or writes it waits for the D2H: the next call for
+  the same layer and the prefetches for that layer wait for that layer's demotions (long done by then). None is left
+  in flight after the token's last routed layer, or when a prompt or multi-token call starts.
+- The same bytes reach the same arena slot. `DS4_CHECK_LRU=1` (every swap's VRAM slot and demoted arena copy against
+  the file, byte for byte) over the forced run: 5000+ swaps, 0 bad.
+
+`DS4_TIER_PROF`, one run each (rb13 set + `GGML_CUDA_FP4_PACK`), the sum's sync in ms:
+
+| layer calls | count | without | with |
+|---|---|---|---|
+| no PCIe expert, no file read, a demotion | 2170 | 0.348 | 0.104 |
+| one PCIe expert, no file read, a demotion | 283 | 0.389 | 0.219 |
+| no demotion (for comparison) | 11631 | 0.100 | 0.100 |
+
+That is about 0.55 ms a token; the token time shrank by about half of it (below). Where the rest goes was not traced.
+
+### `GGML_CUDA_FP4_PACK=1` (vendored ggml)
+
+With `--kv-fp4`, `set_rows` packs the compressed KV rows into NVFP4 and the indexer keys into MXFP4. The packers look,
+per 16 values (NVFP4) or 32 (MXFP4), for the scale that reproduces the fake-quantized values exactly. They ran one
+thread per block, so a 512-value decode row was 8 threads, each trying up to 7 scales on 4 sub-blocks in turn.
+
+With this switch every value has its own thread. The lanes of a (sub-)block try each candidate scale together and keep
+the first one all of them reproduce (a warp vote): the same candidates in the same order, the same bytes. CUDA only;
+HIP and MUSA keep the per-block kernel.
+
+- A set_rows test against the per-block kernel was byte-identical. It wrote 1 to 4096 rows, 11 seeds, of: values on
+  the NVFP4 and MXFP4 grids at every E4M3 scale, rows that several scales reproduce, values off the grid (some with
+  amax = 3 * 2^k), zeros, huge and tiny values, inf and NaN.
+- nsys, one 512-value row alone: NVFP4 18.1 -> 2.8 us, MXFP4 6.3 -> 1.4 us.
+- nsys in the decode: the packers 14.7 -> 2.1 us a call. The attention graphs that write a compressed row (4 a token)
+  took 283 -> 265 us. That is about 0.07 ms a token, below what the decode runs below can resolve.
+
 ## Measured
 
 GSQ, forced 1093, `--slots 2378`, interleaved pairs (tok/s):
@@ -325,6 +372,20 @@ The whole rb13 set against rb12 best, on the same build:
 | + `ATTN_TAIL=3` + `GRAPH_CONC=7` + `QKV_FUSE` | 39.47 | 40.74 | 40.64 | 44.32 | 41.29 (+3.9 %) |
 
 The PC moved to its fast state for pair 4. Routes and logits were 50c29791 in every arm.
+
+### rb14
+
+GSQ, the same run, interleaved, in tok/s. Every arm has the rb13 set (rb12 best + `ATTN_TAIL=3` + `GRAPH_CONC=7` +
+`QKV_FUSE`).
+
+| arms | pair 1 | pair 2 | pair 3 | pair 4 | mean |
+|---|---|---|---|---|---|
+| rb13 set | 39.99 | 39.96 | 39.35 | 39.50 | 39.70 |
+| + `FP4_PACK` | 39.76 | 39.84 | 39.57 | 39.49 | 39.67 (-0.1 %) |
+| + `FP4_PACK` + `DEMOTE_ASYNC` | 40.13 | 40.12 | 40.05 | 39.97 | 40.07 (+0.9 %) |
+
+Routes and logits were 50c29791 in every arm, and with `DS4_CHECK_LRU=1` too. `FP4_PACK`'s expected +0.3 % is within
+the pairs' spread (+-0.3 %).
 
 ## Tried and removed
 
