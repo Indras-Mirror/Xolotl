@@ -1013,6 +1013,11 @@ int main(int argc, char ** argv) {
                 int ta_ids[16];
                 if (d.predict(l + advise_ahead, ta_ids, 16)) t.advise_file(l + advise_ahead, ta_ids, advise_top);
             }
+            // STRATA_HIT_PF: the arming first, so this layer's prefetch below goes out with its stamp (an ahead layer was
+            // armed before its graph went out)
+            static const bool hit_pf = std::getenv("STRATA_HIT_PF") && std::getenv("STRATA_HIT_PF")[0] == '1';
+            const bool arm_here = hit_graph && rdev && d.ahead_layer() != l;
+            if (hit_pf && arm_here) t.hit_arm(l, rdev);
             if (mc.pf_b > 0 && !mc.cpu_only) {
                 int t16[16];
                 if (have_pred) t.prefetch(l, top16, 16);
@@ -1022,7 +1027,7 @@ int main(int argc, char ** argv) {
                 }
                 have_pred = false;
             }
-            if (hit_graph && rdev && d.ahead_layer() != l) t.hit_arm(l, rdev);   // =3: the graph attn_router launches
+            if (!hit_pf && arm_here) t.hit_arm(l, rdev);   // =3: the graph attn_router launches
             if (hit_fast > 0 && hit_fast < 3 && rdev && d.ahead_layer() == l) {
                 bool want = true;
                 for (int j = 0; hit_fast == 2 && want && j < top_k; ++j) want = top16[j] >= 0 && t.resident(l, top16[j]);

@@ -1,4 +1,4 @@
-# Decode opt-ins from the DeepInfer review (rb10 - rb16)
+# Decode opt-ins from the DeepInfer review (rb10 - rb17)
 
 A decode token runs 40 layers, and each layer makes a round trip:
 
@@ -533,6 +533,89 @@ Checked, no change: `STRATA_SERVE_STEP_MAX=48` against 16, on the rb16 configura
 - A 21 / 34 / 45-token turn as passes took 1.07 / 1.67 / 2.15 s, and as one batch 0.90 / 1.31 / 1.53 s.
 - A 31-token turn took 0.97 s both ways.
 - 16 stays.
+
+## Prefetched experts and partial layers in the graph (rb17)
+
+The review also suggested running a layer's resident experts in the attention graph when one of its six is missing.
+`DS4_TIER_PROF` now also splits the tier calls by kind. On the K:\model\test configuration (route bias 0.5 / 0.3,
+forced 1093, `--slots 2378`, `--vision`), rb16:
+
+| kind of layer call | calls | ms a call |
+|---|---|---|
+| all six resident, run in the graph (kept) | 26725 | 0.002 |
+| hits + pool (no PCIe share, no file read) | 10733 | 0.303 |
+| a PCIe share | 422 | 0.550 |
+| a file read | 5800 | 1.041 |
+
+The hits + pool calls averaged 5.70 hits and 0.30 pool experts, and 10778 prefetched experts were used. So about
+7500 of them were six hits with one prefetched:
+
+- The prefetch for layer L goes out after L's graph. `STRATA_ATTN_AHEAD` queues that graph with the previous layer's
+  finish, so the graph's dispatch only had the table of resident slots.
+- The tier then waited for the DMA, launched all six and synced their sum.
+
+### `STRATA_HIT_PF=1` (with `STRATA_HIT_FAST=3`)
+
+The graph's dispatch also takes the layer's prefetched experts.
+
+- prefetch() publishes its list (expert ids and staging addresses) in mapped pinned memory, stamped with the layer's
+  arming. A copy queued behind the DMAs writes the stamp into device memory when they are home.
+- The dispatch matches its routed misses against the list and publishes its decision: all six or not, and which.
+  Then it waits for the stamp, so the grouped launch behind it reads the DMA'd bytes.
+- After 50 ms that wait sets an error word, and the host aborts on it. That never happened.
+- The host reads the decision only when a routed expert is in the prefetch. Otherwise the table decides, as before.
+- Odd layers stage in a second buffer (6 blobs, ~55 MB, allocated at the first decode, after the seed), so a
+  prefetch never writes what the previous layer's graph may still read.
+- vram_lru's copy of a prefetched expert into a slot waits for the prefetch on the host first.
+- Where a layer's graph was not queued ahead, its arming moves before its prefetch, so the list carries the stamp.
+
+### `STRATA_HIT_PART=1` (with `STRATA_HIT_PF`)
+
+A layer with a miss runs its resident and prefetched experts in the graph: packed, each with its routing index as its
+row. The in-graph sum is gated off, and the call computes only the rest.
+
+- When the rest is the pool's alone (arena experts, no PCIe share, no file read), the call launches nothing on the
+  card. Its sum goes on the dense stream behind the graph, unsynced; the finish behind it reads the output in order.
+- Otherwise the call's own card work waits for the graph's grouped launch: the graph's sum kernel writes a stamp
+  into mapped memory once it has run. The layer's file reads go out before that wait.
+- A graph event-record node for that wait was refused in the capture ("the operation cannot be performed in the
+  present state").
+
+Both switches run the same kernels on the same inputs, and the sums add in the same order (`decode_rows_sum_gated` /
+`_sel`).
+
+Forced 1093, `--slots 2378`, the K:\model\test configuration (rb16), 3 rounds interleaved (tok/s):
+
+| arm | runs | mean |
+|---|---|---|
+| rb16 | 46.13 / 45.89 / 46.01 | 46.01 |
+| + `STRATA_HIT_PF` | 47.09 / 46.63 / 46.83 | 46.85 (+1.8 %) |
+| + `STRATA_HIT_PF` + `STRATA_HIT_PART` | 47.09 / 47.43 / 47.68 | 47.40 (+3.0 %) |
+
+- Routes (4c5a4ba7) were the same in all arms.
+- With both, by kind (one profiled run):
+  - kept: 34262 calls, 7537 of them with a prefetched expert, 0.015 ms;
+  - hits + pool: 3196 calls, 0.216 ms (0.182 of it the pool);
+  - a file read: 5800 calls, 1.050 ms.
+- Why not more: a prefetched expert's DMA lands 0.1 to 0.2 ms after the routing. That wait moved from the host to the
+  card.
+- Caught on the way by the route hash (46edbe66 instead of 4c5a4ba7): once the decision came before the DMA's end,
+  vram_lru copied a prefetched expert into its slot before its bytes were home. The host wait above fixed it.
+
+Serve, the K:\model\test configuration (rb16), srvtest with the image probe first, 12 scenarios, rb16 / rb17
+alternated twice:
+
+| run | answers | decode, all |
+|---|---|---|
+| rb16 | reference | 52.27 tok/s |
+| rb17 + both switches | all 12 the same, the image and the cancelled stream too | 54.99 |
+| rb17, 8 s idle before each request | all 12 the same | 54.80 |
+| rb16, second start | all 12 the same | 53.13 |
+| rb17, second start | all 12 the same | 55.09 |
+
+- +5.2 % and +3.7 % in the two pairs, every scenario faster.
+- Prompt times did not change: 29.0 to 29.4 s over the 12 scenarios.
+- The re-seed after the 15.7K prompt was 2344 experts in all five runs.
 
 ## Tried and removed
 
