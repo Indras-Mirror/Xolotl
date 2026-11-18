@@ -143,6 +143,17 @@ Top-1 agreement 0.674 vs 0.701. In the engine: 4096-token code prompt ppl 2.380,
   its mmproj changes only the four tensors that write the LM's space (x - v (v.x)), so image rows come from the encoder
   as they are. On GSQ IQ2_XS: the same decode speed, normal answers stay normal, the canned refusals go. Without the
   flag no graph node or input byte changes.
+- **A pool boundary at the end of the system prompt** (opt-in, local rb27): `STRATA_SERVE_PREFIX_SAVE=1`. Subagents
+  send one system prompt + tools and each its own task, and a pool record resumes only at a saved boundary (a prompt's
+  end) or up to 16 tokens below one, so every new conversation re-read the shared system prompt. With the switch a
+  layer-major read that crosses the first user-turn token (`<｜User｜>` 128803 / `<｜latest_reminder｜>` 128828;
+  `STRATA_SERVE_PREFIX_TOKENS`) stops there, saves [0, p) to the pool and reads on; a later conversation resumes at p
+  and reads only its own part. Prefixes under `STRATA_SERVE_PREFIX_MIN` (1024) tokens are left alone; text prompts on
+  the solo path only (no batch slots, images or DSpark tail). GSQ IQ2_XS, RTX 5090 + 64 GB, route bias 0.5/0.3, a
+  6K-token system prompt: a second conversation's first prompt 7.2 -> 0.87 s; four conversations x two turns sent
+  together 83.2 -> 58.0 s; the first conversation pays its tail's own expert sweep (~1 s). A resumed prompt's last-row
+  logits equal a fresh read's bit for bit; against the unsplit read the tail's logits move by batch-shape noise (KL
+  0.014-0.019, the same top-1). Off: the 13 serve scenarios answer as rb26.
 - Where the time goes - prefill (8192 tokens, ~37 s): dense half ~11 s, experts ~26 s (the grouped expert kernels and
   ~10 GB/s of expert uploads). Decode (~38 ms/token): dense half ~19 ms (its Q8_0 weights read at ~880 GB/s - the
   card's bandwidth), expert tier ~16 ms.

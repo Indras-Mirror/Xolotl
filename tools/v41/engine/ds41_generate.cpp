@@ -3782,7 +3782,63 @@ int main(int argc, char ** argv) {
                     return true;
                 };
             dense.reset_span_width();   // a sub-batch narrowed by the last prompt's tight card starts wide again
-            bool ok = total == reused || dh == 0 || (mix_read ? feed_mixed() : by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
+            // rb27 STRATA_SERVE_PREFIX_SAVE=1 (opt-in; off = rb26 bit for bit): a pool boundary at the end of the system
+            // prompt.  Subagents send the same system prompt + tools and each its own task: a pool record can only be
+            // resumed at a saved boundary (its prompt's end) or <= kConvPartialMax below one, so with tasks longer than
+            // that every conversation re-read the whole system prompt (2026-11-02, 4 conversations on a 6K system
+            // prompt: "reuse lcp=6064 ... -> reused=0", 7-9 s each).  A layer-major read that crosses the first
+            // user-turn token (STRATA_SERVE_PREFIX_TOKENS, default <｜User｜> 128803 and <｜latest_reminder｜> 128828)
+            // now stops there, snapshots and saves [0, p) to the pool, and reads on from p - the same two reads as a
+            // turn that continues an earlier one, so a request that later resumes at p computes what this one did.
+            // Costs the rest of the prompt its own expert sweep (~1 s for a short task); text prompts on the solo path
+            // only (no batch slots, no images, no DSpark tail).  STRATA_SERVE_PREFIX_MIN: the shortest such prefix
+            // worth a boundary (default 1024 tokens).
+            static const bool prefix_save = std::getenv("STRATA_SERVE_PREFIX_SAVE") && std::getenv("STRATA_SERVE_PREFIX_SAVE")[0] == '1';
+            static const int prefix_min = std::getenv("STRATA_SERVE_PREFIX_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PREFIX_MIN")) : 1024;
+            static const std::vector<int> prefix_toks = [] {
+                std::vector<int> v;
+                if (const char * e = std::getenv("STRATA_SERVE_PREFIX_TOKENS")) {
+                    for (const char * s = e; *s; ) {
+                        char * end = nullptr;
+                        const long t = std::strtol(s, &end, 10);
+                        if (end == s) { ++s; continue; }
+                        v.push_back((int) t);
+                        s = end;
+                    }
+                } else v = { 128803, 128828 };
+                return v;
+            }();
+            int pfx = 0;
+            if (prefix_save && pool_on && NS <= 0 && !is_vision && !mix_read && !by_step && bcap == 0 && tail_keep == 0 &&
+                dh == delta && total > reused + 1 && PB > 1) {
+                for (int i = 1; i < total; ++i)
+                    if (std::find(prefix_toks.begin(), prefix_toks.end(), ids[(size_t) i]) != prefix_toks.end()) {
+                        if (i > reused && i >= prefix_min && i - reused >= 2 && total - i >= 2) pfx = i;
+                        break;
+                    }
+            }
+            bool ok;
+            if (pfx > 0) {
+                std::fprintf(stderr, "serve: prefix save: the read stops at %d of %d (the first user turn) for a pool boundary\n",
+                             pfx, total);
+                ok = feed(ids.data() + reused, pfx - reused, reused, pp, nullptr);
+                if (ok) {
+                    const double ts0 = now_ms();
+                    std::string perr;
+                    int64_t id = 0;
+                    if (dense.snapshot(pfx))
+                        id = pool.save(dense, ids.data(), rid.data(), std::min<size_t>(rid.size(), (size_t) pfx), pfx, nullptr, 0, perr);
+                    else perr = "snapshot failed";
+                    std::string ferr3;   // the rest of the read writes the spare compressor row the save copies
+                    if (!pool.fence(&ferr3)) std::fprintf(stderr, "strata serve: conversation cache: fence: %s\n", ferr3.c_str());
+                    std::fprintf(stderr, "strata serve: conversation cache: %s %d tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu (prefix%s%s)\n",
+                                 id ? "parked" : "skipped", pfx, now_ms() - ts0, pool.size(), pool.bytes(), pool.evictions(),
+                                 id ? "" : ": ", id ? "" : perr.c_str());
+                    dense.reset_span_width();
+                    ok = feed(ids.data() + pfx, total - pfx, pfx, [&](int d) { pp(pfx - reused + d); }, nullptr);
+                }
+            } else
+                ok = total == reused || dh == 0 || (mix_read ? feed_mixed() : by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
             feed_yield = nullptr;
             persistent_chunk = nullptr;
             bcap_n = 0;
