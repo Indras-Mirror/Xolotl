@@ -160,6 +160,7 @@ export function createModelProviders({ directory, changed = () => {}, fetchImpl 
     const choice = typeof thinking === 'string' ? thinking.toLowerCase() : '';
     if (protocol === 'openai-chat' && (model.reasoning ?? knownThinks(connection, model.id)) === true && ['off', 'low', 'medium', 'high', 'max'].includes(choice)) {
       if (isOpenRouter(connection)) payload.reasoning = { effort: OPENROUTER_EFFORTS[choice] };
+      else if (connection.provider === 'minimax' && model.id === 'MiniMax-M3.1-Flash' && choice === 'max') payload.reasoning_effort = choice;
       else payload.reasoning_effort = ({ off: 'none', max: 'high' })[choice] ?? choice;
     }
     const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(10 * 60 * 1000)]) : AbortSignal.timeout(10 * 60 * 1000);
