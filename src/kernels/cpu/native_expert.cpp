@@ -18,6 +18,10 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 
+#if !defined(_MSC_VER) && (defined(__x86_64__) || defined(__i386__))
+#include <cpuid.h>   // cpu_bmi2_ok (iq3_one)
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
