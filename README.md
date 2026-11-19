@@ -12,6 +12,10 @@
 
 ## Latest
 
+- **19 Nov** - DeepSeek-V4.1 decodes faster by default: Keisawaakira's decode switches cut the verify pass 98.8 -> 89.1
+  ms (-10 %) on an 8K probe and lift fast-mode agent tasks from ~40 to **42.7 tok/s** (+5-8 %) on one 4090, quality
+  inside the noise. Also new, opt-in: two-layers-ahead NVMe reads (TokenWing's idea) and GLM-5.3-Flash on a second
+  card. [CHANGELOG](docs/xolotl/CHANGELOG.md#deepseek-v41-decode-switches-on-by-default-agent-tasks-427-toks-19-nov).
 - **18 Nov** - The dense engine runs looped transformers: SenseNova-Loop-9B (layers 4-27 twice, two mHC streams) at
   Q8_0 matches the reference within Q8_0 error, prompt 3,027 tok/s and decode 45 tok/s on a 4090. Opt-in FP32
   activations halve its KL against FP32. [CHANGELOG](docs/xolotl/CHANGELOG.md#looped-transformers-in-the-dense-engine-sensenova-loop-9b-18-nov).

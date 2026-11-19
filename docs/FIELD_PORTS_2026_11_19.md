@@ -32,6 +32,18 @@ differences under ~5 % need interleaved rounds.
 **s3 is the served default now**, set in `tools/v41/serve/ds41-engine.sh`; `XOLOTL_KEIS_DECODE=0` turns the set off,
 any single switch with its own `=0`.  Not bit-identical (sums move); quality inside the noise.
 
+**On agent tasks** (Gauntlet v3-small tasks 01 and 03, fast mode, served settings, one run against the two 7 Nov fast
+runs): decode **42.7 tok/s** against 39.6 / 40.8, **+5-8 %**.  01 solved at turn 4, 03 at 0.50 as in every earlier run.
+Today's 03 ran longer (16,356 tokens against ~9,600), which slows decode, so the gain is not flattered.
+
+**Which s3 switches engage on the served config.**  The engine log says only seven do: X_DEV, META_PULL, PF_HOSTWAIT,
+HIT_FAST=3, DENSE_ASYNC, PIN_RB, QKV_FUSE.  `STRATA_RB_PROTECT=2` turns on the smart router, whose route meter
+(`o_xids`) the attention tail does not support (`tail_on` requires `!o_xids`), so **ATTN_TAIL is off, and RB_HOOK and
+GRAPH_CONC with it** ("OFF (needs STRATA_ATTN_TAIL ...)").  ROUTE_FUSE is skipped by the smart router too (`route_op`
+requires `!smart_router()`), and a `--vision` engine needs `STRATA_ROUTE_FUSE=2` for its router anyway.  So the -10 %
+is the seven switches; that is why steps 2 and 3 measured flat.  Open job: carry the route meter's readback in the
+attention tail, so ATTN_TAIL / RB_HOOK / GRAPH_CONC work with RB_PROTECT, then measure (gain unknown until then).
+
 Note for scripted runs: `score_v4.py`-style harnesses that start `ds41_generate` directly skip the launcher, so they
 also skip `STRATA_DSPARK_KEEP` (DSpark then takes 5.14 GB instead of 2.91 GB and the VRAM seed drops ~130 experts)
 and the s3 defaults.  Export them, or go through `ds41-engine.sh`.

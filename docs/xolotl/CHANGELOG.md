@@ -8,6 +8,35 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### DeepSeek-V4.1 decode switches on by default, agent tasks 42.7 tok/s (19 Nov)
+
+`tools/v41/serve/ds41-engine.sh` now turns on [Keisawaakira](https://github.com/Keisawaakira)'s decode set
+(`tools/v41/engine/DECODE_OPTINS.md`): routing copies fused and read on the card, the metadata pulled once, the
+prefetch waiting on the host, the hit fast path, async dense, pinned route buffers, fused QKV.
+`XOLOTL_KEIS_DECODE=0` turns it off; any single switch takes its own `=0`.
+
+Measured on an RTX 4090 + Ryzen 7 5700X, DeepSeek-V4.1-Flash-1017 V4 XQ, dense Q6_K, fast mode:
+
+| test | before | after |
+| --- | ---: | ---: |
+| 8K prompt + 512 tokens, verify pass | 98.8 ms (34.3 tok/s) | **89.1 ms (37.4 tok/s), -10 %** |
+| Gauntlet v3-small tasks 01 + 03, decode during the tasks | 39.6 / 40.8 tok/s (two runs, 7 Nov) | **42.7 tok/s (+5-8 %)** |
+| short34 NLL / top-1 | 0.4614-0.4653 / 88.42-88.65 % (noise band) | 0.4651 / 88.61 % |
+
+Not bit-identical (the sums move); quality is inside the noise. With `STRATA_RB_PROTECT` set, the attention tail and
+the two switches behind it (`STRATA_RB_HOOK`, `STRATA_GRAPH_CONC`) stay off and `STRATA_ROUTE_FUSE` is skipped, so the
+numbers above come from the other seven; making the tail work with the route meter is the next job.
+
+Also on this branch, opt-in:
+- `STRATA_LA2=1 STRATA_D3_SPEC_SRC=la2 STRATA_D3_SPEC=2`: layer l's attention graph also guesses layer l+2's experts,
+  and the NVMe-tier ones are read early (the design of [TokenWing](https://github.com/runmyai/tokenwing)). Time blocked
+  on NVMe reads per pass falls 16.4 -> 9.6 ms (-41 %, three interleaved rounds); the pass itself gains 3-7 %, inside the
+  run-to-run spread, so it stays off.
+- GLM-5.3-Flash expert tier on a second card: `glm_generate --remote-device N --remote-gib G`, checked exact to rounding
+  on one card (`STRATA_REMOTE_SAME_DEVICE=1 STRATA_REMOTE_CHECK=1`).
+
+Full record: [docs/FIELD_PORTS_2026_11_19.md](../FIELD_PORTS_2026_11_19.md).
+
 ### Looped transformers in the dense engine: SenseNova-Loop-9B (18 Nov)
 
 `xolotl-dense` runs models that repeat a block of layers per token. SenseNova-Loop-9B (a Qwen3.5-9B body) runs layers

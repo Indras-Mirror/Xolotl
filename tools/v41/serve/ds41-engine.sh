@@ -66,6 +66,9 @@ export STRATA_PRESTAGE_GIB="${STRATA_PRESTAGE_GIB:-1.5}"
 # hook, async dense, pinned route buffers, graph concurrency 7, fused QKV.  RTX 4090, served q6 config + fast mode,
 # 8K prompt / 512 tokens: 98.8 -> 89.1 ms per verify pass (-10 %); short34 0.4651 / 88.61 % against the base's
 # 0.4614-0.4653 / 88.42-88.65 % (not bit-identical: sums move).  Not taken: STRATA_DEMOTE_ASYNC (lost, 98.6 ms).
+# With STRATA_RB_PROTECT set (the smart router's route meter) ATTN_TAIL, and RB_HOOK / GRAPH_CONC behind it, stay off
+# and ROUTE_FUSE is skipped; the -10 % above is the other seven (the engine log prints which are OFF).  Agent tasks
+# (Gauntlet 01+03, fast): 42.7 tok/s against 39.6 / 40.8 on 7 Nov (+5-8 %).
 # Turn the whole set off with XOLOTL_KEIS_DECODE=0; any single switch with its own =0.
 if [ "${XOLOTL_KEIS_DECODE:-1}" != 0 ]; then
     for _kv in STRATA_ROUTE_FUSE=1 STRATA_X_DEV=1 STRATA_META_PULL=1 STRATA_PF_HOSTWAIT=1 STRATA_ATTN_TAIL=3 STRATA_RB_HOOK=1 \
