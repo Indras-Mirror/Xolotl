@@ -36,6 +36,11 @@ void unlock_resident(void* p, uint64_t bytes);
 /// `why` says so) when the query is not possible - always elsewhere than Windows.
 bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why);
 
+/// Windows: the same for the GPU's own (local) memory - DXGI_MEMORY_SEGMENT_GROUP_LOCAL, the budget WDDM gives this
+/// process and how much of it this process uses.  A diagnostic, not a no-spill bound: 2026-10-22 WDDM demoted 384 MiB
+/// of a process that stayed ~1 GiB under its reported budget (the card itself was full).  False elsewhere than Windows.
+bool gpu_local_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why);
+
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 

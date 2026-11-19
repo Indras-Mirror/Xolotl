@@ -13,9 +13,14 @@
 #include "strata/kernels/cpu/ptq1_0.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/cpu/tq_cpu.hpp"
+#include "strata/kernels/cpu/iq3_one.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
+
+#if !defined(_MSC_VER) && (defined(__x86_64__) || defined(__i386__))
+#include <cpuid.h>   // cpu_bmi2_ok (iq3_one)
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -161,7 +166,44 @@ void init_once() {
     std::call_once(once, [] { ggml_cpu_init(); });
 }
 
+bool cpu_bmi2_ok() {   // iq3_one's signs (pdep); every AVX-512 VBMI CPU has it, but the rows say what they use
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    int x[4];
+    __cpuidex(x, 0, 0);
+    if (x[0] < 7) return false;
+    __cpuidex(x, 7, 0);
+    return ((unsigned) x[1] >> 8) & 1u;
+#elif defined(__x86_64__) || defined(__i386__)
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return false;
+    return (b >> 8) & 1u;
+#else
+    return false;
+#endif
+}
+
 }  // namespace
+
+bool iq3_one_ok(int type) {
+    if (type != 18 && type != 21) return false;
+    static const int mode = [] { const char* v = std::getenv("STRATA_IQ3_ONE"); return v != nullptr ? std::atoi(v) : 0; }();
+    if (mode <= 0) return false;
+    static const bool isa = cpu_avx512_ok() && cpu_bmi2_ok();   // F / BW / VL / VNNI / VBMI, then BMI2: before any call
+    if (!isa) return false;
+    static std::once_flag once[2];
+    static bool ok[2] = {false, false};
+    const int k = type == 18 ? 0 : 1;
+    std::call_once(once[k], [&] {
+        init_once();
+        double tg = 0, to = 0;
+        const bool exact = iq3_one_selftest(type, 5120, tg, to);
+        ok[k] = exact && (mode >= 2 || to < 0.9 * tg);
+        std::fprintf(stderr, "iq3_one: %s rows (Project Maya's register-codebook AVX-512) vs ggml-cpu's dot: %s, one token "
+                             "%.2f vs %.2f us a 32-row slice -> %s\n", type == 18 ? "IQ3_XXS" : "IQ3_S",
+                     exact ? "bit-exact" : "NOT bit-exact", to, tg, ok[k] ? "ours" : "ggml-cpu's");
+    });
+    return ok[k];
+}
 
 bool native_experts_available() noexcept { return true; }
 
@@ -602,6 +644,28 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         nvfp4_256_gu_rows(blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1, sg, su);
         return;
     }
+    // STRATA_IQ3_ONE (xolotl, opt-in): IQ3_XXS / IQ3_S rows that would reach ggml-cpu's dot below (a lone decode token:
+    // the multi-token kernels above start at mt_min) by Project Maya's register-codebook rows (iq3_one.cpp) - the same
+    // bits as that dot, checked once per type on this CPU - then the same clamp and SwiGLU steps
+    if (!mixed && f.tail_off == 0 && r1 > r0 && iq3_one_ok(f.gu_type)) {
+        const int R = r1 - r0;
+        thread_local std::vector<float> gb, ub;
+        gb.resize((size_t) nt * (size_t) R);
+        ub.resize((size_t) nt * (size_t) R);
+        float* gp[MAXT];
+        float* upp[MAXT];
+        for (int t = 0; t < nt; ++t) { gp[t] = gb.data() + (size_t) t * R; upp[t] = ub.data() + (size_t) t * R; }
+        iq3_one_rows(f.gu_type, blob + (size_t) r0 * f.gu_row, f.gu_row, n, act, nt, gp, 0, R);
+        iq3_one_rows(f.gu_type, blob + f.up_off + (size_t) r0 * f.gu_row, f.gu_row, n, act, nt, upp, 0, R);
+        const float lim = f.swiglu_limit;
+        for (int t = 0; t < nt; ++t)
+            for (int i = 0; i < R; ++i) {
+                const float g = std::min(gp[t][i], lim);       // DeepSeek-V4's clamp, as below
+                const float u = std::min(std::max(upp[t][i], -lim), lim);
+                ff[t][r0 + i] = (g / (1.f + std::exp(-g))) * u;
+            }
+        return;
+    }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const ggml_vec_dot_t udot = mixed ? traits(f.up_type)->vec_dot : dot;
     const size_t urow = mixed ? f.up_row : f.gu_row;
@@ -693,6 +757,14 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     static const bool nvfp4_256 = cpu_avx2_ok() && std::getenv("STRATA_NO_NVFP4_256") == nullptr;   // see above
     if (f.d_type == kNvfp4Type && nvfp4_256 && nvfp4_256_fits(n)) {
         nvfp4_256_rows(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1, sd);
+        return;
+    }
+    // STRATA_IQ3_ONE (xolotl): an IQ3_S / IQ3_XXS down (Unsloth's UD-IQ3_XXS layers 35-37 and 39) - ggml's dot for every
+    // group size until now - by the same bit-exact rows as the gate / up above
+    if (f.tail_off == 0 && r1 > r0 && nt <= MAXT && iq3_one_ok(f.d_type)) {
+        float* o[MAXT];
+        for (int t = 0; t < nt; ++t) o[t] = out[t] + r0;
+        iq3_one_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, o, r0, r1);
         return;
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;

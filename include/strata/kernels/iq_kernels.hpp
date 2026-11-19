@@ -91,6 +91,92 @@ void weighted_rows_sum(const float* parts, const float* w, int K, int64_t H, int
 /// One decode token's top-k mix on the card: out[i] = sum_k w[k] * parts[k * H + i] in double, k in order (== the
 /// tier's host loop bit for bit); w[k] == 0 skips row k.
 void decode_rows_sum(const float* parts, const float* w, int K, int64_t H, float* out, void* stream);
+/// decode_rows_sum with the pool's rows read where the host wrote them: row k comes from `host_rows` (pinned host
+/// memory under UVA, read by the kernel over PCIe - no H2D copy per row) when sel[k] != 0, else from `parts`; the
+/// weights and selectors travel with the launch.  The same values in the same k-order double sum: the same bits.
+constexpr int kRowsSumSelMax = 16;
+struct RowsSumSel {
+    float w[kRowsSumSelMax];
+    int32_t sel[kRowsSumSelMax];
+};
+void decode_rows_sum_sel(const float* parts, const float* host_rows, const RowsSumSel& ws, int K, int64_t H, float* out,
+                         void* stream);
+/// STRATA_META_PULL (ds41 decode): copy `bytes` (a multiple of 4) from mapped pinned host memory `src` (its device
+/// address) to device memory `dst` with a kernel, on `stream` - not through the copy engine, where a small copy waits
+/// behind every bulk DMA queued before it.
+void pull_from_host(void* dst, const void* src, size_t bytes, void* stream);
+/// STRATA_HIT_FAST (ds41 decode): the routed hits' grouped-launch addresses from the routing on the card.  row[e]: expert
+/// e's VRAM slot address, 0 = not resident.  All K of ids resident -> grp_ptr[k] = row[ids[k]], *n_groups = K; else
+/// *n_groups = 0 (then the grouped kernels and decode_rows_sum_gated do nothing).  All pointers are device memory.
+/// armed (STRATA_HIT_FAST=3; null = always): a word in mapped pinned memory; 0 -> *n_groups = 0; the dispatch clears it.
+/// par (STRATA_HIT_PAR): one lane per lookup, all reads in flight at once - one bus round trip for a mapped row table and
+/// armed word instead of K + 1; the same *n_groups and (when it is K) grp_ptr.
+void decode_hit_dispatch(const int32_t* ids, const unsigned long long* row, int K, int n_experts,
+                         unsigned long long* grp_ptr, int32_t* n_groups, void* stream, int32_t* armed = nullptr,
+                         bool par = false);
+/// STRATA_HIT_PF: the layer's prefetched experts as the host published them (mapped pinned memory): valid when `stamp`
+/// is the arming's stamp (the armed word's value), `n` entries of expert id and staging address.
+constexpr int kHitPfMax = 8;
+struct HitPfList {
+    int32_t stamp;
+    int32_t n;
+    int32_t e[kHitPfMax];
+    unsigned long long ptr[kHitPfMax];
+};
+/// decode_hit_dispatch (par) that also takes a routed expert from `pf` when it is not resident.  All K found: grp_ptr /
+/// ent_dst for all of them, *n_groups = *sum_gate = K.  Otherwise, with `part` (STRATA_HIT_PART), the found ones packed
+/// in routing order (ent_dst = their routing index), *n_groups = their count and *sum_gate = 0; without it *n_groups =
+/// *sum_gate = 0.  dec (mapped pinned memory): [1] = K or 0, [2] = the mask of routing indices the launch runs, then
+/// [0] = the stamp - the decision, published at once (the host plans the layer on it).  Then, if a prefetched expert is
+/// taken, the dispatch waits until *ready == the stamp (device memory, written by a copy queued behind the prefetch's
+/// DMAs), so the grouped launch behind it reads their bytes; after wait_ns it sets *err = the stamp (mapped; the host
+/// aborts on it) and *n_groups = *sum_gate = 0, so nothing behind it reads the stage.  *stamp_dev = the stamp.  An
+/// unarmed launch (armed word 0) only zeroes *n_groups and *sum_gate.
+/// ready_item (null = none): kHitPfMax words, word j written with the stamp by a copy queued right behind list entry j's
+/// DMA.  item_wait (STRATA_HIT_PF=2): wait for the taken entries' words only, not for *ready (the whole batch).
+/// stat (STRATA_HIT_PF_STAT, device memory, kHitPfStatWords; null = off): counters of the waits, see kHitPfStatWords.
+/// Layout of the stat counters: [((n - 1) * 8 + last) * 4 + f] for a wait on a list of n entries whose last taken entry
+/// is `last`, then [256 + r * 4 + f] by r = the taken resident experts; f: 0 waits, 1 ns until the taken entries were
+/// home, 2 ns until the wait ended (the batch without item_wait), 3 waits whose taken entries were home at once.
+constexpr int kHitPfStatWords = 8 * 8 * 4 + 8 * 4;
+/// STRATA_HIT_PF=3 (device memory; grp_ptr null = no split): the run's prefetched experts as a second set for their
+/// own grouped launch (grp_ptr / ent_dst / *n_groups; the first set then holds the residents alone) and wrec[3] =
+/// {mask of the list entries taken, list entries, residents taken} for decode_hit_pf_wait.  The dispatch does not wait.
+struct HitPfSplit {
+    unsigned long long* grp_ptr = nullptr;
+    int32_t* n_groups = nullptr;
+    int32_t* ent_dst = nullptr;
+    int32_t* wrec = nullptr;
+};
+void decode_hit_dispatch_pf(const int32_t* ids, const unsigned long long* row, int K, int n_experts,
+                            unsigned long long* grp_ptr, int32_t* n_groups, void* stream, int32_t* armed,
+                            const HitPfList* pf, const int32_t* ready, int32_t* dec, long long wait_ns,
+                            int32_t* ent_dst, int32_t* sum_gate, bool part, int32_t* stamp_dev, int32_t* err,
+                            const int32_t* ready_item = nullptr, bool item_wait = false,
+                            unsigned long long* stat = nullptr, HitPfSplit split = {});
+/// STRATA_HIT_PF=3: a split dispatch's wait for its taken entries' words (ready_item == *stamp_dev), queued on the
+/// stream of the prefetched set's grouped launch.  After wait_ns: *err = the stamp, *n_groups2 = *sum_gate = 0.
+void decode_hit_pf_wait(const int32_t* wrec, const int32_t* stamp_dev, const int32_t* ready_item, long long wait_ns,
+                        int32_t* n_groups2, int32_t* sum_gate, int32_t* err, unsigned long long* stat, void* stream);
+/// decode_rows_sum_sel without pool rows, the weights in device memory, and only when *gate != 0: the same bits.
+/// done (STRATA_HIT_PART, mapped pinned memory; null = none): *done = *stamp first, whatever the gate - the launches
+/// queued before this one (the grouped kernel) are finished then.
+void decode_rows_sum_gated(const float* parts, const float* w, const int32_t* gate, int K, int64_t H, float* out,
+                           void* stream, const int32_t* stamp = nullptr, int32_t* done = nullptr);
+/// STRATA_RB_HOOK (ds41 decode): a readback queued inside a captured graph.  Up to kHostPushMax arrays of 4-byte words
+/// go from device memory to mapped pinned host memory (its device address) by one block, not through the copy engine;
+/// then *flag = 1 (mapped pinned memory; null = no flag) once the words are visible to the host.
+constexpr int kHostPushMax = 4;
+struct HostPush {
+    const void* src[kHostPushMax];
+    void* dst[kHostPushMax];
+    int words[kHostPushMax];
+    int n;
+    int32_t* flag;
+};
+void push_to_host(const HostPush& p, void* stream);
+/// The device address of pinned host memory (cudaHostGetDevicePointer), or nullptr.
+void* host_dev_ptr(void* host);
 
 /// A770 port (STRATA_PF_XMX=2): up to kXmxGroupMax experts' products in one XMX launch, the weights decoded from the
 /// quantized rows into local memory.  Expert i: Y_i[cnt[i]][N] = X_i . W_i^T (X FP16, Y FP32, rows back to back).

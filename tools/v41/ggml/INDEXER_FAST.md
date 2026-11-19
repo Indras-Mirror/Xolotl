@@ -68,3 +68,22 @@ legacy-mask vec, nvis vec and nvis WMMA (launch and synchronisation included).
 The synthetic cases also cover non-monotonic/empty visibility,
 partial blocks, strided/broadcast nvis, multiple streams, nonrepresentable Q,
 fp16 subnormals, out-of-range K scales, and zero blocks.
+
+## Sparse attention keys in one op
+
+`STRATA_KV_GATHER=1` builds each query's flash-attn key block - its window rows,
+its top-k compressed rows and the zero rows that pad the count to a multiple of
+256 - with one CUDA op, `ggml_dsv41_kv_gather`, instead of three `get_rows` and
+two concats (the concats alone read and wrote the whole block twice: 3.6 s of
+a 60K-token prompt's GPU time). Each value comes from the conversion the gathers
+use (`ggml_cuda_cast<half>`, `dequantize_nvfp4<half>` with the same thread
+split), so the keys are the same bytes. It covers the F16 key path of the
+single-group attention graphs (prompt spans and decode); batch passes over
+several slots keep the composite. The CPU backend does not implement the op.
+
+Measured on an RTX 5090 with the UD-IQ3_XXS model and the production settings,
+one-shot, 2 runs per arm, a 60,001-token prompt: 54.98 / 54.98 s; with
+`STRATA_KV_GATHER=1` 51.78 / 51.53 s; with `STRATA_INDEXER_NVIS=1` and
+`GGML_CUDA_MXFP4_WMMA=1` instead 51.83 / 51.77 s; all three 48.36 / 48.51 s.
+The last-row logits were byte-identical in every arm, and the routes of the
+forced 1093-token decode were identical with and without the switch.

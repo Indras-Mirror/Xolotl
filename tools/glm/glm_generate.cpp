@@ -48,6 +48,8 @@ struct Args {
     double vram_grow_keep = 0.0, vram_margin_gib = 1.0, pcie = 0.25, pf_b = 1.43, arena_gib = 60.0;
     int threads = 0;
     int64_t ctx = 0;
+    int remote_device = -1;          // --remote-device N: a second card holds the experts ranked after the VRAM head (ds4 tier)
+    double remote_gib = 0.0;         // --remote-gib G: its expert budget (0 = its free memory less 1 GiB)
     float route_bias_file = 0.0f;   // --route-bias-file X: DECODE-only selection penalty -X on file-tier experts
                                     // (neither VRAM cache nor RAM arena) - soft, every expert stays reachable and keeps
                                     // its LoRA delta (unlike --skip-*), the ds41 decode recipe (route-bias-file 0.3)
@@ -95,6 +97,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
         else if (k == "--profile") a.profile = next();
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
+        else if (k == "--remote-device") a.remote_device = std::atoi(next().c_str());   // a second card's expert tier
+        else if (k == "--remote-gib") a.remote_gib = std::atof(next().c_str());
         else if (k == "--threads") a.threads = std::atoi(next().c_str());
         else if (k == "--ctx") a.ctx = std::atoll(next().c_str());
         else if (k == "--temp") a.temp = (float) std::atof(next().c_str());
@@ -191,7 +195,8 @@ int main(int argc, char ** argv) {
                              "       [--lora adapter.gguf] [--prefill-chunk N [--chunk-mmq] [--chunk-prestage]] [--allow-long-ctx]\n"
                              "       [--prune f [--prune-penalty X]] [--arena-adapt [--arena-admit HALF_LIFE_TOKENS]]\n"
                              "       [--skip-miss T] [--skip-file T] [--skip-file-prefill T] [--renorm-skip] [--arena-lazy] [--vram-grow KEEP_GIB]\n"
-                             "       [--lora-exps] (with --lora: also apply the routed-expert ffn_*_exps deltas)\n");
+                             "       [--lora-exps] (with --lora: also apply the routed-expert ffn_*_exps deltas)\n"
+                             "       [--remote-device N [--remote-gib G]] (a second card computes a static set of experts)\n");
         return 2;
     }
     std::vector<int> prompt = a.ids_csv.empty() ? std::vector<int>() : parse_csv(a.ids_csv);
@@ -312,6 +317,8 @@ int main(int argc, char ** argv) {
     mc.threads = a.threads;
     mc.arena_gib = a.arena_gib;
     mc.max_arena_gib = a.arena_gib;
+    mc.remote_device = a.remote_device;
+    mc.remote_gib = a.remote_gib;
     mc.cpu_only = a.experts == "cpu";
     mc.vram_lru = a.vram_lru;
     if (slot_gib_max > 0 && mc.vram_lru) {   // the elastic regrow re-admits in the seed's order: slots must not move

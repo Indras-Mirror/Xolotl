@@ -3,6 +3,9 @@
 // (layers.{1,14}.engram.embed.weight F8_E4M3 [rows, 256] + .scale F8_E8M0 [rows, 8]), two small preads per row,
 // in parallel.  A row dequantizes to 256 floats = fp8 * 2^(e8m0 - 127) per 32 (model.py ParallelEngramEmbedding;
 // exactly representable in bf16, so model.py's bf16 cast is a no-op on them).
+// A GGUF whose deepseek41.engram.encoding is "q6_k_gguf" (a llama.cpp file converted by tools/v41/v41_from_llamacpp.py)
+// reads them instead from the llama.cpp GGUF's per_layer_token_embd.weight (Q6_K [256, rows of every slot], one pread
+// per row of 210 bytes, dequantized with the arithmetic of ggml's dequantize_row_q6_K).
 //
 // rows()/start() are the fast batch reader: hashes are deduped and sorted by row id, so per row the two preads come out
 // ascending and the unique rows whose bytes share a 4 KiB page are one pread - which on the exFAT volume the tables live
@@ -14,7 +17,7 @@
 // same (sorted, page-coalesced preads, row cache); a row is one span (no separate scale tensor) dequantized at read.  The
 // hash geometry still comes from the backbone GGUF; the table rows must match it. Modern PLE GGUFs may instead store
 // one per_layer_token_embd.weight table, IQ4_NL or Q5_K, with all layers concatenated in validated layer order.
-// The hot set (FP8 rows) is not used for GGUF tables.
+// the GGUF's own raw rows (ds41_engram_hot pack); a version-1 (FP8) pack is skipped.
 #pragma once
 
 #include "ds41_geometry.hpp"
@@ -37,8 +40,9 @@ class Ds41Engram {
 public:
     struct RawMap;   ///< a fragmented table file read straight from its block device (see ds41_engram.cpp)
     ~Ds41Engram();
-    /// dirs: where the shards are (the index json is looked up in each, the shard files too).  Loads the hot set too when
-    /// one is given (set_hot_path, else STRATA_ENGRAM_HOT); a hot set that fails its checks is skipped with a warning.
+    /// dirs: where the shards are (the index json is looked up in each, the shard files too); for "q6_k_gguf", GGUF files
+    /// or folders holding one (the first with per_layer_token_embd.weight is used).  Loads the hot set too when one is
+    /// given (set_hot_path, else STRATA_ENGRAM_HOT); a hot set that fails its checks is skipped with a warning.
     bool open(const Ds41Geometry & g, const std::vector<std::string> & dirs, int threads, std::string & err);
     /// The hash state only (no tables, no threads): enough for hash() - used by the offline hot-set tool.
     void setup_hash(const Ds41Geometry & g);
@@ -51,6 +55,9 @@ public:
     bool enabled() const { return !tables_.empty(); }
     int64_t n_cols() const { return cols_; }                    ///< hash columns per token per layer (24)
     int64_t row_dim() const { return dim_; }                    ///< 256
+    int64_t raw_row_bytes() const { return wrow_ + srow_; }     ///< a raw row's bytes: 264 (FP8 + scales) or 210 (Q6_K)
+    int64_t scale_row_bytes() const { return srow_; }           ///< of which the scale span: 8 (FP8), 0 (a GGUF table)
+    int table_type() const { return qtype_; }                   ///< -1 (HF FP8), else the GGUF type (IQ4_NL 20, Q6_K 14)
     /// Record token `tid` at position `pos` (history for the hashes; positions may be rewritten).
     void set_token(int64_t pos, int tid);
     /// Record position `pos` as a DEAD token (an image span): it takes no part in any n-gram and stops the look-back,
@@ -101,6 +108,8 @@ private:
     std::vector<Table> tables_;
     // Row format.  qtype_ < 0: the HF FP8 tables - wrow_ = dim fp8 bytes (F8_E4M3) + srow_ = dim/32 scale bytes (F8_E8M0, in
     // the .scale tensor). GGUF: qtype_ = 20 (IQ4_NL, 18 bytes per 32 values) or 13 (Q5_K, 176 per 256), srow_ = 0.
+    // the .scale tensor).  qtype_ = 20 (IQ4_NL): a GGUF table - wrow_ = dim/32 blocks of 18 bytes, srow_ = 0 (no scale span).
+    // qtype_ = 14 (Q6_K): one llama.cpp tensor for every slot - wrow_ = dim/256 blocks of 210 bytes, srow_ = 0.
     int qtype_ = -1;
     int64_t wrow_ = 0, srow_ = 0;
     void deq_row(const uint8_t * w, const uint8_t * s, float * out) const;   ///< one raw row -> dim_ floats
@@ -131,6 +140,8 @@ private:
     std::shared_ptr<Batch> start_ids(std::vector<int64_t> & ids, int n, std::vector<std::vector<float>> & out, std::string & err);
     std::vector<int64_t> offsets_;   // [slot * cols + col] bucket range start
     int64_t cols_ = 0, dim_ = 0;
+    // the Q6_K tables (qtype_ 14) from a GGUF's per_layer_token_embd.weight (Unsloth / llama.cpp #30817's layout)
+    bool open_q6k(const std::vector<std::string> & paths, std::string & err);
     uint64_t bytes_ = 0, reads_ = 0;
 
     // A fixed I/O pool with a FIFO job queue.  The row reads are latency-bound, so the pool is the disk's queue depth:

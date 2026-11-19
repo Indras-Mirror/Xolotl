@@ -244,9 +244,10 @@ int main(int argc, char ** argv) {
         }
     }
     // ---- serve / verify path: N tokens per layer through run_multi (random picks over all experts)
+    // (the output buffers are OUTB: windows.h defines OUT as an empty SAL macro)
     for (int l : (nmulti > 0 ? layers : std::vector<int>{})) {
         const int nm = std::min(nmulti, Ds41MoeTier::kMaxMulti);
-        std::vector<float> X((size_t) nm * D), W((size_t) nm * K), OUT((size_t) nm * D);
+        std::vector<float> X((size_t) nm * D), W((size_t) nm * K), OUTB((size_t) nm * D);
         std::vector<int32_t> IDS((size_t) nm * K);
         for (int rep = 0; rep < 8; ++rep) {
             for (auto & v : X) v = nd(rng) * 0.3f;
@@ -258,12 +259,12 @@ int main(int argc, char ** argv) {
                     IDS[(size_t) t * K + k] = e;
                     W[(size_t) t * K + k] = 0.1f + 0.4f * (float) (rng() % 1000) / 1000.0f;
                 }
-            if (!tier.run_multi(l, nm, IDS.data(), W.data(), X.data(), OUT.data())) { std::fprintf(stderr, "run_multi failed\n"); return 1; }
+            if (!tier.run_multi(l, nm, IDS.data(), W.data(), X.data(), OUTB.data())) { std::fprintf(stderr, "run_multi failed\n"); return 1; }
             int nrem = 0;
             for (int32_t e : IDS) nrem += tier.in_remote(l, e);
             double mw = 0;
             for (int t = 0; t < nm; ++t) {
-                std::vector<float> got(OUT.begin() + (size_t) t * D, OUT.begin() + (size_t) (t + 1) * D), want((size_t) D, 0.0f), one((size_t) D);
+                std::vector<float> got(OUTB.begin() + (size_t) t * D, OUTB.begin() + (size_t) (t + 1) * D), want((size_t) D, 0.0f), one((size_t) D);
                 for (int64_t k = 0; k < K; ++k) {
                     const int32_t e = IDS[(size_t) t * K + k];
                     src.read(l, e, blob.data());
@@ -279,7 +280,7 @@ int main(int argc, char ** argv) {
     }
     // ---- prompt path: N tokens per layer through run_chunk (random picks over all experts: every class, mixed)
     for (int l : (nchunk > 0 ? layers : std::vector<int>{})) {
-        std::vector<float> X((size_t) nchunk * D), W((size_t) nchunk * K), OUT((size_t) nchunk * D);
+        std::vector<float> X((size_t) nchunk * D), W((size_t) nchunk * K), OUTB((size_t) nchunk * D);
         std::vector<int32_t> IDS((size_t) nchunk * K);
         for (auto & v : X) v = nd(rng) * 0.3f;
         for (int t = 0; t < nchunk; ++t)
@@ -293,7 +294,7 @@ int main(int argc, char ** argv) {
         if (noref) {
             for (int rep = 0; rep < 3; ++rep) {
                 const auto c0 = std::chrono::steady_clock::now();
-                if (!tier.run_chunk(l, nchunk, IDS.data(), W.data(), X.data(), OUT.data())) { std::fprintf(stderr, "run_chunk failed\n"); return 1; }
+                if (!tier.run_chunk(l, nchunk, IDS.data(), W.data(), X.data(), OUTB.data())) { std::fprintf(stderr, "run_chunk failed\n"); return 1; }
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
                 int nrem = 0;
                 for (int32_t e : IDS) nrem += tier.in_remote(l, e);
@@ -301,11 +302,11 @@ int main(int argc, char ** argv) {
             }
             continue;
         }
-        if (!tier.run_chunk(l, nchunk, IDS.data(), W.data(), X.data(), OUT.data())) { std::fprintf(stderr, "run_chunk failed\n"); return 1; }
+        if (!tier.run_chunk(l, nchunk, IDS.data(), W.data(), X.data(), OUTB.data())) { std::fprintf(stderr, "run_chunk failed\n"); return 1; }
         int cf = 0, nan_rows = 0;
         double cw = 0;
         for (int t = 0; t < nchunk; ++t) {
-            std::vector<float> got(OUT.begin() + (size_t) t * D, OUT.begin() + (size_t) (t + 1) * D), want((size_t) D, 0.0f), one((size_t) D);
+            std::vector<float> got(OUTB.begin() + (size_t) t * D, OUTB.begin() + (size_t) (t + 1) * D), want((size_t) D, 0.0f), one((size_t) D);
             bool fin = true;
             for (float v : got) fin &= std::isfinite(v);
             nan_rows += !fin;

@@ -58,6 +58,19 @@ struct Ds41DenseConfig {
     /// them back after it (the prompt_batch columns are ~2.6 GiB at 8192 - expert slots while decoding).
     bool    elastic_cols = false;
     bool    vision = false;            ///< opt-in image embeddings, VL routing and Engram masking
+    /// --ablate FILE (opt-in, local rb26): one direction out of every residual write, x - r (v.x) / (v.r) on the text
+    /// token embeddings, the Engram value, the attention output and the FFN output (shared + routed).  r = the write
+    /// direction, v = the read direction (n_embd floats each); Orca's DeepSeek-V4.1-Flash-1017 abliteration is this map
+    /// on those weights.  Image rows are the encoder's (Orca's mmproj carries its own); DSpark's draft layers are not
+    /// mapped (drafts only - the verify is).  Both empty = off: no graph node and no input byte changes.
+    std::vector<float> ablate_r, ablate_v;
+    /// --ablate-scale S / --ablate-sites LIST (local rb32): x - S r (v.x) / (v.r) on the writes in ablate_sites
+    /// (kAbl* bits, default all = the rb26 map).  S = 2 with v = r is a reflection - the r-part of a write changes sign,
+    /// its norm stays: Atomic's DeepSeek-V4.1-Flash-1017 edit (W - 2 r r^T W on the attention output, the shared and
+    /// routed experts' down and the Engram value, no embeddings; their GSQ build leaves the routed experts out).
+    enum { kAblEmbd = 1, kAblEngram = 2, kAblAttn = 4, kAblShexp = 8, kAblRouted = 16, kAblAll = 31 };
+    float ablate_scale = 1.0f;
+    int   ablate_sites = kAblAll;
 
     /// Batch slots (--batch-slots N): conversation states held at once, each of the full ctx_max - its window rings,
     /// ratio-2 compressor states, compressed KV + indexer keys, snapshot, park and Engram history.  Slot 0 is the one
@@ -152,6 +165,9 @@ public:
     const int32_t * batch_ids() const;
     const float * batch_wts() const;
     const float * batch_fn() const;
+    /// the MoE-input rows on the card (o_fn, [n_embd, columns]; null on the CPU backend).  STRATA_WIDE_PROMPT: batch_fn
+    /// is not filled by the spans - the tier reads these instead (Ds41MoeTier::run_chunk_xdev).
+    const float * batch_fn_dev() const;
     int batch_size() const;
     /// finish for the batch's sub-batch at column col0: x_state[.., col0+n) = hc_post(shexp + routed, hap, post_f,
     /// comb_f).  `routed_host` is n_embd * B (token-major); call once per layer, before the sub-batches' finishes.
@@ -162,6 +178,8 @@ public:
     bool finish_span(int il, int col0, int n);
     /// STRATA_DENSE_PROF=1: print + reset the batch dense split (build / alloc / compute / Engram / readback) - diagnostic
     void prof_report(const char * tag);
+    /// STRATA_EMBD_PROF=1: print + reset the embedding row reads since the last report - diagnostic
+    void embd_prof_report(const char * tag);
     /// Give the prompt passes' compute buffer back to the device (rebuilt by the next multi-token pass): the deferred
     /// VRAM expert cache opens into it after the prompt.
     void release_pass();
@@ -193,6 +211,8 @@ public:
     /// STRATA_LOOKAHEAD=1: after attn_router(il) of a pass of at most 16 columns, layer il+1's predicted top 16 per
     /// column (16 x n, token-major), or nullptr (off, a bigger pass, or il is the last routed layer).  A hint only.
     const int * lookahead_ids() const;
+    const int * lookahead2_ids() const;   ///< STRATA_LA2: layer il+2's top lookahead2_width() per column from the last attn_router(il), or null
+    int lookahead2_width() const;
     /// STRATA_DS41_ENGRAM_AHEAD (default on): the next prompt chunk (tokens tids[0..n) at pos0), given right after this chunk's
     /// begin() / begin_batch(): its Engram reads start once this chunk's rows are uploaded (its first Engram layer) and
     /// become that chunk's batch if it is exactly (pos0, n); otherwise they are drained.  A no-op when off.
@@ -210,6 +230,31 @@ public:
     /// layer reads the state finish just wrote, so the result is identical to finish() then predict(), with one graph
     /// launch / sync / readback less per layer.  top_ids gets the next layer's top n_top (<= 16) predicted experts.
     bool finish_predict(int il, const float * routed_sum, int next_il, int * top_ids, int n_top);
+    /// STRATA_ATTN_AHEAD (decode, opt-in): finish_predict(), with next_il's attention graph and its readbacks queued
+    /// right behind it on the same stream; returns once the prediction has landed, while that attention runs on, and
+    /// the caller's attn_router(next_il) then only waits for it.  The same graphs in the same order: the same bits.
+    /// Nothing else may run on this object between the two calls.  Falls back to finish_predict() when the setup has
+    /// no pinned readbacks (can_attn_ahead) or a graph is not cached yet.
+    bool finish_predict_attn(int il, const float * routed_sum, int next_il, int * top_ids, int n_top);
+    bool can_attn_ahead() const;   // STRATA_PIN_RB's pinned packet + STRATA_DENSE_ASYNC, a one-token pass
+    /// STRATA_HIT_FAST (decode): the layer whose attention graph finish_predict_attn queued (-1 = none), the routing
+    /// that graph writes on the card (o_ids / o_wts, n_used each; null on the CPU backend), and the backend's CUDA
+    /// stream (null when it is not CUDA) - the tier queues that layer's hits behind the graph before the readback lands.
+    int ahead_layer() const;
+    const int32_t * ids_dev() const;
+    const float * wts_dev() const;
+    void * cuda_stream() const;
+    /// STRATA_HIT_FAST=3: layer il's single-token attention graph gets a node behind its routing readback that calls
+    /// launch(ud, stream, ids, wts, x, routed) on the card's routing, the MoE input and the routed sum's tensor (when the
+    /// graph is captured: the work it queues is part of the graph).  Needs STRATA_RB_HOOK (rb_hook_on): the host then
+    /// has the routing before that work runs.  Drops the cached graphs.
+    using HitLaunch = void (*)(void * ud, void * stream, const int32_t * ids, const float * wts, const void * x, void * routed);
+    bool set_hit_hook(int il, HitLaunch launch, void * ud);
+    bool rb_hook_on() const;
+    /// STRATA_ATTN_TAIL=2: queue layer il's tail graph (the FFN hc mixes + the shared expert that attn_router left
+    /// out) if it is still owed; the decode loop calls it from the tier's after-card-side hook.  finish / predict
+    /// queue an owed tail themselves, so a missed call only costs the overlap.  True when there is nothing to do.
+    bool queue_tail(int il);
     /// finish_predict + the routing predictions of the `ahead` layers after next_il, from the same state, in the same
     /// graph: ahead_ids[a * 16 ..] = layer next_il + 1 + a's top 16 (-1 past the last layer).  For speculative
     /// file-tier reads; a hint only.

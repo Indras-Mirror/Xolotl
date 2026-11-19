@@ -48,6 +48,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <map>
 #include <memory>
 #include <limits>
@@ -143,6 +144,21 @@ public:
         if (part == 0) read(layer, expert, dst);
         (void) nparts;
     }
+    /// read_part into a destination that has `cap` bytes from dst: a source with 4 KiB-aligned blobs may then read a
+    /// part straight into a 4 KiB-aligned dst + part offset (O_DIRECT, no bounce copy) when the 4 KiB-rounded end still
+    /// fits in `cap`.  cap 0 = unknown.  Default: read_part.
+    virtual void read_part_cap(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst, size_t cap) const {
+        (void) cap;
+        read_part(layer, expert, part, nparts, dst);
+    }
+    /// Whether read_range_cap works (else only whole read_part parts).
+    virtual bool has_range_reads() const { return false; }
+    /// Bytes [lo, hi) of the blob into dst + lo (lo 4 KiB-aligned; hi too unless it is the blob's end), read_part_cap's
+    /// way: `part` of `nparts` only stands for the fixed mirror share's choice of drive (STRATA_MIRROR_POLICY 0).
+    virtual void read_range_cap(int64_t layer, int64_t expert, uint64_t lo, uint64_t hi, int part, int nparts, uint8_t* dst,
+                                size_t cap) const {
+        (void) layer; (void) expert; (void) lo; (void) hi; (void) part; (void) nparts; (void) dst; (void) cap;
+    }
     /// The chunk-prefetch reader pool's read: the same bytes as `read`, through the fastest path the source has.  A
     /// source with a raw file layout overrides this to pread through an `O_DIRECT` twin fd via the aligned `scratch`
     /// bounce (`read_staged_scratch()` bytes per thread, 4096-aligned).  Measured on the V41-GSQ GGUF: the scattered
@@ -222,7 +238,13 @@ public:
     size_t blob_bytes() const override { return max_; }
     size_t blob_bytes(int64_t l) const override;
     void read(int64_t layer, int64_t expert, uint8_t* dst) const override;
-    void read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const override;
+    void read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const override {
+        read_part_cap(layer, expert, part, nparts, dst, 0);
+    }
+    void read_part_cap(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst, size_t cap) const override;
+    bool has_range_reads() const override { return true; }
+    void read_range_cap(int64_t layer, int64_t expert, uint64_t lo, uint64_t hi, int part, int nparts, uint8_t* dst,
+                        size_t cap) const override;
     void read_staged(int64_t layer, int64_t expert, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes) const override;
     size_t read_staged_scratch() const override { return scratch_; }
     void advise(int64_t layer, int64_t expert) const override;
@@ -256,11 +278,13 @@ private:
     /// One 4096-aligned `pread` of [off, off+n) through the O_DIRECT twin fd, sliced out of `scratch`.  False when
     /// there is no twin fd or the bounce is too small (the caller then falls back to the buffered `read`).
     bool read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes, int fd = -1) const;
-    bool open_mirror(const char* path, std::string& err);
+    bool open_mirror(const char* path, std::string& err, bool primary = false);
     /// read_staged (whole blobs): does this mirrored blob come from the mirror?  mshare_ per mille, by a fixed hash.
     bool mirror_pick(int64_t layer, int64_t expert) const;
     int mfd_ = -1;                        ///< the mirror (O_DIRECT), -1 = none
     std::vector<uint64_t> moff_;          ///< per (layer, expert): the blob's offset in the mirror, ~0 = not mirrored
+    int pfd_ = -1;                        ///< STRATA_BLOB_PRIMARY: an aligned copy on the model's drive (O_DIRECT), -1 = none
+    std::vector<uint64_t> poff_;          ///< per (layer, expert): the blob's offset in that copy, ~0 = not in it
     int64_t mirrored_ = 0;
     int mshare_ = 280;                    ///< per mille of a mirrored blob's parts read from the mirror
     int mpshare_ = 280;                   ///< the same for read_part (decode misses) only
@@ -483,7 +507,37 @@ public:
     /// `run` with the weighted sum computed on the card and written to the device row `out_dev` (n_embd floats, e.g.
     /// the dense half's routed tensor): the same bits as `run`'s host sum, without its parts readback and upload.
     /// GPU tier only (false in cpu_only).
-    bool run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev);
+    /// x_dev (optional): the same activation on the card (the dense half's o_fn).  The card then quantizes it there and
+    /// the pool takes x - no host-to-device copy of the activation (STRATA_X_DEV).
+    bool run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev,
+                    const void* x_dev = nullptr);
+    /// STRATA_ATTN_TAIL=2: `f` runs once, inside the next GPU-path layer call, right after that call has launched its
+    /// card-side work (hits, PCIe share, vram_lru copies) - the dense half queues its tail graph there, behind the
+    /// tier's kernels.  Cleared when it runs; a call that never gets there leaves it set (clear it with nullptr).
+    void set_after_gpu(std::function<void()> f);
+    /// STRATA_HIT_FAST (decode, opt-in): queue `layer`'s routed hits ON `dense_stream` (a cudaStream_t), behind what it
+    /// holds now - the attention graph that writes the routing (ids_dev / w_dev, top_k each) and the MoE input (x_dev)
+    /// on the card - before the host has the routing.  A one-thread dispatch looks the routed experts up in a pinned
+    /// table of VRAM slot addresses; when all top_k are resident, the hits' grouped launch and the weighted sum into
+    /// out_dev run from it, the kernels and values the layer's run_to_dev would launch.  Otherwise they do nothing.
+    /// The next run_to_dev(layer, ..., out_dev) keeps the launch when the routing it gets is all resident in the slots
+    /// the table had (then that call has no card work, and what the dense stream queues next reads the sum in order);
+    /// every other call runs as before.  False (no launch) when the layer's experts do not share one format class or
+    /// the setup has no such path.
+    bool spec_hits(int64_t layer, const int32_t* ids_dev, const float* w_dev, const void* x_dev, void* out_dev,
+                   void* dense_stream);
+    /// STRATA_HIT_FAST=3: the same launch as a node of the dense half's attention graph, behind the routing readback
+    /// (Ds41Dense::set_hit_hook).  hit_hook(layer, dense_stream): the node's user data, null when the layer has no such
+    /// path; hit_launch is the node's function (it queues the kernels when the graph is captured).  The dispatch runs
+    /// the hits only when hit_arm(layer, out_dev) was called before the graph's launch (the table row as the cache has
+    /// it then); each arming is used by one launch, and the next run_to_dev(layer, ..., out_dev) keeps it as above.
+    void* hit_hook(int64_t layer, void* dense_stream);
+    static void hit_launch(void* ud, void* stream, const int32_t* ids_dev, const float* w_dev, const void* x_dev,
+                           void* out_dev);
+    bool hit_arm(int64_t layer, void* out_dev);
+    /// STRATA_HIT_PF: the stamp of a graph dispatch whose prefetched expert did not arrive in time (it ran nothing of
+    /// the stage), 0 = none.  The caller stops before it uses logits computed after it.
+    int32_t hit_pf_fault() const;
     /// The same with `x` already on the device (the engine's attention output).  CUDA modes only.
     bool run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out);
 
@@ -491,6 +545,8 @@ public:
 
     const Ds41MoeStats& stats() const;
     void reset_stats();
+    /// STRATA_LRU_STAT=1 (diagnostic): print the vram_lru promotions' host waits since the last report, then reset
+    void lru_stat_report(const char* tag);
     void add_stats(const Ds41MoeStats& s);
 
     const Ds41MoeGeom& geom() const;
@@ -499,6 +555,8 @@ public:
     const char* mode() const;          ///< "cpu-only" | "gpu" | "uninitialised"
     int64_t resident() const;          ///< experts admitted to the VRAM cache
     int64_t arena_experts() const;     ///< blobs the host arena holds
+    /// (layer, expert) pairs in the VRAM cache, in the host arena, and in both (diagnostic: STRATA_DEC_REPORT)
+    void cache_census(int64_t& vram, int64_t& arena, int64_t& both) const;
     int64_t file_tier() const;         ///< blobs the arena could not take
     double arena_gib() const;
     int64_t blob_bytes(int64_t layer) const;   ///< one expert's gate+up+down bytes in `layer` (0 if not routed)
@@ -536,6 +594,13 @@ public:
     /// run_chunk writing the n * n_embd sums to device memory `out_dev` (same device, e.g. the dense half's chunk
     /// tensor) instead of the host.  GPU tier only.
     bool run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// STRATA_WIDE_PROMPT: run_chunk_dev with the n input rows on the card too (`x_dev`, e.g. the dense half's MoE-input
+    /// tensor).  No host copy of them, and the call holds only the buffers it uses (no c_x / c_out / landing pad; the
+    /// MMVQ scratch only for a call with VRAM-resident experts), so a wide prompt batch costs ~0.12 MiB a token here
+    /// instead of ~0.37.  Same kernels and sums.  False when chunk_xdev_ok() is not.
+    bool run_chunk_xdev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x_dev, void* out_dev);
+    /// run_chunk_xdev can run: a GPU tier without a remote helper card.
+    bool chunk_xdev_ok() const;
     /// The arena alone from a routing profile (the order `seed_from_routes` would give it, incl. arena_skip_resident),
     /// WITHOUT opening the VRAM cache - so prompt chunks can run first and `release_chunk` can give their buffers back
     /// before the cache takes the VRAM.  A later `seed_from_routes` keeps this arena and only seeds the cache.
@@ -563,11 +628,18 @@ public:
     /// Xolotl s6 (STRATA_SERVE_KEEP_CACHE=1; the cache opens segmented then): give back only the VRAM a small batch
     /// prompt needs instead of the whole cache.  Evicts the cache's TAIL slots (the lowest-ranked seeds) until
     /// `need_bytes` are free, remembering slot -> expert; returns the number evicted (0: it already fits), or -1 when
-    /// the cache is not segmented (the caller then falls back to release_cache).
-    int64_t shrink_cache_for(int64_t need_bytes, std::string& err);
+    /// the cache is not segmented (the caller then falls back to release_cache).  `more`: the cache may already be
+    /// shrunk for this batch - evict further tail slots (the batch's width came up short of the turn), regrow_cache
+    /// then refills both rounds.  `fixed` (STRATA_SERVE_KEEP_FIXED): evict the tail slots that hold `need_bytes`,
+    /// whatever is free now - the evicted set then follows from the batch alone, not from a free-VRAM reading.
+    int64_t shrink_cache_for(int64_t need_bytes, std::string& err, bool more = false, bool fixed = false);
     /// After that prompt: map the tail back and refill exactly the evicted experts into exactly their slots (from the
     /// RAM arena, else the file).  Returns the number refilled, or -1 with `err`.
     int64_t regrow_cache(std::string& err);
+    /// Local (rb21, the serve loop's LEND): the VRAM cache's live bytes now (0 without a cache).
+    int64_t cache_bytes() const;
+    /// Local (rb21): drop the shrink record without a regrow - the cache was released whole after a LEND.
+    void forget_shrunk();
     static bool keep_cache_mode();
     /// REAP accumulators (Ds41MoeConfig::saliency), [layer * n_experts + expert]; empty when off.
     const std::vector<double>& saliency_sum() const;

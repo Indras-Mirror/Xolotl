@@ -16,6 +16,7 @@ swaps in V4.1's pieces (same shape as ~/AI/Strata-GLM/tools/glm/serve/serve_glm.
 
   serve_ds41.py --engine strata --config strata-ds41.json --port 8150
 """
+import hashlib
 import json
 import os
 import re
@@ -323,11 +324,140 @@ class Ds41Vision(_Vision):
         if cfg.get("warmup_tokens"):
             args += ["--warmup-tokens", str(int(cfg["warmup_tokens"]))]
         self.spawn = (args, log, env)
-        if not lazy and not self.lazy_vision and not self.elastic:
+        # (local, rb21) "lend_mib" (an encoder on the card): before the first new picture of an image turn the engine
+        # lends that much of its VRAM expert cache's tail (the ds41 engine's LEND: slots the turn's batch borrow gives
+        # back anyway), so the encoder's per-image VRAM (--offload: the weights' copy and the activations, ~2.6 GiB for
+        # the largest grid) never meets a card the engine filled to its --vram-margin.  0 / absent: no lend.
+        on_card = str(cfg.get("device") or "") == "cuda" or cfg.get("gpu") is True
+        # STRATA_VISION_LEND_ANY=1 (test switch): the LEND for a CPU encoder too - the engine's state after a lent image
+        # turn can then be compared with the same turn without one
+        lend_any = os.environ.get("STRATA_VISION_LEND_ANY") == "1"
+        self.lend_mib = int(cfg.get("lend_mib") or 0) if on_card or lend_any else 0
+        self.lend_cb = None          # the image turn's LEND, armed by Service._vision_up, used once by encode
+        # (local, rb21) "per_image": true (on the card, not "offload"): no encoder process between image turns - none
+        # of its VRAM (a CUDA context alone keeps ~0.7 GiB) stays beside the engine's cache.  An image turn with a new
+        # picture starts it after the LEND (--fast-load, no warm-up: ~1.7 s), encodes the turn's pictures and stops it
+        # before the prompt goes to the engine.  lend_mib must cover the whole process (~3.5 GiB: context + cuBLAS +
+        # f32 weights + the largest grid's activations).
+        self.per_image = on_card and cfg.get("per_image") is True and cfg.get("offload") is not True
+        # "standby": true (with per_image): the next turn's encoder is started as soon as the last one stopped (and with
+        # the server), as ds41_vision.py --standby - torch and the weights loaded, the card untouched (no CUDA context,
+        # no VRAM) until its picture, which then takes ~0.4 s instead of a 1.7 s start
+        self.standby = self.per_image and cfg.get("standby") is True
+        if self.per_image:
+            extra = ("--standby",) if self.standby else ("--fast-load", "--no-warmup")
+            self.spawn = (args + [x for x in extra if x not in args], log, env)
+        import threading
+        self._spawned = threading.Event()   # set: no standby start running in the background
+        self._spawned.set()
+        if not lazy and not self.lazy_vision and not self.elastic and (not self.per_image or self.standby):
             self._start()
+
+    def encode(self, source, keep=()):
+        if self.lend_cb is None and not self.per_image:
+            return super().encode(source, keep)
+        data = self.normalize(source if isinstance(source, bytes) else self.load(source))   # normalize is idempotent
+        if hashlib.sha256(data).hexdigest()[:32] not in self.cache:   # the key encode() uses: a picture to encode
+            if self.lend_cb is not None:
+                lend, self.lend_cb = self.lend_cb, None
+                lend()
+            if self.per_image:
+                self._spawned.wait()              # a standby still starting after the last image turn
+                if not self.alive():
+                    import time
+                    t0 = time.time()
+                    self._start()
+                    print(f"[strata] images: the image encoder started in {time.time() - t0:.1f} s", flush=True)
+        return super().encode(data, keep)
+
+    def encode_all(self, sources, cancel=None):
+        try:
+            return super().encode_all(sources, cancel)
+        finally:
+            self.lend_cb = None
+            if self.per_image and self.alive():   # before the prompt reaches the engine: its VRAM back to the cache
+                self.unload()
+                if self.standby:
+                    self._respawn()
+
+    def _respawn(self):
+        """standby: the next image turn's encoder starts now, in the background (it holds no VRAM until its picture)."""
+        import threading
+        self._spawned.clear()
+
+        def run():
+            try:
+                self._start()
+            except Exception as e:                # noqa: BLE001 - the next picture starts one itself
+                print(f"[strata] images: the standby image encoder did not start ({e}); the next picture starts one",
+                      flush=True)
+            finally:
+                self._spawned.set()
+        threading.Thread(target=run, daemon=True).start()
 
 
 S.Vision = Ds41Vision
+
+
+def _engine_lend(self, mib: int, timeout: float = 60.0) -> dict:
+    """rb21: `LEND <MiB>` between requests (the caller holds the service's FIFO): the engine evicts that much of its
+    VRAM cache's tail for the image encoder -> {"slots", "mib", "free_mib"} (0 slots: nothing lent, e.g. no cache is
+    open yet); ValueError with the engine's reason when it refuses, EngineDied when it ended."""
+    import queue
+    import time
+    if not self.alive():
+        raise S.EngineDied("the engine is not running")
+    self.proc.stdin.write(f"LEND {int(mib)}\n")
+    self.proc.stdin.flush()
+    deadline = time.time() + timeout
+    while True:
+        try:
+            line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+        except queue.Empty:
+            raise S.EngineDied("the engine did not answer LEND") from None
+        if line is None:
+            raise S.EngineDied("the engine ended")
+        line = line.strip()
+        if line.startswith("ERR"):
+            raise ValueError(line[4:].strip() or "the engine refused LEND")
+        if line.startswith("LENT "):
+            f = line.split()
+            return {"slots": int(f[1]), "mib": int(f[2]), "free_mib": int(f[3])}
+        if time.time() > deadline:
+            raise S.EngineDied("the engine did not answer LEND")
+
+
+S.StrataEngine.lend = _engine_lend
+_svc_vision_up = S.Service._vision_up
+
+
+def _vision_up_ds41(self):
+    """rb21: arm the image turn's LEND (vision "lend_mib"); Ds41Vision.encode sends it before the turn's first new
+    picture, so an image turn whose pictures are all cached lends nothing."""
+    _svc_vision_up(self)
+    v = self.vision
+    if getattr(v, "lend_mib", 0) > 0 and hasattr(self.engine, "lend") and self.loaded():
+        def lend(mib=v.lend_mib):
+            try:
+                out = self.engine.lend(mib)
+                print(f"[strata] images: the expert cache lent {out['mib']} MiB ({out['slots']} slots) to the image "
+                      f"encoder, {out['free_mib']} MiB free", flush=True)
+            except ValueError as e:
+                print(f"[strata] images: the expert cache lent nothing to the image encoder ({e}); encoding anyway",
+                      flush=True)
+        v.lend_cb = lend
+
+
+S.Service._vision_up = _vision_up_ds41
+_svc_vision_down = S.Service._vision_down
+
+
+def _vision_down_ds41(self) -> bool:
+    """rb21: a "per_image" encoder is down between image turns by design (the engine's load does not start it)."""
+    return _svc_vision_down(self) and not getattr(self.vision, "per_image", False)
+
+
+S.Service._vision_down = _vision_down_ds41
 
 # ---- tool calls: DSML
 CALLS_OPEN = f"<{E.dsml_token}{E.tool_calls_block_name}>"           # <｜DSML｜ calls>
@@ -559,10 +689,14 @@ def _note_ds41(self, n, evs, st=None, rate=None):
 
 
 # a model name ending in one of these (a config alias) = that routing for the request, for the strata_tune keys the
-# request doesn't name: -exact = no decode biases (quality mode), -fast = the stronger 0.5 / 0.3 nudge (speed mode); the
-# plain name gets the config's --route-bias / --route-bias-file
+# request doesn't name: -exact = no decode biases (quality mode), -light = the 0.25 / 0.15 nudge (V41_START_HERE.md
+# section 5c: ~1 pt API top-1 under exact), -fast = the stronger 0.5 / 0.3 nudge (speed mode), -max = the engine's own
+# default 1.0 / 0.6 nudge (strongest; local 1093-token forced test: top-1 868/1093 vs exact); the plain name gets the
+# config's --route-bias / --route-bias-file
 ROUTE_SUFFIXES = {"-exact": {"route_bias": 0.0, "route_bias_file": 0.0, "route_bias_remote": 0.0},
-                  "-fast": {"route_bias": 0.5, "route_bias_file": 0.3}}
+                  "-light": {"route_bias": 0.25, "route_bias_file": 0.15},
+                  "-fast": {"route_bias": 0.5, "route_bias_file": 0.3},
+                  "-max": {"route_bias": 1.0, "route_bias_file": 0.6}}
 
 
 def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # **kw: the server's newer keywords (0.1.44: force=)

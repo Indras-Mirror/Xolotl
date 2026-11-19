@@ -27,7 +27,8 @@
 namespace strata::v41 {
 
 namespace ty {
-constexpr uint32_t F32 = 0, F16 = 1, Q8_0 = 8, Q3_K = 11, I8 = 24, I32 = 26, MXFP4 = 39, Q2_0 = 42, PTQ1_0 = 143;
+constexpr uint32_t F32 = 0, F16 = 1, Q8_0 = 8, Q3_K = 11, Q5_K = 13, Q6_K = 14, I8 = 24, I32 = 26, MXFP4 = 39, Q2_0 = 42,
+                   PTQ1_0 = 143;
 }
 
 /// One layer's routed experts: the type of each expert's gate+up and of its down, and where each expert's rows are
@@ -58,6 +59,9 @@ struct Ds41Geometry {
     std::vector<uint32_t> engram_token_map;          ///< [vocab] compressed id
     std::vector<uint64_t> engram_primes;             ///< [n_engram_layers * (ngram-1) * heads]
     std::vector<int64_t> engram_mult;                ///< [n_engram_layers * ngram]
+    /// deepseek41.engram.encoding: "q6_k_gguf" = the tables are a llama.cpp GGUF's per_layer_token_embd.weight (Q6_K,
+    /// every slot's rows in one tensor); anything else (DwarfStar's "e4m3_e8m0_32_row264", or no key) = the HF shards
+    std::string engram_encoding;
     int64_t bos = -1, eos = -1;
     std::vector<Ds41ExpertMap> experts;              ///< [n_layer]
 
@@ -536,6 +540,10 @@ inline std::string ds41_read_geometry(const GgufModel & model, Ds41Geometry & G)
     if (!(e = detail::u64(g, P + "engram.compressed_vocab_size", G.engram_cvocab)).empty()) return e;
     if (!(e = detail::arr(g, P + "engram.layer_ids", G.engram_layers)).empty()) return e;
     if (!(e = detail::arr(g, P + "engram.rows", G.engram_rows)).empty()) return e;
+    {   // optional, and only "q6_k_gguf" changes the reader: every other file reads the FP8 shards as before
+        const MetaValue * enc = g.get(P + "engram.encoding");
+        G.engram_encoding = enc && enc->type == MetaType::STRING ? enc->s : "e4m3_e8m0_32_row264";
+    }
     const std::string & path = g.path();
     std::vector<int64_t> tm, pr;
     if (!(e = ds41_read_int_array(path, P + "engram.token_map", tm)).empty()) return e;
@@ -564,6 +572,9 @@ inline std::string ds41_read_geometry(const GgufModel & model, Ds41Geometry & G)
 inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, const std::vector<int64_t> & layers) {
     std::map<std::string, std::pair<std::vector<uint64_t>, uint32_t>> want;   // name -> (shape GGUF order, type; ~0 = any)
     const uint32_t ANY = ~0u;
+    // a dense matrix the graphs multiply as it is: Q8_0, or the Q6_K / Q5_K that Unsloth's Dynamic V3.1 GGUFs
+    // (UD-IQ2_XXS) keep for the head and 13 layers (v41_from_llamacpp.py copies them as they are)
+    const uint32_t QK = ~1u;
     // the llama.cpp convention (ISTA-DASLab's GGUFs): the same tensors and shapes, but dense types of the quantizer's
     // choice (Q5_K / Q8_0 / BF16 / F32 - the loader converts what the graph needs), attn_output_a stored 3-D, the
     // Engram projections under llama.cpp's names, no vision router bias, and the Engram hash arrays as tensors
@@ -576,7 +587,7 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
     const uint64_t IH = (uint64_t) G.idx_heads, ID = (uint64_t) G.idx_dim;
     add("token_embd.weight", { D, (uint64_t) G.vocab }, ty::F16);
     add("output_norm.weight", { D }, ty::F32);
-    add("output.weight", { D, (uint64_t) G.vocab }, ty::Q8_0);
+    add("output.weight", { D, (uint64_t) G.vocab }, QK);
     G.experts.assign((size_t) G.n_layer, {});
     for (int64_t l : layers) {
         const std::string b = "blk." + std::to_string(l) + ".";
@@ -587,14 +598,14 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
             add(b + site + "_norm.weight", { D }, ty::F32);
         }
         add(b + "attn_sinks.weight", { NH }, ty::F32);
-        add(b + "attn_q_a.weight", { D, RQ }, ty::Q8_0);
-        add(b + "attn_q_b.weight", { RQ, NH * DH }, ty::Q8_0);
+        add(b + "attn_q_a.weight", { D, RQ }, QK);
+        add(b + "attn_q_b.weight", { RQ, NH * DH }, QK);
         add(b + "attn_q_a_norm.weight", { RQ }, ty::F32);
-        add(b + "attn_kv.weight", { D, DH }, ty::Q8_0);
+        add(b + "attn_kv.weight", { D, DH }, QK);
         add(b + "attn_kv_a_norm.weight", { DH }, ty::F32);
         if (lc && !up) add(b + "attn_output_a.weight", { NH * DH / OG, OL, OG }, ANY);   // the same bytes, 3-D
-        else add(b + "attn_output_a.weight", { NH * DH / OG, OG * OL }, ty::Q8_0);
-        add(b + "attn_output_b.weight", { OG * OL, D }, ty::Q8_0);
+        else add(b + "attn_output_a.weight", { NH * DH / OG, OG * OL }, QK);
+        add(b + "attn_output_b.weight", { OG * OL, D }, QK);
         if (G.is_kv_source(l)) {
             add(b + "attn_compressor_kv.weight", { D, DH }, ty::F16);
             add(b + "attn_compressor_norm.weight", { DH }, ty::F32);
@@ -610,9 +621,9 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
         add(b + "exp_probs_b.bias", { NE }, ty::F32);
         // (vision only: absent in PR #30817's files, optional upstream - --vision checks for it)
         if (!lc || (up && m.find(b + "exp_probs_b_vl.bias"))) add(b + "exp_probs_b_vl.bias", { NE }, ty::F32);
-        add(b + "ffn_gate_shexp.weight", { D, FF }, ty::Q8_0);
-        add(b + "ffn_up_shexp.weight", { D, FF }, ty::Q8_0);
-        add(b + "ffn_down_shexp.weight", { FF, D }, ty::Q8_0);
+        add(b + "ffn_gate_shexp.weight", { D, FF }, QK);
+        add(b + "ffn_up_shexp.weight", { D, FF }, QK);
+        add(b + "ffn_down_shexp.weight", { FF, D }, QK);
         if (G.engram_slot(l) >= 0) {   // (llama.cpp names: engram_q / engram_k / engram_wkv - ds41_canonical_name)
             if (up) {
                 add(b + "engram_gate.weight", { D, HC }, ty::F32);   // = engram_q * engram_k, what the graph multiplies
@@ -699,7 +710,9 @@ inline std::string ds41_check_tensors(const GgufModel & m, Ds41Geometry & G, con
             for (auto x : st.first) w += std::to_string(x) + " ";
             return n + ": shape [" + a + "] expected [" + w + "]";
         }
-        if (st.second != ANY && t->type != st.second)
+        if (st.second == QK && t->type != ty::Q8_0 && t->type != ty::Q6_K && t->type != ty::Q5_K)
+            return n + ": type " + std::string(ggml_type_name(t->type)) + " expected q8_0 / q6_K / q5_K";
+        if (st.second != ANY && st.second != QK && t->type != st.second)
             return n + ": type " + std::string(ggml_type_name(t->type)) + " expected " + ggml_type_name(st.second);
         if (n != "per_layer_token_embd.weight" && !m.in_bounds(*t, s)) return n + ": out of bounds";
     }

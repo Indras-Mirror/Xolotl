@@ -133,6 +133,32 @@ Top-1 agreement 0.674 vs 0.701. In the engine: 4096-token code prompt ppl 2.380,
   exact and every expert stays reachable. Cost on 4096-token perplexity: code 2.38 -> 2.87, agentic text 15.11 -> 6.39
   (better: the GSQ quant gave its cheapest formats to rarely-used experts). `--route-bias 0 --route-bias-file 0` =
   exact routing at ~3.5 tok/s.
+- **One direction out of every residual write** (opt-in, local rb26): `--ablate FILE` (2 x 5120 float32: r, then v)
+  maps x -> x - r (v.x) / (v.r) on the text token embeddings, the Engram value, the attention output and the FFN output
+  (shared + routed) - what an abliteration does to those weights, applied on top of any quant. Orca's
+  DeepSeek-V4.1-Flash-1017-abliterated is exactly this map with one pair for all 40 layers (v = the direction it zeroes,
+  r = the direction it changes along, 14 degrees apart; readers, router, HC, head and the Engram tables are untouched);
+  its mmproj changes only the four tensors that write the LM's space (x - v (v.x)), so image rows come from the encoder
+  as they are. On GSQ IQ2_XS: the same decode speed, normal answers stay normal, the canned refusals go. Without the
+  flag no graph node or input byte changes.
+  `--ablate-scale S` and `--ablate-sites LIST` (local rb32; LIST = a comma list of embd, engram, attn, shexp, routed,
+  default all) make it x -> x - S r (v.x) / (v.r) on the listed writes only. A pair file with v = r and S = 2 is a
+  reflection: the r-part of each write changes sign and its norm stays. AtomicChat's DeepSeek-V4.1-Flash-1017 LoRA
+  (rank 1, alpha 1, used at `--lora-scaled 2.0`) is exactly that on the original weights: every lora_b is the same unit
+  r and lora_a = -(r^T W) on the attention output, the shared and routed experts' down and the Engram value, with no
+  embeddings, so `--ablate-scale 2 --ablate-sites engram,attn,shexp,routed` applies it to the weights the engine runs.
+  Their GSQ build re-quantizes only the dense writers and leaves the routed experts as ISTA shipped them (`engram,attn,shexp`).
+- **A pool boundary at the end of the system prompt** (opt-in, local rb27): `STRATA_SERVE_PREFIX_SAVE=1`. Subagents
+  send one system prompt + tools and each its own task, and a pool record resumes only at a saved boundary (a prompt's
+  end) or up to 16 tokens below one, so every new conversation re-read the shared system prompt. With the switch a
+  layer-major read that crosses the first user-turn token (`<｜User｜>` 128803 / `<｜latest_reminder｜>` 128828;
+  `STRATA_SERVE_PREFIX_TOKENS`) stops there, saves [0, p) to the pool and reads on; a later conversation resumes at p
+  and reads only its own part. Prefixes under `STRATA_SERVE_PREFIX_MIN` (1024) tokens are left alone; text prompts on
+  the solo path only (no batch slots, images or DSpark tail). GSQ IQ2_XS, RTX 5090 + 64 GB, route bias 0.5/0.3, a
+  6K-token system prompt: a second conversation's first prompt 7.2 -> 0.87 s; four conversations x two turns sent
+  together 83.2 -> 58.0 s; the first conversation pays its tail's own expert sweep (~1 s). A resumed prompt's last-row
+  logits equal a fresh read's bit for bit; against the unsplit read the tail's logits move by batch-shape noise (KL
+  0.014-0.019, the same top-1). Off: the 13 serve scenarios answer as rb26.
 - Where the time goes - prefill (8192 tokens, ~37 s): dense half ~11 s, experts ~26 s (the grouped expert kernels and
   ~10 GB/s of expert uploads). Decode (~38 ms/token): dense half ~19 ms (its Q8_0 weights read at ~880 GB/s - the
   card's bandwidth), expert tier ~16 ms.

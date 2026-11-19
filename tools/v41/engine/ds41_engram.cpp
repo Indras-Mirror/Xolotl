@@ -102,6 +102,62 @@ float fp16_to_f32(uint16_t h) {
     return f;
 }
 
+// Q6_K (ggml block_q6_K, 210 bytes per 256 weights): Unsloth's / llama.cpp #30817's per_layer_token_embd.weight
+constexpr int kQ6k = 14;
+
+// MXFP8 (llama.cpp #30817's GGML_TYPE_MXFP8 = 43, 33 bytes per 32 weights: one E8M0 scale e, then 32 E4M3 (fn) codes,
+// value = e4m3(q) * 2^(e - 127)): Unsloth's UD-Q8_K_XL per_layer_token_embd.weight.  The arithmetic of that branch's
+// dequantize_row_mxfp8 (exact in fp32 for every code and scale).
+constexpr int kMxfp8 = 43;
+
+float e4m3_to_f32(uint8_t x) {
+    const int e = (x >> 3) & 0xF, m = x & 0x7;
+    const float v = e == 0xF && m == 0x7 ? NAN : e == 0 ? std::ldexp((float) m, -9) : std::ldexp((float) (8 + m), e - 10);
+    return (x & 0x80) ? -v : v;
+}
+
+void mxfp8_dequant(const uint8_t * x, float * y, int64_t k) {
+    for (int64_t i = 0; i < k / 32; ++i, x += 33, y += 32) {
+        const float d = x[0] == 0xFF ? NAN : x[0] == 0 ? std::ldexp(1.0f, -127) : std::ldexp(1.0f, (int) x[0] - 127);
+        for (int j = 0; j < 32; ++j) y[j] = e4m3_to_f32(x[1 + j]) * d;
+    }
+}
+
+// k Q6_K values (ggml's block_q6_K, 210 bytes per 256: ql[128] qh[64] scales[16] d) -> floats.  The arithmetic of
+// ggml's dequantize_row_q6_K, term for term, so a row comes out as llama.cpp's get_rows gives it on the CPU; kept here
+// instead of linking ggml because bench_ds41_engram / ds41_engram_hot build this file without it.
+void q6k_dequant(const uint8_t * x, float * y, int64_t k) {
+    for (int64_t i = 0; i < k / 256; ++i, x += 210) {
+        const uint8_t * ql = x;
+        const uint8_t * qh = x + 128;
+        const int8_t * sc = (const int8_t *) (x + 192);
+        uint16_t dh;
+        std::memcpy(&dh, x + 208, 2);
+        const float d = fp16_to_f32(dh);
+        for (int n = 0; n < 256; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                const int is = l / 16;
+                const int8_t q1 = (int8_t) ((ql[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int8_t q2 = (int8_t) ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int8_t q3 = (int8_t) ((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int8_t q4 = (int8_t) ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l + 0] = d * sc[is + 0] * q1;
+                y[l + 32] = d * sc[is + 2] * q2;
+                y[l + 64] = d * sc[is + 4] * q3;
+                y[l + 96] = d * sc[is + 6] * q4;
+            }
+            y += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+// does the GGUF at `path` hold a tensor `name`?  (a file that does not parse: no)
+bool gguf_has(const std::string & path, const char * name) {
+    try { return GgufFile(path).find(name) != nullptr; } catch (const std::exception &) { return false; }
+}
 }  // namespace
 
 // ---- raw block-device reads for a fragmented table file ----------------------------------------------------------
@@ -197,8 +253,30 @@ static std::shared_ptr<Ds41Engram::RawMap> raw_map(const std::string & path, int
 #endif
 }
 
+// STRATA_ENGRAM_NOCACHE=1 (a test switch): the tables are opened with O_DIRECT (FILE_FLAG_NO_BUFFERING on Windows), so
+// every row read goes to the drive as on a cold page cache - a repeatable cold run on the same text.  The spans go
+// through a 4 KiB-aligned bounce buffer of the reading thread.
+static bool engram_nocache() {
+    static const bool on = std::getenv("STRATA_ENGRAM_NOCACHE") && std::getenv("STRATA_ENGRAM_NOCACHE")[0] == '1';
+    return on;
+}
+
 static inline ssize_t tread(int fd, const std::shared_ptr<Ds41Engram::RawMap> & m, void * buf, size_t n, uint64_t off) {
-    return m ? m->read(buf, n, off) : ds41_sys::pread(fd, buf, n, (int64_t) off);
+    if (m) return m->read(buf, n, off);
+    if (!engram_nocache()) return ds41_sys::pread(fd, buf, n, (int64_t) off);
+    constexpr uint64_t A = 4096;
+    const uint64_t a0 = off & ~(A - 1), a1 = (off + n + A - 1) & ~(A - 1);
+    thread_local std::vector<uint8_t> raw;
+    if (raw.size() < a1 - a0 + A) raw.resize((size_t) (a1 - a0 + A));
+    uint8_t * b = (uint8_t *) (((uintptr_t) raw.data() + A - 1) & ~(uintptr_t) (A - 1));
+    const ssize_t r = ds41_sys::pread(fd, b, (size_t) (a1 - a0), (int64_t) a0);
+    if (r < (ssize_t) (off - a0 + n)) return r < 0 ? r : 0;   // the span not read whole (a1 may pass the file's end)
+    std::memcpy(buf, b + (off - a0), n);
+    return (ssize_t) n;
+}
+
+static inline int table_open(const std::string & path) {
+    return ds41_sys::open(path.c_str(), O_RDONLY | (engram_nocache() ? O_DIRECT : 0));
 }
 
 Ds41Engram::~Ds41Engram() {
@@ -239,6 +317,8 @@ void Ds41Engram::deq_row(const uint8_t * w, const uint8_t * s, float * o) const 
         }
         return;
     }
+    if (qtype_ == kQ6k) { q6k_dequant(w, o, dim_); return; }
+    if (qtype_ == kMxfp8) { mxfp8_dequant(w, o, dim_); return; }
     if (qtype_ == kIq4nl) {
         for (int64_t b = 0; b < dim_ / 32; ++b) {
             const uint8_t * blk = w + b * kIq4nlBlock;
@@ -304,7 +384,7 @@ bool Ds41Engram::open_gguf(const std::string & path, std::string & err) {
     wrow_ = qtype_ == kQ5K ? dim_ / 256 * kQ5KBlock : dim_ / 32 * kIq4nlBlock;
     srow_ = 0;
     for (size_t e = 0; e < loc.size(); ++e) {
-        const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
+        const int fd = table_open(path);
         if (fd < 0) { err = "engram: cannot open " + path; return false; }
         ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
         Table t; t.fd_w = fd; t.off_w = loc[e]; t.rm_w = raw_map(path, fd); t.rows = g_->engram_rows[e];
@@ -357,23 +437,30 @@ bool Ds41Engram::read_raw(int e, uint32_t row, uint8_t * dst) const {
 }
 
 // Hot-set pack (written by ds41_engram_hot pack):
-//   "XENGHOT1" | u32 version (1) | u32 slots | u32 dim | u32 scale bytes (dim/32) | u64 geometry fingerprint | u64 count
-//   | u64 keys[count] (sorted ascending, slot << 32 | row) | raw rows[count][dim + dim/32] in key order.
+//   "XENGHOT1" | u32 version | u32 slots | u32 dim | u32 scale bytes | u64 geometry fingerprint | u64 count
+//   [version 2: | i32 table type | u32 row bytes] | u64 keys[count] (sorted ascending, slot << 32 | row)
+//   | raw rows[count][row bytes] in key order.
+// Version 1 holds the HF FP8 rows (dim + dim/32 bytes; scale bytes dim/32).  Version 2 holds a GGUF table's raw rows: the
+// table type (IQ4_NL 20: 144-byte rows, scale bytes 0) and row size must be the open tables', so it loads only into them.
 // open() refuses a pack whose geometry fingerprint differs, and spot-checks 64 rows against the tables, so a pack built
 // from another checkpoint's Engram (e.g. V4.1 vs 1017 - same geometry, different weights) is caught and skipped.
 bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
     const auto t0 = std::chrono::steady_clock::now();
-    if (qtype_ >= 0) { err = "a hot set holds FP8 rows, the tables are a GGUF's"; return false; }
     const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
     if (fd < 0) { err = "cannot open"; return false; }
     struct Hdr { char magic[8]; uint32_t version, slots, dim, srsz; uint64_t fp, count; } h {};
-    const int64_t srsz = dim_ / 32, rsz = dim_ + srsz;
+    struct Hdr2 { int32_t type; uint32_t row_bytes; } h2 {};
+    const int64_t rsz = wrow_ + srow_;
     bool ok = ds41_sys::pread(fd, &h, sizeof h, 0) == (ssize_t) sizeof h;
-    if (ok && (std::memcmp(h.magic, "XENGHOT1", 8) != 0 || h.version != 1)) { err = "not a hot-set pack"; ok = false; }
-    if (ok && (h.slots != tables_.size() || h.dim != (uint32_t) dim_ || h.srsz != (uint32_t) srsz)) { err = "shape mismatch"; ok = false; }
+    if (ok && (std::memcmp(h.magic, "XENGHOT1", 8) != 0 || (h.version != 1 && h.version != 2))) { err = "not a hot-set pack"; ok = false; }
+    if (ok && h.version == 1 && qtype_ >= 0) { err = "a version-1 pack holds FP8 rows, the tables are a GGUF's"; ok = false; }
+    if (ok && h.version == 2 && (ds41_sys::pread(fd, &h2, sizeof h2, sizeof h) != (ssize_t) sizeof h2 || h2.type != qtype_ ||
+                                 (int64_t) h2.row_bytes != rsz)) { err = "the pack's rows are another table type"; ok = false; }
+    const uint64_t hdr = sizeof h + (h.version == 2 ? sizeof h2 : 0);
+    if (ok && (h.slots != tables_.size() || h.dim != (uint32_t) dim_ || h.srsz != (uint32_t) srow_)) { err = "shape mismatch"; ok = false; }
     if (ok && h.fp != geometry_fingerprint()) { err = "geometry fingerprint mismatch (built for another model)"; ok = false; }
     ds41_sys::Stat st;
-    if (ok && (ds41_sys::fstat(fd, &st) != 0 || (uint64_t) st.st_size != sizeof h + h.count * (8 + (uint64_t) rsz))) { err = "truncated"; ok = false; }
+    if (ok && (ds41_sys::fstat(fd, &st) != 0 || (uint64_t) st.st_size != hdr + h.count * (8 + (uint64_t) rsz))) { err = "truncated"; ok = false; }
     if (ok) {
         ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
         hot_keys_.resize((size_t) h.count);
@@ -386,7 +473,7 @@ bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
             }
             return true;
         };
-        ok = rd(hot_keys_.data(), h.count * 8, sizeof h) && rd(hot_pool_.data(), hot_pool_.size(), sizeof h + h.count * 8);
+        ok = rd(hot_keys_.data(), h.count * 8, hdr) && rd(hot_pool_.data(), hot_pool_.size(), hdr + h.count * 8);
         if (!ok) err = "read failed";
     }
     ds41_sys::close(fd);
@@ -413,6 +500,64 @@ bool Ds41Engram::load_hot(const std::string & path, std::string & err) {
     return true;
 }
 
+// The Q6_K tables: one llama.cpp tensor per_layer_token_embd.weight [dim, rows of every slot] holds slot 0's rows, then
+// slot 1's (its hash ids are offset by slot 0's rows: llama.cpp's head_offsets run across both), so slot e's table
+// starts at the rows of the slots before it.  Each slot gets its own descriptor (the destructor closes every one).
+bool Ds41Engram::open_q6k(const std::vector<std::string> & paths, std::string & err) {
+    // (the same layout in MXFP8 - Unsloth's UD-Q8_K_XL: the row size follows the file's type)
+    const char * name = "per_layer_token_embd.weight";
+    int64_t total = 0;
+    for (int64_t r : g_->engram_rows) total += r;
+    if (dim_ % 256) { err = "engram: Q6_K rows need a dim that is a multiple of 256"; return false; }
+    srow_ = 0;
+    std::string path;
+    uint64_t off = 0;
+    for (const auto & p : paths) {
+        std::vector<std::string> cand;
+        std::error_code ec;
+        if (std::filesystem::is_directory(p, ec)) {
+            for (const auto & de : std::filesystem::directory_iterator(p, ec))
+                if (de.path().extension() == ".gguf") cand.push_back(de.path().string());
+            std::sort(cand.begin(), cand.end());
+        } else if (exists(p)) {
+            cand.push_back(p);
+        }
+        for (const auto & c : cand) {
+            std::unique_ptr<GgufFile> f;
+            try { f = std::make_unique<GgufFile>(c); } catch (const std::exception &) { continue; }
+            const TensorInfo * t = f->find(name);
+            if (!t) continue;
+            if ((t->type != (uint32_t) kQ6k && t->type != (uint32_t) kMxfp8) || t->shape.size() != 2 || t->shape[0] != (uint64_t) dim_ ||
+                t->shape[1] != (uint64_t) total) {
+                err = "engram: " + c + ": " + name + " is not Q6_K / MXFP8 [" + std::to_string(dim_) + ", " + std::to_string(total) + "]";
+                return false;
+            }
+            qtype_ = (int) t->type;
+            wrow_ = qtype_ == kQ6k ? dim_ / 256 * 210 : dim_ / 32 * 33;
+            path = c;
+            off = f->data_start() + t->offset;
+            break;
+        }
+        if (!path.empty()) break;
+    }
+    if (path.empty()) { err = std::string("engram: no GGUF with ") + name + " in the given paths"; return false; }
+    uint64_t row0 = 0;
+    for (int64_t e = 0; e < (int64_t) g_->engram_rows.size(); ++e) {
+        Table t;
+        t.fd_w = table_open(path);
+        if (t.fd_w < 0) { err = "engram: cannot open " + path; return false; }
+        ds41_sys::posix_fadvise(t.fd_w, 0, 0, POSIX_FADV_RANDOM);
+        t.off_w = off + row0 * (uint64_t) wrow_;
+        t.rm_w = raw_map(path, t.fd_w);
+        t.rows = g_->engram_rows[(size_t) e];
+        row0 += (uint64_t) t.rows;
+        tables_.push_back(t);
+    }
+    std::fprintf(stderr, "engram: %s tables from %s (%lld rows, %lld bytes each)\n", qtype_ == kQ6k ? "Q6_K" : "MXFP8",
+                 path.c_str(), (long long) total, (long long) wrow_);
+    return true;
+}
+
 bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & dirs, int threads, std::string & err) {
     setup_hash(g);
     const int64_t nel = (int64_t) g.engram_layers.size();
@@ -422,15 +567,21 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
     std::string gguf;
     for (const auto & d : dirs)
         if (d.size() > 5 && d.compare(d.size() - 5, 5, ".gguf") == 0) { gguf = d; break; }
+    // Q6_K tables (Unsloth's / llama.cpp #30817's per_layer_token_embd.weight): a converted GGUF says so
+    // (deepseek41.engram.encoding = "q6_k_gguf"), and a .gguf entry holding that tensor is read the same way under any
+    // backbone of the checkpoint (ISTA-DASLab's GSQ-RCO GGUFs: their own Engram GGUF is IQ4_NL, blk.<l>.engram_embd)
+    const bool q6k = g.engram_encoding == "q6_k_gguf" || (!gguf.empty() && gguf_has(gguf, "per_layer_token_embd.weight"));
     std::string index;
-    if (gguf.empty()) {
+    if (q6k) {
+        if (!open_q6k(dirs, err)) return false;
+    } else if (gguf.empty()) {
         for (const auto & d : dirs) {
             index = slurp(d + "/model.safetensors.index.json");
             if (!index.empty()) break;
         }
         if (index.empty()) { err = "engram: no model.safetensors.index.json in the given dirs (and no .gguf entry)"; return false; }
     } else if (!open_gguf(gguf, err)) return false;
-    for (int64_t e = 0; gguf.empty() && e < nel; ++e) {
+    for (int64_t e = 0; gguf.empty() && !q6k && e < nel; ++e) {
         const std::string base = "layers." + std::to_string(g.engram_layers[(size_t) e]) + ".engram.embed.";
         Table t;
         for (int k = 0; k < 2; ++k) {
@@ -449,7 +600,7 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
                 err = "engram: " + name + " has an unexpected dtype/size";
                 return false;
             }
-            const int fd = ds41_sys::open(path.c_str(), O_RDONLY);
+            const int fd = table_open(path);
             if (fd < 0) { err = "engram: cannot open " + path; return false; }
             ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
             (k ? t.fd_s : t.fd_w) = fd;
@@ -462,6 +613,7 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
     for (int i = 0; i < std::max(1, threads); ++i)       // the pool is the disk's queue depth
         workers_.emplace_back([this] { pump(); });
     nthreads_ = (int64_t) workers_.size();
+    if (engram_nocache()) std::fprintf(stderr, "engram: STRATA_ENGRAM_NOCACHE=1: table reads bypass the OS file cache (a test switch)\n");
     {
         const char * env = std::getenv("STRATA_ENGRAM_CACHE_ROWS");
         cache_cap_ = env ? (size_t) std::atoll(env) : (size_t) 2000000;

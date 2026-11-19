@@ -266,6 +266,12 @@ public:
     /// geometry is uniform across its format classes; a mixed-geometry batch falls back to one call per job).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
+    /// run_split_multi_native in two halves (xolotl, STRATA_CPU_OVERLAP=3: an expert's gate/up rows run while its down
+    /// rows are still being read): half 0 = the gate/up rows and the SwiGLU row's quantization, half 1 = the down rows,
+    /// of the SAME job objects (a LoRA's a . h stays in the job); job e keeps its intermediate in split slot slots[e]
+    /// (< kMaxSplitMulti) between the two.  Each row's arithmetic and the quantization are the one call's, so the
+    /// outputs are its bits.  A batch of mixed n_embd/n_ff runs one job at a time, like the one call.
+    void run_split_multi_native_half(const NativeFmt& f, ExpertJobMulti* jobs, int n, int half, const int* slots);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -297,6 +303,11 @@ public:
     /// also sleep mid-request - which the claim protocol above must survive (issue #29).
     /// `STRATA_POOL_SPIN_US` overrides it (a test knob: a short spin makes the workers sleep constantly).
     static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
+    /// STRATA_POOL_ADAPTIVE_SPIN=1 (opt-in; Juud_engine's JUUD_POOL_ADAPTIVE_SPIN): after a batch that ends the CPU's
+    /// work for a layer (modes 0, 2, 4, 6 - a whole expert, or a down phase) a worker parks after this short spin
+    /// instead of kSpinBeforeSleep; between a gate/up phase and its down phase it keeps the normal spin.  The jobs and
+    /// their bits are unchanged.  An explicit STRATA_POOL_SPIN_US wins.
+    static constexpr std::chrono::microseconds kAdaptiveFinalPhaseSpin{100};
     /// A pool wait that sees no completion for this long is a bug; the engine stops with a message instead of
     /// spinning forever, and the server starts it again (issue #29).
     static constexpr std::chrono::seconds kStall{60};
@@ -364,6 +375,7 @@ private:
     std::mutex sleep_mu_;
     std::condition_variable sleep_cv_;
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
+    bool adaptive_spin_ = false;   // STRATA_POOL_ADAPTIVE_SPIN
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
@@ -389,6 +401,7 @@ private:
     };
     const NativeFmt* nfmt_ = nullptr;
     NativeArithmetic narithmetic_ = NativeArithmetic::Default;
+    const int* mslots_ = nullptr;   // run_split_multi_native_half: job e's split slot (null: slot e)
     std::vector<SplitBufMulti> split_multi_;
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the

@@ -56,7 +56,8 @@ class ModelCardSampling(unittest.TestCase):
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10).read()
-        return StrataEngine.sampling_keys(self.engine.sampling)
+        # a request without a seed gets a random one (serve rb25); these tests are about the card's defaults
+        return StrataEngine.sampling_keys({k: v for k, v in self.engine.sampling.items() if k != "seed"})
 
     def test_tables(self):
         self.assertEqual(model_card_sampling("qwen4exp", True), {"temperature": 1.0, "top_p": 0.95, "top_k": 20})
@@ -102,6 +103,8 @@ class ModelCardSampling(unittest.TestCase):
     def test_no_family_no_defaults(self):
         self.svc.model_arch = None
         self.assertEqual(self.keys(), "")
+        seed = self.engine.sampling.get("seed")      # the per-request random seed is the only sampling key added
+        self.assertTrue(isinstance(seed, int) and seed > 0)
 
 
 if __name__ == "__main__":

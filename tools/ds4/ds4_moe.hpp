@@ -283,6 +283,13 @@ struct Ds4MoeConfig {
     /// default: off).  The grouped CUDA path applies them; the CPU pool and the MMQ chunk path do not (yet).
     const Ds4MoeLoraHost* lora = nullptr;
     uint64_t seed = 20261005;     ///< the synthetic arm's generator (unused by the tier itself)
+    /// A second card holds a STATIC set of routed experts and computes them itself (the DeepSeek-V4.1 tier's
+    /// --remote-device, ported for GLM): the ranking right after this card's VRAM head goes there and stays out of
+    /// the arena and the cache.  -1 = off.  remote_gib: its expert budget (0 = its free memory less remote_reserve_gib).
+    /// A layer that carries a routed-expert LoRA delta keeps all its experts here (the remote card has no LoRA path).
+    int remote_device = -1;
+    double remote_gib = 0.0;
+    double remote_reserve_gib = 1.0;
 
     static constexpr int kPredW = 16;   ///< ranked predictions the caller passes to `prefetch`
     static constexpr int kMaxPf = 6;    ///< prefetch staging slots (the DMA window of one layer)
