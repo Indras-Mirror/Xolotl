@@ -191,6 +191,19 @@ bool lookahead_on() {
     return on;
 }
 constexpr int kLaMaxCols = 16;   // o_la is built and read back for passes of at most this many columns
+// STRATA_LA2=1: build_attn also predicts the experts of the layer AFTER next (o_la2: layer il+2's router on this layer's
+// FFN input), so speculative NVMe reads (STRATA_D3_SPEC_SRC=la2) get about two layers of lead without a separate
+// prediction graph (TokenWing's two-ahead router guess, computed inside the launch the layer already makes).
+bool lookahead2_on() {
+    static const bool on = env_on("STRATA_LA2", false);
+    return on;
+}
+// o_la2's width: the file tier's experts carry the decode route bias's penalty, so they sit deep in the guess - a top 16
+// held only ~8% of the file misses (2026-11-19); 64 reaches them (STRATA_LA2_W, 16..128)
+int la2_width() {
+    static const int w = [] { const char* v = std::getenv("STRATA_LA2_W"); return v ? std::max(16, std::min(128, std::atoi(v))) : 64; }();
+    return w;
+}
 
 bool smart_router() {
     static const bool on = env_on("STRATA_RB_SMART", false) || env_rank("STRATA_RB_PROTECT") > 0 || env_rank("STRATA_RB_POOL") > 0;
@@ -232,6 +245,7 @@ struct Ds41Dense::Impl {
     ggml_tensor * o_ids = nullptr;        // I32 [NU, NC]
     ggml_tensor * o_wts = nullptr;        // [NU, NC]
     ggml_tensor * o_la = nullptr;         // I32 [16, NC]  STRATA_LOOKAHEAD: the NEXT layer's top 16, predicted in this layer's graph
+    ggml_tensor * o_la2 = nullptr;        // I32 [16, NC]  STRATA_LA2: layer il+2's top 16, predicted in this layer's graph
     ggml_tensor * o_xids = nullptr;       // I32 [NU, NC]  route meter (smart router): the exact top-NU
     ggml_tensor * o_xwts = nullptr;       // [NU, NC]      ... and their normalized weights
     ggml_tensor * rknob = nullptr;        // F32 [kRK + 1, 2] smart router: protect / pool rank selectors (set_route_select)
@@ -390,6 +404,8 @@ struct Ds41Dense::Impl {
     std::vector<float> host_fn, host_wts, host_logits, host_emb;
     std::vector<int32_t> host_la;         // STRATA_LOOKAHEAD readback (16 per column)
     bool la_ok = false;                   // the last attn_router read a lookahead
+    bool la2_ok = false;                  // ... and a two-ahead lookahead (STRATA_LA2)
+    std::vector<int> host_la2;
     std::vector<int32_t> host_ids;
     std::vector<int32_t> host_xids;       // route meter: o_xids / o_xwts readbacks, and the counters since route_meter(true)
     std::vector<float> host_xwts;
@@ -1310,12 +1326,12 @@ static bool shexp_late_on() {
     return on;
 }
 
-// STRATA_LOOKAHEAD: layer il+1 is a routed layer whose router can be built (what o_la needs)
-static bool la_next_ok(const Ds41Dense::Impl & im, int il) {
-    const int nl = il + 1;
+// STRATA_LOOKAHEAD: layer il+1 is a routed layer whose router can be built (what o_la needs); la_layer_ok: layer nl
+static bool la_layer_ok(const Ds41Dense::Impl & im, int nl) {
     return nl < (int) im.ly.size() && im.ly[(size_t) nl].rbias && im.w.t.count("blk." + std::to_string(nl) + ".ffn_gate_inp.weight") &&
            im.w.t.count("blk." + std::to_string(nl) + ".exp_probs_b.bias");
 }
+static bool la_next_ok(const Ds41Dense::Impl & im, int il) { return la_layer_ok(im, il + 1); }
 
 // STRATA_ATTN_TAIL: what build_attn(tail) leaves out, for one token: the FFN hc mixes of hap (= h) and the shared
 // expert on o_fn (= fn), written as build_attn writes them - the outputs to expand, in order
@@ -1893,6 +1909,14 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                                      ggml_reshape_2d(gc, im.ly[(size_t) nl].rbias, im.NE, 1));
         outs.push_back(ggml_cpy(gc, ggml_argsort_top_k(gc, sc2, 16), b.cols2(im.o_la, 16, n, col0)));
     }
+    if (im.o_la2 && n <= kLaMaxCols && col0 == 0 && la_layer_ok(im, il + 2)) {   // STRATA_LA2: the same guess for il+2
+        const int nl = il + 2;
+        ggml_tensor * rl3 = ggml_mul_mat(gc, im.BLpred(nl), b.rms_w(xffn, im.BL(nl, "ffn_norm.weight")));
+        ggml_mul_mat_set_prec(rl3, GGML_PREC_F32);
+        ggml_tensor * sc3 = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl3)), im.BL(nl, "exp_probs_b.bias")),
+                                     ggml_reshape_2d(gc, im.ly[(size_t) nl].rbias, im.NE, 1));
+        outs.push_back(ggml_cpy(gc, ggml_argsort_top_k(gc, sc3, la2_width()), b.cols2(im.o_la2, la2_width(), n, col0)));
+    }
     ggml_tensor * hit_end = nullptr;   // STRATA_GRAPH_CONC & 2: the hits' branch (joined at the graph's end)
 #ifdef DS41_HAVE_SK
     if (tail && im.rb_hook) {
@@ -2246,6 +2270,7 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.o_ids = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.NU, NC);
     im.o_wts = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.NU, NC);
     if (lookahead_on()) im.o_la = ggml_new_tensor_2d(c, GGML_TYPE_I32, 16, NC);
+    if (lookahead2_on()) im.o_la2 = ggml_new_tensor_2d(c, GGML_TYPE_I32, la2_width(), NC);
     if (smart_router()) {
         im.o_xids = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.NU, NC);
         im.o_xwts = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.NU, NC);
@@ -2715,6 +2740,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         im.host_ids.resize((size_t) (im.NU * NCM));
         im.host_wts.resize((size_t) (im.NU * NCM));
         if (lookahead_on()) im.host_la.resize((size_t) (16 * NCM));
+        if (lookahead2_on()) im.host_la2.resize((size_t) (la2_width() * NCM));
         if (smart_router()) {
             im.host_xids.resize((size_t) (im.NU * NCM));
             im.host_xwts.resize((size_t) (im.NU * NCM));
@@ -3696,6 +3722,8 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     }
     im.la_ok = im.o_la && n <= kLaMaxCols && la_next_ok(im, il);
     if (im.la_ok) ggml_backend_tensor_get_async(im.backend, im.o_la, im.host_la.data(), 0, (size_t) (16 * n) * 4);
+    im.la2_ok = im.o_la2 && n <= kLaMaxCols && la_layer_ok(im, il + 2);
+    if (im.la2_ok) ggml_backend_tensor_get_async(im.backend, im.o_la2, im.host_la2.data(), 0, (size_t) (la2_width() * n) * 4);
     if (im.o_xids) {
         ggml_backend_tensor_get_async(im.backend, im.o_xids, im.host_xids.data(), 0, (size_t) (im.NU * n) * 4);
         ggml_backend_tensor_get_async(im.backend, im.o_xwts, im.host_xwts.data(), 0, (size_t) (im.NU * n) * 4);
@@ -3724,6 +3752,8 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
 }
 
 const int * Ds41Dense::lookahead_ids() const { return p_->la_ok ? p_->host_la.data() : nullptr; }
+const int * Ds41Dense::lookahead2_ids() const { return p_->la2_ok ? p_->host_la2.data() : nullptr; }
+int Ds41Dense::lookahead2_width() const { return la2_width(); }
 
 bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
     Impl & im = *p_;

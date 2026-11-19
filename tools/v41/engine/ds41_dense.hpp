@@ -211,6 +211,8 @@ public:
     /// STRATA_LOOKAHEAD=1: after attn_router(il) of a pass of at most 16 columns, layer il+1's predicted top 16 per
     /// column (16 x n, token-major), or nullptr (off, a bigger pass, or il is the last routed layer).  A hint only.
     const int * lookahead_ids() const;
+    const int * lookahead2_ids() const;   ///< STRATA_LA2: layer il+2's top lookahead2_width() per column from the last attn_router(il), or null
+    int lookahead2_width() const;
     /// STRATA_DS41_ENGRAM_AHEAD (default on): the next prompt chunk (tokens tids[0..n) at pos0), given right after this chunk's
     /// begin() / begin_batch(): its Engram reads start once this chunk's rows are uploaded (its first Engram layer) and
     /// become that chunk's batch if it is exactly (pos0, n); otherwise they are drained.  A no-op when off.

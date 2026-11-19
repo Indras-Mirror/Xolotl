@@ -1316,7 +1316,11 @@ int main(int argc, char ** argv) {
             // 7.9 ms/token on the decode thread).  A wrong guess costs SSD bandwidth only.
             static const int d3_spec = std::getenv("STRATA_D3_SPEC") ? std::atoi(std::getenv("STRATA_D3_SPEC")) : 0;
             static const int d3_spec_ahead = std::getenv("STRATA_D3_SPEC_AHEAD") ? std::atoi(std::getenv("STRATA_D3_SPEC_AHEAD")) : 2;
-            if (rdev && !no_tier_batch && d3_spec > 0 && m <= Ds41MoeTier::kMaxMulti && l + d3_spec_ahead < stage_end) {
+            // STRATA_D3_SPEC_SRC=la2 (needs STRATA_LA2=1): the guesses come from layer l's own attention graph instead
+            // (o_la2: l+2's router on l's FFN input, read back with l's routing), so the separate predict_multi graph
+            // per layer - the cost that made D3_SPEC flat on 27 Oct - goes away; the reads issue after attn_router(l).
+            static const bool d3_src_la2 = [] { const char* v = std::getenv("STRATA_D3_SPEC_SRC"); return v && std::string(v) == "la2"; }();
+            if (!d3_src_la2 && rdev && !no_tier_batch && d3_spec > 0 && m <= Ds41MoeTier::kMaxMulti && l + d3_spec_ahead < stage_end) {
                 pv_pred.resize((size_t) m * 16);
                 if (d.predict_multi(l + d3_spec_ahead, pv_pred.data())) {
                     pv_score.clear();
@@ -1336,6 +1340,36 @@ int main(int argc, char ** argv) {
             const float * fn = nullptr;
             if (!d.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = d.last_error(); return false; }
             lap(0);
+            if (d3_src_la2 && rdev && !no_tier_batch && d3_spec > 0 && m <= Ds41MoeTier::kMaxMulti && l + 2 < stage_end) {
+                if (const int * la2 = d.lookahead2_ids()) {
+                    // only the NVMe-tier experts among the pass tokens' guesses, scored W - rank summed over the tokens
+                    // (a per-expert array: O(tokens x W)), the best D3_SPEC of them read per layer - the drive serves
+                    // one blob at a time, so a wide budget queues guesses in front of real misses
+                    const int W = d.lookahead2_width();
+                    static std::vector<int> la2_sc;
+                    static std::vector<int> la2_touch;
+                    if ((int) la2_sc.size() < (int) TG.n_experts) la2_sc.assign((size_t) (int) TG.n_experts, 0);
+                    la2_touch.clear();
+                    for (int t = 0; t < m; ++t)
+                        for (int i = 0; i < W; ++i) {
+                            const int e = la2[(size_t) t * W + i];
+                            if (e < 0 || e >= (int) TG.n_experts) continue;
+                            if (la2_sc[(size_t) e] == 0) {
+                                if (tr.resident(l + 2, e) || tr.in_arena(l + 2, e)) { la2_sc[(size_t) e] = -1; la2_touch.push_back(e); continue; }
+                                la2_touch.push_back(e);
+                            }
+                            if (la2_sc[(size_t) e] >= 0) la2_sc[(size_t) e] += W - i;
+                        }
+                    pv_rank.clear();
+                    for (int e : la2_touch) if (la2_sc[(size_t) e] > 0) pv_rank.push_back(e);
+                    const int nb = std::min(d3_spec, (int) pv_rank.size());
+                    std::partial_sort(pv_rank.begin(), pv_rank.begin() + nb, pv_rank.end(),
+                                      [&](int a, int b) { return la2_sc[(size_t) a] != la2_sc[(size_t) b] ? la2_sc[(size_t) a] > la2_sc[(size_t) b] : a < b; });
+                    pv_rank.resize((size_t) nb);
+                    for (int e : la2_touch) la2_sc[(size_t) e] = 0;
+                    if (!pv_rank.empty()) tr.spec_read(l + 2, pv_rank.data(), (int) pv_rank.size(), true);
+                }
+            }
             // STRATA_LOOKAHEAD (after Project Maya; ported from c7896e3d9 for STRATA_P2P): attn_router(l) also gave layer
             // l+1's guessed top 16 per pass token (o_la: l+1's router on l's FFN input, ~96% of the real top-6 inside it on
             // 25 Oct).  STRATA_PRED_STAT=1 scores the previous layer's guess at THIS layer ([lookahead] line).  =2: layer
