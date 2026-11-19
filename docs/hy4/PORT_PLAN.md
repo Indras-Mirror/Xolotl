@@ -8,8 +8,8 @@ Started 20 Nov 2026. Branch `hy4-port` (worktree `~/AI/Xolotl-hy4`), cut from ma
 |---|---|
 | FP8 parent (tencent/Hy4-flash-FP8 rev 003107fa24, 148 shards, 268 GiB) | `/media/mal/Team CX2/Xolotl/hy4-flash/Hy4-flash-FP8` (shards 24-148 symlinked from Crucible) |
 | Reference llama.cpp (PR #32517, `Little0o0/hy4-flash` cf70454a) | `/media/Crucial1TB/llama.cpp-hy4`, worktree of `~/AI/llama.cpp-qwen4exp` |
-| Converter patch for the public release | branch `hy4-release-convert` 7a6520f8 in that worktree (local only) |
-| Q8_0 GGUF (Engram F8_E4M3), ~230 GB | `/media/mal/NVME1TB/Xolotl/hy4-flash/Hy4-flash-Q8_0.gguf` (unit `hy4-convert-q8`, log `~/v41-work/hy4/convert-q8.log`) |
+| Converter patch for the public release | branch `hy4-release-convert` in that worktree (local only) |
+| Q8_0 GGUF, split: shard 1 = 166.6 GB of Q8_0, shard 2 = Engram F8_E4M3, 63.4 GB | `/media/mal/NVME1TB/Xolotl/hy4-flash/Hy4-flash-Q8_0-0000{1,2}-of-00002.gguf` (`~/v41-work/hy4/convert-q8.sh`, unit `hy4-convert-q8`, log `~/v41-work/hy4/convert-q8.log`) |
 | Tencent's GGUF headers (metadata reference) | `~/v41-work/hy4/angelslim/q4km-0000{1,2}-head.bin`, patches + READMEs alongside |
 | Header parser | `~/v41-work/hy4/tools/gguf_head.py` |
 
@@ -23,7 +23,8 @@ The patch changes names only, never the maths, so our GGUF is the one Tencent's 
 - there's no `engram_enable` key: Engram is on whenever `engram_layer_ids` is set
 - there's no `engram_vocab_map.npz`: the token map is a `lookup_table` int32 buffer per Engram layer (120,818 entries, all four equal), and the compressed vocab is `max + 1 = 92620`
 - the 5-layer `model.dfly_layers.*` draft head is dropped (Tencent's GGUF has a 1-layer MTP block from their internal checkpoint instead)
-- the Engram tables ship as BF16 (660,006,416 rows x 96) but run as e4m3 (`engram_fp8_embedding`), so they're written as F8_E4M3, as Tencent did
+- the Engram tables ship as BF16 (660,006,416 rows x 96, 127 GB). Concatenating them inside the converter ran past 85 GB of RSS, so I stopped it. They're now written as a separate second shard by `tools/hy4/hy4_engram_gguf.py`, streamed in row chunks (`HY4_ENGRAM_SPLIT=1` keeps them out of shard 1, which is also Tencent's layout).
+- **Engram encoding:** Tencent's table is F8_E4M3 with **each row scaled so its max |x| hits 448, computed in BF16** (`x / (rowmax/448)`). It's 100% byte-equal on the 19.2M-byte reference chunk; a plain cast matched about 0.001%. This is lossless for the model because the graph RMS-norms every looked-up row. The BF16 values are not E4M3-exact (about 91% change under a plain cast), so BF16 is the master.
 
 Checked against Tencent's Q4_K_M header (range-fetched, no full download):
 
