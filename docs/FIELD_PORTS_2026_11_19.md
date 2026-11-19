@@ -48,6 +48,16 @@ Note for scripted runs: `score_v4.py`-style harnesses that start `ds41_generate`
 also skip `STRATA_DSPARK_KEEP` (DSpark then takes 5.14 GB instead of 2.91 GB and the VRAM seed drops ~130 experts)
 and the s3 defaults.  Export them, or go through `ds41-engine.sh`.
 
+### Two follow-ups, 19 Nov night: both flat
+
+- **Attention tail under `STRATA_RB_PROTECT`** (`STRATA_ROUTE_METER=0`, opt-in): the tail, RB_HOOK and GRAPH_CONC
+  engage, but 3 rotated rounds give 98.7 ms per pass against 94.8 with the meter on.  Dense stays ~30 ms either way; the
+  expert tier (57-65 ms) is the pass.  Default unchanged.
+- **`STRATA_LA2` re-measured** (6 clean rounds each, alternating; 3 more overlapped another job's CPU renders and were
+  dropped): baseline 94.0 ms per pass (89.5-98.2), LA2 W64 95.1 (90.8-102.2); it won the first 2 rounds and lost the last
+  4 by 3-5 ms.  NVMe blocked 14.9 -> 9.6 ms, but the guess adds ~2 ms of dense and the early reads queue in front of real
+  misses on the drive.  Stays opt-in; not pursued further.
+
 ### Where decode time goes now: NVMe
 
 The engine's own pass split says it: **file-tier reads block 15 % of each pass in fast mode (15 ms of 99) and 18 % in
