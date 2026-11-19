@@ -956,6 +956,17 @@ static int attn_tail_mode() {
 }
 static bool attn_tail() { return attn_tail_mode() > 0; }
 
+// STRATA_ROUTE_METER (with the smart router, default on): read back the exact top-k beside the biased picks, only for
+// the log line "routing vs exact: N% of expert picks swapped".  The protect / pool ranks do not use it.  Its extra
+// readback keeps the attention tail (and RB_HOOK / GRAPH_CONC behind it) and the pinned single-token readback off.
+// =0 lets them engage under STRATA_RB_PROTECT - measured 2026-11-19 (served q6 config, fast mode + s3, 8K probe / 512,
+// 3 rotated rounds): meter on 97.3 / 95.7 / 91.3 ms per pass (mean 94.8), meter off = tail on 100.3 / 96.7 / 99.1 (98.7);
+// dense stays ~30 ms either way, the expert tier (57-65 ms) is the pass.  No gain, so the default keeps the meter.
+static bool route_meter_on() {
+    static const bool on = smart_router() && env_on("STRATA_ROUTE_METER", true);
+    return on;
+}
+
 // STRATA_RB_HOOK=1 (decode, opt-in; needs STRATA_ATTN_TAIL): see Impl::rb_hook
 static bool rb_hook_env() {
     static const bool on = std::getenv("STRATA_RB_HOOK") && std::getenv("STRATA_RB_HOOK")[0] == '1';
@@ -1825,7 +1836,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         ggml_tensor * like = ggml_new_tensor_2d(gc, GGML_TYPE_F32, im.NE, n);
         ggml_tensor * protect = nullptr, * pool = nullptr;
         if (smart_router()) {
-            xids = ggml_cont(gc, ggml_view_2d(gc, ti, im.NU, n, ti->nb[1], 0));
+            if (route_meter_on()) xids = ggml_cont(gc, ggml_view_2d(gc, ti, im.NU, n, ti->nb[1], 0));
             // rknob column c = a one-hot over the kRK exact ranks + an offset: the P-th / M-th exact score, or +-1e30 for
             // rank 0 (protect nothing / pool everything).  mul + sum_rows, not mul_mat: one nonzero term, exact in F32.
             auto thr = [&](int c) {
@@ -2271,7 +2282,7 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.o_wts = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.NU, NC);
     if (lookahead_on()) im.o_la = ggml_new_tensor_2d(c, GGML_TYPE_I32, 16, NC);
     if (lookahead2_on()) im.o_la2 = ggml_new_tensor_2d(c, GGML_TYPE_I32, la2_width(), NC);
-    if (smart_router()) {
+    if (route_meter_on()) {
         im.o_xids = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.NU, NC);
         im.o_xwts = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.NU, NC);
     }
@@ -2741,7 +2752,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         im.host_wts.resize((size_t) (im.NU * NCM));
         if (lookahead_on()) im.host_la.resize((size_t) (16 * NCM));
         if (lookahead2_on()) im.host_la2.resize((size_t) (la2_width() * NCM));
-        if (smart_router()) {
+        if (route_meter_on()) {
             im.host_xids.resize((size_t) (im.NU * NCM));
             im.host_xwts.resize((size_t) (im.NU * NCM));
         }
