@@ -58,6 +58,9 @@
 - **[bnkaiteam / Juud_engine](https://github.com/bnkaiteam/Juud_engine)**: the adaptive pool spin and the skipped
   activation quantization for card-only tokens (`STRATA_POOL_ADAPTIVE_SPIN`, `STRATA_SKIP_UNUSED_ACTQ`), measured on an
   RTX 4090
+- **[TokenWing / Run My AI](https://github.com/runmyai/tokenwing)** (Harin007, Grawnch; MIT): the design behind
+  `STRATA_LA2` - the router guess for two layers ahead computed inside the launch the layer already makes, so
+  speculative NVMe reads cost no extra prediction graph (ported 2026-11-19, `field-ports-20261119`).
 - **[Xiaomi2008](https://github.com/Xiaomi2008)**: IQ1_S routed experts for Unsloth's DeepSeek-V4.1 UD-IQ1_M (#86); ds41
   fused router ops and batched state copies (#87); DSML tool-call fixes and the opt-in keep_cut_tool_calls (#106,
   #109, #110)

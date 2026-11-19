@@ -4,8 +4,56 @@ What came in from other forks and engines on branch `field-ports-20261119`, what
 that decide each one.  The scan behind it: `private/notes/ENGINE_SCAN_2026-11-19.html`.  Upstream Strata was **not**
 merged (Mal: later versions are reported to have slowdowns); only parts that stand alone were looked at.
 
-Everything below is **off by default**.  A switch becomes a default only after an A/B on this box (RTX 4090, Ryzen 7
-5700X, 110 GB) shows a win outside the noise and the same tokens (Xolotl's rule).
+Everything below is **off by default** unless the results section says otherwise.  A switch becomes a default only
+after an A/B on this box (RTX 4090, Ryzen 7 5700X, 110 GB) shows a win outside the noise (Xolotl's rule).
+
+## Results on this box (19 Nov)
+
+DeepSeek-V4.1 V4 XQ, Mal's served config (`private/serve/strata-ds41-1017-v4-serve-q6.json`: Q6_K dense, 80 GiB arena,
+DSpark depth 4, route bias 1.0 / 1.0, `STRATA_RB_PROTECT=2`, `STRATA_CHUNK_CPU=1`) through this branch's
+`ds41-engine.sh`, fixed probe 8K prompt / 512 tokens.  Results under `~/v41-work/ports-20261119/`.
+
+**Judge by milliseconds per verify pass, not tok/s.**  tok/s moves 5-8 % between identical runs with how many drafted
+tokens DSpark gets accepted (2.98-3.71 tokens per pass here); the pass time is steadier (89.0 / 89.1 ms for the same
+arm in two runs), but the box drifts too (three baselines in one afternoon: 96.1, 98.5, 103.8 ms).  Single-run
+differences under ~5 % need interleaved rounds.
+
+| Check | Result |
+| --- | --- |
+| Identity: this branch, nothing set, vs production `build-xolotl` (short34, 2 runs each) | NLL 0.4614 / 0.4653 vs 0.4630 / 0.4634, top-1 88.42-88.65 %; mean KL to production 0.0038-0.0042 vs 0.0023 production-to-itself (VRAM seed 690-702 differs run to run, so no bit identity) |
+| Normal mode decode | 28.5 tok/s, 110 ms/pass (7 Nov table: 26.1) |
+| Fast mode (`XOLOTL_SHADOW`) decode | 34.3 tok/s, 98.8 ms/pass (7 Nov table: 33.0) |
+| Keisawaakira step 1 (ROUTE_FUSE X_DEV META_PULL PF_HOSTWAIT HIT_FAST=1), fast | 90.6 ms/pass |
+| + step 2 (ATTN_TAIL=3 RB_HOOK HIT_FAST=3 DENSE_ASYNC PIN_RB) | 92.5 ms/pass |
+| **+ step 3 (GRAPH_CONC=7 QKV_FUSE) = "s3"** | **89.1 ms/pass (-10 %)**, 37.4 tok/s; short34 0.4651 / 88.61 % (inside the noise band) |
+| + step 4 (DEMOTE_ASYNC) | 98.6 ms/pass: lost, not taken |
+| DSpark keep 48 / 32 experts (`STRATA_DSPARK_KEEP`) instead of 64 | 92.9 / 89.3 ms/pass but 3.16 / 2.98 tokens per pass vs 3.39: slower overall, keep 64 |
+
+**s3 is the served default now**, set in `tools/v41/serve/ds41-engine.sh`; `XOLOTL_KEIS_DECODE=0` turns the set off,
+any single switch with its own `=0`.  Not bit-identical (sums move); quality inside the noise.
+
+Note for scripted runs: `score_v4.py`-style harnesses that start `ds41_generate` directly skip the launcher, so they
+also skip `STRATA_DSPARK_KEEP` (DSpark then takes 5.14 GB instead of 2.91 GB and the VRAM seed drops ~130 experts)
+and the s3 defaults.  Export them, or go through `ds41-engine.sh`.
+
+### Where decode time goes now: NVMe
+
+The engine's own pass split says it: **file-tier reads block 15 % of each pass in fast mode (15 ms of 99) and 18 % in
+normal mode (20 of 110)**, about 2.8 ms per read, almost none overlapped.  That is the most any prefetching can give.
+
+- `STRATA_D3_SPEC=8` (October's verify-pass speculative reads, `predict_multi` per layer): 40 of 44 reads used (91 %),
+  but the extra prediction graph made a pass 117 ms instead of 89.  `STRATA_SPEC_TOP` only exists in the one-token
+  decode loop (the served path never calls it); `STRATA_LOOKAHEAD=2` (one layer ahead, in-graph) issues almost
+  nothing in time.
+- New, **`STRATA_LA2=1` + `STRATA_D3_SPEC_SRC=la2` + `STRATA_D3_SPEC=N`** (TokenWing's two-ahead guess, below): layer l's
+  attention graph also applies layer l+2's router to l's FFN input (top `STRATA_LA2_W`, default 64: the decode route
+  bias pushes file-tier experts deep into the guess, a top 16 held ~8 % of the file misses), read back with l's
+  routing; the best-scored NVMe-tier experts (N per layer) go to the stash readers.  File blocked 15.9 -> 10.4 ms/pass
+  (width 64, N 2) / 11.7 (width 32); 34-62 % of the reads are used.  Pass time: 3 interleaved rounds (fast + s3, N 2): baseline 113.8 / 88.9 / 101.4 ms (mean 101.4,
+  blocked 16.4), width 32 100.6 / 93.5 / 96.9 (97.0, blocked 11.7), width 64 96.7 / 91.0 / 96.1 (94.6, blocked 9.6); wall
+  15.57 / 15.14 / 15.39 s.  **Blocked -41 % reproducibly; the pass gain (~3-7 %) is inside the baseline's spread** (its
+  three runs span 25 ms).  The guess still costs dense time (wider argsort + readback per layer), so it stays opt-in;
+  next: rank only file-tier experts on the card (a per-layer residency mask) so a narrow top-k does, then re-measure.
 
 ## Ported
 
@@ -84,3 +132,47 @@ DeepSeek: short34 logit dumps for identity (`xolotl-test-method`), then served d
   the same family as the switches above, so they wait for the A/B results.
 - **Ostinato** (arXiv 2611.11533): the short prefill after a tool output routed onto resident experts; no code, a
   design job for the DS4.1 prompt path.
+
+## Second card: GLM (`glm_generate --remote-device N --remote-gib G`)
+
+Verified on one card before the RTX 3060 arrives: `STRATA_REMOTE_SAME_DEVICE=1` (tests only) lets the "second card" be
+the tier's own card, and `STRATA_REMOTE_CHECK=1` (debug) runs each prompt chunk once with its original experts.  Maya-S
+v2 IQ2_XXS, 2,312-token prompt + 64 tokens: the remote rows match their true share to <= 5.2e-7, and remote on vs
+off moves the first-step logits by KL 0.164 - exactly what changing only `--prefill-chunk` 1024 -> 512 does on the
+plain tier (0.164; this quant amplifies summation order).  Plain runs are bit-identical run to run.  Prompt and decode
+calls both go through the remote.  Without `--census` GLM ranks experts in index order, so a test without it puts the
+remote's experts in one or two layers; the served config passes `--census` (use-ranked across layers).  On one card
+the remote's memory comes out of the VRAM margin (`--vram-margin` 9 with `--remote-gib 2` fits; 6 + 3 runs the prompt
+staging out of memory) - not an issue on a real second card.
+
+## Looked at on 19 Nov (afternoon)
+
+- **TokenWing** (runmyai/tokenwing, MIT, llama.cpp fork; streams experts from NVMe): the same design as ours (router
+  lookahead, RAM + VRAM caches that follow use, layer-major prompts).  What it has that we lacked: the two-ahead guess
+  computed in the launch the layer already makes (taken above as `STRATA_LA2`), the ids written into pinned host
+  memory inside that launch with a helper thread queuing the reads, demand reads ahead of guesses with guesses read in
+  512 KiB chunks and cancelled when the layer starts, and an expert's gate/up computed while its down part is still
+  being read.  Their "oracle mode" (the real engine run with perfect guesses) is the right way to measure the ceiling;
+  our pass split already prints the blocked share.  Their docs say tok/s swings by double digits between identical
+  runs; their headline speeds are user reports.
+- **Halocline** (T-Crypt/halocline, MIT; Basalt 0.4.1 + basalt_ada, sm_89 and Qwen4 family only): Qwen3.8-Flash-Next
+  UD-IQ4_XS (93 GB) on one 4090 + 64 GB: decode 148-182 tok/s (ours, QFN45: ~150), prompt **5,322 tok/s at 16K**
+  (ours: 3,000-3,430).  The prompt speed comes from Basalt / basalt_ada's Ada FP8 / F16 prompt products (Infernix tile
+  layouts) and a CPU share for streamed prompt experts - a port from another engine, not a cherry-pick.  Its dense
+  27B notes: the MTP drafter's full 248K-row head costs 1.1 of every 1.6 ms draft step; a frequency-ranked draft head
+  (FR-Spec, arXiv 2502.14856) is their next step - applies to our dense drafters too.
+- **KV precision tail** (Anbeeld/beellama.cpp `--kv-tail-tokens`): most of the KV cache quantized, the newest 1,024
+  tokens in F16, one softmax over both inside FlashAttention.  Their Qwen 27B / 64K / RTX 3090 numbers: q4_0 KV median
+  KLD 0.00185 -> 0.00106 (-43 %) for 96 MiB more; q8_0 barely moves.  Not for DeepSeek-V4.1 (`--kv-fp4` packs to the
+  model's own FP4 grids, exact).  It fits the dense engine's `q4_0` / `k8v4` KV profiles (Qwen3.8-27B now, Qwen4-27B
+  next); needs the attention kernels to merge two segments by log-sum-exp.  Also there: KVarN (variance-normalised
+  KV quant, better than q4_0 at the same size).
+- **Hy4-flash** (Tencent, 16 Nov): 220B (155.5B network + 64B Engram), 512 routed / 16 active, 12B active, hybrid
+  sparse + sliding-window attention, hyper-connections, built-in DFly2 drafter - DeepSeek-V4.1's family.  llama.cpp
+  support is an unmerged PR (#32517); early testers like its token efficiency (20-24 tok/s Q3 on 2x3090).  An XQ run
+  waits for the PR to merge and for independent evals; the engine would build on the DS4.1 port.
+- **Nace** quants: their 72 GB DeepSeek-V4.1 coding quant keeps 200 of 384 experts per layer (a hard prune - against
+  our soft-prune rule); their Hy4-flash Q3_K / Q4_K files report KL 0.233 / 0.133.
+- **PolyStrata** (a Strata wrapper with one-click install), **BigMoeOnEdge** (flash streaming on stock llama.cpp,
+  8-16 GB cards): nothing for this box.
+
