@@ -340,6 +340,8 @@ struct Gpu {
     void close() {}
 };
 struct RemoteTier {
+    int64_t calls = 0, entries = 0;
+    double wait_ms = 0, busy_ms = 0;
     bool held(int64_t, int64_t, int64_t) const { return false; }
     void close() {}
 };
