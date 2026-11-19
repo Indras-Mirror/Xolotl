@@ -60,6 +60,19 @@ export STRATA_DENSE_REQUANT="${STRATA_DENSE_REQUANT-q6_K}"
 # the chunk prestage region: 1.5 GiB is what the adopted 12288 batch was measured with (3.0 GiB starves the batch's
 # own buffers on a 24 GB card).  0 = off.
 export STRATA_PRESTAGE_GIB="${STRATA_PRESTAGE_GIB:-1.5}"
+# Keisawaakira's decode set (ported 2026-11-19, tools/v41/engine/DECODE_OPTINS.md), served default since 19 Nov:
+# routing copies fused + read on the card, the metadata pulled once, the prefetch waits on the host, the hit fast path,
+# the attention tail (the shared expert moves into the attention graph; it replaces STRATA_DS41_SHEXP_LATE), the route
+# hook, async dense, pinned route buffers, graph concurrency 7, fused QKV.  RTX 4090, served q6 config + fast mode,
+# 8K prompt / 512 tokens: 98.8 -> 89.1 ms per verify pass (-10 %); short34 0.4651 / 88.61 % against the base's
+# 0.4614-0.4653 / 88.42-88.65 % (not bit-identical: sums move).  Not taken: STRATA_DEMOTE_ASYNC (lost, 98.6 ms).
+# Turn the whole set off with XOLOTL_KEIS_DECODE=0; any single switch with its own =0.
+if [ "${XOLOTL_KEIS_DECODE:-1}" != 0 ]; then
+    for _kv in STRATA_ROUTE_FUSE=1 STRATA_X_DEV=1 STRATA_META_PULL=1 STRATA_PF_HOSTWAIT=1 STRATA_ATTN_TAIL=3 STRATA_RB_HOOK=1 \
+               STRATA_HIT_FAST=3 STRATA_DENSE_ASYNC=1 STRATA_PIN_RB=1 STRATA_GRAPH_CONC=7 STRATA_QKV_FUSE=1; do
+        _k=${_kv%%=*}; [ -z "${!_k+x}" ] && export "$_kv"
+    done; unset _kv _k
+fi
 # an explicit STRATA_PROMPT_BATCH still wins over the json's --prompt-batch (it is appended after those args)
 [ -n "${STRATA_PROMPT_BATCH:-}" ] && set -- "$@" --prompt-batch "$STRATA_PROMPT_BATCH"
 [ -z "$STRATA_SERVE_DSPARK" ] && unset STRATA_SERVE_DSPARK
