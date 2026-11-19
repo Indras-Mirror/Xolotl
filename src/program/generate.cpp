@@ -1,3 +1,4 @@
+#include "strata/kernels/expert_keep.hpp"
 #include "strata/core/logit_bias.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
@@ -5118,12 +5119,24 @@ int main(int argc, char** argv) {
         return mtp_first_default_on();
     }();
 
+    // STRATA_EXPERT_KEEP: the host table is read here, before the profile fills the VRAM tier and the RAM copy is
+    // planned, so pruned experts take no slot and no RAM (uploaded for the router later, before graph capture)
+    if (!strata::kernels::expert_keep_load(g.n_layers, g.n_expert)) return 2;
     std::vector<std::pair<int32_t, int32_t>> profile;
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
         if (!strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, profile, pslots, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        {   // pruned experts are never routed: rank them last, so the VRAM slots go to kept experts
+            auto cut = std::stable_partition(profile.begin(), profile.end(), [](const std::pair<int32_t, int32_t>& pr) {
+                return strata::kernels::expert_keep_kept(pr.first, pr.second);
+            });
+            const size_t n_pruned = (size_t) (profile.end() - cut);
+            if (n_pruned > 0)
+                std::fprintf(stderr, "strata generate: STRATA_EXPERT_KEEP: %zu pruned pairs ranked last in the profile\n",
+                             n_pruned);
         }
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the
         // file).  `--expert-cache 0` used to take the count the profile was built for; the profile now ranks
@@ -7825,6 +7838,8 @@ int main(int argc, char** argv) {
         strata::core::stage_timing_name(14, "  gdn: z + out_norm");
         strata::core::stage_timing_name(15, "  gdn: out gemv");
     }
+    // STRATA_EXPERT_KEEP (simulated expert prune / task profile): uploaded here, before any graph is captured
+    if (!strata::kernels::expert_keep_init(g.n_layers, g.n_expert)) return 2;
     std::FILE* routing = nullptr;
     if (!o.dump_routing.empty()) {
         if (o.no_pool) {

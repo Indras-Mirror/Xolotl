@@ -1,3 +1,4 @@
+#include "strata/kernels/expert_keep.hpp"
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
 #include "strata/core/expert_nibble.hpp"
@@ -233,6 +234,8 @@ bool make_cache_complement_plan(
         for (int64_t expert = 0; expert < n_expert; ++expert) {
             const size_t index = (size_t) layer * (size_t) n_expert + (size_t) expert;
             if (omitted[index] != 0) continue;
+            // STRATA_EXPERT_KEEP: a pruned expert is never routed - it stays in the mapped file, untouched (no RAM)
+            if (!strata::kernels::expert_keep_kept(layer, expert)) continue;
             if (bytes > std::numeric_limits<uint64_t>::max() - blob_bytes) {
                 offsets.clear();
                 bytes = 0;

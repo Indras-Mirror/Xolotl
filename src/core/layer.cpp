@@ -1,5 +1,6 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
+#include "strata/kernels/expert_keep.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/qwen35_attention.hpp"
@@ -418,6 +419,7 @@ if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 //      `bf16_gemv_split` exists for precisely this case; its own header says so.  Measured here:
 //      LEDGER L41 -> L42.
 project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
+strata::kernels::expert_keep_apply(b.logits, 1, g.n_expert, layer, stream);   // STRATA_EXPERT_KEEP (no-op when unset)
 // ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
 // the native fused router is canonical-512x10 only; anything else takes the generic top-k kernel
 if (native_router_enabled() && g.n_expert == 512 && k == 10) {
@@ -465,6 +467,7 @@ bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t
                                 g.n_expert, stream);
     else
         bf16_gemv_fp32_mmvf_cols(x, (const uint16_t*) w_router->data, logits, g.n_embd, g.n_expert, n, stream);
+    expert_keep_apply(logits, n, g.n_expert, layer, stream);   // STRATA_EXPERT_KEEP (no-op when unset)
     router_top10(logits, n, (int) g.n_expert, (int) k, ids, weights, stream);
     return true;
 }
