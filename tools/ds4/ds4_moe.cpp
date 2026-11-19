@@ -3316,6 +3316,41 @@ bool Ds4MoeTier::run_chunk(int64_t layer, int n, const int32_t* ids, const float
     if (!im_->g.routed(layer)) return false;
 #if defined(DS4_MOE_CUDA)
     if (im_->gpu && !im_->cfg.cpu_only) {
+        // STRATA_REMOTE_CHECK=1 (debug, slow): the chunk also runs once with its original experts (the remote's from
+        // file) and prints, per layer, how far the remote result is from it and which part is off.
+        static const bool rcheck = [] { const char* v = std::getenv("STRATA_REMOTE_CHECK"); return v && v[0] == '1'; }();
+        if (rcheck && im_->remote) {
+            const int64_t H = im_->g.n_embd;
+            std::vector<float> ref((size_t) n * (size_t) H);
+            if (!gpu_run_chunk(*im_, layer, n, ids, w, x, ref.data())) return false;
+            const int32_t* ids2 = ids;
+            const float* w2 = w;
+            bool ok = false, on = false;
+            {
+                RemoteScope rs(*im_, layer, n, ids2, w2, x, nullptr, out);
+                ok = gpu_run_chunk(*im_, layer, n, ids2, w2, x, out);
+                on = rs.on;
+                if (on) {   // before the scope adds the remote rows: out = the main card's part
+                    double e_main_rem = 0, e_tot = 0, mag = 0;
+                    {
+                        std::unique_lock<std::mutex> lk(im_->remote->mu);
+                        im_->remote->cv.wait(lk, [&] { return !im_->remote->pending; });
+                    }
+                    const float* hr = im_->remote->h_out;
+                    for (size_t i = 0; i < ref.size(); ++i) {
+                        const double true_rem = (double) ref[i] - out[i];   // what the remote should have produced
+                        e_main_rem = std::max(e_main_rem, std::fabs(true_rem - hr[i]));
+                        e_tot = std::max(e_tot, std::fabs((double) ref[i] - ((double) out[i] + hr[i])));
+                        mag = std::max(mag, std::fabs((double) ref[i]));
+                    }
+                    double rmag = 0;
+                    for (size_t i = 0; i < ref.size(); ++i) rmag = std::max(rmag, std::fabs((double) hr[i]));
+                    std::fprintf(stderr, "remote check L%lld n=%d: max|ref| %.3g max|remote rows| %.3g max|true remote - remote rows| %.3g max|ref - (main+remote)| %.3g\n",
+                                 (long long) layer, n, mag, rmag, e_main_rem, e_tot);
+                }
+            }
+            return ok;
+        }
         RemoteScope rs(*im_, layer, n, ids, w, x, nullptr, out);
         return gpu_run_chunk(*im_, layer, n, ids, w, x, out);
     }
