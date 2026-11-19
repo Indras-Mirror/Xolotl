@@ -1062,7 +1062,7 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool async) {
     }
     // Opt-in input fixtures, one per indexer layer. No model outputs are changed.
     if (const char * dir = std::getenv("STRATA_INDEXER_DUMP")) {
-        if (!sync) ggml_backend_synchronize(backend);   // xolotl: an async compute (STRATA_DENSE_ASYNC) is still running
+        if (async) ggml_backend_synchronize(backend);   // xolotl: an async compute (STRATA_DENSE_ASYNC) is still running
         static std::set<std::string> saved;
         const int64_t min_kv = std::getenv("STRATA_INDEXER_DUMP_MIN_KV") ?
             std::atoll(std::getenv("STRATA_INDEXER_DUMP_MIN_KV")) : 65536;
