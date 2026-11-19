@@ -30,6 +30,13 @@ test('saved reasoning models receive all official composer choices with the rema
   assert.equal(frames.at(-1).type,'done');
  }
 });
+test('MiniMax-M3.1-Flash sends the selected Max effort', async t => {
+ const f = await fixture(t, {
+  kind: 'provider', provider: 'minimax', models: [{ id: 'MiniMax-M3.1-Flash', reasoning: true }],
+ });
+ await f.service.stream({ selection: f.selection, message: 'Test', thinking: 'Max', onFrame: () => {} });
+ assert.equal(f.mock.requests.at(-1).body.reasoning_effort, 'max');
+});
 test('invalid or omitted efforts keep the provider default',async t=>{
  const f=await fixture(t);
  for(const thinking of [undefined,null,false,1,{},'','Default','Provider Default','ultra','none','__proto__']){
