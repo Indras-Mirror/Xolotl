@@ -238,3 +238,17 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   graph", and `--prefill 256` without `--spec` was refused up front. `--dump-halves` has the identical condition.
   Recorded in `tools/train/qfn_dump_layers.sh` so nobody re-burns a GPU slot: the next step is an ENGINE change
   (keep the token graph while dumping, or allow a dumped non-spec run on a native pack), not a flag combination.
+- 21 Nov 06:10: **hyper-connections: PORTED BUT NOT VERIFIED - the FD gate does not complete.** `qfn_hc_mix` /
+  `qfn_hc_combine` (non-fused paths of qwen4exp.cpp 347-414 / 416-444) are in `tools/train/qfn_layer_train.hpp` and
+  `tools/train/test_qfn_hc.cpp` builds against them, but the test hangs and I stopped rather than keep burning time.
+  What is actually known:
+  * the SMALL configuration completes: D=4 hc=2 hd=2, with `ggml_graph_compute` at **nth=1** - forward graph, backward
+    graph and compute all finish and the loss prints;
+  * at **nth=8** the same case deadlocks - 8 threads spinning, ~140 min CPU over 17 min wall, no progress;
+  * at D=8 hc=3 hd=4 it spins single-threaded at 100% CPU for 10 min with no output - an infinite loop the small case
+    does not hit. Not yet localised (candidates: the hand-rolled `ggml_view_2d` strides in `qfn_hc_mix`, the
+    `ggml_repeat_4d` broadcast in `qfn_hc_combine`, or the rms_norm+MUL chain in backward).
+  **Nothing here should claim hyper-connections are validated.** The validated pieces (conv -> l2 norm -> head tile ->
+  GDN -> gated norm -> out proj, and the MoE) do not include them.
+  Lesson: run every new gate at a SMALL shape with nth=1 first, then scale - two of these failures were threading,
+  not maths.

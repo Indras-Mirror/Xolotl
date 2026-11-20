@@ -28,7 +28,7 @@ static double run(int D, int hc, int lr, int hd, int nk, int nv, int hc2, const 
                   std::vector<float> * g_up, std::vector<float> * g_inj, std::vector<float> * g_fg,
                   std::vector<float> * g_fu, std::vector<float> * g_fd, std::vector<float> * out_o) {
     const int d_conv = 4;
-    ggml_init_params ip = { 1024u << 20, nullptr, false };
+    ggml_init_params ip = { 8u << 20, nullptr, false };
     ggml_context * c = ggml_init(ip);
     const int64_t n_qkv = 2 * hd * nk + hd * nv, n_z = hd * nv;
     const int T = 8;
@@ -90,10 +90,10 @@ static double run(int D, int hc, int lr, int hd, int nk, int nv, int hc2, const 
 
     ggml_tensor * loss = ggml_sum(c, ggml_mul(c, out, rr));
     ggml_set_loss(loss);
-    ggml_cgraph * gf = ggml_new_graph_custom(c, 262144, true);
+    ggml_cgraph * gf = ggml_new_graph_custom(c, 8192, true);
     ggml_build_forward_expand(gf, loss);
     if (want) { ggml_build_backward_expand(c, gf, nullptr); ggml_graph_reset(gf); }
-    ggml_graph_compute_with_ctx(c, gf, 8);
+    ggml_graph_compute_with_ctx(c, gf, 1);
     const double L = ((float *) loss->data)[0];
     if (out_o) out_o->assign((float *) out->data, (float *) out->data + (size_t) D * hc * T);
     if (want) {
