@@ -357,3 +357,8 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   i.e. exact up to an isolated ~2e-4-relative difference (float ordering of the batched quantized matmul or a near-tie
   in one position's expert pick), 10x below the trainer-vs-engine noise (1.5e-2). One-pass results unchanged (top-1
   25/25, CE 0.8229). So the 20K-token Quetza prefix can be run once and carried into every window.
+- 21 Nov 12:00: **LONG-CONTEXT GATE PASSED on a real harness window** (qfn_topk_long, w07038: 20,135-token Quetza
+  prefix + 1,551-token window, served YaRN x2, layer 47's engine selection replayed as a mask, prefix via carries in
+  2048-position chunks): L44 cos 0.999758, L45 0.999673, L46 0.999202, L47 0.997584;
+  **CE over 885 real loss tokens: trainer 1.7798 (top-1 567) vs the engine's final residual 1.7795 (top-1 568).**
+  So the training forward is the served model to 3e-4 nats on real data. Next: GPU smoke of qfn_harness_train.
