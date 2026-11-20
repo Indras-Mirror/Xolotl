@@ -58,3 +58,9 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   so finite differences must use the smooth copy); CUDA vs CPU dA 4.1e-4, dB 4.6e-4, dx 3.3e-4.
   Lessons for the trainer: route with host-known ids as a FLAT 2-D gather (t * E + id) - GET_ROWS' backward is 2-D only.
   xolotl-ggml.patch regenerated from the private tree (same 22 files + out-prod.cu; applies clean on a fresh 6050b467).
+- 20 Nov 19:40: **T1 Hy4 trainer converges** - 64 tokens, rank-8 adapters on layers 38-41 attention (16 adapters,
+  1.30 M params), loss 6.774 -> 0.215 in 30 steps, backward 1.2 s/step (4 layers), forward ~4 s (reference CPU experts);
+  adapters saved to /media/Crucial1TB/xolotl-train/lora-t1.bin. OPEN: whole-model FD on blk.41.attn_output B gives
+  analytic -0.0484 vs numeric -0.0922 (1.9x) - HY4_TRAIN_CHECK=1 (train-graph output vs forward per layer) is built and
+  next. Adapter-at-inference test (HY4_LORA_LOAD, t1prompt/) built, not run. Handover: ~/.quetza-data/RESUME-2026-11-20-LORA-QFN.md.
+  Reference docs from Basalt/Adamant (MIT) saved in docs/train/ref/.
