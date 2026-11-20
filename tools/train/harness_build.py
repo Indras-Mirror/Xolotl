@@ -113,6 +113,7 @@ def main():
     tpl = ChatTemplate(TOKDIR / "chat_template.jinja")
     tok = load_tokenizer(TOKDIR)
     prod = re.compile(a.producers)
+    local_q = re.compile(r"strata|xq|gsq|xolotl|abl|gguf|<synthetic>", re.I)
     sources = set(a.sources.split(","))
 
     def render(msgs, gen):
@@ -171,7 +172,8 @@ def main():
 
             def trainable(am):
                 models = {s.get("model") or "" for s in am["_src"]}
-                if not any(prod.search(x) for x in models):
+                # strong API producers only: our own local quants (DS4.1 XQ/GSQ, strata builds) are not teachers
+                if not any(prod.search(x) and not local_q.search(x) for x in models):
                     return "producer"
                 calls = [b for b in am["content"] if b["type"] == "tool_use"]
                 if any(c["name"] not in tool_names for c in calls):
@@ -184,6 +186,18 @@ def main():
 
             first, rest = conv[0], conv[1:]
             first_ids = len(tok.encode(render([first], False)[cut:], parse_special=True))
+            if first_ids > 1024:
+                # Claude Code's first message carries 14-40K tokens of harness attachments (CLAUDE.md, memory, hook
+                # output, skill lists); keep only what was typed (text blocks that did not come from an attachment)
+                typed = []
+                for src in first["_src"]:
+                    for b in src.get("content") or []:
+                        if b.get("type") == "text" and b.get("text"):
+                            typed.append({"type": "text", "text": b["text"]})
+                if typed:
+                    first = {"role": "user", "content": typed, "_src": first["_src"]}
+                    first_ids = len(tok.encode(render([first], False)[cut:], parse_special=True))
+                    st["first_stripped"] = st.get("first_stripped", 0) + 1
             budget = a.max_conv_tokens - first_ids
             if budget < 256:
                 continue
@@ -219,23 +233,33 @@ def main():
                     e = render(msgs[:k + 1], False)
                     if not full.startswith(g) or not full.startswith(e) or len(e) <= len(g):
                         st["split_mismatch"] += 1
+                        if st["split_mismatch"] <= 4:
+                            kind = "gen" if not full.startswith(g) else "end" if not full.startswith(e) else "empty"
+                            a_, b_ = (g, full) if kind == "gen" else (e, full) if kind == "end" else (e, g)
+                            i_ = next((i for i, (x, y) in enumerate(zip(a_, b_)) if x != y), min(len(a_), len(b_)))
+                            with open(out / "mismatch.txt", "a") as mf:
+                                mf.write(f"===== {kind} turn {k}/{len(msgs)} blocks {[bl['type'] for bl in msgs[k]['content']]}\n"
+                                         f"{a_[max(0, i_ - 400):i_ + 150]!r}\n---\n{b_[max(0, i_ - 400):i_ + 150]!r}\n")
                         continue
                     end = e.find("<|im_end|>", len(g))
                     end = end + len("<|im_end|>") if end >= 0 else len(e)
                     spans.append((len(g), end, next(iter({s.get("model") for s in msgs[k]["_src"]}))))
                 if not spans:
                     continue
-                # tokenize piecewise at span edges; the pieces must concatenate to the whole-text ids
-                edges = sorted({len(prefix_text), len(full)} | {p for s in spans for p in s[:2]})
-                ids, mask = [], []
-                in_span = [(s0, s1) for s0, s1, _ in spans]
-                for p0, p1 in zip(edges, edges[1:]):
-                    piece = tok.encode(full[p0:p1], parse_special=True)
-                    lab = any(s0 <= p0 and p1 <= s1 for s0, s1 in in_span)
-                    ids += piece
-                    mask += [1 if lab else 0] * len(piece)
-                whole = tok.encode(full[len(prefix_text):], parse_special=True)
-                if whole != ids:
+                # tokenize the window ONCE (pieces would let BPE merge across a span edge, e.g. "<think>\n" + "\n...")
+                # and give each token to the loss by its byte offset: a token is a loss token when it STARTS inside a
+                # span. The ids are the ones the served model would see for this text.
+                body = full[len(prefix_text):]
+                ids = tok.encode(body, parse_special=True)
+                enc = body.encode("utf-8")
+                base = len(prefix_text)
+                bspans = [(len(full[base:s0].encode("utf-8")), len(full[base:s1].encode("utf-8"))) for s0, s1, _ in spans]
+                mask, off = [], 0
+                for t in ids:
+                    tb = tok.token_bytes(t)
+                    mask.append(1 if any(b0 <= off < b1 for b0, b1 in bspans) else 0)
+                    off += len(tb)
+                if off != len(enc):
                     st["split_mismatch"] += 1
                     continue
                 if len(ids) > a.max_conv_tokens * 2:      # the char estimate was far off: drop rather than overrun

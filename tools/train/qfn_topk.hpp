@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -113,6 +114,11 @@ struct PackTensors {
 struct QfnGeom {
     int64_t D, hc, hd, nk, nv, d_conv, E, K, NL, fai, n_head, n_kv, ahd, n_rot, top_k, n_vocab;
     float eps, rope_base;
+    // the SERVED rope: xol-qfn runs --rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144 (ext_factor resolves to
+    // 1 for yarn, generate.cpp:4343). Strata's YaRN (kernels/rope_scaling.hpp) is ggml's rope_yarn exactly, so these
+    // go straight into ggml_rope_ext. QFN_ROPE_SCALE=2 turns it on (0/unset = plain rope, the smoke captures).
+    float rope_freq_scale = 1.0f, rope_ext = 0.0f;
+    int rope_orig_ctx = 0;
     bool is_qsa(int64_t l) const { return (l + 1) % fai == 0; }
 };
 
@@ -137,6 +143,11 @@ inline QfnGeom qfn_geom(const PackTensors & p) {
     q.rope_base = p.kv_f("qwen4exp.rope.freq_base");
     ggml_tensor * o = ggml_get_tensor(p.meta, "output.weight");
     q.n_vocab = o ? o->ne[1] : 0;
+    if (const char * rs = std::getenv("QFN_ROPE_SCALE"); rs && std::atof(rs) > 1.0) {
+        q.rope_freq_scale = 1.0f / (float) std::atof(rs);
+        q.rope_ext = 1.0f;
+        q.rope_orig_ctx = 262144;
+    }
     return q;
 }
 
@@ -197,8 +208,10 @@ inline ggml_tensor * qfn_qsa_dense_block(ggml_context * c, ggml_tensor * x, cons
     k = ggml_mul(c, ggml_rms_norm(c, k, G.eps), ggml_repeat_4d(c, p.get(b + "attn_k_norm.weight"), hd, HK, T, 1));
     ggml_tensor * v = ggml_reshape_3d(c, lin(c, p.get(b + "attn_v.weight"), x, lo ? &lo->v : nullptr, ls), hd, HK, T);
 
-    q = ggml_rope_ext(c, q, pos, nullptr, (int) G.n_rot, GGML_ROPE_TYPE_NEOX, 0, G.rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    k = ggml_rope_ext(c, k, pos, nullptr, (int) G.n_rot, GGML_ROPE_TYPE_NEOX, 0, G.rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    q = ggml_rope_ext(c, q, pos, nullptr, (int) G.n_rot, GGML_ROPE_TYPE_NEOX, G.rope_orig_ctx, G.rope_base,
+                      G.rope_freq_scale, G.rope_ext, 1.0f, 32.0f, 1.0f);
+    k = ggml_rope_ext(c, k, pos, nullptr, (int) G.n_rot, GGML_ROPE_TYPE_NEOX, G.rope_orig_ctx, G.rope_base,
+                      G.rope_freq_scale, G.rope_ext, 1.0f, 32.0f, 1.0f);
 
     if (carry) { carry->k_out = k; carry->v_out = v; }
     int64_t n_past = 0;
