@@ -194,3 +194,8 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   applies exactly `(alpha/rank) * B (A x)`, so a saved adapter behaves identically inside llama.cpp at the default
   `adapter_scale = 1.0`. (The structural check - `w->ne[0] == a->ne[0]`, `w->ne[1] == b->ne[1]` - is what the moe/loader
   path validates; both hold for all 6 stack adapters.)
+- 21 Nov 04:45: **loader-equivalence check for adapters** - `tools/train/lora_loader_check.py` replicates, from
+  `src/llama-adapter.cpp:195-390`, every condition that makes llama.cpp accept or throw (general.type/adapter.type,
+  arch equality, tensor existence in the base model, a/b pairing, `W.ne0 == a.ne0`, `W.ne1 == b.ne1`,
+  `a.ne1 == b.ne0`, and the resulting `scale = alpha / rank`). Both adapters pass on all 9 checks:
+  `qfn_l0_lora.gguf` (3 weights) and `qfn_stack2_lora.gguf` (6 weights), scale 2.000 each.
