@@ -199,3 +199,14 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   arch equality, tensor existence in the base model, a/b pairing, `W.ne0 == a.ne0`, `W.ne1 == b.ne1`,
   `a.ne1 == b.ne0`, and the resulting `scale = alpha / rank`). Both adapters pass on all 9 checks:
   `qfn_l0_lora.gguf` (3 weights) and `qfn_stack2_lora.gguf` (6 weights), scale 2.000 each.
+- 21 Nov 04:55: **adapter loaded by llama.cpp ITSELF - PASS** (the external check that was missing). Built
+  `llama-completion` (this tree names the CLI that, not llama-cli) against the private ggml and ran the real
+  `qwen4exp` pack with `--lora`:
+  * positive: `-m Swift1.5-QFN-XQ-45GB.gguf --lora qfn_l0_lora.gguf` loads with NO error and generates; greedy
+    output on "The capital of France is" changes from `Paris. The capital of Germany is Berlin` (base) to
+    `</think>![` (adapted) - the adapter is genuinely applied at inference.
+  * negative control: the same flag pointed at the model file itself fails with
+    `failed to apply lora adapter: expect general.type to be 'adapter', but got: model` - proving the loader's
+    checks really execute (so the positive run is meaningful, not a silently ignored flag).
+  So the whole chain is proven with real artefacts: train -> save GGUF -> llama.cpp accepts it -> inference changes.
+  Note: CPU-only in this run (the 4090 was busy with chronos-qx's arm), `-ngl 0`, ctx 64.
