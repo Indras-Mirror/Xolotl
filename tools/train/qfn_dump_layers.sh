@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SUPERSEDED 21 Nov by qfn_capture.sh (prefill taps STRATA_KVA_CAPTURE / STRATA_PREFILL_DUMP_R_ALL, no engine change).
+# Kept for the record of why --dump-layers cannot work on a native pack.
+#
 # One-shot QFN run that records the residual after EVERY layer (the training data path).
 #
 #   qfn_dump_layers.sh <prompt-tokens-file> <out.bin> [max-new] [extra strata args...]

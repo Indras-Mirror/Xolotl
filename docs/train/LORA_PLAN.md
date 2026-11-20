@@ -286,3 +286,116 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   Component gates still hold individually (bisect_hc: mix loss -0.008787, combine loss -0.032751).
   LESSON (again): a "hang" in a numerical harness is usually an argument/loop bug - check the parsed parameters and
   print an effective-config line before suspecting the maths. Two of the three HC "failures" were mine.
+- 21 Nov 08:10 (fresh session): **REAL ACTIVATIONS UNBLOCKED, NO ENGINE CHANGE.** Two findings:
+  * `--dump-layers` can never fire on a native pack, whatever the token-graph conditions: the per-token loop hands a
+    native pack straight to verify windows (`generate.cpp:18390`, `if (native_pack) { spec_pos = pos; break; }`)
+    before the dump write at 18486. The earlier "relax 8335/8400" fix would not have helped.
+  * The prefill already has the taps: `STRATA_KVA_CAPTURE=<dir>` (+ `_FP32=1`, `STRATA_KVA_SPLIT=s`) writes the
+    residual ENTERING every layer >= s as `L<l>.bin` [T, hc*n_embd]; `STRATA_PREFILL_DUMP_R_ALL` writes the final
+    residual (bf16). Both are in the production binary. Smoke on the real pack (`--prefill 256 --spec 2`, 25-token
+    prompt): L44..L47 + final written, 25 positions, no NaN, output unchanged (" Madrid"), 1.5 s of GPU.
+    Script: `tools/train/qfn_capture.sh` (replaces `qfn_dump_layers.sh`).
+  **WHOLE-LAYER GATE ON REAL DATA PASSES.** `tools/train/qfn_full_layer_ref.py` recomputes a full GDN layer from the
+  dequantized pack exactly as `qwen4exp.cpp` builds it (hc_mix -> GDN -> hc_combine -> hc_mix -> MoE top-10 softmax
+  renorm + sigmoid-gated shared expert -> hc_combine) from captured L<l> and compares with captured L<l+1>:
+    layer 44: update rel err 2.85e-3, cos 0.999996 (identity baseline 0.535), 76 experts touched
+    layer 45: update rel err 1.35e-3, cos 0.999999 (identity 0.597)
+    layer 46: update rel err 3.42e-3, cos 0.999994 (identity 0.547)
+  The residual error is the engine's quantized-activation noise (Q8 activations, int8 KV, CPU share on in the smoke).
+  So the trainer's model of a QFN GDN layer is the served model's. Next: the QSA layer (47) reference + head, then the
+  C++ trainer forward of the top-k stack checked against these captures, then CE on harness transcripts.
+- 21 Nov 08:40: **TOP-4 STACK + HEAD REPRODUCE THE SERVED MODEL ON REAL DATA.** `qfn_full_layer_ref.py ... 44
+  --to-final --tokens smoke.tok` chains OUR outputs (not the captures) through layers 44-47 and the head:
+    44 GDN update err 2.85e-3 cos 0.999996 | 45 GDN 2.32e-3 0.999997 | 46 GDN 4.48e-3 0.999990
+    47 QSA (dense path, T <= indexer top_k 2048) 1.18e-2 cos 0.999930 vs final.bf16 (bf16-rounded target)
+    logits ours vs from the captured final: rel 6.4e-3, top-1 agree 25/25
+    next-token CE over the prompt: ours 0.8275 vs captured-final 0.8271; 23/25 positions predict the actual next token
+  QSA facts: per head Q = [256 q | 256 gate] (gate -> sigmoid on the attention output), q/k RMS norm, IMRoPE == NEOX on
+  the first 64 dims for text (all sections share the position), GQA 24/2 with q head h -> kv head h // 12 (ggml
+  broadcast, NOT the GDN tiling), scale 1/sqrt(256). The head mixer `output_hc_*` has no inject. So a top-k LoRA with a
+  CE loss can be trained on captured L<48-k> inputs; above 2048 positions the QSA selection must be replayed
+  (STRATA_QSA_DUMP exists in prefill.cpp:4083) as a constant mask.
+- 21 Nov 09:30: **C++ TOP-STACK FORWARD GATE ON REAL DATA - and a real bug it caught.**
+  `tools/train/qfn_topk.hpp` (pack loader keeping stored types, BF16->F32 since OUT_PROD cannot read BF16; QSA dense
+  block; MoE + shared expert; head) + `qfn_topk_gate.cpp`. First run was garbage (head on the CAPTURED final gave
+  CE 11.6): **`qfn_hc_mix` was missing the sigmoid on the gate** (`xn * gate` instead of `xn * sigmoid(gate)`).
+  The HC FD gate verified this morning passed WITH the bug, because analytic and numeric were consistently wrong;
+  there was no forward reference for HC. Lesson 3, again. Fixed in qfn_layer_train.hpp. (A second near-miss: moe_route
+  wants logits e*T+t, ggml's mul_mat gives t*E+e - transposed in the gate.)
+  After the fix, chained 44 -> 47 -> head from captured L44, quantized weights, 16 threads, ~1 s total:
+    44 GDN update err 1.48e-2 cos 0.999891 (76 experts) | 45 1.70e-2 0.999856 (70) | 46 2.45e-2 0.999701 (62)
+    47 QSA 4.00e-2 cos 0.999205 (67) | logits rel 1.8e-2, top-1 agree 25/25
+    CE ours 0.8229 vs head(captured final) 0.8290; 23/25 positions predict the actual next token
+  The extra error vs numpy (0.3-1 %) is ggml CPU quantizing the activations for Q8_0/IQ4 matmuls (Q8 src1), the same
+  class of noise the engine has; routing agrees with numpy except one flip at layer 46.
+- 21 Nov 10:30: **HARNESS LoRA (QFN) - data + design.**
+  * The corpus logs (chats.jsonl, xq/tools/cdmem/chats.py) have messages + tool calls but NOT the system prompt or
+    tool schemas. Captured one real QuetzaCodetl request with `tools/train/harness_capture_server.py` (fake
+    /v1/messages endpoint, Quetza run once in -p mode with xol-qfn's env): 14 tools, system 33K chars, tools 42K chars.
+    Rendered by serve's own path (frontend.anthropic_to_messages -> pack chat_template.jinja, cache marker stripped,
+    strata_tokenizer - ids checked equal to llama-tokenize) the shared prefix is **20,135 tokens**, identical for
+    every example. The QFN template keeps all reasoning in history, so one render supervises every assistant turn.
+  * `tools/train/harness_build.py`: windows (first user msg + segments starting at an assistant turn, <= 2048 conv
+    tokens), loss on assistant spans (thinking + calls + <|im_end|>) from strong producers whose calls use a tool
+    AND arguments in Quetza's current schemas; sources quetza, quetza-conductor, claude-code, claude-data (Quetza is a
+    Claude Code fork: 99 % of Claude Code calls fit the Quetza schemas). Corpus size: ~86M tokens (QFN tokenizer);
+    ~48M Quetza sessions. Two builds merged by id (the 21 Nov rebuild lost conductor histories cleaned on 14-15 Nov).
+  * Trainer design: the prefix is constant -> layers 44-47 run it ONCE without gradient (refresh every N steps) and
+    hand each window the GDN states + conv tails + layer-47 K/V; gradients only through the window. The served config
+    uses **YaRN x2 (orig 262144)**: captures must use the serve's rope flags and layer 47's rope must match (TODO gate).
+    Layer 47 beyond 2048 cells: replay the engine's QSA selection (STRATA_QSA_DUMP) as a constant mask.
+  * GPU: every op of the QFN backward graph has a CUDA kernel in the private ggml (and OUT_PROD dequantizes quantized
+    src0 on the device); top-4 layers + head ~7 GB quantized -> the trainer goes on the 4090 like hy4_train.
+  * `gdn_chunked` gained s0 (initial state, constant) / s_out; gate `test_gdn_state.cpp`: one pass == prefix + carried
+    state + suffix, max err 0 at a chunk boundary, <= 8.3e-7 inside a chunk (splits 128/100/37/64).
+- 21 Nov 11:00: **PREFIX CARRY GATE (whole layers, real data).** `GdnCarry` (conv rows + recurrent state) in
+  qfn_gdn_block and `QsaCarry` (normed+rotated K, V; window positions continue the prefix; diag mask n_past) in the
+  QSA block. `QFN_GATE_SPLIT=T1 qfn_topk_gate ...` runs each layer as [0,T1) then [T1,T) from host copies of the
+  carries and compares with the one-pass output on the captured smoke data:
+    split 11: L44 2.6e-3 (of |out| 13.8), L45 1.2e-7, L46 2.4e-7, L47 7.3e-6
+    split 4 : L44 2.6e-3, L45 9.4e-4, L46 2.4e-7, L47 7.3e-6
+  i.e. exact up to an isolated ~2e-4-relative difference (float ordering of the batched quantized matmul or a near-tie
+  in one position's expert pick), 10x below the trainer-vs-engine noise (1.5e-2). One-pass results unchanged (top-1
+  25/25, CE 0.8229). So the 20K-token Quetza prefix can be run once and carried into every window.
+- 21 Nov 12:00: **LONG-CONTEXT GATE PASSED on a real harness window** (qfn_topk_long, w07038: 20,135-token Quetza
+  prefix + 1,551-token window, served YaRN x2, layer 47's engine selection replayed as a mask, prefix via carries in
+  2048-position chunks): L44 cos 0.999758, L45 0.999673, L46 0.999202, L47 0.997584;
+  **CE over 885 real loss tokens: trainer 1.7798 (top-1 567) vs the engine's final residual 1.7795 (top-1 568).**
+  So the training forward is the served model to 3e-4 nats on real data. Next: GPU smoke of qfn_harness_train.
+- 21 Nov ~07:15: **LONG-CONTEXT GATE PASSES (real harness window w07038, 21,686 positions, served YaRN x2,
+  layer-47 engine selection replayed).** `qfn_topk_long`, CPU, 812 s, layers chained from captured x44:
+    44 GDN err 2.20e-2 cos 0.999758 | 45 2.56e-2 0.999673 | 46 4.00e-2 0.999202 | 47 QSA 6.95e-2 cos 0.997584
+    CE over 885 loss tokens: ours 1.7798 (top-1 567) vs head(captured final) 1.7795 (top-1 568)
+  Per-layer error is ~1.5-1.7x the 25-token smoke gate at EVERY layer (1.5/1.7/2.45/4.0e-2 there) - uniform growth
+  from longer chained accumulation, not an L47-specific defect; the CE agreement (3e-4) is the decisive number. So the
+  20K-prefix GDN carry, the YaRN rope and the QSA selection replay are all right on real data.
+- 21 Nov ~07:25: **GPU TRAINER SMOKE PASSES (qfn_harness_train on the 4090, 9b5168f59).** First runs needed three
+  fixes: (1) G1 graphs on one shared ggml_gallocr instead of alloc_ctx_tensors (17.7 / 28 GB -> 14.8 GiB peak
+  compute, ~23 GB card total at W = 3063); (2) CUDA OUT_PROD: src1 views with an ld cuBLAS rejects (degenerate
+  one-column stride rewritten, exact; else a contiguous copy); (3) CUDA REPEAT_BACK in grid-z slabs (layer 47's GQA
+  expand over ~16K+ union cells > 32768). Both CUDA fixes are in tools/xolotl/ggml/xolotl-ggml.patch.
+  Run smoke-r16 (rank 16, alpha 32, lr 2e-4, warmup 2, 1 train window w02284 / 1 held out w07038, 20 steps):
+    step-0 eval CE 1.7780 (= base; CPU long gate 1.7798, head on captured final 1.7795) -> prefix carry 12 s
+    train loss 2.025 -> 1.531 (20 steps, 19.5-20 s/step at 3063 tokens, 2784 loss tokens)
+    eval 1.778 -> 1.681 (5) -> 1.633 (10) -> 1.651 (15) -> 1.664 (20): one-window overfit, as expected
+  adapter.gguf (13 tensors, 7.7 MB) passes lora_loader_check.py (llama.cpp accept rules). Loss PNG:
+  /media/Crucial1TB/xolotl-train/runs/smoke-r16-loss.png. llama-completion --lora load test still TODO (needs the
+  card free of captures; the 73 GB pack wants the GPU + RAM).
+  Captures of 40 more windows started (unit qfn-harness-cap, log harness/cap-run2.log, ~67 s/window at 1.4K tokens).
+- 21 Nov ~08:05: **PROOF RUN: the harness LoRA generalises to held-out windows.** proof-r16: 14 captured windows
+  (12 train, 12,917 loss tokens; 2 held out), rank 16, alpha 32, lr 2e-4, warmup 4, 36 steps (3 epochs), ~6 min:
+    held-out CE 1.4116 (base) -> 1.3345 (step 12) -> 1.3214 (24) -> 1.3197 (36): -6.5 %, on windows it never saw
+    the same train window each epoch (w02284, 2784 loss tokens): 1.947 -> 1.895 -> 1.872
+  adapter passes lora_loader_check. Graph: /media/Crucial1TB/xolotl-train/runs/proof-r16-loss.png.
+  Slow captures stopped at 14 windows (Mal: lean, share the GPU). Serve-mode capture (a622a956c) built, PARKED, gate
+  not run. No full run today (Mal). Still open: llama-completion --lora load test; behavioural eval.
+- 21 Nov ~08:20: **FAST (serve-mode) CAPTURE RUNS BUT DOES NOT MATCH THE COLD CAPTURE - kept off main.**
+  harness_capture_serve.py with STRATA_KVA_CAPTURE_PER_REQ (a622a956c): engine READY 39 s, then 2.6-3.6 s per window
+  (vs 66-137 s cold), reads resume at the root checkpoint 20135 as designed. harness_capture_compare.py vs cap1 (4
+  windows): prefix rows bit-identical (diff 0), but EVERY window row differs - x44 median per-row rel 0.12-0.13, worst
+  0.22, x45..final similar, layer-47 selection 0/N queries identical; shifting rows by +-1 is far worse (aligned).
+  Also in the request that read cold from 0 (w02284: reads [0, 20135, 20408]) - so not the checkpoint restore: the
+  serve path reads the window differently (split reads at turn boundaries). Suspect first: PLE n-gram history or
+  another per-read state reset at a read split; then the serve short-read / verify-window path. Which one the SERVED
+  model really computes decides which capture is right (the slow one-shot path passed the trainer/head CE gates).
+  Next: CE of the head on serve final.bf16 vs cold final.bf16 over the loss tokens (the discriminator).

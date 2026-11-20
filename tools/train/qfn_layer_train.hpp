@@ -50,9 +50,19 @@ inline ggml_tensor * qfn_linear(ggml_context * c, ggml_tensor * W, ggml_tensor *
     return y;
 }
 
+// What a GDN layer carries across a split (a shared prefix -> a window): the recurrent state and the conv history.
+// Inputs are constants (no gradient into the prefix); outputs are filled when the block runs the prefix itself.
+struct GdnCarry {
+    ggml_tensor * conv_in = nullptr;    // [d_conv-1, channels] the prefix's last qkv rows (time on dim0), or nullptr = zeros
+    ggml_tensor * s_in = nullptr;       // [hd, hd, 1, n_v] recurrent state, or nullptr = zeros
+    ggml_tensor * conv_out = nullptr;   // filled: [d_conv-1, channels] this block's last qkv rows
+    ggml_tensor * s_out = nullptr;      // filled: the state after the last token
+};
+
 // The layer's own contribution to the residual (no residual add), [D, T].
 inline ggml_tensor * qfn_gdn_block(ggml_context * c, ggml_tensor * cur /* [D, T] */, const QfnLayer & w,
-                                   int64_t hd, int64_t nk, int64_t nv, int64_t d_conv, float rms_eps) {
+                                   int64_t hd, int64_t nk, int64_t nv, int64_t d_conv, float rms_eps,
+                                   GdnCarry * carry = nullptr) {
     const int64_t D = cur->ne[0], T = cur->ne[1];
     const int64_t n_qkv = 2 * hd * nk + hd * nv, channels = n_qkv, n_z = hd * nv;
 
@@ -62,8 +72,13 @@ inline ggml_tensor * qfn_gdn_block(ggml_context * c, ggml_tensor * cur /* [D, T]
 
     // ---- causal conv, zero history ----
     // ssm_conv takes the conv window on dim0 and channels on dim1: [d_conv-1+T, channels]
-    ggml_tensor * conv_in = ggml_cont(c, ggml_pad_ext(c, ggml_cont(c, ggml_transpose(c, qkv)),
-                                                      (int) (d_conv - 1), 0, 0, 0, 0, 0, 0, 0));
+    ggml_tensor * qkv_t = ggml_cont(c, ggml_transpose(c, qkv));                     // [T, channels]
+    ggml_tensor * conv_in = carry && carry->conv_in
+        ? ggml_concat(c, carry->conv_in, qkv_t, 0)                                  // prefix history, then the window
+        : ggml_cont(c, ggml_pad_ext(c, qkv_t, (int) (d_conv - 1), 0, 0, 0, 0, 0, 0, 0));
+    if (carry && T >= d_conv - 1)
+        carry->conv_out = ggml_cont(c, ggml_view_2d(c, qkv_t, d_conv - 1, channels, qkv_t->nb[1],
+                                                    (size_t) (T - (d_conv - 1)) * ggml_element_size(qkv_t)));
     ggml_tensor * y = ggml_silu(c, ggml_ssm_conv(c, conv_in, w.conv_w));      // [channels, T]
 
     const size_t es = ggml_element_size(y), row = ggml_row_size(y->type, channels);
@@ -90,7 +105,8 @@ inline ggml_tensor * qfn_gdn_block(ggml_context * c, ggml_tensor * cur /* [D, T]
     gate = ggml_reshape_4d(c, gate, 1, nv, T, 1);                             // [1, n_v, T]
 
     // ---- the delta-net core ----
-    ggml_tensor * o = gdn_chunked(c, q, k, ggml_cont(c, v), gate, beta, w.ident);   // [hd, n_v, T]
+    ggml_tensor * o = gdn_chunked(c, q, k, ggml_cont(c, v), gate, beta, w.ident,
+                                  carry ? carry->s_in : nullptr, carry ? &carry->s_out : nullptr);   // [hd, n_v, T]
     o = ggml_reshape_3d(c, o, hd, nv, T);
 
     // ---- gated norm + output projection ----
@@ -136,7 +152,10 @@ inline ggml_tensor * qfn_hc_mix(ggml_context * c, ggml_tensor * x, const QfnHc &
     lo = ggml_silu(c, lo);                                                          // [hc_lr, T]
     ggml_tensor * gate = ggml_mul_mat(c, w.up, lo);                                 // [D*hc, T]
 
-    ggml_tensor * gated = ggml_mul(c, xn, ggml_reshape_3d(c, ggml_cont(c, gate), D, hc, T));
+    // sigmoid gate (qwen4exp.cpp build_hc_mix: ggml_mul(xn, ggml_sigmoid(gate))). It was MISSING until 21 Nov 09:30:
+    // the FD gate passed without it (analytic and numeric were wrong together); the real-data gate
+    // (qfn_topk_gate vs captures) caught it - lesson 3 again: every piece needs a forward reference, not only FD.
+    ggml_tensor * gated = ggml_mul(c, xn, ggml_sigmoid(c, ggml_reshape_3d(c, ggml_cont(c, gate), D, hc, T)));
     // collapse the streams by their mean (same loop as the model's hc_stream_mean: views over dim1)
     ggml_tensor * mixed = ggml_cont(c, ggml_view_2d(c, gated, D, T, (size_t) D * hc * sizeof(float), 0));
     for (int64_t s = 1; s < hc; ++s)

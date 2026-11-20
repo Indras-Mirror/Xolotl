@@ -66,6 +66,9 @@ inline void moe_expert_lists(const std::vector<int32_t> & ids, int64_t K, int64_
 struct MoeIndex {
     ggml_tensor * wsel = nullptr;                 // I32 [K*T]: flat index t*E + expert, for get_rows on probs
     std::vector<ggml_tensor *> tok, pair;         // per expert: I32 [ne]; empty experts have nullptr
+    // the same lists concatenated in expert order (one gather / one scatter for the whole layer)
+    ggml_tensor * tok_all = nullptr, * pair_all = nullptr;   // I32 [K*T]
+    std::vector<int64_t> off, cnt;                            // per expert: first row in tok_all, row count
 };
 
 // ids: expert per (t, k) as t*K + k -> the flat index into probs is t*E + e, built here so the caller cannot
@@ -80,6 +83,21 @@ inline MoeIndex moe_make_index(ggml_context * c, const std::vector<int32_t> & id
             ((int32_t *) ix.wsel->data)[(size_t) (t * K + k)] = (int32_t) (t * E + ids[(size_t) (t * K + k)]);
     ix.tok.resize(tok_of_expert.size());
     ix.pair.resize(pair_of_expert.size());
+    {
+        std::vector<int32_t> ta, pa;
+        ix.off.assign(tok_of_expert.size(), 0);
+        ix.cnt.assign(tok_of_expert.size(), 0);
+        for (size_t e = 0; e < tok_of_expert.size(); ++e) {
+            ix.off[e] = (int64_t) ta.size();
+            ix.cnt[e] = (int64_t) tok_of_expert[e].size();
+            ta.insert(ta.end(), tok_of_expert[e].begin(), tok_of_expert[e].end());
+            pa.insert(pa.end(), pair_of_expert[e].begin(), pair_of_expert[e].end());
+        }
+        ix.tok_all = ggml_new_tensor_1d(c, GGML_TYPE_I32, (int64_t) ta.size());
+        ix.pair_all = ggml_new_tensor_1d(c, GGML_TYPE_I32, (int64_t) pa.size());
+        std::memcpy(ix.tok_all->data, ta.data(), ta.size() * sizeof(int32_t));
+        std::memcpy(ix.pair_all->data, pa.data(), pa.size() * sizeof(int32_t));
+    }
     for (size_t e = 0; e < tok_of_expert.size(); ++e) {
         if (tok_of_expert[e].empty()) continue;
         const int64_t ne = (int64_t) tok_of_expert[e].size();
@@ -107,6 +125,34 @@ inline ggml_tensor * moe_ffn(ggml_context * c, ggml_tensor * cur, ggml_tensor * 
     if (w_scale != 0.0f && w_scale != 1.0f) w = ggml_scale(c, w, w_scale);
     ggml_tensor * wf = ggml_reshape_2d(c, ggml_cont(c, w), 1, K * T);
 
+    // One gather of every (token, expert) row in expert order, the per-expert matmuls on VIEWS of it, a balanced
+    // concat back to [n_embd, K*T], one routing-weight multiply and ONE scatter (get_rows_back sums the K rows of each
+    // token). The earlier form scattered every expert into its own [n_embd, T] tensor: O(experts * T * n_embd) memory,
+    // 10+ GB at T = 2048 on QFN (512 experts) - this is O(K * T * n_embd * log E).
+    if (ix.tok_all && !ix.off.empty()) {
+        ggml_tensor * xs = ggml_get_rows(c, cur, ix.tok_all);                                 // [n_embd, K*T]
+        std::vector<ggml_tensor *> parts;
+        for (int64_t ex = 0; ex < E; ++ex) {
+            const int64_t ne = ix.cnt[(size_t) ex];
+            if (ne == 0) continue;
+            ggml_tensor * gW = ggml_view_3d(c, gate_exps, n_embd, n_ff, 1, gate_exps->nb[1], gate_exps->nb[2], ex * gate_exps->nb[2]);
+            ggml_tensor * uW = ggml_view_3d(c, up_exps,   n_embd, n_ff, 1, up_exps->nb[1],   up_exps->nb[2],   ex * up_exps->nb[2]);
+            ggml_tensor * dW = ggml_view_3d(c, down_exps, n_ff, n_embd, 1, down_exps->nb[1], down_exps->nb[2], ex * down_exps->nb[2]);
+            ggml_tensor * xe = ggml_view_2d(c, xs, n_embd, ne, xs->nb[1], (size_t) ix.off[(size_t) ex] * xs->nb[1]);
+            ggml_tensor * a = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, gW, xe)), ggml_mul_mat(c, uW, xe));
+            parts.push_back(ggml_mul_mat(c, dW, a));                                          // [n_embd, ne]
+        }
+        while (parts.size() > 1) {                                                            // balanced concat
+            std::vector<ggml_tensor *> nx;
+            for (size_t i = 0; i + 1 < parts.size(); i += 2) nx.push_back(ggml_concat(c, parts[i], parts[i + 1], 1));
+            if (parts.size() % 2) nx.push_back(parts.back());
+            parts.swap(nx);
+        }
+        ggml_tensor * ys = parts[0];                                                          // [n_embd, K*T]
+        ggml_tensor * ws = ggml_reshape_2d(c, ggml_get_rows(c, wf, ix.pair_all), 1, ys->ne[1]);
+        ys = ggml_mul(c, ys, ggml_repeat_4d(c, ws, n_embd, ys->ne[1], 1, 1));                // MUL backward: equal shapes
+        return ggml_get_rows_back(c, ys, ix.tok_all, cur);                                    // [n_embd, T]
+    }
     ggml_tensor * routed = nullptr;
     for (int64_t ex = 0; ex < E; ++ex) {
         if (!ix.tok[(size_t) ex]) continue;
