@@ -14,6 +14,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 #include "moe_train.hpp"
 #include "qfn_layer_train.hpp"
@@ -99,6 +100,44 @@ struct PackTensors {
                 return false;
             }
             t[n] = x;
+        }
+        std::fclose(f);
+        return true;
+    }
+    // the same tensors into a BACKEND buffer (the trainer: weights on the 4090); BF16 still becomes F32
+    ggml_backend_buffer_t wbuf = nullptr;
+    bool load_backend(const std::vector<std::string> & names, ggml_backend_t be) {
+        std::vector<std::string> have;
+        for (const auto & n : names) if (ggml_get_tensor(meta, n.c_str())) have.push_back(n);
+        ggml_init_params ip = { have.size() * ggml_tensor_overhead() + (1u << 20), nullptr, true };
+        w = ggml_init(ip);
+        for (const auto & n : have) {
+            ggml_tensor * m = ggml_get_tensor(meta, n.c_str());
+            ggml_tensor * x = ggml_new_tensor(w, m->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : m->type, ggml_n_dims(m), m->ne);
+            ggml_set_name(x, n.c_str());
+            t[n] = x;
+        }
+        wbuf = ggml_backend_alloc_ctx_tensors(w, be);
+        if (!wbuf) return false;
+        FILE * f = std::fopen(path.c_str(), "rb");
+        if (!f) return false;
+        const size_t data0 = gguf_get_data_offset(g);
+        std::vector<uint8_t> stage;
+        std::vector<float> conv;
+        for (const auto & n : have) {
+            ggml_tensor * m = ggml_get_tensor(meta, n.c_str());
+            const size_t nb = ggml_nbytes(m);
+            stage.resize(nb);
+            if (fseeko(f, (off_t) (data0 + gguf_get_tensor_offset(g, gguf_find_tensor(g, n.c_str()))), SEEK_SET) != 0 ||
+                std::fread(stage.data(), 1, nb, f) != nb) { std::fclose(f); return false; }
+            if (m->type == GGML_TYPE_BF16) {
+                conv.resize((size_t) ggml_nelements(m));
+                const uint16_t * b = (const uint16_t *) stage.data();
+                for (size_t i = 0; i < conv.size(); ++i) { const uint32_t u = (uint32_t) b[i] << 16; std::memcpy(&conv[i], &u, 4); }
+                ggml_backend_tensor_set(t[n], conv.data(), 0, conv.size() * 4);
+            } else {
+                ggml_backend_tensor_set(t[n], stage.data(), 0, nb);
+            }
         }
         std::fclose(f);
         return true;
