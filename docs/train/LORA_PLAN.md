@@ -188,3 +188,9 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   `qfn_stack2_lora.gguf`, reloaded bit-exact, **relative L2 vs target 1.4318 -> 0.0130 (109.9x)**. All 6 adapter
   pairs checked against the pack's real tensors: PASS. This is the first run where each layer's gradient travels
   back through the layers above it - the depth path is exercised, not just a single layer's internals.
+- 21 Nov 04:35: **Llama.cpp application convention verified against the source** (`src/llama-graph.cpp:1652-1671` +
+  `src/llama-adapter.h:53-57`): `scale = adapter_scale * alpha / rank` with `rank = b->ne[0]`, and the delta is
+  `scale * B (A x)` added to `W^T x`. Our writer emits `a` ne = [n_in, rank], `b` ne = [rank, n_out] and the trainer
+  applies exactly `(alpha/rank) * B (A x)`, so a saved adapter behaves identically inside llama.cpp at the default
+  `adapter_scale = 1.0`. (The structural check - `w->ne[0] == a->ne[0]`, `w->ne[1] == b->ne[1]` - is what the moe/loader
+  path validates; both hold for all 6 stack adapters.)
