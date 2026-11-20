@@ -6,7 +6,7 @@
 // edges).  After the prefill: the last row's logits against <dir>/logits_last.f32 and the last chunk's final-layer
 // state against <dir>/l_out-<last>.f32 when present.  Then n_gen greedy tokens, one pass each, printed detokenized.
 #include "hy4_dense.hpp"
-#include "hy4_moe_ref.hpp"
+#include "hy4_moe.hpp"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -84,8 +84,8 @@ int main(int argc, char ** argv) {
     std::string err;
     if (!dense.init(gguf, cfg, err)) { std::fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
     const Hy4Geometry & G = dense.geom();
-    Hy4RefMoe moe;
-    if (!moe.init(dense.model(), G, nthr, err)) { std::fprintf(stderr, "moe: %s\n", err.c_str()); return 1; }
+    Hy4Moe moe;
+    if (!moe.init(dense.model(), gguf, G, nthr, err)) { std::fprintf(stderr, "moe: %s\n", err.c_str()); return 1; }
     const MetaValue * tv = dense.model().meta().get("tokenizer.ggml.tokens");
     auto piece = [&](int id) { return tv && id >= 0 && (size_t) id < tv->items.size() ? detok(tv->items[(size_t) id].s) : std::string("?"); };
 
@@ -134,9 +134,13 @@ int main(int argc, char ** argv) {
         std::printf("prefill logits vs ref: argmax ours %d '%s' ref %d '%s' %s | max|diff| %.4f | KL %.3e\n", next,
                     piece(next).c_str(), ar, piece(ar).c_str(), next == ar ? "MATCH" : "DIFFER", mx, kl);
     }
-    if (load(gd + "/l_out-" + std::to_string(G.n_layer - 1) + ".f32", sref) && dense.read_state(st)) {
-        const size_t row = (size_t) (G.hc * G.n_embd), off = (size_t) (np - last_n) * row;
-        if (sref.size() == (size_t) np * row) {
+    // the final-layer reference: the whole prompt in one file, or (HY4_LOUT_REF=<file>) only the last ubatch's rows
+    const std::string lref_f = std::getenv("HY4_LOUT_REF") ? std::string(std::getenv("HY4_LOUT_REF"))
+                                                           : gd + "/l_out-" + std::to_string(G.n_layer - 1) + ".f32";
+    if (load(lref_f, sref) && dense.read_state(st)) {
+        const size_t row = (size_t) (G.hc * G.n_embd);
+        const size_t off = sref.size() == (size_t) np * row ? (size_t) (np - last_n) * row : 0;
+        if (sref.size() == (size_t) np * row || sref.size() == (size_t) last_n * row) {
             double num = 0, den = 0;
             for (size_t i = 0; i < st.size(); ++i) {
                 const double d = (double) st[i] - sref[off + i];
@@ -164,5 +168,6 @@ int main(int argc, char ** argv) {
     std::printf("generated %zu tokens (%.2f tok/s reference-expert path):", gen.size(), (gen.size() - 1) / std::max(t_dec, 1e-9));
     for (int t : gen) std::printf(" %d", t);
     std::printf("\n---\n%s\n---\n", text.c_str());
+    moe.report();
     return 0;
 }

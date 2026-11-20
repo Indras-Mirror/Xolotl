@@ -6,7 +6,7 @@
 // with ffn_moe_topk, then the last row's logits: argmax match, max |diff|, KL(ref || ours).
 // Env: HY4_CPU=1 (dense half on the CPU too), HY4_LAYERS=N (stop after N layers), HY4_THREADS.
 #include "hy4_dense.hpp"
-#include "hy4_moe_ref.hpp"
+#include "hy4_moe.hpp"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -77,8 +77,8 @@ int main(int argc, char ** argv) {
     auto t0 = std::chrono::steady_clock::now();
     if (!dense.init(gguf, cfg, err)) { std::fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
     const Hy4Geometry & G = dense.geom();
-    Hy4RefMoe moe;
-    if (!moe.init(dense.model(), G, nthr, err)) { std::fprintf(stderr, "moe init: %s\n", err.c_str()); return 1; }
+    Hy4Moe moe;
+    if (!moe.init(dense.model(), gguf, G, nthr, err)) { std::fprintf(stderr, "moe init: %s\n", err.c_str()); return 1; }
     std::printf("hy4_check: %d tokens, init %.1f s\n", n,
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 
