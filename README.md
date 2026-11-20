@@ -196,6 +196,7 @@ pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up
 | [DeepSeek-V4.1 fast mode](docs/XOLOTL_FAST.md)     | the 2-bit expert sidecar: build, serve, switches, what it costs and what we tried |
 | [DeepSeek-V4.1 on Windows](docs/WINDOWS.md)        | native MSVC + CUDA build, configs, RTX 50 notes                                   |
 | [GLM-5.3-Flash engine](docs/glm)                   | KDA + MLA attention, the LoRA on routed experts, soft pruning                     |
+| [Prune masking](docs/EXPERT_KEEP.md)               | `STRATA_EXPERT_KEEP` task profiles: keep lists, how to build and gate one, results |
 | [LFM3-Omni engine](docs/LFM3.md)                   | pictures, audio, video and speech on a 2B model, park/unpark beside a big one     |
 | [Muse Glimmer engine](docs/GLIMMER.md)             | Meta's dense 30B at 512K on 24 GB, its channel / ATEM tool-call format, pictures  |
 | [Qwen3.8-27B dense howto](docs/dense/HOWTO.md)     | dense vs MoE paths, binaries, configs, MTP (by Mirko Perrone, also in Italian)    |
