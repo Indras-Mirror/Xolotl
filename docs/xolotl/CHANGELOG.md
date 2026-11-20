@@ -16,8 +16,9 @@ the backward rules ggml lacked (SIGMOID, SWIGLU_CLAMP, CONCAT, CLAMP, GET_ROWS_B
 SSM_CONV, PAD), the chunked gated delta net and the MoE expert loop as differentiable graphs, a Hy4-flash trainer and
 QFN trainers on real pack weights, adapters written in llama.cpp's LoRA GGUF format (llama.cpp loads them). Every piece
 has finite-difference and reference gates. **Real fine-tuning is not proven yet** - the runs so far fit a fixed target.
-Nothing changes for inference; the forward ops the patch touches keep their old behaviour (DeepSeek-V4.1 greedy output
-compared token for token against main before this landed).
+Nothing changes for inference: every ggml change is in the backward pass or in SOLVE_TRI's new upper variant, and
+DeepSeek-V4.1 greedy output (96 tokens, served settings) is identical to main's when both runs get the same number of
+VRAM expert slots - the slot count follows the card's free VRAM, and one slot more or less moves main's own output too.
 
 **Hy4-flash engine** (`tools/hy4/`, built only when asked): geometry + tensor map, the Engram shard writer (F8_E4M3,
 byte-exact vs Tencent), the dense half on CUDA passing the golden gate, experts on the DeepSeek-V4.1 tier, k-pool
@@ -30,7 +31,8 @@ selection. `ds41_moe.cpp`'s expert cap is now `DS41_MOE_MAX_K` (default 8: DeepS
 **Windows:** `src/kernels/cuda/expert_keep.cu` builds with MSVC again (#143, reported and verified by
 [kelheor](https://github.com/kelheor)). Also: the Q2_0 AVX2 row kernel unpacks codes in 7 ops instead of ~8.5
 (llama.cpp #30447, homeofe; bit-identical, one token 1.28-1.58x faster a row), opt-in `STRATA_TRACE_DIR` live
-thinking traces in serve, and a serve test that no longer breaks other tests under `unittest discover`.
+thinking traces in serve, a serve test that no longer breaks other tests under `unittest discover`, and ERNIE 5.5
+Flash (`ernie5_5`) is recognised - geometry and tensor map - and refused with a clear message (no execution path yet).
 
 ### DeepSeek-V4.1 decode switches on by default, agent tasks 42.7 tok/s (19 Nov)
 
