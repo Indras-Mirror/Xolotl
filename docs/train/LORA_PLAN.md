@@ -389,3 +389,13 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   adapter passes lora_loader_check. Graph: /media/Crucial1TB/xolotl-train/runs/proof-r16-loss.png.
   Slow captures stopped at 14 windows (Mal: lean, share the GPU). Serve-mode capture (a622a956c) built, PARKED, gate
   not run. No full run today (Mal). Still open: llama-completion --lora load test; behavioural eval.
+- 21 Nov ~08:20: **FAST (serve-mode) CAPTURE RUNS BUT DOES NOT MATCH THE COLD CAPTURE - kept off main.**
+  harness_capture_serve.py with STRATA_KVA_CAPTURE_PER_REQ (a622a956c): engine READY 39 s, then 2.6-3.6 s per window
+  (vs 66-137 s cold), reads resume at the root checkpoint 20135 as designed. harness_capture_compare.py vs cap1 (4
+  windows): prefix rows bit-identical (diff 0), but EVERY window row differs - x44 median per-row rel 0.12-0.13, worst
+  0.22, x45..final similar, layer-47 selection 0/N queries identical; shifting rows by +-1 is far worse (aligned).
+  Also in the request that read cold from 0 (w02284: reads [0, 20135, 20408]) - so not the checkpoint restore: the
+  serve path reads the window differently (split reads at turn boundaries). Suspect first: PLE n-gram history or
+  another per-read state reset at a read split; then the serve short-read / verify-window path. Which one the SERVED
+  model really computes decides which capture is right (the slow one-shot path passed the trainer/head CE gates).
+  Next: CE of the head on serve final.bf16 vs cold final.bf16 over the loss tokens (the discriminator).
