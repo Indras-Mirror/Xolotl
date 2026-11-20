@@ -1,0 +1,64 @@
+diff --git a/conversion/inkling2.py b/conversion/inkling2.py
+index 63e73a6d..67558f6b 100644
+--- a/conversion/inkling2.py
++++ b/conversion/inkling2.py
+@@ -87,6 +87,9 @@ class Inkling2Model(TextModel):
+     def __init__(self, dir_model: Path, *args, **kwargs):
+         self._expert_quant: dict[str, dict] = {}
+         self._packed_experts: dict[str, gguf.LazyChunkedTensor] = {}
++        self._nvfp4_experts: dict[str, tuple] = {}
++        import os
++        self._keep_nvfp4 = os.environ.get("INKLING_KEEP_NVFP4", "1") != "0"
+         quant_path = dir_model / "hf_quant_config.json"
+         if quant_path.is_file():
+             with open(quant_path, encoding="utf-8") as f:
+@@ -165,6 +168,14 @@ class Inkling2Model(TextModel):
+                     t = gen()
+                     if t.dtype != torch.float32 or tuple(t.shape) != expected:
+                         raise ValueError(f"Inkling2: {companion}: expected F32 {expected}, got {t.dtype} {tuple(t.shape)}")
++            if nvfp4 and self._keep_nvfp4:
++                # Xolotl: keep the official NVFP4 bits - repacked into ggml NVFP4 blocks, the per-expert amax/denominator as
++                # an F32 `.scale` tensor that build_moe_ffn multiplies in (exact: the outer scale is linear)
++                self._nvfp4_experts[name] = (weight, scale, amax, denominator, w13, shape)
++                self.model_tensors[name] = lambda shape=shape: torch.empty(shape, dtype=torch.float32, device="meta")
++                for companion in required:
++                    del self.model_tensors[companion]
++                continue
+             chunks: list[Callable[[], np.ndarray]] = []
+             for expert in range(experts):
+                 for half in range(2 if w13 else 1):
+@@ -247,7 +258,34 @@ class Inkling2Model(TextModel):
+             return gguf.GGMLQuantizationType.F32
+         return super().tensor_force_quant(name, new_name, bid, n_dims)
+ 
++    def _write_nvfp4_experts(self, name: str):
++        weight, scale, amax, denominator, w13, shape = self._nvfp4_experts.pop(name)
++        experts, rows, cols = shape
++        w = LazyTorchTensor.to_eager(weight()).view(torch.uint8)
++        sc = LazyTorchTensor.to_eager(scale()).view(torch.uint8)
++        if w13:
++            # checkpoint rows interleave gate/up (2i, 2i+1); ggml's fused gate_up wants [gate; up]
++            w = w.reshape(experts, rows // 2, 2, -1).transpose(1, 2).reshape(experts, rows, -1)
++            sc = sc.reshape(experts, rows // 2, 2, -1).transpose(1, 2).reshape(experts, rows, -1)
++        if (sc & 0x80).any():
++            raise ValueError(f"Inkling2: {name}_scale: negative E4M3 block scale cannot be stored as UE4M3")
++        if ((sc & 0x7F) == 0x7F).any():
++            raise ValueError(f"Inkling2: {name}_scale: E4M3FN NaN")
++        merged = np.stack([self._nvfp4_pack(w[e].contiguous(), sc[e].view(torch.float8_e4m3fn).contiguous())[0] for e in range(experts)], axis=0)
++        target = name.replace(".w13_weight", ".gate_up_proj").replace(".w2_weight", ".down_proj")
++        new_name = self.map_tensor_name(target, try_suffixes=()) + ".weight"
++        logger.info(f"Inkling2: kept {new_name} as NVFP4 [{experts}, {rows}, {cols}] (raw official bits)")
++        self.gguf_writer.add_tensor(new_name, merged, raw_dtype=gguf.GGMLQuantizationType.NVFP4)
++        a = LazyTorchTensor.to_eager(amax()).float().numpy().astype(np.float32)
++        d = np.float32(LazyTorchTensor.to_eager(denominator()).item())
++        if not (np.isfinite(a).all() and (a >= 0).all() and np.isfinite(d) and d > 0):
++            raise ValueError(f"Inkling2: {name}: bad amax/denominator")
++        self.gguf_writer.add_tensor(new_name.replace(".weight", ".scale"), (a / d).astype(np.float32))
++
+     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        if name in self._nvfp4_experts:
++            self._write_nvfp4_experts(name)
++            return
+         if name in self._packed_experts:
+             target = name.replace(".w13_weight", ".gate_up_proj").replace(".w2_weight", ".down_proj")
+             yield self.map_tensor_name(target, try_suffixes=()) + ".weight", cast("Tensor", self._packed_experts[name])

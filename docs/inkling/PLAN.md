@@ -59,3 +59,18 @@ Evaluation (Mal, 21 Nov): the PARENT model - the official checkpoint converted e
 xolotl-inkling - is the baseline every derivative is compared against, on the same box, same harness, same settings:
 parent vs ablated vs XQ vs ablated+XQ on the Gauntlet (greedy) and on held-out logit KL / top-1 against the parent.
 Mini is not on OpenRouter (21 Nov), so there is no API run; the comparison is local only.
+
+## S0 log (21 Nov)
+
+- Parent GGUF = `/media/mal/NVME1TB/Xolotl/inkling-2-mini/Inkling-2-Mini-NVFP4.gguf` (22.9 GB, 744 tensors): routed experts of
+  layers 0-19 kept as the official NVFP4 bits (repacked into ggml NVFP4 blocks: nibble order per 16 + UE4M3 = the E4M3 scale
+  byte) with the per-expert amax/denominator as `blk.N.ffn_{gate_up,down}_exps.scale` [128] F32, which `build_moe_ffn`
+  multiplies after the expert matmul (exact: the outer scale is linear); layers 20-23 MXFP8 -> BF16 (E4M3 x 2^k always fits
+  BF16); everything else as the upstream converter writes it. Converter change = `tools/inkling/convert-keep-nvfp4.patch`
+  (on PR #32694's `conversion/inkling2.py`; committed locally in the reference tree as be961d37).
+- `tools/inkling/check_nvfp4_exact.py`: GGUF vs the official formula on experts 0/63/127 of layers 0, 19, 20, 23 -> **0
+  mismatches (EXACT)**.
+- Reference runs need `INKLING_CPU_EXPS` (default: experts of layers 20-23 in RAM) - 22.9 GB does not fit a 24 GB card whole.
+  The engine's own GGUF should carry layers 20-23 as Xolotl MXFP8 (type 43, exact) -> ~18.9 GB, all on the GPU.
+- Prompting: the template has no generation prompt; the model writes `<|message_model|>` itself. Golden prompts in
+  `.../inkling-2-mini/golden/` (p0 plain, p1 chat effort 0.2, p2 code effort 0).
