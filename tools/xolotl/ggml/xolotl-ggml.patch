@@ -1,5 +1,5 @@
 diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
-index 1cd81ee..93143c9 100644
+index 1cd81eeae..93143c994 100644
 --- a/ggml/include/ggml-cuda.h
 +++ b/ggml/include/ggml-cuda.h
 @@ -24,6 +24,25 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
@@ -29,7 +29,7 @@ index 1cd81ee..93143c9 100644
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
  
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index d62a631..610b38e 100644
+index d62a63104..610b38ecc 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -586,6 +586,15 @@ extern "C" {
@@ -194,7 +194,7 @@ index d62a631..610b38e 100644
  
      typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index fb35be3..31f3b53 100644
+index fb35be352..31f3b53fe 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -1047,7 +1047,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
@@ -216,7 +216,7 @@ index fb35be3..31f3b53 100644
              } break;
              case GGML_OP_UNARY: {
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 53d39d2..4eed078 100644
+index 53d39d249..4eed0781d 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -2114,6 +2114,42 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
@@ -285,7 +285,7 @@ index 53d39d2..4eed078 100644
          case GGML_OP_REPEAT_BACK:
          case GGML_OP_LEAKY_RELU:
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
-index 81ff5d7..ee2dbfc 100644
+index 81ff5d79f..ee2dbfc4d 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
 +++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
 @@ -440,6 +440,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
@@ -301,7 +301,7 @@ index 81ff5d7..ee2dbfc 100644
          case GGML_OP_SET_ROWS:
              return
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 5735f96..231f124 100644
+index 5735f96f8..231f124d1 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -12545,7 +12545,7 @@ void ggml_compute_forward_lightning_indexer(
@@ -525,7 +525,7 @@ index 5735f96..231f124 100644
 +    }
 +}
 diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
-index 00a2ea7..1e28823 100644
+index 00a2ea7dc..1e28823d8 100644
 --- a/ggml/src/ggml-cpu/ops.h
 +++ b/ggml/src/ggml-cpu/ops.h
 @@ -109,6 +109,11 @@ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params
@@ -541,7 +541,7 @@ index 00a2ea7..1e28823 100644
  void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
-index 101afeb..0d82fd7 100644
+index 101afeba2..0d82fd73b 100644
 --- a/ggml/src/ggml-cuda/argsort.cu
 +++ b/ggml/src/ggml-cuda/argsort.cu
 @@ -227,6 +227,143 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
@@ -843,7 +843,7 @@ index 101afeb..0d82fd7 100644
 +    GGML_ABORT("fatal error");
 +}
 diff --git a/ggml/src/ggml-cuda/argsort.cuh b/ggml/src/ggml-cuda/argsort.cuh
-index 86df5fd..0ec6cb5 100644
+index 86df5fda2..0ec6cb590 100644
 --- a/ggml/src/ggml-cuda/argsort.cuh
 +++ b/ggml/src/ggml-cuda/argsort.cuh
 @@ -5,6 +5,7 @@
@@ -855,7 +855,7 @@ index 86df5fd..0ec6cb5 100644
  #ifdef GGML_CUDA_USE_CUB
  void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 6b36ca9..ff03498 100644
+index 6b36ca90b..ff03498df 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -1446,6 +1446,7 @@ struct ggml_backend_cuda_context {
@@ -878,7 +878,7 @@ index 6b36ca9..ff03498 100644
      ggml_cuda_pool & pool(int device) {
          if (pools[device][curr_stream_no] == nullptr) {
 diff --git a/ggml/src/ggml-cuda/cpy-utils.cuh b/ggml/src/ggml-cuda/cpy-utils.cuh
-index 7697c29..86d0fb8 100644
+index 7697c292d..86d0fb800 100644
 --- a/ggml/src/ggml-cuda/cpy-utils.cuh
 +++ b/ggml/src/ggml-cuda/cpy-utils.cuh
 @@ -186,6 +186,151 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
@@ -1034,7 +1034,7 @@ index 7697c29..86d0fb8 100644
  static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
      quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);
 diff --git a/ggml/src/ggml-cuda/dequantize.cuh b/ggml/src/ggml-cuda/dequantize.cuh
-index 651524b..57c5b8a 100644
+index 651524be7..57c5b8ae7 100644
 --- a/ggml/src/ggml-cuda/dequantize.cuh
 +++ b/ggml/src/ggml-cuda/dequantize.cuh
 @@ -435,6 +435,24 @@ static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const
@@ -1063,7 +1063,7 @@ index 651524b..57c5b8a 100644
  static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
  
 diff --git a/ggml/src/ggml-cuda/dsv4-hc.cu b/ggml/src/ggml-cuda/dsv4-hc.cu
-index 2d0b3cf..26005e2 100644
+index 2d0b3cfea..26005e26b 100644
 --- a/ggml/src/ggml-cuda/dsv4-hc.cu
 +++ b/ggml/src/ggml-cuda/dsv4-hc.cu
 @@ -331,3 +331,265 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
@@ -1333,7 +1333,7 @@ index 2d0b3cf..26005e2 100644
 +    CUDA_CHECK(cudaGetLastError());
 +}
 diff --git a/ggml/src/ggml-cuda/dsv4-hc.cuh b/ggml/src/ggml-cuda/dsv4-hc.cuh
-index 1885e76..79bd30c 100644
+index 1885e7665..79bd30c05 100644
 --- a/ggml/src/ggml-cuda/dsv4-hc.cuh
 +++ b/ggml/src/ggml-cuda/dsv4-hc.cuh
 @@ -6,3 +6,8 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
@@ -1346,7 +1346,7 @@ index 1885e76..79bd30c 100644
 +void ggml_cuda_op_dsv41_route_weights(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +void ggml_cuda_op_dsv41_copies(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 41d9483..4cb6ea0 100644
+index 41d948335..4cb6ea0b0 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -622,6 +622,28 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
@@ -1388,7 +1388,7 @@ index 41d9483..4cb6ea0 100644
          static_assert(type_V == -1, "bad type");
          return nullptr;
 diff --git a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
-index d97e8fd..0adaa34 100644
+index d97e8fdb0..0adaa34e2 100644
 --- a/ggml/src/ggml-cuda/getrows.cu
 +++ b/ggml/src/ggml-cuda/getrows.cu
 @@ -404,6 +404,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
@@ -1510,7 +1510,7 @@ index d97e8fd..0adaa34 100644
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/getrows.cuh b/ggml/src/ggml-cuda/getrows.cuh
-index 3c5bea5..89e759f 100644
+index 3c5bea5f4..89e759fb2 100644
 --- a/ggml/src/ggml-cuda/getrows.cuh
 +++ b/ggml/src/ggml-cuda/getrows.cuh
 @@ -13,3 +13,5 @@ void get_rows_cuda(
@@ -1520,7 +1520,7 @@ index 3c5bea5..89e759f 100644
 +
 +void ggml_cuda_op_dsv41_kv_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index aff687a..2a66d24 100644
+index aff687a9a..d500c43fa 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -764,6 +764,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -1691,7 +1691,20 @@ index aff687a..2a66d24 100644
  int ggml_backend_cuda_get_device_count() {
      return ggml_cuda_info().device_count;
  }
-@@ -5815,6 +5941,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5783,8 +5909,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                         return false;
+                 }
+             }
+-        case GGML_OP_OUT_PROD:
+-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
++        case GGML_OP_OUT_PROD:   // Xolotl: a quantized / F16 / BF16 src0 too (dequantized on the device; LoRA training)
++            return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                   (op->src[0]->type == GGML_TYPE_F32 ||
++                    (ggml_get_to_fp32_cuda(op->src[0]->type) != nullptr && ggml_is_contiguous(op->src[0])));
+         case GGML_OP_GET_ROWS:
+             {
+                 switch (op->src[0]->type) {
+@@ -5815,6 +5943,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          return true;
                      case GGML_TYPE_IQ4_NL:
                      case GGML_TYPE_MXFP4:
@@ -1699,7 +1712,7 @@ index aff687a..2a66d24 100644
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
                          return op->src[0]->ne[0] % QK_K == 0;
-@@ -5830,7 +5957,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5830,7 +5959,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                             (
                                 (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                 op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
@@ -1709,7 +1722,7 @@ index aff687a..2a66d24 100644
                                 op->src[0]->type == GGML_TYPE_F32
                             ) || (
                                 op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
-@@ -6109,6 +6237,27 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6109,6 +6239,27 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;
@@ -1738,7 +1751,7 @@ index aff687a..2a66d24 100644
              return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
          case GGML_OP_CROSS_ENTROPY_LOSS:
 diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
-index 429d2e2..cd99653 100644
+index 429d2e200..cd9965321 100644
 --- a/ggml/src/ggml-cuda/lightning-indexer.cu
 +++ b/ggml/src/ggml-cuda/lightning-indexer.cu
 @@ -3,6 +3,18 @@
@@ -2107,7 +2120,7 @@ index 429d2e2..cd99653 100644
          default:
              return false;
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index 565ed14..838e2f1 100644
+index 565ed1481..838e2f1a5 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
 @@ -264,6 +264,12 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
@@ -2157,7 +2170,7 @@ index 565ed14..838e2f1 100644
      template void mul_mat_q_case<type, GGML_PREC_Q8>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
  
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
-index 752d28c..c1bbb15 100644
+index 752d28c4f..c1bbb1560 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
 +++ b/ggml/src/ggml-cuda/mmvf.cu
 @@ -384,6 +384,85 @@ static __global__ void mul_mat_vec_f(
@@ -2270,8 +2283,74 @@ index 752d28c..c1bbb15 100644
      const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
      const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
      const dim3 block_dims(block_size_best, 1, 1);
+diff --git a/ggml/src/ggml-cuda/out-prod.cu b/ggml/src/ggml-cuda/out-prod.cu
+index c46e0455d..0f81262dd 100644
+--- a/ggml/src/ggml-cuda/out-prod.cu
++++ b/ggml/src/ggml-cuda/out-prod.cu
+@@ -1,4 +1,5 @@
+ #include "out-prod.cuh"
++#include "convert.cuh"
+ 
+ #include <cstdint>
+ 
+@@ -30,7 +31,10 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
++    // Xolotl (LoRA training): src0 may be a frozen quantized / F16 / BF16 weight - the backward of mul_mat w.r.t. its
++    // activation is out_prod(W, dy^T).  W is dequantized to F32 on the device (in chunks of rows along the contraction
++    // dimension ne01 for a single GEMM, so a large weight never needs one full-size F32 copy), then the F32 path runs.
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 || ggml_get_to_fp32_cuda(src0->type) != nullptr);
+     GGML_ASSERT(src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+ 
+@@ -54,6 +58,43 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const float alpha = 1.0f;
+     const float beta = 0.0f;
+ 
++    if (src0->type != GGML_TYPE_F32) {
++        GGML_ASSERT(ggml_is_contiguous(src0));
++        const to_fp32_cuda_t to_f32 = ggml_get_to_fp32_cuda(src0->type);
++        const bool    s1T  = ggml_is_transposed(src1);
++        const int64_t ldb1 = (s1T ? nb10 : nb11) / sizeof(float);
++        GGML_ASSERT((s1T ? nb11 : nb10) == sizeof(float));
++        const cublasOperation_t op1 = s1T ? CUBLAS_OP_N : CUBLAS_OP_T;
++        if (ne2 == 1 && ne3 == 1) {
++            // single GEMM: dst[ne0, ne1] = sum over k of W[:, k] * src1[:, k]^T, k in chunks of whole rows of W
++            const size_t  rb   = ggml_row_size(src0->type, ne00);
++            const int64_t kc   = std::max<int64_t>(1, std::min<int64_t>(ne01, (int64_t) ((256u << 20) / (ne00 * sizeof(float)))));
++            ggml_cuda_pool_alloc<float> w(ctx.pool(), (size_t) (kc * ne00));
++            for (int64_t k0 = 0; k0 < ne01; k0 += kc) {
++                const int64_t n = std::min(kc, ne01 - k0);
++                to_f32((const char *) src0->data + (size_t) k0 * rb, w.get(), n * ne00, stream);
++                const float b = k0 == 0 ? 0.0f : 1.0f;
++                CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, op1, ne0, ne1, n,
++                                         &alpha, w.get(), ne00,
++                                                 src1_d + (s1T ? k0 : k0 * ldb1), ldb1,
++                                         &b,     dst_d, nb1 / sizeof(float)));
++            }
++            return;
++        }
++        // batched shapes (rare for weights): one full F32 copy of src0, then the F32 path below on it
++        ggml_tensor tmp = *src0;
++        ggml_cuda_pool_alloc<float> w(ctx.pool(), (size_t) ggml_nelements(src0));
++        to_f32(src0->data, w.get(), ggml_nelements(src0), stream);
++        tmp.type = GGML_TYPE_F32;
++        tmp.data = w.get();
++        tmp.nb[0] = sizeof(float);
++        for (int d = 1; d < GGML_MAX_DIMS; ++d) tmp.nb[d] = tmp.nb[d - 1] * tmp.ne[d - 1];
++        ggml_tensor d2 = *dst;
++        d2.src[0] = &tmp;
++        ggml_cuda_out_prod(ctx, &d2);
++        return;
++    }
++
+     const int64_t lda = nb01 / sizeof(float);
+     const int64_t ldc = nb1  / sizeof(float);
+ 
 diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
-index 4659970..340afa8 100644
+index 465997065..340afa8e8 100644
 --- a/ggml/src/ggml-cuda/set-rows.cu
 +++ b/ggml/src/ggml-cuda/set-rows.cu
 @@ -110,6 +110,111 @@ static void set_rows_cuda_quant(
@@ -2436,7 +2515,7 @@ index 4659970..340afa8 100644
          GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
      }
 diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
-index b0f6099..19cb45d 100644
+index b0f609990..19cb45d1f 100644
 --- a/ggml/src/ggml-cuda/top-k.cu
 +++ b/ggml/src/ggml-cuda/top-k.cu
 @@ -88,18 +88,18 @@ static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
@@ -2628,7 +2707,7 @@ index b0f6099..19cb45d 100644
          src += (size_t) ncols * iter_nrows;
          dst += (size_t) k     * iter_nrows;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 33936ac..cb6ff36 100644
+index 33936acae..cb6ff367c 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -16029,7 +16029,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
@@ -2641,7 +2720,7 @@ index 33936ac..cb6ff36 100644
                  }
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index ed8554b..bf10a64 100644
+index ed8554b14..9ac7aa68c 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1093,6 +1093,15 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -2931,3 +3010,111 @@ index ed8554b..bf10a64 100644
  struct ggml_tensor * ggml_dsv4_hc_pre(
          struct ggml_context * ctx,
          struct ggml_tensor  * x,
+@@ -6931,7 +7160,11 @@ static void ggml_compute_backward(
+                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, grad, src1));
+             }
+             if (src1_needs_grads) {
+-                ggml_sub_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1)));
++                struct ggml_tensor * tmp = ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1));
++                if (!ggml_are_same_shape(src0, src1)) {   // Xolotl: a broadcast divisor (e.g. w / sum_rows(w))
++                    tmp = ggml_repeat_back(ctx, tmp, src1);
++                }
++                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
+             }
+         } break;
+         case GGML_OP_SQR: {
+@@ -7161,6 +7394,12 @@ static void ggml_compute_backward(
+                 // noop
+             }
+         } break;
++        case GGML_OP_GET_ROWS_BACK: {   // Xolotl: a scatter-add of rows; its gradient gathers the same rows back
++            if (src0_needs_grads) {
++                struct ggml_tensor * g2 = ggml_reshape_2d(ctx, ggml_cont(ctx, grad), grad->ne[0], ggml_nelements(grad) / grad->ne[0]);
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, ggml_get_rows(ctx, g2, src1), src0));
++            }
++        } break;
+         case GGML_OP_DIAG_MASK_INF: {
+             if (src0_needs_grads) {
+                 /* ggml_diag_mask_inf_impl() shouldn't be here */
+@@ -7270,6 +7509,12 @@ static void ggml_compute_backward(
+                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, grad, src0));
+                     }
+                 } break;
++                case GGML_UNARY_OP_SIGMOID: {   // Xolotl: d sigmoid = y (1 - y)
++                    if (src0_needs_grads) {
++                        ggml_add_or_set(ctx, cgraph, isrc0,
++                            ggml_mul(ctx, grad, ggml_mul(ctx, tensor, ggml_scale_bias(ctx, tensor, -1.0f, 1.0f))));
++                    }
++                } break;
+                 case GGML_UNARY_OP_EXP: {
+                     if (src0_needs_grads) {
+                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, tensor, grad));
+@@ -7309,11 +7554,50 @@ static void ggml_compute_backward(
+                         ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
+                     }
+                 } break;
++                case GGML_GLU_OP_SWIGLU_CLAMP: {
++                    // Xolotl: out = silu(min(g, L)) * clamp(u, -L, L); the clamps pass the gradient only inside them
++                    GGML_ASSERT(src1 && "backward pass only implemented for split swiglu_clamp");
++                    const float L = ggml_get_op_params_f32(tensor, 3);
++                    struct ggml_tensor * g0 = ggml_is_contiguous(src0) ? src0 : ggml_cont(ctx, src0);   // views (v=1)
++                    struct ggml_tensor * u0 = ggml_is_contiguous(src1) ? src1 : ggml_cont(ctx, src1);
++                    struct ggml_tensor * gc = ggml_clamp(ctx, g0, -INFINITY, L);
++                    struct ggml_tensor * uc = ggml_clamp(ctx, u0, -L, L);
++                    if (src0_needs_grads) {
++                        struct ggml_tensor * in_g = ggml_step(ctx, ggml_scale_bias(ctx, g0, -1.0f, L));   // g < L
++                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, ggml_silu_back(ctx, ggml_mul(ctx, grad, uc), gc), in_g));
++                    }
++                    if (src1_needs_grads) {
++                        struct ggml_tensor * in_u = ggml_step(ctx, ggml_scale_bias(ctx, ggml_abs(ctx, u0), -1.0f, L));   // |u| < L
++                        ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_mul(ctx, ggml_silu(ctx, gc), grad), in_u));
++                    }
++                } break;
+                 default: {
+                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
+                 } //break;
+             }
+         } break;
++        case GGML_OP_CONCAT: {   // Xolotl: the two halves of the gradient along the concat dim
++            const int dim = ggml_get_op_params_i32(tensor, 0);
++            if (src0_needs_grads) {
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx,
++                    ggml_view_4d(ctx, grad, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], grad->nb[1], grad->nb[2], grad->nb[3], 0)));
++            }
++            if (src1_needs_grads) {
++                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx,
++                    ggml_view_4d(ctx, grad, src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], grad->nb[1], grad->nb[2], grad->nb[3],
++                                 (size_t) src0->ne[dim] * grad->nb[dim])));
++            }
++        } break;
++        case GGML_OP_CLAMP: {    // Xolotl: the gradient passes where min < x < max
++            if (src0_needs_grads) {
++                const float mn = ggml_get_op_params_f32(tensor, 0), mx = ggml_get_op_params_f32(tensor, 1);
++                struct ggml_tensor * m = grad;
++                struct ggml_tensor * x0 = ggml_is_contiguous(src0) ? src0 : ggml_cont(ctx, src0);
++                if (isfinite(mn)) m = ggml_mul(ctx, m, ggml_step(ctx, ggml_scale_bias(ctx, x0, 1.0f, -mn)));
++                if (isfinite(mx)) m = ggml_mul(ctx, m, ggml_step(ctx, ggml_scale_bias(ctx, x0, -1.0f, mx)));
++                ggml_add_or_set(ctx, cgraph, isrc0, m == grad ? ggml_cont(ctx, grad) : m);
++            }
++        } break;
+         case GGML_OP_NONE: {
+             // noop
+         } break;
+@@ -7494,6 +7778,17 @@ void ggml_build_backward_expand(
+                 ignore_src[1] = true;
+                 break;
+ 
++            // Xolotl (LoRA training): selections are constants of the step
++            case GGML_OP_SOFT_MAX:      // the mask (src1) and the attention sinks (src2) take no gradient
++                ignore_src[1] = true;
++                ignore_src[2] = true;
++                break;
++            case GGML_OP_TOP_K_MASK:    // a selection mask: piecewise constant in its scores
++            case GGML_OP_ARGSORT:
++            case GGML_OP_TOP_K:
++                for (int j = 0; j < GGML_MAX_SRC; ++j) ignore_src[j] = true;
++                break;
++
+             default:
+                 break;
+         }
