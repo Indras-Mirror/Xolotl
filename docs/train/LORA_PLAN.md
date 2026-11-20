@@ -155,3 +155,14 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   null gradient - caught by a segfault on grab(), not by FD; (2) the weight gather needs the flat index t*E + expert,
   not the expert id - the FD check passed on that wrong graph (analytic and numeric were wrong together), only the
   numpy reference caught it. Hence: every differentiable component gets BOTH a FD gate and a reference forward.
+- 20 Nov 23:55: **one COMPLETE QFN gated-delta-net layer as a training graph - PASS**
+  (`tools/train/qfn_layer_train.hpp`, `qfn_gdn_layer`): wqkv_z projection + qkv/z split, conv with zero history
+  (tokens on dim0, as ssm_conv wants), SILU, q|k|v split, l2 norm, repeat-tile to 48 v heads, beta/alpha from
+  w_ba (beta = rows [0,n_v), alpha = [n_v,2n_v) - the alpha view's offset in qwen4exp.cpp:1133 pins the order),
+  gate = softplus(alpha + dt) * ssm_a, gdn_chunked, gated RMS norm (sigmoid gate, not silu), ssm_out, residual.
+  Forward vs `tools/train/qfn_layer_ref.py`: 4.5e-7 rel at T=20 (1 chunk) and 6.3e-7 at T=70 (2 chunks, state path).
+  FD on every element of cur and all 7 weight tensors: the downstream pieces are 1e-6..1e-4 relative; the pieces
+  upstream of the delta net (cur, wqkv, conv) show a larger gap that is **pure central-difference truncation** -
+  dconv's worst element goes 1.50 (eps 1e-2) -> 3.84 (3e-2) -> 0.23 (3e-3) -> 2.6e-3 (3e-4), i.e. linear in eps
+  and still falling. A real gradient error would be a constant offset (that is how the MoE index bug presented).
+  Rule for this layer: FD at eps ~3e-4 (still above the F32 noise floor) or judge by convergence in eps.
