@@ -301,10 +301,25 @@ index 81ff5d79f..ee2dbfc4d 100644
          case GGML_OP_SET_ROWS:
              return
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 5735f96f8..231f124d1 100644
+index 5735f96f8..e317c7d3a 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -12545,7 +12545,7 @@ void ggml_compute_forward_lightning_indexer(
+@@ -11190,9 +11190,12 @@ static void ggml_compute_forward_solve_tri_f32(const struct ggml_compute_params
+ 
+         float * X_batch = X + i02 * nb2 / sizeof(float) + i03 * nb3 / sizeof(float);
+ 
+-        for (int64_t i00 = 0; i00 < n; ++i00) {
++        const bool upper = ggml_get_op_params_i32(dst, 0) != 0;   // Xolotl: back substitution for an upper A
++        for (int64_t ii = 0; ii < n; ++ii) {
++            const int64_t i00 = upper ? n - 1 - ii : ii;
+             float sum = 0.0f;
+-            for (int64_t t = 0; t < i00; ++t) {
++            const int64_t t0 = upper ? i00 + 1 : 0, t1 = upper ? n : i00;
++            for (int64_t t = t0; t < t1; ++t) {
+                 sum += A_batch[i00 * n + t] * X_batch[t * k + i01];
+             }
+ 
+@@ -12545,7 +12548,7 @@ void ggml_compute_forward_lightning_indexer(
      GGML_ASSERT(dst->type  == GGML_TYPE_F32);
      GGML_ASSERT(   q->type == GGML_TYPE_F32);
      GGML_ASSERT(   w->type == GGML_TYPE_F32);
@@ -313,7 +328,7 @@ index 5735f96f8..231f124d1 100644
  
      GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
      GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
-@@ -12592,7 +12592,12 @@ void ggml_compute_forward_lightning_indexer(
+@@ -12592,7 +12595,12 @@ void ggml_compute_forward_lightning_indexer(
              const float       *   w_row =       (float *) ((char *)   w->data + t*nbw1 +        s*nbw3);
              const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
              float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
@@ -326,7 +341,7 @@ index 5735f96f8..231f124d1 100644
                  char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
                  if (k_to_float) {
                      k_to_float(k_row, k_row_f32, n_embd);
-@@ -12609,8 +12614,196 @@ void ggml_compute_forward_lightning_indexer(
+@@ -12609,8 +12617,196 @@ void ggml_compute_forward_lightning_indexer(
                      score += MAX(qk, 0.0f) * w_row[h];
                  }
                  // apply mask
@@ -2514,6 +2529,47 @@ index 465997065..340afa8e8 100644
      } else {
          GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
      }
+diff --git a/ggml/src/ggml-cuda/solve_tri.cu b/ggml/src/ggml-cuda/solve_tri.cu
+index d96783420..ce857b867 100644
+--- a/ggml/src/ggml-cuda/solve_tri.cu
++++ b/ggml/src/ggml-cuda/solve_tri.cu
+@@ -41,7 +41,8 @@ static void solve_tri_f32_cublas(ggml_backend_cuda_context & ctx,
+                                  size_t                      s13,
+                                  size_t                      s2,
+                                  size_t                      s3,
+-                                 cudaStream_t                stream) {
++                                 cudaStream_t                stream,
++                                 bool                        upper = false) {
+     const float   alpha         = 1.0f;
+     const int64_t total_batches = ne02 * ne03;
+     if (total_batches == 0) {
+@@ -67,7 +68,7 @@ static void solve_tri_f32_cublas(ggml_backend_cuda_context & ctx,
+ 
+     // Yes, this is necessary, without this we get RMSE errors
+     CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_DEFAULT_MATH));
+-    CUBLAS_CHECK(cublasStrsmBatched(ctx.cublas_handle(), CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
++    CUBLAS_CHECK(cublasStrsmBatched(ctx.cublas_handle(), CUBLAS_SIDE_RIGHT, upper ? CUBLAS_FILL_MODE_LOWER : CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
+                                     CUBLAS_DIAG_NON_UNIT, k, n, &alpha, A_ptrs_dev, n, X_ptrs_dev, k, total_batches));
+ 
+     // revert to standard mode from common.cuh
+@@ -259,7 +260,8 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     const int64_t ne02 = src0->ne[2];
+     const int64_t ne03 = src0->ne[3];
+ 
+-    if (n <= MAX_N_FAST && k <= MAX_K_FAST) {
++    const bool upper = ggml_get_op_params_i32(dst, 0) != 0;   // Xolotl: upper (the backward's A^T solve) via cuBLAS
++    if (!upper && n <= MAX_N_FAST && k <= MAX_K_FAST) {
+         solve_tri_f32_cuda((const float *) src0->data, (const float *) src1->data, (float *) dst->data, n, k,
+                            src0->ne[2], src0->ne[3], src0->nb[2] / sizeof(float), src0->nb[3] / sizeof(float),
+                            src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float), dst->nb[2] / sizeof(float),
+@@ -268,6 +270,6 @@ void ggml_cuda_op_solve_tri(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+         solve_tri_f32_cublas(ctx, (const float *) src0->data, (const float *) src1->data, (float *) dst->data, n, k,
+                              ne02, ne03, src0->nb[2] / sizeof(float), src0->nb[3] / sizeof(float),
+                              src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float), dst->nb[2] / sizeof(float),
+-                             dst->nb[3] / sizeof(float), ctx.stream());
++                             dst->nb[3] / sizeof(float), ctx.stream(), upper);
+     }
+ }
 diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
 index b0f609990..19cb45d1f 100644
 --- a/ggml/src/ggml-cuda/top-k.cu
@@ -2720,7 +2776,7 @@ index 33936acae..cb6ff367c 100644
                  }
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index ed8554b14..238be358d 100644
+index ed8554b14..62b322249 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1093,6 +1093,15 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -2783,7 +2839,20 @@ index ed8554b14..238be358d 100644
  
      result = ggml_view_4d(ctx, result,
                  k, result->ne[1], result->ne[2], result->ne[3],
-@@ -6482,9 +6503,9 @@ struct ggml_tensor * ggml_lightning_indexer(
+@@ -6403,10 +6424,11 @@ struct ggml_tensor * ggml_solve_tri(
+     GGML_ASSERT(ggml_is_contiguous(a));
+     GGML_ASSERT(ggml_is_contiguous(b));
+ 
+-    GGML_ASSERT(lower && left && !uni); // TODO: support other variants
++    GGML_ASSERT(left && !uni); // TODO: support other variants (Xolotl: upper added for the backward)
+ 
+     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, b->ne[0], b->ne[1], b->ne[2], b->ne[3]);
+ 
++    ggml_set_op_params_i32(result, 0, lower ? 0 : 1);   // Xolotl: 1 = upper triangular (back substitution)
+     result->op     = GGML_OP_SOLVE_TRI;
+     result->src[0] = a;
+     result->src[1] = b;
+@@ -6482,9 +6504,9 @@ struct ggml_tensor * ggml_lightning_indexer(
  
      GGML_ASSERT(       q->type == GGML_TYPE_F32);
      GGML_ASSERT( weights->type == GGML_TYPE_F32);
@@ -2795,7 +2864,7 @@ index ed8554b14..238be358d 100644
      GGML_ASSERT(      q->ne[1] == weights->ne[0]);
      GGML_ASSERT(      k->ne[1] == 1);
      GGML_ASSERT(   mask->ne[1] == q->ne[2]);
-@@ -6598,6 +6619,214 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
+@@ -6598,6 +6620,214 @@ static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
      return result;
  }
  
@@ -3010,7 +3079,7 @@ index ed8554b14..238be358d 100644
  struct ggml_tensor * ggml_dsv4_hc_pre(
          struct ggml_context * ctx,
          struct ggml_tensor  * x,
-@@ -6931,7 +7160,11 @@ static void ggml_compute_backward(
+@@ -6931,7 +7161,11 @@ static void ggml_compute_backward(
                  ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, grad, src1));
              }
              if (src1_needs_grads) {
@@ -3023,7 +3092,7 @@ index ed8554b14..238be358d 100644
              }
          } break;
          case GGML_OP_SQR: {
-@@ -7094,10 +7327,11 @@ static void ggml_compute_backward(
+@@ -7094,10 +7328,11 @@ static void ggml_compute_backward(
              // same as cpy
              if (src0_needs_grads) {
                  GGML_ASSERT(!cgraph->grads[isrc0] || ggml_is_contiguous(cgraph->grads[isrc0]));
@@ -3037,7 +3106,7 @@ index ed8554b14..238be358d 100644
              }
          } break;
          case GGML_OP_RESHAPE: {
-@@ -7161,6 +7395,12 @@ static void ggml_compute_backward(
+@@ -7161,6 +7396,12 @@ static void ggml_compute_backward(
                  // noop
              }
          } break;
@@ -3050,7 +3119,7 @@ index ed8554b14..238be358d 100644
          case GGML_OP_DIAG_MASK_INF: {
              if (src0_needs_grads) {
                  /* ggml_diag_mask_inf_impl() shouldn't be here */
-@@ -7270,6 +7510,12 @@ static void ggml_compute_backward(
+@@ -7270,6 +7511,12 @@ static void ggml_compute_backward(
                          ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, grad, src0));
                      }
                  } break;
@@ -3063,7 +3132,7 @@ index ed8554b14..238be358d 100644
                  case GGML_UNARY_OP_EXP: {
                      if (src0_needs_grads) {
                          ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, tensor, grad));
-@@ -7309,11 +7555,50 @@ static void ggml_compute_backward(
+@@ -7309,11 +7556,101 @@ static void ggml_compute_backward(
                          ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
                      }
                  } break;
@@ -3111,10 +3180,61 @@ index ed8554b14..238be358d 100644
 +                ggml_add_or_set(ctx, cgraph, isrc0, m == grad ? ggml_cont(ctx, grad) : m);
 +            }
 +        } break;
++        case GGML_OP_SOLVE_TRI: {   // Xolotl: X = A^-1 B (A lower): dB = A^-T G (upper solve), dA = -tril(dB X^T)
++            GGML_ASSERT(ggml_get_op_params_i32(tensor, 0) == 0 && "SOLVE_TRI backward: lower-triangular forward only");
++            struct ggml_tensor * dB = ggml_solve_tri(ctx, ggml_cont(ctx, ggml_transpose(ctx, src0)), ggml_cont(ctx, grad), true, false, false);
++            if (src1_needs_grads) {
++                ggml_add_or_set(ctx, cgraph, isrc1, dB);
++            }
++            if (src0_needs_grads) {
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale(ctx, ggml_tri(ctx, ggml_mul_mat(ctx, tensor, dB), GGML_TRI_TYPE_LOWER_DIAG), -1.0f));
++            }
++        } break;
++        case GGML_OP_TRI: {         // Xolotl: the same mask on the gradient
++            if (src0_needs_grads) {
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_tri(ctx, ggml_cont(ctx, grad), (enum ggml_tri_type) ggml_get_op_params_i32(tensor, 0)));
++            }
++        } break;
++        case GGML_OP_CUMSUM: {      // Xolotl: reverse cumsum along dim 0 = sum - cumsum + g
++            if (src0_needs_grads) {
++                struct ggml_tensor * g = ggml_cont(ctx, grad);
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_add(ctx, ggml_sub(ctx, ggml_repeat(ctx, ggml_sum_rows(ctx, g), g), ggml_cumsum(ctx, g)), g));
++            }
++        } break;
++        case GGML_OP_SSM_CONV: {    // Xolotl: y[i,t,s] = sum_k sx[t+k,i,s] c[k,i]
++            const int64_t d_conv = src1->ne[0], d_inner = src1->ne[1], n_t = tensor->ne[1], n_s = tensor->ne[2];
++            struct ggml_tensor * gT = ggml_cont(ctx, ggml_transpose(ctx, grad));   // [n_t, d_inner, n_s]
++            struct ggml_tensor * dsx = NULL, * dc = NULL;
++            for (int64_t k = 0; k < d_conv; ++k) {
++                if (src0_needs_grads) {
++                    struct ggml_tensor * ck = ggml_cont(ctx, ggml_view_2d(ctx, src1, 1, d_inner, src1->nb[1], (size_t) k * src1->nb[0]));
++                    struct ggml_tensor * t = ggml_pad_ext(ctx, ggml_mul(ctx, gT, ck), (int) k, (int) (d_conv - 1 - k), 0, 0, 0, 0, 0, 0);
++                    dsx = dsx ? ggml_add(ctx, dsx, t) : t;
++                }
++                if (src1_needs_grads) {
++                    struct ggml_tensor * sk = ggml_cont(ctx, ggml_view_3d(ctx, src0, n_t, d_inner, n_s, src0->nb[1], src0->nb[2], (size_t) k * src0->nb[0]));
++                    struct ggml_tensor * r = ggml_sum_rows(ctx, ggml_mul(ctx, gT, sk));                          // [1, d_inner, n_s]
++                    r = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, r, 2, 1, 0, 3)));                 // [1, d_inner, 1]
++                    r = ggml_reshape_2d(ctx, r, 1, d_inner);
++                    dc = dc ? ggml_concat(ctx, dc, r, 0) : r;
++                }
++            }
++            if (src0_needs_grads) ggml_add_or_set(ctx, cgraph, isrc0, dsx);
++            if (src1_needs_grads) ggml_add_or_set(ctx, cgraph, isrc1, dc);
++        } break;
++        case GGML_OP_PAD: {         // Xolotl: crop the gradient back to the input
++            GGML_ASSERT(ggml_get_op_params_i32(tensor, 8) == 0 && "PAD backward: circular padding not supported");
++            if (src0_needs_grads) {
++                const size_t off = (size_t) ggml_get_op_params_i32(tensor, 0) * grad->nb[0] + (size_t) ggml_get_op_params_i32(tensor, 2) * grad->nb[1] +
++                                   (size_t) ggml_get_op_params_i32(tensor, 4) * grad->nb[2] + (size_t) ggml_get_op_params_i32(tensor, 6) * grad->nb[3];
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx,
++                    ggml_view_4d(ctx, grad, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], grad->nb[1], grad->nb[2], grad->nb[3], off)));
++            }
++        } break;
          case GGML_OP_NONE: {
              // noop
          } break;
-@@ -7494,6 +7779,17 @@ void ggml_build_backward_expand(
+@@ -7494,6 +7831,17 @@ void ggml_build_backward_expand(
                  ignore_src[1] = true;
                  break;
  

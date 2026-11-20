@@ -64,3 +64,36 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   analytic -0.0484 vs numeric -0.0922 (1.9x) - HY4_TRAIN_CHECK=1 (train-graph output vs forward per layer) is built and
   next. Adapter-at-inference test (HY4_LORA_LOAD, t1prompt/) built, not run. Handover: ~/.quetza-data/RESUME-2026-11-20-LORA-QFN.md.
   Reference docs from Basalt/Adamant (MIT) saved in docs/train/ref/.
+- 20 Nov 20:10: **FD question RESOLVED - the gradient is correct.** HY4_TRAIN_CHECK=1 (`~/v41-work/hy4/check1.log`): the
+  training graph's layer output vs the inference forward's, layers 41..38, rel err 1.3e-3 / 1.1e-3 / 8e-4 / 5.6e-4 (both
+  steps) - the train graph IS the served forward. HY4_FD_DIR (new; directional derivative along the unit gradient over
+  all 1.3 M adapter params, `fd2.log`): numeric/analytic = 2.130 (eps 0.003), 1.369 (0.01), 1.092 (0.03), **0.996 (0.1)**;
+  the excess is a constant ~0.007 loss noise floor (activation rounding in quantized products + top-k expert flips),
+  so it shrinks as 1/eps. The single-element FD flips SIGN across eps (+0.051, +0.072, -0.069, -0.054 vs analytic
+  -0.048): pure noise - the earlier "1.9x" was noise. Rule: on the as-served forward, check gradients directionally
+  with eps ~0.1, never per element.
+  Adapter GGUF (5c, writer + loader): `tools/train/lora_gguf.hpp` (llama.cpp format: general.type=adapter,
+  general.architecture=<base>, adapter.type=lora, adapter.lora.alpha; `<W>.lora_a` [n_in, r], `<W>.lora_b` [r, n_out],
+  F32; reader takes F32/F16). hy4_train HY4_TRAIN_SAVE=*.gguf writes it; hy4_generate HY4_LORA_LOAD takes .gguf or the
+  raw .bin (alpha from the file). `tools/train/lora_bin_to_gguf` converted lora-t1.bin -> lora-t1.gguf, round trip
+  EXACT, gguf-py reads keys + 32 tensors (arch hy_v4_flash).
+- 20 Nov 20:50: **5b PASS - the trained adapter works at inference.** `hy4_generate_lora` with
+  HY4_LORA_LOAD=lora-t1.gguf (via the new GGUF reader) on the first 24 training tokens: the 40 generated ids equal
+  `t1prompt/expected.txt` exactly (40/40); the base model produces different text (`~/v41-work/hy4/lorainf.log`). So
+  T1 is complete on Hy4: train -> save GGUF -> load -> reproduces the trained continuation.
+  **QFN (5e) scoping:** the pack is `qwen4exp` (48 layers: 36 gated-delta-net + 12 full-attention with the QSA
+  lightning indexer and compress ratio 4, hyper-connections hc=4 with low-rank 320 mix, PLE per-layer embeddings,
+  512 experts top-10, latent 640; weights Q8_0/BF16/F32 dense, experts Q2_0/IQ1_M/IQ4_XS/IQ4_NL). The Strata QFN engine
+  is native CUDA (no ggml graphs), so the trainer will be a per-layer ggml graph ported from the private llama.cpp's
+  `src/models/qwen4exp.cpp` (its non-fused paths: build_hc_mix/combine from plain ops; delta net via
+  delta-net-base.cpp build_delta_net_chunking) - the Hy4 trainer structure, forward = the same graphs.
+  **K4 GDN backward rules (ggml.c) + SOLVE_TRI upper:** SOLVE_TRI (dB = A^-T G via a new upper-triangular solve: CPU
+  back substitution, CUDA via the cuBLAS path with the fill mode flipped; op param 0 = upper, 0 keeps old graphs),
+  dA = -tril(dB X^T); TRI (mask the grad); CUMSUM (sum - cumsum + g); SSM_CONV (dsx = sum_k pad_k(g^T * c_k), dc =
+  per-k reductions); PAD (crop, non-circular). Gates: test-backend-ops grad mode CPU + CUDA OK for TRI, CUMSUM,
+  SSM_CONV, PAD; SOLVE_TRI forward incl. 3 new upper cases CUDA vs CPU 27/27 OK; SOLVE_TRI backward checked by
+  `tools/train/test_xtrain_solve_tri.cpp` (max abs vs central FD, n 10/17/30, 3-D + 4-D batches, 1 + 16 threads:
+  4e-7..4e-5). test-backend-ops' own SOLVE_TRI grad check stays red: its relative per-element metric divides by
+  (gn + ga), which is 0 on the untouched upper triangle - not a gradient error (same gradients score 1e-4 when the
+  0/0 entries are skipped). Test-side changes live in `tools/train/test-backend-ops-train.patch` (production patch
+  stays ggml/ only; both apply clean on 6050b467).

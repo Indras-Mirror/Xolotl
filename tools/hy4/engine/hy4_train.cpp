@@ -9,10 +9,11 @@
 //   update   AdamW on the host copies, uploaded back
 // Env: HY4_LORA_LAYERS "a-b" (default the top 4), HY4_LORA_TARGETS (comma list of per-layer weight suffixes, default
 // attn_q_a,attn_q_b,attn_kv_a_mqa,attn_output), HY4_LORA_RANK (8), HY4_LORA_ALPHA (16), HY4_LR (1e-3), HY4_TRAIN_N
-// (64), HY4_TRAIN_FD=1 (finite-difference check of one adapter element before training), HY4_TRAIN_SAVE=<file.bin>
-// (the adapters after the last step: raw F32, name + shapes, until the GGUF writer lands).  Expert env as hy4_generate.
+// (64), HY4_TRAIN_FD=1 (finite-difference check of one adapter element before training), HY4_TRAIN_SAVE=<file.gguf|file.bin>
+// (the adapters after the last step: .gguf = llama.cpp-format LoRA GGUF, else raw F32 name + shapes).  Expert env as hy4_generate.
 #include "hy4_dense.hpp"
 #include "hy4_moe.hpp"
+#include "../../train/lora_gguf.hpp"
 
 #include "ggml-cuda.h"
 
@@ -185,6 +186,44 @@ int main(int argc, char ** argv) {
         dense.lora_set(i, A[(size_t) i].data(), B[(size_t) i].data());
         std::printf("FD check %s B[%zu]: analytic %+.6f numeric %+.6f (loss %.5f)\n", dense.lora_name(i).c_str(), j,
                     gB[(size_t) i][j], (lp - lm) / (2 * eps), loss);
+        // HY4_FD_DIR="e1,e2,...": directional derivative along the unit gradient over ALL adapter params. Analytic
+        // = |g|; the loss change is eps*|g| per side, far above the activation-rounding noise of one element.
+        // The same eps list is also used for the single element above (per-element numeric at each eps).
+        const char * dl = env("HY4_FD_DIR", "");
+        if (*dl) {
+            double gn2 = 0;
+            for (int q = 0; q < NL; ++q) {
+                for (float g : gA[(size_t) q]) gn2 += (double) g * g;
+                for (float g : gB[(size_t) q]) gn2 += (double) g * g;
+            }
+            const double gnorm = std::sqrt(gn2);
+            auto set_dir = [&](double s) {   // params + s * g / |g|
+                for (int q = 0; q < NL; ++q) {
+                    auto a = A[(size_t) q], b = B[(size_t) q];
+                    if (!gA[(size_t) q].empty()) for (size_t k = 0; k < a.size(); ++k) a[k] += (float) (s * gA[(size_t) q][k] / gnorm);
+                    if (!gB[(size_t) q].empty()) for (size_t k = 0; k < b.size(); ++k) b[k] += (float) (s * gB[(size_t) q][k] / gnorm);
+                    dense.lora_set(q, a.data(), b.data());
+                }
+            };
+            for (const char * p = dl; *p;) {
+                const double e = std::atof(p);
+                float dp = 0, dm = 0;
+                set_dir(+e); loss_only(dp);
+                set_dir(-e); loss_only(dm);
+                set_dir(0);
+                float ep = 0, em = 0;
+                auto Bq = B[(size_t) i];
+                Bq[j] += (float) e; dense.lora_set(i, A[(size_t) i].data(), Bq.data()); loss_only(ep);
+                Bq[j] -= (float) (2 * e); dense.lora_set(i, A[(size_t) i].data(), Bq.data()); loss_only(em);
+                dense.lora_set(i, A[(size_t) i].data(), B[(size_t) i].data());
+                std::printf("FD eps %.4g: direction analytic %.6f numeric %.6f (ratio %.3f; L+ %.5f L- %.5f) | element numeric %+.6f (ratio %.3f)\n",
+                            e, gnorm, (dp - dm) / (2 * e), (dp - dm) / (2 * e) / gnorm, dp, dm,
+                            (ep - em) / (2 * e), (ep - em) / (2 * e) / gB[(size_t) i][j]);
+                std::fflush(stdout);
+                while (*p && *p != ',') ++p;
+                if (*p == ',') ++p;
+            }
+        }
     }
 
     const float lr = (float) std::atof(env("HY4_LR", "1e-3")), b1 = 0.9f, b2 = 0.999f, wd = 0.0f, aeps = 1e-8f;
@@ -221,7 +260,23 @@ int main(int argc, char ** argv) {
         float loss = 0;
         if (loss_only(loss)) std::printf("final loss %.5f\n", loss);
     }
-    if (const char * sv = std::getenv("HY4_TRAIN_SAVE")) {
+    if (const char * sv = std::getenv("HY4_TRAIN_SAVE"); sv && std::string(sv).size() > 5 &&
+        std::string(sv).compare(std::string(sv).size() - 5, 5, ".gguf") == 0) {
+        // llama.cpp-format LoRA GGUF (tools/train/lora_gguf.hpp)
+        std::vector<xolotl::train::LoraTensorPair> ad((size_t) NL);
+        for (int i = 0; i < NL; ++i) {
+            auto & p = ad[(size_t) i];
+            dense.lora_shape(i, p.n_in, p.n_out, p.rank);
+            p.name = dense.lora_name(i);
+            p.A = A[(size_t) i];
+            p.B = B[(size_t) i];
+        }
+        const MetaValue * av = dense.model().meta().get("general.architecture");
+        const std::string arch = av && !av->s.empty() ? av->s : "hy4";
+        std::string werr;
+        if (!xolotl::train::write_lora_gguf(sv, arch, alpha, ad, werr)) { std::fprintf(stderr, "save: %s\n", werr.c_str()); return 1; }
+        std::printf("saved %d adapters to %s (LoRA GGUF, arch %s, alpha %.0f)\n", NL, sv, arch.c_str(), alpha);
+    } else if (sv) {
         std::ofstream o(sv, std::ios::binary);
         for (int i = 0; i < NL; ++i) {
             int64_t a, b, r;

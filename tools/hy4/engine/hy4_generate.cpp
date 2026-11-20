@@ -7,6 +7,7 @@
 // state against <dir>/l_out-<last>.f32 when present.  Then n_gen greedy tokens, one pass each, printed detokenized.
 #include "hy4_dense.hpp"
 #include "hy4_moe.hpp"
+#include "../../train/lora_gguf.hpp"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -84,13 +85,26 @@ int main(int argc, char ** argv) {
     std::string err;
     if (!dense.init(gguf, cfg, err)) { std::fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
     const Hy4Geometry & G = dense.geom();
-    // HY4_LORA_LOAD=<file>: adapters saved by hy4_train (HY4_TRAIN_SAVE): name, n_in, n_out, rank, A, B per adapter
+    // HY4_LORA_LOAD=<file>: adapters saved by hy4_train (HY4_TRAIN_SAVE): a LoRA GGUF (.gguf, llama.cpp format) or the raw
+    // .bin (name, n_in, n_out, rank, A, B per adapter)
     if (const char * lf = std::getenv("HY4_LORA_LOAD")) {
-        std::ifstream in(lf, std::ios::binary);
         std::vector<std::string> names;
         std::vector<std::vector<float>> As, Bs;
         int64_t rank = 0;
-        for (uint32_t len; in.read((char *) &len, 4);) {
+        float file_alpha = 0;
+        const std::string lfs = lf;
+        if (lfs.size() > 5 && lfs.compare(lfs.size() - 5, 5, ".gguf") == 0) {
+            std::vector<xolotl::train::LoraTensorPair> ad;
+            std::string arch;
+            if (!xolotl::train::read_lora_gguf(lfs, ad, file_alpha, arch, err)) { std::fprintf(stderr, "lora load: %s\n", err.c_str()); return 1; }
+            for (auto & p : ad) {
+                if (rank && p.rank != rank) { std::fprintf(stderr, "lora load: mixed ranks are not supported\n"); return 1; }
+                rank = p.rank;
+                names.push_back(p.name); As.push_back(std::move(p.A)); Bs.push_back(std::move(p.B));
+            }
+        }
+        std::ifstream in(lfs.size() > 5 && lfs.compare(lfs.size() - 5, 5, ".gguf") == 0 ? std::string() : lfs, std::ios::binary);
+        for (uint32_t len; in && in.read((char *) &len, 4);) {
             std::string nm(len, '\0');
             in.read(nm.data(), len);
             int64_t a, b, r;
@@ -101,7 +115,7 @@ int main(int argc, char ** argv) {
             names.push_back(nm);
             rank = r;
         }
-        const float alpha = std::getenv("HY4_LORA_ALPHA") ? (float) std::atof(std::getenv("HY4_LORA_ALPHA")) : 16.0f;
+        const float alpha = std::getenv("HY4_LORA_ALPHA") ? (float) std::atof(std::getenv("HY4_LORA_ALPHA")) : file_alpha > 0 ? file_alpha : 16.0f;
         if (names.empty() || !dense.lora_add(names, (int) rank, alpha, 1, err)) { std::fprintf(stderr, "lora load: %s\n", err.c_str()); return 1; }
         for (int i = 0; i < dense.lora_count(); ++i) dense.lora_set(i, As[(size_t) i].data(), Bs[(size_t) i].data());
         std::printf("loaded %d adapters (rank %lld, alpha %.0f) from %s\n", dense.lora_count(), (long long) rank, alpha, lf);
