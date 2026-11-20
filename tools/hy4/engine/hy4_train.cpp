@@ -140,8 +140,18 @@ int main(int argc, char ** argv) {
         gB.assign((size_t) NL, {});
         if (!dense.train_head(st.x_last.data(), targets.data(), &loss, gx.data(), gA, gB)) return false;
         auto t1 = std::chrono::steady_clock::now();
+        const bool chk = env("HY4_TRAIN_CHECK", "0")[0] == '1';
         for (int il = (int) G.n_layer - 1; il >= lowest; --il) {
-            if (!dense.train_layer(il, st.x_in[(size_t) il].data(), gx.data(), st.ids[(size_t) il].data(), gin.data(), gA, gB)) return false;
+            // HY4_TRAIN_CHECK=1: the training graph's layer output vs the forward's (the next layer's saved input)
+            const float * expect = chk ? (il + 1 < G.n_layer ? st.x_in[(size_t) il + 1].data() : st.x_last.data()) : nullptr;
+            double re = -1;
+            if (!dense.train_layer(il, st.x_in[(size_t) il].data(), gx.data(), st.ids[(size_t) il].data(), gin.data(), gA, gB,
+                                   expect, &re)) return false;
+            if (chk) {
+                double gn = 0;
+                for (float v : gin) gn += (double) v * v;
+                std::printf("  layer %2d: train-graph output vs forward rel err %.3e | |g_in| %.3e\n", il, re, std::sqrt(gn));
+            }
             std::swap(gx, gin);
         }
         auto t2 = std::chrono::steady_clock::now();

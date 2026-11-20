@@ -90,7 +90,9 @@ public:
     /// forward's routing (n * n_used).  Out: g_in = d loss / d x_in; gA / gB[i] += the gradient of every adapter of
     /// this layer (sized by the caller to the adapters' A / B).
     bool train_layer(int il, const float * x_in, const float * g_out, const int * ids, float * g_in,
-                     std::vector<std::vector<float>> & gA, std::vector<std::vector<float>> & gB);
+                     std::vector<std::vector<float>> & gA, std::vector<std::vector<float>> & gB,
+                     const float * expect_out = nullptr, double * out_rel_err = nullptr);
+    ///   expect_out (optional): the forward's output of this layer; *out_rel_err = the training graph's output vs it
     /// The head: x_last (the state after the last layer), targets[t] = the token expected at t + 1 (-1 = no loss there).
     /// Out: the mean cross-entropy over the counted positions and g_x = d loss / d x_last.
     bool train_head(const float * x_last, const int * targets, float * loss, float * g_x,

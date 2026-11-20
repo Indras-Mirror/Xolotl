@@ -84,6 +84,28 @@ int main(int argc, char ** argv) {
     std::string err;
     if (!dense.init(gguf, cfg, err)) { std::fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
     const Hy4Geometry & G = dense.geom();
+    // HY4_LORA_LOAD=<file>: adapters saved by hy4_train (HY4_TRAIN_SAVE): name, n_in, n_out, rank, A, B per adapter
+    if (const char * lf = std::getenv("HY4_LORA_LOAD")) {
+        std::ifstream in(lf, std::ios::binary);
+        std::vector<std::string> names;
+        std::vector<std::vector<float>> As, Bs;
+        int64_t rank = 0;
+        for (uint32_t len; in.read((char *) &len, 4);) {
+            std::string nm(len, '\0');
+            in.read(nm.data(), len);
+            int64_t a, b, r;
+            in.read((char *) &a, 8); in.read((char *) &b, 8); in.read((char *) &r, 8);
+            As.emplace_back((size_t) (a * r)); Bs.emplace_back((size_t) (r * b));
+            in.read((char *) As.back().data(), (std::streamsize) (As.back().size() * 4));
+            in.read((char *) Bs.back().data(), (std::streamsize) (Bs.back().size() * 4));
+            names.push_back(nm);
+            rank = r;
+        }
+        const float alpha = std::getenv("HY4_LORA_ALPHA") ? (float) std::atof(std::getenv("HY4_LORA_ALPHA")) : 16.0f;
+        if (names.empty() || !dense.lora_add(names, (int) rank, alpha, 1, err)) { std::fprintf(stderr, "lora load: %s\n", err.c_str()); return 1; }
+        for (int i = 0; i < dense.lora_count(); ++i) dense.lora_set(i, As[(size_t) i].data(), Bs[(size_t) i].data());
+        std::printf("loaded %d adapters (rank %lld, alpha %.0f) from %s\n", dense.lora_count(), (long long) rank, alpha, lf);
+    }
     Hy4Moe moe;
     if (!moe.init(dense.model(), gguf, G, nthr, err)) { std::fprintf(stderr, "moe: %s\n", err.c_str()); return 1; }
     const MetaValue * tv = dense.model().meta().get("tokenizer.ggml.tokens");

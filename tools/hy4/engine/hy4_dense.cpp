@@ -869,7 +869,8 @@ void add_grad(ggml_cgraph * gf, ggml_tensor * t, std::vector<float> & acc) {
 }  // namespace
 
 bool Hy4Dense::train_layer(int il, const float * x_in, const float * g_out, const int * ids, float * g_in,
-                           std::vector<std::vector<float>> & gA, std::vector<std::vector<float>> & gB) {
+                           std::vector<std::vector<float>> & gA, std::vector<std::vector<float>> & gB,
+                           const float * expect_out, double * out_rel_err) {
     Impl & im = *p_;
     const Hy4Geometry & G = im.G;
     const Layer & ly = im.L[(size_t) il];
@@ -973,7 +974,15 @@ bool Hy4Dense::train_layer(int il, const float * x_in, const float * g_out, cons
     }
     ggml_tensor * out = im.hc_post(c, f, xm, post_f);
     ggml_tensor * loss = ggml_sum(c, ggml_mul(c, out, gout));   // the surrogate: d loss / d (params) = the layer's VJP
+    ggml_set_output(out);
     if (!tg.run(im.be, loss)) return im.fail("train_layer: graph allocation or compute failed");
+    if (expect_out && out_rel_err) {
+        std::vector<float> o((size_t) (D * HC * n));
+        ggml_backend_tensor_get(out, o.data(), 0, o.size() * 4);
+        double num = 0, den = 0;
+        for (size_t i = 0; i < o.size(); ++i) { const double d = o[i] - expect_out[i]; num += d * d; den += (double) expect_out[i] * expect_out[i]; }
+        *out_rel_err = std::sqrt(num / std::max(den, 1e-30));
+    }
     ggml_backend_tensor_get(ggml_graph_get_grad(tg.gf, x), g_in, 0, (size_t) (D * HC * n) * 4);
     gA.resize(im.lora.size());
     gB.resize(im.lora.size());
