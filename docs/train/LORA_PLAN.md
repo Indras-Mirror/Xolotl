@@ -166,7 +166,7 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   dconv's worst element goes 1.50 (eps 1e-2) -> 3.84 (3e-2) -> 0.23 (3e-3) -> 2.6e-3 (3e-4), i.e. linear in eps
   and still falling. A real gradient error would be a constant offset (that is how the MoE index bug presented).
   Rule for this layer: FD at eps ~3e-4 (still above the F32 noise floor) or judge by convergence in eps.
-- 21 Nov 00:40: **FIRST QFN TRAINING RUN on real pack weights - PASS** (`tools/train/qfn_train.cpp` +
+- 20 Nov 21:58: **FIRST QFN TRAINING RUN on real pack weights - PASS** (`tools/train/qfn_train.cpp` +
   `tools/train/qfn_export.py`). Real `blk.0` gated-delta-net tensors dequantized from the 45 GB XQ pack
   (`/media/Crucial1TB/xolotl-train/qfn_l0.f32`, D 2560, hd 128, 16 k / 48 v heads, channels 10240), two real
   token-embedding windows (32 tokens each, token_embd rows 100-163). Frozen base, rank-8 alpha-16 adapters on
