@@ -97,3 +97,17 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   (gn + ga), which is 0 on the untouched upper triangle - not a gradient error (same gradients score 1e-4 when the
   0/0 entries are skipped). Test-side changes live in `tools/train/test-backend-ops-train.patch` (production patch
   stays ggml/ only; both apply clean on 6050b467).
+- 20 Nov 21:05: **5d GDN as a differentiable ggml graph - PASS.** `tools/train/gdn_train.hpp` (`gdn_chunked`) is a
+  line-for-line port of llama.cpp `build_delta_net_chunking` (non-KDA path, which is what QFN uses: its gate is
+  [1, H, T]) built only from ops that have backward rules. Two changes were needed for autodiff, both semantics-neutral:
+  the identity matrix is an input (ggml_fill/ggml_diag have no backward) and the per-chunk outputs are CONCATenated
+  instead of ggml_set_inplace into v (in-place writes break backward graphs). Forward gate: python reference
+  `tools/train/gdn_ref.py` (same algorithm, ggml op conventions verified numerically) agrees to 1.2e-6 (rel 2.7e-7) at
+  S16/H2/T100 (2 chunks incl. 28 padded), and at T=4/64/128/200 shapes. Gradient gate: `tools/train/test_gdn_chunked.cpp`
+  central FD on every element of q,k,v,g,b (10k elements, eps 1e-2, stride 1): max abs err dq 6.9e-5, dk 1.3e-4,
+  dv 6.4e-5, dg 1.5e-4, db 1.2e-4 against gradient magnitudes 1.2..10.5 (mean relative 1e-5..1e-4 = FD noise).
+  Autodiff gaps this exposed and fixed in ggml.c (all backward-only): (1) ADD/SUB/MUL backward assume equal shapes, so
+  gdn_chunked expands every grad-carrying broadcast operand with ggml_repeat_4d (the reference gets away with implicit
+  broadcast because it never trains); (2) PERMUTE/TRANSPOSE backward returned bare strided views, which the binary-op
+  CPU kernel rejects as src0 (nb00 != 4) - both now ggml_cont; (3) SCALE backward hit the same thing via a permuted
+  grad - it conts when !ggml_is_padded_1d.

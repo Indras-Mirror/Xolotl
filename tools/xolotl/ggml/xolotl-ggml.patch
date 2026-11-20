@@ -2776,7 +2776,7 @@ index 33936acae..cb6ff367c 100644
                  }
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index ed8554b14..62b322249 100644
+index ed8554b14..0884baa55 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1093,6 +1093,15 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -3092,7 +3092,18 @@ index ed8554b14..62b322249 100644
              }
          } break;
          case GGML_OP_SQR: {
-@@ -7094,10 +7328,11 @@ static void ggml_compute_backward(
+@@ -7048,7 +7282,9 @@ static void ggml_compute_backward(
+             if (src0_needs_grads) {
+                 float s;
+                 memcpy(&s, tensor->op_params, sizeof(float));
+-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad, s, 0.0, false));
++                // Xolotl: PERMUTE's backward hands over a strided grad; ggml_scale_impl wants padded-1d
++                struct ggml_tensor * g = ggml_is_padded_1d(grad) ? grad : ggml_cont(ctx, grad);
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, g, s, 0.0, false));
+             }
+         } break;
+         case GGML_OP_SET: {
+@@ -7094,10 +7330,11 @@ static void ggml_compute_backward(
              // same as cpy
              if (src0_needs_grads) {
                  GGML_ASSERT(!cgraph->grads[isrc0] || ggml_is_contiguous(cgraph->grads[isrc0]));
@@ -3106,7 +3117,24 @@ index ed8554b14..62b322249 100644
              }
          } break;
          case GGML_OP_RESHAPE: {
-@@ -7161,6 +7396,12 @@ static void ggml_compute_backward(
+@@ -7145,12 +7382,14 @@ static void ggml_compute_backward(
+                 axb[axis1] = 1;
+                 axb[axis2] = 2;
+                 axb[axis3] = 3;
+-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_permute(ctx, grad, axb[0], axb[1], axb[2], axb[3]));
++                // Xolotl: binary ops downstream want contiguous rows; a bare permute view breaks MUL/ADD/SUB backward
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, ggml_permute(ctx, grad, axb[0], axb[1], axb[2], axb[3])));
+             }
+         } break;
+         case GGML_OP_TRANSPOSE: {
+             if (src0_needs_grads) {
+-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_transpose(ctx, grad));
++                // Xolotl: cont the view - downstream binary ops (MUL/ADD/SUB backward) need contiguous rows
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, ggml_transpose(ctx, grad)));
+             }
+         } break;
+         case GGML_OP_GET_ROWS: {
+@@ -7161,6 +7400,12 @@ static void ggml_compute_backward(
                  // noop
              }
          } break;
@@ -3119,7 +3147,7 @@ index ed8554b14..62b322249 100644
          case GGML_OP_DIAG_MASK_INF: {
              if (src0_needs_grads) {
                  /* ggml_diag_mask_inf_impl() shouldn't be here */
-@@ -7270,6 +7511,12 @@ static void ggml_compute_backward(
+@@ -7270,6 +7515,12 @@ static void ggml_compute_backward(
                          ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, grad, src0));
                      }
                  } break;
@@ -3132,7 +3160,7 @@ index ed8554b14..62b322249 100644
                  case GGML_UNARY_OP_EXP: {
                      if (src0_needs_grads) {
                          ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, tensor, grad));
-@@ -7309,11 +7556,101 @@ static void ggml_compute_backward(
+@@ -7309,11 +7560,101 @@ static void ggml_compute_backward(
                          ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
                      }
                  } break;
@@ -3234,7 +3262,7 @@ index ed8554b14..62b322249 100644
          case GGML_OP_NONE: {
              // noop
          } break;
-@@ -7494,6 +7831,17 @@ void ggml_build_backward_expand(
+@@ -7494,6 +7835,17 @@ void ggml_build_backward_expand(
                  ignore_src[1] = true;
                  break;
  
