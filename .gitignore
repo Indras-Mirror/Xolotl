@@ -37,6 +37,9 @@ td.log
 /.venv/
 /build/
 /third_party/llama.cpp
+# ERNIE 5.5 reference harness: llama.cpp at PR #31925's head, built standalone to smoke-test the arch before
+# the engine port.  Local-only, like the vendored pin above (tools/ernie/fetch-ernie-llama.sh recreates it).
+/third_party/llama.cpp-ernie55
 /models/
 /packs/
 /mtp/

@@ -16,11 +16,13 @@ enum class ModelFamily {
     Unknown = 0,
     Qwen4Exp,    ///< Qwen3.8-Flash-Next and its fine-tunes / pruned variants (Swift 1.5, the Coder)
     Qwen35Moe,   ///< Qwen3.6-35B-A3B (Unsloth's MTP GGUFs): plain pre-norm residual, dense attention, nextn MTP block
+    Ernie55,     ///< Baidu ERNIE 5.5 Flash (280B-A14B): a DeepSeek-V4 hybrid - HCA + MLA/DSA, latent MoE, ECHO MTP
 };
 
 inline ModelFamily model_family_from_arch(const std::string& arch) {
     if (arch == "qwen4exp") return ModelFamily::Qwen4Exp;
     if (arch == "qwen35moe") return ModelFamily::Qwen35Moe;
+    if (arch == "ernie5_5") return ModelFamily::Ernie55;
     return ModelFamily::Unknown;
 }
 
@@ -31,6 +33,8 @@ inline const char* model_family_arch(ModelFamily f) {
         return "qwen4exp";
     case ModelFamily::Qwen35Moe:
         return "qwen35moe";
+    case ModelFamily::Ernie55:
+        return "ernie5_5";
     default:
         return "";
     }
@@ -43,6 +47,8 @@ inline const char* model_family_title(ModelFamily f) {
         return "Qwen3.8-Flash-Next";
     case ModelFamily::Qwen35Moe:
         return "Qwen3.6-35B-A3B";
+    case ModelFamily::Ernie55:
+        return "ERNIE 5.5 Flash";
     default:
         return "an unknown model";
     }
@@ -57,6 +63,10 @@ inline bool model_family_runs(ModelFamily f) { return f == ModelFamily::Qwen4Exp
 inline std::string model_family_not_supported(ModelFamily f) {
     if (model_family_runs(f)) return {};
     if (f == ModelFamily::Unknown) return "this is not a model family Strata knows";
+    if (f == ModelFamily::Ernie55)
+        return std::string(model_family_title(f)) + " (architecture '" + model_family_arch(f) +
+               "') is recognised by the reader and the tensor map, but this engine has no ERNIE 5.5 execution path "
+               "yet; it is refused rather than mis-run. The geometry is in strata/artifact/ernie_geometry.hpp.";
     return std::string(model_family_title(f)) + " (architecture '" + model_family_arch(f) +
            "') runs on the NVIDIA (CUDA) and AMD (HIP) builds of Strata; this build does not run it yet (the Intel "
            "Arc / SYCL port is in development). Use a CUDA or HIP build, or a Qwen3.8-Flash-Next model file";
