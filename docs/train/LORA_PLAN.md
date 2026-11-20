@@ -142,3 +142,16 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   `gdn_ref.py` now exposes `gdn_forward(...)` (the chunk loop, reused by the layer reference).
   Exhaustive re-run (stride 1, S8/nk2/nv6/T96): all 7,920 x elements + all c/g/b: dx 2.6e-4 (|g| 0.23), dc 2.0e-4
   (|g| 0.31), dg 2.2e-6, db 1.5e-6; mean relative 1.5e-5..6.0e-5; forward 1.9e-8 abs / 3.8e-7 rel.
+- 20 Nov 23:20: **MoE expert loop as a differentiable graph - PASS** (`tools/train/moe_train.hpp`): the replacement
+  for MUL_MAT_ID, mirroring build_moe_ffn as qwen4exp calls it - softmax router, top-k selection host-side (constant,
+  as TOP_K/ARGSORT are zero-grad anyway), weights gathered from probs over the flat index t*E + expert, normalised
+  over the k selected (F16-min clamp), then one pass per used expert: get_rows -> gate/up mul_mat -> silu(gate)*up ->
+  down mul_mat -> * weight -> get_rows_back scatter-add. Gates: forward vs `tools/train/moe_ref.py` 1.1e-7 rel
+  (D16/F12/E6/K2/T10) and 2.3e-7 at production shape D64/F32/E512/K10/T8; FD on every element of cur, the router and
+  the expert matrices: dx 6.4e-6 (|g| 0.46), drouter 3.9e-6, dup 2.4e-6, dgate 2.5e-6, ddown 9.3e-7; mean rel
+  7e-6..3e-5. At 512 experts the sampled mean rel rises to 1.3e-4..3.9e-4 purely because each expert now serves
+  0-1 tokens (small |g|), max abs err stays 5e-6.
+  **Two bugs the gates caught (worth remembering):** (1) the first version dropped the up branch, so `up_exps` got a
+  null gradient - caught by a segfault on grab(), not by FD; (2) the weight gather needs the flat index t*E + expert,
+  not the expert id - the FD check passed on that wrong graph (analytic and numeric were wrong together), only the
+  numpy reference caught it. Hence: every differentiable component gets BOTH a FD gate and a reference forward.
