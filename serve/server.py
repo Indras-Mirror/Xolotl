@@ -5073,6 +5073,19 @@ class Service:
             self.reasoning_close_text = atem.REASONING_CLOSE
             self.reasoning_wrap_up_text = atem.REASONING_WRAP_UP
             self.answer_open_text = atem.ANSWER_OPEN
+        elif family in ("inkling2", "inkling2_loop"):
+            # Inkling-2-Mini: its turn is message blocks (thinking, text, "<|message_model|>NAME<|content_invoke_tool_json|>
+            # {json}" calls), each closed by <|end_message|>; only <|content_model_end_sampling|> (200006) ends the turn.
+            # serve/inkling.py reads the blocks as the Qwen form and renders the model's own chat template
+            from serve import inkling
+            sid = getattr(self.tok, "special_ids", None) or {}
+            eos = sid.get("eos")
+            self.stop_ids = {int(eos)} if eos is not None else {inkling.EOS_ID}
+            self.parser_cls = inkling.InklingOutputParser
+            self._force_text = inkling.to_inkling_force
+            self.reasoning_close_text = inkling.REASONING_CLOSE
+            self.reasoning_wrap_up_text = inkling.REASONING_WRAP_UP
+            self.answer_open_text = inkling.ANSWER_OPEN
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
@@ -6157,6 +6170,12 @@ class Service:
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         kwargs = {k: v for k, v in kwargs.items() if k != CACHE_MARK_KEY}
+        if self.family in ("inkling2", "inkling2_loop"):
+            # Inkling-2-Mini's template has no generation prompt (the model writes <|message_model|> itself) and takes
+            # its thinking effort as a template variable; serve/inkling.py renders it (parity-tested against the
+            # official chat_template.jinja).  Its own effort line is the model's, so #458's effort_end does not apply.
+            from serve import inkling
+            return inkling.render(messages, tools, reasoning_effort=inkling.effort_from_kwargs(kwargs))
         if self.preserve_thinking is not None and "preserve_thinking" not in kwargs:
             kwargs = {**kwargs, "preserve_thinking": self.preserve_thinking}   # the config's default for the flag
         if self.add_vision_id is not None and "add_vision_id" not in kwargs:
@@ -10641,6 +10660,10 @@ MODEL_CARD_SAMPLING = {
     # notes: 1.0 skips it, 0.6 / top_p 0.9 / top_k 20 gives clean calls)
     "muse-glimmer": {"thinking": {"temperature": 0.6, "top_p": 0.9, "top_k": 20},
                      "instruct": {"temperature": 0.6, "top_p": 0.9, "top_k": 20}},
+    # Inkling-2-Mini: its generation_config.json recommends temperature 1.0 with do_sample (no top_p/top_k given, so
+    # the engine's own off values stay)
+    "inkling2": {"thinking": {"temperature": 1.0}, "instruct": {"temperature": 1.0}},
+    "inkling2_loop": {"thinking": {"temperature": 1.0}, "instruct": {"temperature": 1.0}},
 }
 
 
@@ -11127,7 +11150,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "muse-glimmer") else None)
+        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "muse-glimmer", "inkling2", "inkling2_loop")
+                       else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])

@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "xol-inkling - Inkling-2-Mini (26B-A3B looped MoE) on Xolotl's own xolotl-inkling engine.",
+    "The GGUF is the official NVFP4 parent (converted with the kept NVFP4 experts); the model is looped, so the",
+    "GGUF's general.architecture is inkling2_loop (serve/server.py treats inkling2 and inkling2_loop alike).",
+    "The chat template has no generation prompt: the model writes <|message_model|> itself, and the thinking",
+    "effort is a template variable (a short prompt system message). Sampling: the model's generation_config.json",
+    "(temperature 1.0, do_sample). The 'tokenizer' folder is the pack (vocab.json, merges.txt, token_type.json,",
+    "tokenizer.json with special_ids); until that pack is generated, the server refuses to start and says so."
+  ],
+
+  "arch": "inkling2_loop",
+  "exe": "build-eng/xolotl-inkling",
+  "cwd": ".",
+
+  "args": [
+    "--native",
+    "/media/mal/NVME1TB/Xolotl/inkling-2-mini/Inkling-2-Mini-NVFP4.gguf",
+    "--context",
+    "32768"
+  ],
+
+  "tokenizer": "/media/mal/NVME1TB/Xolotl/inkling-2-mini/Inkling-2-Mini",
+  "model_name": "inkling-2-mini",
+  "log": "xol-inkling.log",
+  "port": 8134,
+  "gpu": 0,
+
+  "sampling": {
+    "temperature": 1.0
+  }
+}
