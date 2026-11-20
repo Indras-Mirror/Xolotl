@@ -78,7 +78,7 @@ int main(int argc, char ** argv) {
     if (!be) { std::fprintf(stderr, "no CUDA\n"); return 1; }
     Hy4DenseConfig cfg;
     cfg.backend = be;
-    cfg.ctx_max = 2048;
+    cfg.ctx_max = std::max(2048, (np + n_gen + 64 + 3) / 4 * 4);
     cfg.max_pass = std::max(chunk, 1);
     Hy4Dense dense;
     std::string err;

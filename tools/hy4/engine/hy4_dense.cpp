@@ -605,6 +605,10 @@ bool Hy4Dense::attn_router(int il, int * ids, float * wts, const float ** fn_hos
             }
             for (int64_t k = vis * kp; k <= p; ++k) row[k] = 0.0f;   // the tail: the current group up to the token
         }
+        if (const char * dd = std::getenv("HY4_SEL_DUMP")) {   // gate tap: the selection mask [n_kv, n] of this pass
+            const std::string f = std::string(dd) + "/sel-" + std::to_string(il) + "-p" + std::to_string(im.pos0) + ".f32";
+            if (std::FILE * fp = std::fopen(f.c_str(), "wb")) { std::fwrite(sel.data(), 4, sel.size(), fp); std::fclose(fp); }
+        }
     }
 
     Impl::Graph g;
