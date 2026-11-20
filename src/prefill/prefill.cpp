@@ -1,4 +1,5 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+#include <sys/stat.h>
 #include "strata/kernels/expert_keep.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -2867,6 +2868,14 @@ struct PeTimer {
 // layer (`L<layer>.bin`), rows in position order, bf16 (fp32 with STRATA_KVA_CAPTURE_FP32, for parity runs): a
 // reader seeks straight to a position.  The oracle mode replays such a file in place of a projector, which is how
 // the state-only path is checked against the full one before any weights are fitted.
+// STRATA_KVA_CAPTURE_PER_REQ=1 (training data via --serve, opt-in): every top-level prefill read starts a new
+// directory <capture>/r<seq> holding that read's rows from ITS first position (a prompt-cache hit starts past 0),
+// p0.txt ("<pos0> <n>"), and - when those dumps are on - its qsa.bin and final.bf16 in place of the env paths.
+static std::string g_kva_req_dir;   // empty: the classic one-cold-read capture
+static std::string kva_req_path(const char* env_path, const char* name) {
+    return g_kva_req_dir.empty() ? std::string(env_path) : g_kva_req_dir + "/" + name;
+}
+
 struct KvaTap {
     std::string dir;
     bool fp32 = false;
@@ -2887,10 +2896,10 @@ struct KvaTap {
         for (std::FILE*& p : f) { if (p != nullptr) std::fclose(p); p = nullptr; }
     }
     /// A new cold read starts: a capture file holds one prompt's rows, so every layer starts over.
-    void begin_prompt() {
+    void begin_prompt(int64_t start = 0) {
         close();
         if (next_pos.empty()) next_pos.assign(f.size(), 0);
-        for (int64_t& p : next_pos) p = 0;
+        for (int64_t& p : next_pos) p = start;
     }
     std::string path(int64_t layer) const { return dir + "/L" + std::to_string((long long) layer) + ".bin"; }
 
@@ -3014,7 +3023,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     int64_t kva_positions = 0, kva_chunks = 0;   // what actually took the approximate path (diagnostics)
     kva_floor_ = 0;   // this run's: raised below as chunks are approximated
     if (kva.capture && kva_capture.f.empty()) kva_capture.open(kva.capture_dir, kva.capture_fp32);
-    if (kva.capture && pos0 == 0 && hand_in_ == nullptr) kva_capture.begin_prompt();   // one prompt per capture
+    static const bool kva_per_req = [] { const char* e = std::getenv("STRATA_KVA_CAPTURE_PER_REQ"); return e != nullptr && *e == '1'; }();
+    if (kva.capture && kva_per_req && hand_in_ == nullptr) {   // one directory per top-level read, from its pos0
+        static long long kva_seq = 0;
+        char nm[32];
+        std::snprintf(nm, sizeof nm, "/r%05lld", kva_seq++);
+        g_kva_req_dir = kva.capture_dir + nm;
+        ::mkdir(g_kva_req_dir.c_str(), 0775);
+        kva_capture.dir = g_kva_req_dir;
+        kva_capture.begin_prompt(pos0);
+        if (std::FILE* pf = std::fopen((g_kva_req_dir + "/p0.txt").c_str(), "w")) {
+            std::fprintf(pf, "%lld %lld\n", (long long) pos0, (long long) n);
+            std::fclose(pf);
+        }
+    } else if (kva.capture && pos0 == 0 && hand_in_ == nullptr) kva_capture.begin_prompt();   // one prompt per capture
     if (kva_run && kva.mode == KvaConfig::Mode::Oracle && kva_oracle.f.empty())
         kva_oracle.open(kva.oracle_dir, kva.oracle_fp32);
     // The direct successor's future lives on the Prefill object. Intermediate
@@ -4088,7 +4110,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             std::vector<int32_t> h((size_t) (T * m.cap));
                             cudaMemcpyAsync(h.data(), m.sel_ids, h.size() * 4, cudaMemcpyDeviceToHost, m.cs);
                             cudaStreamSynchronize(m.cs);
-                            if (std::FILE* f = std::fopen(dump, "ab")) {
+                            if (std::FILE* f = std::fopen(kva_req_path(dump, "qsa.bin").c_str(), "ab")) {
                                 const int32_t hdr[4] = {(int32_t) qsa_index, (int32_t) p0, (int32_t) T, (int32_t) m.cap};
                                 std::fwrite(hdr, 4, 4, f);
                                 std::fwrite(h.data(), 4, h.size(), f);
@@ -5757,7 +5779,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // S25 (draft-layer distillation data, opt-in): every position's final multi-stream residual as BF16
             // (round-to-nearest-even), rows in position order, appended across chunks and requests: [n][hc*n_embd]
             cudaStreamSynchronize(m.cs);
-            if (std::FILE* f = std::fopen(dump, "ab")) {
+            if (std::FILE* f = std::fopen(kva_req_path(dump, "final.bf16").c_str(), "ab")) {
                 constexpr int64_t kRows = 512;
                 std::vector<float> rows((size_t) (kRows * D));
                 std::vector<uint16_t> out((size_t) (kRows * D));
