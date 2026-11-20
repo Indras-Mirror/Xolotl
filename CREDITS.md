@@ -15,6 +15,8 @@
 - Weights: DeepSeek, Zhipu AI and Qwen, with quants and fine-tunes by peasantsmith, ukisai, d0xin and gcsa-abliterix.
 - SenseNova-Loop-9B by SenseTime; the dense engine's loop and mHC follow their reference `modeling_sensenova_loop.py`.
 - LFM3-Omni by [Liquid AI](https://huggingface.co/LiquidAI); its engine follows llama.cpp's LFM3 and libmtmd work.
+- Inkling-2-Mini by [Thinking Machines Lab](https://thinkingmachines.ai) (Apache 2.0); its engine's graph follows
+  llama.cpp PR #32694 by [Pedro Cuenca](https://github.com/pcuenca) (MIT).
 - Muse Glimmer by Meta Superintelligence Labs; its engine follows llama.cpp's Muse Glimmer support (ggml-org/llama.cpp
   #26841: graph, chat parser, mtmd projector). The abliterated build it was measured with is darkc0de's, quantised by bartowski. Its DFlash drafter is Meta's; the drafter graph follows llama.cpp's `src/models/dflash.cpp`.
 

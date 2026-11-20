@@ -12,6 +12,11 @@
 
 ## Latest
 
+- **21 Nov (Inkling)** - [Inkling-2-Mini](docs/INKLING.md) (Thinking Machines, 26B looped MoE, about 3B active) on
+  its own engine, `xolotl-inkling`: **57 tok/s decode, 1.1K tok/s prefill** on the RTX 4090 from the exact NVFP4
+  checkpoint, greedy output matching the llama.cpp reference. The graph is ported from llama.cpp PR #32694 by Pedro
+  Cuenca (MIT); a loop-pass expert-scale bug in it is fixed here. First numbers: fused kernels, flash attention
+  and MTP drafting are next.
 - **21 Nov (later)** - LoRA training **proven end to end**: a QFN adapter trained on the RTX 4090 from the served
   engine's own activations lowers the loss on held-out agent transcripts 1.4116 -> 1.3197 (-6.5 %) in ~6 min. How to
   train LoRAs on the big MoE models with Xolotl's engine: [docs/LORA_TRAINING.md](docs/LORA_TRAINING.md). Option, not
