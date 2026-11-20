@@ -91,15 +91,28 @@ int main(int argc, char ** argv) {
 
     std::vector<int> ids((size_t) (cfg.max_pass * G.n_used));
     std::vector<float> wts(ids.size()), routed((size_t) (cfg.max_pass * G.n_latent));
+    // HY4_PROF=1: wall time per stage (begin / attn+router / experts / finish), summed over the decode steps
+    const bool prof = std::getenv("HY4_PROF") && std::getenv("HY4_PROF")[0] == '1';
+    double t_begin = 0, t_attn = 0, t_moe = 0, t_fin = 0;
+    using clk = std::chrono::steady_clock;
+    auto since = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
     auto pass = [&](const int * t, int n, int pos0) -> bool {
+        auto a = clk::now();
         if (!dense.begin(t, n, pos0)) return false;
+        if (n == 1) t_begin += since(a);
         for (int il = 0; il < G.n_layer; ++il) {
             const float * fn = nullptr;
             bool dl = false;
+            a = clk::now();
             if (!dense.attn_router(il, ids.data(), wts.data(), &fn, &dl)) return false;
+            if (n == 1) t_attn += since(a);
             if (dl) continue;
+            a = clk::now();
             if (!moe.run(il, fn, ids.data(), wts.data(), n, routed.data())) return false;
+            if (n == 1) t_moe += since(a);
+            a = clk::now();
             if (!dense.finish(il, routed.data())) return false;
+            if (n == 1) t_fin += since(a);
         }
         return true;
     };
@@ -168,6 +181,11 @@ int main(int argc, char ** argv) {
     std::printf("generated %zu tokens (%.2f tok/s reference-expert path):", gen.size(), (gen.size() - 1) / std::max(t_dec, 1e-9));
     for (int t : gen) std::printf(" %d", t);
     std::printf("\n---\n%s\n---\n", text.c_str());
+    if (prof && gen.size() > 1) {
+        const double k = 1e3 / (double) (gen.size() - 1);
+        std::printf("decode ms/token: begin %.1f | attn+router %.1f | experts %.1f | finish %.1f | rest (logits) %.1f\n",
+                    t_begin * k, t_attn * k, t_moe * k, t_fin * k, (t_dec - t_begin - t_attn - t_moe - t_fin) * k);
+    }
     moe.report();
     return 0;
 }
