@@ -23,7 +23,10 @@ namespace xolotl::train {
 
 struct QfnLayer {
     // weights (all F32 in the trainer)
-    ggml_tensor * wqkv_z = nullptr;   // [D, 2*hd*nk + hd*nv + hd*nv]
+    // the pack stores qkv and z (the gate) as SEPARATE tensors - an adapter can only attach to a real base
+    // tensor, so they stay separate here too (a lora on the concatenation would not pair with the model).
+    ggml_tensor * wqkv   = nullptr;   // [D, 2*hd*nk + hd*nv]   (blk.<l>.attn_qkv.weight)
+    ggml_tensor * wgate  = nullptr;   // [D, hd*nv]             (blk.<l>.attn_gate.weight)
     ggml_tensor * conv_w = nullptr;   // [d_conv, channels]
     ggml_tensor * w_ba   = nullptr;   // [D, 2*n_v]
     ggml_tensor * ssm_a  = nullptr;   // [n_v]  (negative: -A_log.exp())
@@ -31,7 +34,21 @@ struct QfnLayer {
     ggml_tensor * norm_w = nullptr;   // [hd]
     ggml_tensor * w_out  = nullptr;   // [hd*n_v, D]
     ggml_tensor * ident  = nullptr;   // [CS, CS] identity input
+    // optional LoRA adapters (A [n_in, r], B [r, n_out]; delta = (alpha/r) * B A)
+    ggml_tensor * lora_a_qkv = nullptr;  ggml_tensor * lora_b_qkv = nullptr;
+    ggml_tensor * lora_a_gate = nullptr; ggml_tensor * lora_b_gate = nullptr;
+    ggml_tensor * lora_a_out = nullptr;  ggml_tensor * lora_b_out = nullptr;
+    float lora_alpha = 16.0f;
+    int64_t lora_rank = 8;
 };
+
+// y = W^T x (+ adapter): the adapter is applied to a frozen base, exactly as llama.cpp's --lora does.
+inline ggml_tensor * qfn_linear(ggml_context * c, ggml_tensor * W, ggml_tensor * x,
+                                ggml_tensor * A, ggml_tensor * B, float alpha, int64_t rank) {
+    ggml_tensor * y = ggml_mul_mat(c, W, x);
+    if (A && B) y = ggml_add(c, y, ggml_scale(c, ggml_mul_mat(c, B, ggml_mul_mat(c, A, x)), alpha / (float) rank));
+    return y;
+}
 
 // returns [D, T]
 inline ggml_tensor * qfn_gdn_layer(ggml_context * c, ggml_tensor * cur /* [D, T] */, const QfnLayer & w,
@@ -40,9 +57,8 @@ inline ggml_tensor * qfn_gdn_layer(ggml_context * c, ggml_tensor * cur /* [D, T]
     const int64_t n_qkv = 2 * hd * nk + hd * nv, channels = n_qkv, n_z = hd * nv;
 
     // ---- projection + split (build_qkvz) ----
-    ggml_tensor * qkvz = ggml_mul_mat(c, w.wqkv_z, cur);                       // [n_qkv + n_z, T]
-    ggml_tensor * qkv = ggml_view_2d(c, qkvz, n_qkv, T, qkvz->nb[1], 0);
-    ggml_tensor * zt  = ggml_view_2d(c, qkvz, n_z, T, qkvz->nb[1], (size_t) n_qkv * ggml_element_size(qkvz));
+    ggml_tensor * qkv = qfn_linear(c, w.wqkv, cur, w.lora_a_qkv, w.lora_b_qkv, w.lora_alpha, w.lora_rank);   // [n_qkv, T]
+    ggml_tensor * zt  = qfn_linear(c, w.wgate, cur, w.lora_a_gate, w.lora_b_gate, w.lora_alpha, w.lora_rank); // [n_z, T]
 
     // ---- causal conv, zero history ----
     // ssm_conv takes the conv window on dim0 and channels on dim1: [d_conv-1+T, channels]
@@ -82,7 +98,7 @@ inline ggml_tensor * qfn_gdn_layer(ggml_context * c, ggml_tensor * cur /* [D, T]
     ggml_tensor * on = ggml_mul(c, ggml_rms_norm(c, o, rms_eps), ggml_repeat_4d(c, w.norm_w, hd, nv, T, 1));
     on = ggml_mul(c, on, ggml_sigmoid(c, z));
     ggml_tensor * flat = ggml_reshape_2d(c, on, hd * nv, T);
-    ggml_tensor * out = ggml_mul_mat(c, w.w_out, flat);                        // [D, T]
+    ggml_tensor * out = qfn_linear(c, w.w_out, flat, w.lora_a_out, w.lora_b_out, w.lora_alpha, w.lora_rank);  // [D, T]
     return ggml_add(c, cur, out);
 }
 

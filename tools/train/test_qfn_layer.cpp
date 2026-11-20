@@ -28,7 +28,8 @@ static double run(int D, int hd, int nk, int nv, int T, const Inputs & in,
     ggml_context * c = ggml_init(ip);
     const int64_t n_qkv = 2 * hd * nk + hd * nv, n_z = hd * nv;
     QfnLayer w;
-    w.wqkv_z = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, n_qkv + n_z);
+    w.wqkv   = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, n_qkv);
+    w.wgate  = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, n_z);
     w.conv_w = ggml_new_tensor_2d(c, GGML_TYPE_F32, d_conv, n_qkv);
     w.w_ba   = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, 2 * nv);
     w.ssm_a  = ggml_new_tensor_1d(c, GGML_TYPE_F32, nv);
@@ -38,7 +39,8 @@ static double run(int D, int hd, int nk, int nv, int T, const Inputs & in,
     w.ident  = ggml_new_tensor_2d(c, GGML_TYPE_F32, kGdnChunk, kGdnChunk);
     ggml_tensor * cur = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, T);
     ggml_tensor * rr  = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, T);
-    memcpy(w.wqkv_z->data, in.wqkv.data(), in.wqkv.size() * 4);
+    memcpy(w.wqkv->data, in.wqkv.data(), (size_t) D * n_qkv * 4);
+    memcpy(w.wgate->data, in.wqkv.data() + (size_t) D * n_qkv, (size_t) D * n_z * 4);
     memcpy(w.conv_w->data, in.conv.data(), in.conv.size() * 4);
     memcpy(w.w_ba->data, in.wba.data(), in.wba.size() * 4);
     memcpy(w.ssm_a->data, in.a.data(), in.a.size() * 4);
@@ -53,7 +55,7 @@ static double run(int D, int hd, int nk, int nv, int T, const Inputs & in,
 
     const bool want = g_cur != nullptr;
     if (want) {
-        ggml_set_param(cur); ggml_set_param(w.wqkv_z); ggml_set_param(w.conv_w); ggml_set_param(w.w_ba);
+        ggml_set_param(cur); ggml_set_param(w.wqkv); ggml_set_param(w.wgate); ggml_set_param(w.conv_w); ggml_set_param(w.w_ba);
         ggml_set_param(w.ssm_a); ggml_set_param(w.dt); ggml_set_param(w.norm_w); ggml_set_param(w.w_out);
     }
     ggml_tensor * o = qfn_gdn_layer(c, cur, w, hd, nk, nv, d_conv, 1e-6f);
@@ -70,7 +72,8 @@ static double run(int D, int hd, int nk, int nv, int T, const Inputs & in,
             ggml_tensor * g = ggml_graph_get_grad(gf, t);
             dst->assign((float *) g->data, (float *) g->data + ggml_nelements(t));
         };
-        grab(cur, g_cur); grab(w.wqkv_z, g_wqkv); grab(w.conv_w, g_conv); grab(w.w_ba, g_wba);
+        grab(cur, g_cur); grab(w.wqkv, g_wqkv);
+        { ggml_tensor * gg2 = ggml_graph_get_grad(gf, w.wgate); std::vector<float> tmp((float *) gg2->data, (float *) gg2->data + ggml_nelements(w.wgate)); g_wqkv->insert(g_wqkv->end(), tmp.begin(), tmp.end()); } grab(w.conv_w, g_conv); grab(w.w_ba, g_wba);
         grab(w.ssm_a, g_a); grab(w.dt, g_dt); grab(w.norm_w, g_nrm); grab(w.w_out, g_wout);
     }
     ggml_free(c);

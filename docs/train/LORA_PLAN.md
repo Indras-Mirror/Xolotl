@@ -166,3 +166,19 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   dconv's worst element goes 1.50 (eps 1e-2) -> 3.84 (3e-2) -> 0.23 (3e-3) -> 2.6e-3 (3e-4), i.e. linear in eps
   and still falling. A real gradient error would be a constant offset (that is how the MoE index bug presented).
   Rule for this layer: FD at eps ~3e-4 (still above the F32 noise floor) or judge by convergence in eps.
+- 21 Nov 00:40: **FIRST QFN TRAINING RUN on real pack weights - PASS** (`tools/train/qfn_train.cpp` +
+  `tools/train/qfn_export.py`). Real `blk.0` gated-delta-net tensors dequantized from the 45 GB XQ pack
+  (`/media/Crucial1TB/xolotl-train/qfn_l0.f32`, D 2560, hd 128, 16 k / 48 v heads, channels 10240), two real
+  token-embedding windows (32 tokens each, token_embd rows 100-163). Frozen base, rank-8 alpha-16 adapters on
+  `blk.0.attn_qkv.weight`, `blk.0.attn_gate.weight`, `blk.0.ssm_out.weight`, AdamW lr 3e-3, loss = ||layer(x_a) -
+  target||^2 with target = the same layer's base output on the other window (a memorisation gate).
+  **400 steps, 2m08s on CPU (16 threads, ~0.3 s/step): loss 9.667 -> 0.008 (the last-third scatter 0.002-0.018 is
+  AdamW noise at lr 3e-3), saved `qfn_l0_lora.gguf`; reloading it into a fresh graph gives relative L2 vs target
+  base 1.410 -> adapted 0.041 (34.6x).** GGUF round trip bit-exact, `general.type=adapter`, arch `qwen4exp`,
+  alpha 16. Adapter/base tensor pairing checked against the pack itself: all three pairs OK.
+  **Bug the pairing check caught:** the first version put one adapter on the CONCATENATED qkv+z (16384 rows) - no
+  such base tensor exists in the pack, so llama.cpp could never apply it. The layer now keeps `attn_qkv` and
+  `attn_gate` separate (an adapter can only attach to a real base tensor); the layer gates still pass after the split.
+  Not yet done: loading the adapter in llama.cpp itself (no llama-cli in this build tree) - that is the external
+  check, and it needs the full model resident. Also not a fine-tune: the target is synthetic (memorisation), because
+  real gradients need real activations from the served model (next step).
