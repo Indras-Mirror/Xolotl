@@ -93,6 +93,12 @@ int main(int argc, char ** argv) {
         auto ts = std::chrono::steady_clock::now();
         const float * fn = nullptr;
         bool dense_layer = false;
+        // HY4_FORCE=1: start each layer from the reference's previous l_out, so every row is that layer's own error
+        if (std::getenv("HY4_FORCE") && il > 0) {
+            std::vector<float> prev;
+            if (!load(gd + "/l_out-" + std::to_string(il - 1) + ".f32", prev)) { std::fprintf(stderr, "no golden l_out\n"); return 1; }
+            dense.write_state(prev.data());
+        }
         if (!dense.attn_router(il, ids.data(), wts.data(), &fn, &dense_layer)) return 1;
         auto taps = dense.taps();   // copy: finish() replaces them
         double overlap = -1;
@@ -118,6 +124,27 @@ int main(int argc, char ** argv) {
         const double e_e = taps.count("engram_out") && load(gd + "/engram_out-" + sl + ".f32", ref) && ref.size() == taps["engram_out"].size()
                                ? relerr(taps["engram_out"], ref) : -1;
         worst = std::max(worst, e_l);
+        if (const char * sd = std::getenv("HY4_SAVE")) {   // HY4_SAVE=dir: our l_out of every layer, for offline analysis
+            std::ofstream f(std::string(sd) + "/ours_l_out-" + sl + ".f32", std::ios::binary);
+            f.write((const char *) st.data(), (std::streamsize) (st.size() * 4));
+            for (auto & kv : taps) {
+                std::ofstream g(std::string(sd) + "/ours_" + kv.first + "-" + sl + ".f32", std::ios::binary);
+                g.write((const char *) kv.second.data(), (std::streamsize) (kv.second.size() * 4));
+            }
+        }
+        // HY4_PERTOK=1: per-token rel err of l_out every 10 layers and at the last (where does the drift sit?)
+        if (std::getenv("HY4_PERTOK") && (il % 10 == 0 || il == n_layers - 1) && load(gd + "/l_out-" + sl + ".f32", ref) &&
+            ref.size() == st.size()) {
+            const size_t tok = (size_t) (G.hc * G.n_embd);
+            std::printf("  pertok l%d:", il);
+            for (int t = 0; t < n; ++t) {
+                std::vector<float> rt(ref.begin() + t * tok, ref.begin() + (t + 1) * tok);
+                double nr = 0;
+                for (float v : rt) nr += (double) v * v;
+                std::printf(" %d:%.3f(|%.0f|)", t, relerr(st, rt, t * tok, tok), std::sqrt(nr));
+            }
+            std::printf("\n");
+        }
         std::printf("%5d %10.3e %10.3e %10.3e %8.2f %8.2f\n", il, e_l, e_a, e_e, overlap,
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count());
         std::fflush(stdout);

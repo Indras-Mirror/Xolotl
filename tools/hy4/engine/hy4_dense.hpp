@@ -65,6 +65,8 @@ public:
 
     /// The hc state after the last attn_router (dense layer) / finish: n * hc * n_embd floats ([n_embd, hc, n]).
     bool read_state(std::vector<float> & x);
+    /// Overwrite the hc state (n * hc * n_embd floats) - the golden gate's teacher forcing.
+    bool write_state(const float * x);
     /// cfg.taps: the named intermediates of the last layer call (name -> floats, ggml layout).
     const std::map<std::string, std::vector<float>> & taps() const;
     const std::string & last_error() const;

@@ -571,4 +571,10 @@ bool Hy4Dense::read_state(std::vector<float> & x) {
     return true;
 }
 
+bool Hy4Dense::write_state(const float * x) {
+    Impl & im = *p_;
+    ggml_backend_tensor_set(im.x, x, 0, ggml_nbytes(im.x));
+    return true;
+}
+
 }  // namespace strata::hy4
