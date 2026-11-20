@@ -514,7 +514,9 @@ bool Hy4Dense::init(const std::string & gguf, const Hy4DenseConfig & cfg, std::s
     im.tok_embd = M.shard(si).tensor_data(*te);
     im.tok_row_bytes = ggml_row_size(GGML_TYPE_Q8_0, G.n_embd);
     const TensorInfo * tt = M.find("per_layer_token_embd.weight", &si);
-    if (!tt || tt->type != 43 || (int64_t) tt->shape[0] != G.engram_dim) { err = "per_layer_token_embd.weight must be F8_E4M3 [dim, rows]"; return false; }
+    // F8_E4M3: the reader retags upstream's type 43 to strata::kTypeF8E4M3 by size (43 is MXFP8 in older DS4.1 GGUFs);
+    // a raw 43 is still accepted for a table too small for the size test to decide
+    if (!tt || (tt->type != strata::kTypeF8E4M3 && tt->type != 43) || (int64_t) tt->shape[0] != G.engram_dim) { err = "per_layer_token_embd.weight must be F8_E4M3 [dim, rows]"; return false; }
     im.engram_tab = M.shard(si).tensor_data(*tt);
     im.hist.assign((size_t) cfg.ctx_max, -1);
 

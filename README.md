@@ -12,6 +12,11 @@
 
 ## Latest
 
+- **21 Nov** - LoRA training, **experimental**: backward kernels and training graphs for adapters on the served MoE
+  models (base frozen, quantized as served), a Hy4-flash trainer and QFN trainers on real weights, adapters in llama.cpp's
+  format. Real fine-tuning is not proven yet. Also: the Hy4-flash engine, FP8 Qwen4-Exp GGUFs from upstream's converter,
+  and the Windows build fix (#143). [docs/LORA_TRAINING.md](docs/LORA_TRAINING.md),
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#lora-training-experimental-the-hy4-flash-engine-fp8-qwen4-exp-n-gram-tables-windows-build-fix-21-nov).
 - **19 Nov** - DeepSeek-V4.1 decodes faster by default: Keisawaakira's decode switches cut the verify pass 98.8 -> 89.1
   ms (-10 %) on an 8K probe and lift fast-mode agent tasks from ~40 to **42.7 tok/s** (+5-8 %) on one 4090, quality
   inside the noise. Also new, opt-in: two-layers-ahead NVMe reads (TokenWing's idea) and GLM-5.3-Flash on a second
