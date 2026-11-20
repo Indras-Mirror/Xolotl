@@ -54,3 +54,8 @@ conv states taken one token before the end of the prompt (the Glimmer scheme).
 
 After S3: ablation (refusal direction on the reference, applied to the BF16 parts) and the XQ pipeline (private - nothing of
 it lands in this repo). The official NVFP4/MXFP8 experts are the source precision for both.
+
+Evaluation (Mal, 21 Nov): the PARENT model - the official checkpoint converted exactly (NVFP4/MXFP8 kept) and run on
+xolotl-inkling - is the baseline every derivative is compared against, on the same box, same harness, same settings:
+parent vs ablated vs XQ vs ablated+XQ on the Gauntlet (greedy) and on held-out logit KL / top-1 against the parent.
+Mini is not on OpenRouter (21 Nov), so there is no API run; the comparison is local only.
