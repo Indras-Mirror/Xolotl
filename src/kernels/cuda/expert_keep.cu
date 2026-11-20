@@ -8,6 +8,10 @@
 #include <cstring>
 #include <vector>
 
+#if defined(_MSC_VER)
+#define strtok_r strtok_s   // MSVC has no POSIX strtok_r; same alias as src/dsv41/ds4_model.cu and ds4_packinfo.cpp
+#endif
+
 namespace strata::kernels {
 namespace {
 
