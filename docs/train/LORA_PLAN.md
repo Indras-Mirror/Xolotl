@@ -210,3 +210,12 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
     checks really execute (so the positive run is meaningful, not a silently ignored flag).
   So the whole chain is proven with real artefacts: train -> save GGUF -> llama.cpp accepts it -> inference changes.
   Note: CPU-only in this run (the 4090 was busy with chronos-qx's arm), `-ngl 0`, ctx 64.
+- 21 Nov 05:10: **real-activation path mapped** - `tools/train/qfn_layer_dump.py` reads a strata `--dump-layers`
+  file into per-layer (input, target) pairs. Layout read from the source (`src/core/session.cpp:662-670`,
+  `757-763`): per position one record of `(n_layers + 1) * hc * n_embd` f32, slot 0 = the input residual (the
+  embedding broadcast to the hc streams), slot l+1 = the residual after layer l, each slot stream-major
+  `hc x n_embd`. Self-tested against a synthetic file with known slot values: position 2 / layer 1 extracts
+  slot 1 as input and slot 2 as output. `--summary` prints per-slot RMS so a real dump can be sanity-checked
+  (slot 0 should look like embeddings, the last slot much larger).
+  What it buys: matching slot l+1 from slot l is RECONSTRUCTION on the model's own data, not a preference
+  fine-tune - the honest first target on real activations.
