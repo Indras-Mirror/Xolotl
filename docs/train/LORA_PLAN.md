@@ -182,3 +182,9 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   Not yet done: loading the adapter in llama.cpp itself (no llama-cli in this build tree) - that is the external
   check, and it needs the full model resident. Also not a fine-tune: the target is synthetic (memorisation), because
   real gradients need real activations from the served model (next step).
+- 21 Nov 04:20: **2-LAYER STACK TRAINING PASS** (`tools/train/qfn_train_stack.cpp`). Real blk.0 + blk.1 of the XQ pack
+  chained (each layer's residual output feeding the next), rank-8 adapters on attn_qkv / attn_gate / ssm_out of BOTH
+  layers (6 adapters), T=16, 100 steps, lr 3e-3: **loss 2.409 -> 0.0004 in ~2 min (CPU, 16 threads)**; saved
+  `qfn_stack2_lora.gguf`, reloaded bit-exact, **relative L2 vs target 1.4318 -> 0.0130 (109.9x)**. All 6 adapter
+  pairs checked against the pack's real tensors: PASS. This is the first run where each layer's gradient travels
+  back through the layers above it - the depth path is exercised, not just a single layer's internals.
