@@ -12,6 +12,11 @@
 
 ## Latest
 
+- **21 Nov (later)** - LoRA training **proven end to end**: a QFN adapter trained on the RTX 4090 from the served
+  engine's own activations lowers the loss on held-out agent transcripts 1.4116 -> 1.3197 (-6.5 %) in ~6 min. How to
+  train LoRAs on the big MoE models with Xolotl's engine: [docs/LORA_TRAINING.md](docs/LORA_TRAINING.md). Option, not
+  yet matching: fast capture through `--serve` (~3 s per window).
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#lora-training-proven-end-to-end-on-qfn-a-harness-adapter-trained-from-the-served-engines-activations-21-nov-later).
 - **21 Nov** - LoRA training, **experimental**: backward kernels and training graphs for adapters on the served MoE
   models (base frozen, quantized as served), a Hy4-flash trainer and QFN trainers on real weights, adapters in llama.cpp's
   format. Real fine-tuning is not proven yet. Also: the Hy4-flash engine, FP8 Qwen4-Exp GGUFs from upstream's converter,

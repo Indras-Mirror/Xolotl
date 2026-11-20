@@ -8,6 +8,24 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### LoRA training proven end to end on QFN: a harness adapter trained from the served engine's activations (21 Nov, later)
+
+**A real fine-tune works** - [docs/LORA_TRAINING.md](../LORA_TRAINING.md#how-it-works-a-lora-for-a-125b-moe-on-one-gaming-pc).
+A rank-16 LoRA on Qwen3.8-Flash-Next's top four layers, trained on the RTX 4090 from activations the **served engine**
+captured (prefix + window prefill, quantized base, YaRN rope, layer 47's own sparse selection replayed), with the real
+next-token loss on agent transcripts (QuetzaCodetl / Claude Code sessions, assistant turns only). On 12 windows for 36
+steps (~6 min) the loss on two held-out windows fell **1.4116 -> 1.3197 (-6.5 %)**. Before training, the trainer's
+forward reproduced the engine on a real 21,686-position window (loss 1.7798 CPU / 1.7780 GPU vs the engine's 1.7795).
+New: the harness data builder and request capture, the capture driver, the QFN top-4 stack with the prefix carry, the
+GPU trainer (`tools/train/qfn_harness_train.cpp`) with live loss graphs (`lossplot.py`). Two CUDA fixes for training
+shapes in `xolotl-ggml.patch` (OUT_PROD with a cuBLAS-invalid view stride, REPEAT_BACK beyond the grid-z limit) - both
+backward-only ops, so inference is unchanged; rebuild after `fetch-llama.sh`.
+
+**Option, experimental: fast capture through `--serve`** - one engine, the root checkpoint at the prefix end: 2.6-3.6 s
+per window instead of 66-137 s. Opt-in engine flag `STRATA_KVA_CAPTURE_PER_REQ=1` (off = unchanged). **Its window rows
+do not match the slow capture yet** (median relative error 0.12-0.13 per row, prefix rows bit-identical), so do not
+train on it until that is explained - details in the doc.
+
 ### LoRA training (experimental), the Hy4-flash engine, FP8 Qwen4-Exp n-gram tables, Windows build fix (21 Nov)
 
 **LoRA training, experimental** - [docs/LORA_TRAINING.md](../LORA_TRAINING.md). Backward kernels for training adapters
