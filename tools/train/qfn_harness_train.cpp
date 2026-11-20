@@ -22,6 +22,7 @@
 //      QFN_EVAL_N (2: windows held out) QFN_CLIP (1.0) QFN_SAVE_EVERY (100) QFN_RUNS (/media/Crucial1TB/xolotl-train/runs)
 //      QFN_ROPE_SCALE (2: the served YaRN) QFN_SEED (1)
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "qfn_topk.hpp"
@@ -73,37 +74,60 @@ static std::vector<int> json_ints(const std::string & s, const std::string & key
 }
 
 // ---- one graph on the backend: a no-alloc context, host inputs uploaded after allocation ---------------------------
+// Memory: ONE shared ggml_gallocr (liveness-based reuse, grows to the largest graph) - not alloc_ctx_tensors, which
+// gives every intermediate its own memory (17.7 GB for one forward layer at W = 1551, 28 GB for the backward at 3063).
+// Inputs (host uploads, gradient accumulators zeroed by graph_reset) are flagged INPUT so nothing computed earlier can
+// share their memory; everything read back afterwards is flagged OUTPUT so it is not reused before we read it.
+static ggml_gallocr_t g_alloc = nullptr;
+static size_t g_alloc_peak = 0;
 struct G1 {
     ggml_context * c = nullptr;
     ggml_cgraph * gf = nullptr;
-    ggml_backend_buffer_t buf = nullptr;
     std::vector<std::pair<ggml_tensor *, std::vector<uint8_t>>> up;
     explicit G1(size_t n_nodes = 1 << 17) {
         ggml_init_params ip = { ggml_tensor_overhead() * (n_nodes * 2) + ggml_graph_overhead_custom(n_nodes, true), nullptr, true };
         c = ggml_init(ip);
         gf = ggml_new_graph_custom(c, n_nodes, true);
     }
-    ~G1() { if (buf) ggml_backend_buffer_free(buf); if (c) ggml_free(c); }
+    ~G1() { if (c) ggml_free(c); }
     ggml_tensor * f32(const float * d, int64_t n0, int64_t n1 = 1, int64_t n2 = 1, int64_t n3 = 1) {
         ggml_tensor * t = ggml_new_tensor_4d(c, GGML_TYPE_F32, n0, n1, n2, n3);
+        ggml_set_input(t);
         up.emplace_back(t, std::vector<uint8_t>((const uint8_t *) d, (const uint8_t *) d + (size_t) ggml_nbytes(t)));
         return t;
     }
     ggml_tensor * i32(const std::vector<int32_t> & d) {
         ggml_tensor * t = ggml_new_tensor_1d(c, GGML_TYPE_I32, (int64_t) d.size());
+        ggml_set_input(t);
         up.emplace_back(t, std::vector<uint8_t>((const uint8_t *) d.data(), (const uint8_t *) (d.data() + d.size())));
         return t;
     }
-    bool run(ggml_backend_t be, ggml_tensor * loss_or_null, const std::vector<ggml_tensor *> & outs) {
-        for (ggml_tensor * o : outs) if (o) ggml_build_forward_expand(gf, o);
+    // grads_of: tensors whose gradient is read back after compute
+    bool run(ggml_backend_t be, ggml_tensor * loss_or_null, const std::vector<ggml_tensor *> & outs,
+             const std::vector<ggml_tensor *> & grads_of = {}) {
+        for (ggml_tensor * o : outs) if (o) { ggml_set_output(o); ggml_build_forward_expand(gf, o); }
         if (loss_or_null) {
             ggml_set_loss(loss_or_null);
             ggml_build_forward_expand(gf, loss_or_null);
             ggml_build_backward_expand(c, gf, nullptr);
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * acc = ggml_graph_get_grad_acc(gf, ggml_graph_node(gf, i));
+                if (acc) ggml_set_input(acc);
+            }
+            for (ggml_tensor * t : grads_of) {
+                if (ggml_tensor * acc = ggml_graph_get_grad_acc(gf, t)) ggml_set_input(acc);
+                if (ggml_tensor * gr = ggml_graph_get_grad(gf, t)) ggml_set_output(gr);
+            }
         }
-        buf = ggml_backend_alloc_ctx_tensors(c, be);
-        if (!buf) { std::fprintf(stderr, "graph allocation failed (VRAM)\n"); return false; }
-        for (auto & h : up) ggml_backend_tensor_set(h.first, h.second.data(), 0, h.second.size());
+        if (!g_alloc) g_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+        if (!ggml_gallocr_alloc_graph(g_alloc, gf)) { std::fprintf(stderr, "graph allocation failed (VRAM)\n"); return false; }
+        const size_t bs = ggml_gallocr_get_buffer_size(g_alloc, 0);
+        if (bs > g_alloc_peak) {
+            g_alloc_peak = bs;
+            std::fprintf(stderr, "[alloc] compute buffer grew to %.2f GiB (%d nodes)\n", bs / 1073741824.0, ggml_graph_n_nodes(gf));
+        }
+        for (auto & h : up)   // an input this graph never reads (e.g. pos in a router-only pass) has no memory: skip it
+            if (h.first->buffer) ggml_backend_tensor_set(h.first, h.second.data(), 0, h.second.size());
         if (loss_or_null) ggml_graph_reset(gf);
         return ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS;
     }
@@ -364,9 +388,11 @@ int main(int argc, char ** argv) {
             io.out = get(y);
             return true;
         }
-        for (auto & a : ads) if (a.layer == l) { ggml_set_param(a.A); ggml_set_param(a.B); }
+        std::vector<ggml_tensor *> want;
+        for (auto & a : ads) if (a.layer == l) { ggml_set_param(a.A); ggml_set_param(a.B); want.push_back(a.A); want.push_back(a.B); }
+        if (want_gx) want.push_back(xin);
         ggml_tensor * loss = ggml_sum(g.c, ggml_mul(g.c, y, g.f32(gout->data(), G.D, G.hc, W)));
-        const bool ok = g.run(be, loss, {});
+        const bool ok = g.run(be, loss, {}, want);
         if (ok) {
             if (want_gx) io.gx = get(ggml_graph_get_grad(g.gf, xin));
             for (auto & a : ads) if (a.layer == l) {
@@ -490,7 +516,7 @@ int main(int argc, char ** argv) {
             for (int64_t t = 0; t < n; ++t) oh[(size_t) (t * G.n_vocab + w.tok[(size_t) rows[(size_t) t] + 1])] = 1.0f;
             ggml_tensor * loss = ggml_scale(g.c, ggml_cross_entropy_loss(g.c, lg, g.f32(oh.data(), G.n_vocab, n)),
                                             (float) n / (float) NLp);                     // chunk mean -> window mean
-            if (!g.run(be, train ? loss : nullptr, { loss })) return false;
+            if (!g.run(be, train ? loss : nullptr, { loss }, train ? std::vector<ggml_tensor *>{ xh } : std::vector<ggml_tensor *>{})) return false;
             ce += get(loss)[0];
             if (train) {
                 auto gv = get(ggml_graph_get_grad(g.gf, xh));
