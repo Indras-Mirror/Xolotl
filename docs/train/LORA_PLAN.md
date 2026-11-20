@@ -348,3 +348,12 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
     src0 on the device); top-4 layers + head ~7 GB quantized -> the trainer goes on the 4090 like hy4_train.
   * `gdn_chunked` gained s0 (initial state, constant) / s_out; gate `test_gdn_state.cpp`: one pass == prefix + carried
     state + suffix, max err 0 at a chunk boundary, <= 8.3e-7 inside a chunk (splits 128/100/37/64).
+- 21 Nov 11:00: **PREFIX CARRY GATE (whole layers, real data).** `GdnCarry` (conv rows + recurrent state) in
+  qfn_gdn_block and `QsaCarry` (normed+rotated K, V; window positions continue the prefix; diag mask n_past) in the
+  QSA block. `QFN_GATE_SPLIT=T1 qfn_topk_gate ...` runs each layer as [0,T1) then [T1,T) from host copies of the
+  carries and compares with the one-pass output on the captured smoke data:
+    split 11: L44 2.6e-3 (of |out| 13.8), L45 1.2e-7, L46 2.4e-7, L47 7.3e-6
+    split 4 : L44 2.6e-3, L45 9.4e-4, L46 2.4e-7, L47 7.3e-6
+  i.e. exact up to an isolated ~2e-4-relative difference (float ordering of the batched quantized matmul or a near-tie
+  in one position's expert pick), 10x below the trainer-vs-engine noise (1.5e-2). One-pass results unchanged (top-1
+  25/25, CE 0.8229). So the 20K-token Quetza prefix can be run once and carried into every window.

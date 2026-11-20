@@ -175,8 +175,17 @@ inline ggml_tensor * lin(ggml_context * c, ggml_tensor * W, ggml_tensor * x, con
 // by sigmoid(gate) before attn_output.
 struct QsaLoras { Lora q, k, v, o; };
 
+// What the attention layer carries across a split: the prefix's keys (normed + rotated) and values, [hd, n_kv, T1].
+// Inputs are constants; outputs are filled when the block runs the prefix. The window's `pos` must continue the
+// prefix's positions (T1, T1+1, ...).
+struct QsaCarry {
+    ggml_tensor * k_in = nullptr, * v_in = nullptr;
+    ggml_tensor * k_out = nullptr, * v_out = nullptr;
+};
+
 inline ggml_tensor * qfn_qsa_dense_block(ggml_context * c, ggml_tensor * x, const PackTensors & p, int64_t l,
-                                         const QfnGeom & G, ggml_tensor * pos, const QsaLoras * lo, float ls) {
+                                         const QfnGeom & G, ggml_tensor * pos, const QsaLoras * lo, float ls,
+                                         QsaCarry * carry = nullptr) {
     const std::string b = "blk." + std::to_string((long long) l) + ".";
     const int64_t T = x->ne[1], H = G.n_head, HK = G.n_kv, hd = G.ahd;
     ggml_tensor * qf = lin(c, p.get(b + "attn_q.weight"), x, lo ? &lo->q : nullptr, ls);     // [2*hd*H, T]
@@ -191,20 +200,28 @@ inline ggml_tensor * qfn_qsa_dense_block(ggml_context * c, ggml_tensor * x, cons
     q = ggml_rope_ext(c, q, pos, nullptr, (int) G.n_rot, GGML_ROPE_TYPE_NEOX, 0, G.rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     k = ggml_rope_ext(c, k, pos, nullptr, (int) G.n_rot, GGML_ROPE_TYPE_NEOX, 0, G.rope_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-    // kv heads expanded to contiguous groups: [hd, 1, HK, T] -> [hd, H/HK, HK, T] -> [hd, H, T]
+    if (carry) { carry->k_out = k; carry->v_out = v; }
+    int64_t n_past = 0;
+    if (carry && carry->k_in) {                                            // prefix cells first, then the window's
+        n_past = carry->k_in->ne[2];
+        k = ggml_concat(c, carry->k_in, k, 2);
+        v = ggml_concat(c, carry->v_in, v, 2);
+    }
+    const int64_t TK = T + n_past;
+    // kv heads expanded to contiguous groups: [hd, 1, HK, TK] -> [hd, H/HK, HK, TK] -> [hd, H, TK]
     auto expand = [&](ggml_tensor * t) {
-        t = ggml_reshape_4d(c, t, hd, 1, HK, T);
-        t = ggml_repeat_4d(c, t, hd, H / HK, HK, T);
-        return ggml_reshape_3d(c, t, hd, H, T);
+        t = ggml_reshape_4d(c, ggml_cont(c, t), hd, 1, HK, TK);
+        t = ggml_repeat_4d(c, t, hd, H / HK, HK, TK);
+        return ggml_reshape_3d(c, t, hd, H, TK);
     };
     k = expand(k);
     v = expand(v);
 
     ggml_tensor * qp = ggml_cont(c, ggml_permute(c, q, 0, 2, 1, 3));      // [hd, T, H]
-    ggml_tensor * kp = ggml_cont(c, ggml_permute(c, k, 0, 2, 1, 3));      // [hd, T, H]
-    ggml_tensor * vt = ggml_cont(c, ggml_permute(c, v, 1, 2, 0, 3));      // [T, hd, H]
-    ggml_tensor * kq = ggml_mul_mat(c, kp, qp);                            // [T_k, T_q, H]
-    kq = ggml_soft_max(c, ggml_diag_mask_inf(c, ggml_scale(c, kq, 1.0f / std::sqrt((float) hd)), 0));
+    ggml_tensor * kp = ggml_cont(c, ggml_permute(c, k, 0, 2, 1, 3));      // [hd, TK, H]
+    ggml_tensor * vt = ggml_cont(c, ggml_permute(c, v, 1, 2, 0, 3));      // [TK, hd, H]
+    ggml_tensor * kq = ggml_mul_mat(c, kp, qp);                            // [TK, T_q, H]
+    kq = ggml_soft_max(c, ggml_diag_mask_inf(c, ggml_scale(c, kq, 1.0f / std::sqrt((float) hd)), (int) n_past));
     ggml_tensor * o = ggml_mul_mat(c, vt, kq);                             // [hd, T_q, H]
     o = ggml_cont(c, ggml_permute(c, o, 0, 2, 1, 3));                      // [hd, H, T]
     o = ggml_mul(c, o, ggml_sigmoid(c, ggml_cont(c, gate)));
@@ -218,6 +235,8 @@ struct TopLayer {
     QfnLayer gdn;          // GDN weights (+ its 3 LoRA slots)
     QsaLoras qsa_lora;     // QSA LoRA slots
     QfnHc hc_attn, hc_ffn;
+    GdnCarry gdn_carry;    // used when `carry` is set on the half below
+    QsaCarry qsa_carry;
 };
 
 inline TopLayer qfn_top_layer(ggml_context * c, const PackTensors & p, int64_t l, const QfnGeom & G, ggml_tensor * ident) {
@@ -266,13 +285,15 @@ inline ggml_tensor * qfn_ffn(ggml_context * c, ggml_tensor * x, const PackTensor
 }
 
 // The attention half of a layer: res [D, hc, T] -> res after hc_combine, and the ffn input (mixed2) + its inject.
-inline ggml_tensor * qfn_attn_half(ggml_context * c, ggml_tensor * res, const TopLayer & L, const PackTensors & p,
+inline ggml_tensor * qfn_attn_half(ggml_context * c, ggml_tensor * res, TopLayer & L, const PackTensors & p,
                                    const QfnGeom & G, ggml_tensor * pos, float ls, ggml_tensor ** mixed2,
-                                   ggml_tensor ** inj2) {
+                                   ggml_tensor ** inj2, bool carry = false) {
     ggml_tensor * inj = nullptr;
     ggml_tensor * mixed = qfn_hc_mix(c, res, L.hc_attn, G.hc, G.eps, &inj);
-    ggml_tensor * att = L.qsa ? qfn_qsa_dense_block(c, mixed, p, L.l, G, pos, &L.qsa_lora, ls)
-                              : qfn_gdn_block(c, mixed, L.gdn, G.hd, G.nk, G.nv, G.d_conv, G.eps);
+    ggml_tensor * att = L.qsa ? qfn_qsa_dense_block(c, mixed, p, L.l, G, pos, &L.qsa_lora, ls,
+                                                    carry ? &L.qsa_carry : nullptr)
+                              : qfn_gdn_block(c, mixed, L.gdn, G.hd, G.nk, G.nv, G.d_conv, G.eps,
+                                              carry ? &L.gdn_carry : nullptr);
     ggml_tensor * res1 = qfn_hc_combine(c, res, att, inj, G.hc);
     *mixed2 = qfn_hc_mix(c, res1, L.hc_ffn, G.hc, G.eps, inj2);
     return res1;

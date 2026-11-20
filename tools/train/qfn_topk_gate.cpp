@@ -81,61 +81,123 @@ int main(int argc, char ** argv) {
     if (T > G.top_k) { std::fprintf(stderr, "T > indexer top_k: QSA is not dense\n"); return 2; }
 
     auto make_ctx = [](size_t mb) { ggml_init_params ip = { mb << 20, nullptr, false }; return ggml_init(ip); };
-    auto inputs = [&](ggml_context * c, const std::vector<float> & r, ggml_tensor ** pos, ggml_tensor ** ident) {
-        ggml_tensor * x = ggml_new_tensor_3d(c, GGML_TYPE_F32, G.D, G.hc, T);
+    auto inputs = [&](ggml_context * c, const std::vector<float> & r, ggml_tensor ** pos, ggml_tensor ** ident,
+                      int64_t p0 = 0) {
+        const int64_t Tn = (int64_t) (r.size() / (size_t) row);
+        ggml_tensor * x = ggml_new_tensor_3d(c, GGML_TYPE_F32, G.D, G.hc, Tn);
         std::memcpy(x->data, r.data(), r.size() * 4);
-        *pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, T);
-        for (int64_t t = 0; t < T; ++t) ((int32_t *) (*pos)->data)[t] = (int32_t) t;
+        *pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, Tn);
+        for (int64_t t = 0; t < Tn; ++t) ((int32_t *) (*pos)->data)[t] = (int32_t) (p0 + t);
         *ident = ggml_new_tensor_2d(c, GGML_TYPE_F32, kGdnChunk, kGdnChunk);
         float * id = (float *) (*ident)->data;
         for (int i = 0; i < kGdnChunk * kGdnChunk; ++i) id[i] = (i % (kGdnChunk + 1)) == 0 ? 1.0f : 0.0f;
         return x;
     };
 
-    for (int64_t l = L0; l < G.NL; ++l) {
-        const auto tl = std::chrono::steady_clock::now();
-        // phase A: the router input from the current weights -> host routing
+    // host copies of what a layer carries across a split (GDN: conv rows + state; QSA: keys + values)
+    struct HostT { std::vector<float> d; int64_t ne[4] = { 1, 1, 1, 1 }; };
+    struct HostCarry { HostT conv, s, k, v; };
+    auto to_host = [](ggml_tensor * t, HostT & h) {
+        if (!t) return;
+        h.d.resize((size_t) ggml_nelements(t));
+        std::memcpy(h.d.data(), t->data, h.d.size() * 4);
+        for (int i = 0; i < 4; ++i) h.ne[i] = t->ne[i];
+    };
+    auto from_host = [](ggml_context * c, const HostT & h) -> ggml_tensor * {
+        if (h.d.empty()) return nullptr;
+        ggml_tensor * t = ggml_new_tensor_4d(c, GGML_TYPE_F32, h.ne[0], h.ne[1], h.ne[2], h.ne[3]);
+        std::memcpy(t->data, h.d.data(), h.d.size() * 4);
+        return t;
+    };
+    // one layer over rows [p0, p0 + Tn): carry_in (may be null) feeds the prefix, carry_out (may be null) is filled
+    auto run_layer = [&](int64_t l, const std::vector<float> & rows, int64_t p0, const HostCarry * cin, HostCarry * cout,
+                         int64_t * n_used) {
+        const int64_t Tn = (int64_t) (rows.size() / (size_t) row);
+        const bool carry = cin || cout;
+        auto setup = [&](ggml_context * c, TopLayer & L) {
+            if (!cin) return;
+            if (L.qsa) {
+                L.qsa_carry.k_in = ggml_reshape_3d(c, from_host(c, cin->k), cin->k.ne[0], cin->k.ne[1], cin->k.ne[2]);
+                L.qsa_carry.v_in = ggml_reshape_3d(c, from_host(c, cin->v), cin->v.ne[0], cin->v.ne[1], cin->v.ne[2]);
+            } else {
+                L.gdn_carry.conv_in = ggml_reshape_2d(c, from_host(c, cin->conv), cin->conv.ne[0], cin->conv.ne[1]);
+                L.gdn_carry.s_in = from_host(c, cin->s);
+            }
+        };
         std::vector<int32_t> ids;
         std::vector<float> wts;
         {
             ggml_context * c = make_ctx(3072);
             ggml_tensor *pos, *ident;
-            ggml_tensor * x = inputs(c, cur, &pos, &ident);
+            ggml_tensor * x = inputs(c, rows, &pos, &ident, p0);
             TopLayer L = qfn_top_layer(c, p, l, G, ident);
+            setup(c, L);
             ggml_tensor *m2, *inj2;
-            qfn_attn_half(c, x, L, p, G, pos, 1.0f, &m2, &inj2);
+            qfn_attn_half(c, x, L, p, G, pos, 1.0f, &m2, &inj2, carry);
             ggml_tensor * logits = ggml_mul_mat(c, p.get("blk." + std::to_string((long long) l) + ".ffn_gate_inp.weight"), m2);
             ggml_cgraph * g = ggml_new_graph_custom(c, 65536, false);
             ggml_build_forward_expand(g, logits);
             ggml_graph_compute_with_ctx(c, g, nth);
             // ggml's [E, T] result is t*E + e; moe_route wants e*T + t (test_moe_train.cpp:91) - transpose here
-            std::vector<float> lt((size_t) (G.E * T));
+            std::vector<float> lt((size_t) (G.E * Tn));
             const float * lp = (const float *) logits->data;
-            for (int64_t t = 0; t < T; ++t)
-                for (int64_t e = 0; e < G.E; ++e) lt[(size_t) (e * T + t)] = lp[(size_t) (t * G.E + e)];
-            moe_route(lt.data(), G.E, T, G.K, ids, wts);
+            for (int64_t t = 0; t < Tn; ++t)
+                for (int64_t e = 0; e < G.E; ++e) lt[(size_t) (e * Tn + t)] = lp[(size_t) (t * G.E + e)];
+            moe_route(lt.data(), G.E, Tn, G.K, ids, wts);
             ggml_free(c);
         }
         std::vector<std::vector<int32_t>> tok_of, pair_of;
-        moe_expert_lists(ids, G.K, T, G.E, tok_of, pair_of);
+        moe_expert_lists(ids, G.K, Tn, G.E, tok_of, pair_of);
+        if (n_used) { *n_used = 0; for (auto & v : tok_of) *n_used += !v.empty(); }
+        std::vector<float> out((size_t) (row * Tn));
+        ggml_context * c = make_ctx(4096);
+        ggml_tensor *pos, *ident;
+        ggml_tensor * x = inputs(c, rows, &pos, &ident, p0);
+        TopLayer L = qfn_top_layer(c, p, l, G, ident);
+        setup(c, L);
+        ggml_tensor *m2, *inj2;
+        ggml_tensor * res1 = qfn_attn_half(c, x, L, p, G, pos, 1.0f, &m2, &inj2, carry);
+        MoeIndex ix = moe_make_index(c, ids, G.K, Tn, G.E, tok_of, pair_of);
+        ggml_tensor * y = qfn_hc_combine(c, res1, qfn_ffn(c, m2, p, l, ix), inj2, G.hc);
+        ggml_cgraph * g = ggml_new_graph_custom(c, 65536, false);
+        ggml_build_forward_expand(g, y);
+        if (cout) {
+            for (ggml_tensor * t : { L.gdn_carry.conv_out, L.gdn_carry.s_out, L.qsa_carry.k_out, L.qsa_carry.v_out })
+                if (t) ggml_build_forward_expand(g, t);
+        }
+        ggml_graph_compute_with_ctx(c, g, nth);
+        std::memcpy(out.data(), y->data, out.size() * 4);
+        if (cout) {
+            to_host(L.gdn_carry.conv_out, cout->conv);
+            to_host(L.gdn_carry.s_out, cout->s);
+            to_host(L.qsa_carry.k_out, cout->k);
+            to_host(L.qsa_carry.v_out, cout->v);
+        }
+        ggml_free(c);
+        return out;
+    };
+
+    const int64_t split = std::getenv("QFN_GATE_SPLIT") ? atoll(std::getenv("QFN_GATE_SPLIT")) : 0;
+    if (split > 0 && split < T)
+        std::printf("[gate] SPLIT mode: positions [0, %lld) then [%lld, %lld) from the carried state\n",
+                    (long long) split, (long long) split, (long long) T);
+    for (int64_t l = L0; l < G.NL; ++l) {
+        const auto tl = std::chrono::steady_clock::now();
         int64_t used = 0;
-        for (auto & v : tok_of) used += !v.empty();
-        // phase B: the whole layer with that routing
-        std::vector<float> out((size_t) (row * T));
-        {
-            ggml_context * c = make_ctx(4096);
-            ggml_tensor *pos, *ident;
-            ggml_tensor * x = inputs(c, cur, &pos, &ident);
-            TopLayer L = qfn_top_layer(c, p, l, G, ident);
-            ggml_tensor *m2, *inj2;
-            ggml_tensor * res1 = qfn_attn_half(c, x, L, p, G, pos, 1.0f, &m2, &inj2);
-            MoeIndex ix = moe_make_index(c, ids, G.K, T, G.E, tok_of, pair_of);
-            ggml_tensor * y = qfn_hc_combine(c, res1, qfn_ffn(c, m2, p, l, ix), inj2, G.hc);
-            ggml_cgraph * g = ggml_new_graph_custom(c, 65536, false);
-            ggml_build_forward_expand(g, y);
-            ggml_graph_compute_with_ctx(c, g, nth);
-            std::memcpy(out.data(), y->data, out.size() * 4);
-            ggml_free(c);
+        std::vector<float> out = run_layer(l, cur, 0, nullptr, nullptr, &used);
+        if (split > 0 && split < T) {
+            std::vector<float> a(cur.begin(), cur.begin() + split * row), b(cur.begin() + split * row, cur.end());
+            HostCarry hc;
+            std::vector<float> oa = run_layer(l, a, 0, nullptr, &hc, nullptr);
+            std::vector<float> ob = run_layer(l, b, split, &hc, nullptr, nullptr);
+            double e = 0, m = 0;
+            for (size_t i = 0; i < out.size(); ++i) {
+                const float got = i < oa.size() ? oa[i] : ob[i - oa.size()];
+                e = std::fmax(e, std::fabs(got - out[i]));
+                m = std::fmax(m, std::fabs(out[i]));
+            }
+            std::printf("[gate] layer %lld split: max |one pass - (prefix + carried window)| = %.3e (max |out| %.3e)\n",
+                        (long long) l, e, m);
         }
         const std::string nxt = l + 1 < G.NL ? cap + "/L" + std::to_string((long long) l + 1) + ".bin" : cap + "/final.bf16";
         char tag[160];
