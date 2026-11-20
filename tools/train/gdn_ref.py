@@ -33,18 +33,8 @@ def solve_tri(a, b):
     return np.linalg.solve(a.T.astype(np.float64), np.ascontiguousarray(b.T).astype(np.float64)).T
 
 
-def main(path):
-    raw = open(path, "rb").read()
-    S, H, T = np.frombuffer(raw[:12], dtype=np.int32)
-    S, H, T = int(S), int(H), int(T)
-    off = 12
-    arrs = []
-    for ne in [(S, H, T, 1)] * 3 + [(1, H, T, 1)] * 2 + [(S, H, T, 1)] * 2:
-        n = int(np.prod(ne)) * 4
-        arrs.append(gg(raw[off:off + n], ne))
-        off += n
-    q, k, v, g, b, r, o_ref = [a[..., 0] for a in arrs]   # drop the 4th (n_seqs) dim
-
+def gdn_forward(q, k, v, g, b, S, H, T):
+    """Chunked gated delta net, zero initial state. q/k/v: [S, H, T], g/b: [1, H, T] -> o: [S, H, T]."""
     pad = (CS - T % CS) % CS
     Tp = T + pad
     n_chunks = Tp // CS
@@ -83,6 +73,25 @@ def main(path):
             if c * CS < T:
                 o[:, h, c * CS:min((c + 1) * CS, T)] = o_ch[:, :min(CS, T - c * CS)]
             state = state * np.exp(G[-1]) + kd_t.T @ v_t_new
+
+    return o
+
+
+def main(path):
+    raw = open(path, "rb").read()
+    S, H, T = np.frombuffer(raw[:12], dtype=np.int32)
+    S, H, T = int(S), int(H), int(T)
+    off = 12
+    arrs = []
+    for ne in [(S, H, T, 1)] * 3 + [(1, H, T, 1)] * 2 + [(S, H, T, 1)] * 2:
+        n = int(np.prod(ne)) * 4
+        arrs.append(gg(raw[off:off + n], ne))
+        off += n
+    q, k, v, g, b, r, o_ref = [a[..., 0] for a in arrs]   # drop the 4th (n_seqs) dim
+
+    o = gdn_forward(q, k, v, g, b, S, H, T)
+    pad = (CS - T % CS) % CS
+    n_chunks = (T + pad) // CS
 
     err = np.abs(o - o_ref[:, :, :T])
     scale = np.abs(o_ref[:, :, :T]).max()

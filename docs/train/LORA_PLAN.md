@@ -131,3 +131,12 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   `ggml_repeat_4d` TILES, so v head j reads k head j % n_k_heads (16) - recorded in the header and QFN_LAYER_MAP.md.
   `test_gdn_chunked` gained an input-scale arg so the loss stays O(1) at production dims (unscaled it reaches 1e12 and
   every metric is relative).
+- 20 Nov 22:35: **QFN layer CORE as one training graph - PASS.** `tools/train/test_gdn_layer.cpp` builds what
+  `qwen4exp.cpp build_layer_attn_linear` does between the qkv projection and the output projection: conv input
+  (zero history = position 0) -> `ggml_ssm_conv(4, channels)` -> SILU -> channel split q|k|v -> `build_gdn_l2_norm`
+  (= rms_norm(x, eps/S) * 1/sqrt(S)) on q,k -> `ggml_repeat_4d` head tile (48 v heads from 16 k heads, j % 16) ->
+  `gdn_chunked`. Forward vs `tools/train/gdn_layer_ref.py` (numpy, same composition): 1.9e-8 abs / 3.8e-7 rel at
+  S8/nk2/nv6/T96 (2 chunks). FD (stride 4, 1980 elements each): dx 1.1e-4 (|g| 0.19), dc 9.8e-5 (|g| 0.30),
+  dg 1.8e-6, db 9.8e-7; mean relative 1.6e-5..6.7e-5. The FD alone would only prove the graph is self-consistent,
+  hence the reference - together they prove the graph IS the model's layer core.
+  `gdn_ref.py` now exposes `gdn_forward(...)` (the chunk loop, reused by the layer reference).
