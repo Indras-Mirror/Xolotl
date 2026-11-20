@@ -115,3 +115,7 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   tools/train/test_gdn_chunked.cpp -L$L/build-cuda/bin -lggml-cpu -lggml-base -lggml -Wl,-rpath,$L/build-cuda/bin
   -lpthread -o $L/bin/test_gdn_chunked` then `test_gdn_chunked S H T 1e-2 <stride> /tmp/g.bin` + `python3
   tools/train/gdn_ref.py /tmp/g.bin` (needs the rebuilt libggml-base/libggml-cpu: the backward fixes are in them).
+  Baseline note (so nobody re-litigates it): `test-backend-ops grad -b CPU -o '^SCALE'` aborts at ggml.c's
+  `!node->view_src || ...` assert and prints one `SUM ... MAA` FAIL - BOTH reproduce with the three Xolotl hunks
+  reverted (verified 20 Nov 21:4x), so they predate this work and are harness/in-place artifacts. MUL_MAT_HADAMARD
+  grad fails with MAA = 1.0 because it has no backward rule (also pre-existing).
