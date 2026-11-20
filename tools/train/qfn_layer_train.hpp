@@ -136,7 +136,10 @@ inline ggml_tensor * qfn_hc_mix(ggml_context * c, ggml_tensor * x, const QfnHc &
     lo = ggml_silu(c, lo);                                                          // [hc_lr, T]
     ggml_tensor * gate = ggml_mul_mat(c, w.up, lo);                                 // [D*hc, T]
 
-    ggml_tensor * gated = ggml_mul(c, xn, ggml_reshape_3d(c, ggml_cont(c, gate), D, hc, T));
+    // sigmoid gate (qwen4exp.cpp build_hc_mix: ggml_mul(xn, ggml_sigmoid(gate))). It was MISSING until 21 Nov 09:30:
+    // the FD gate passed without it (analytic and numeric were wrong together); the real-data gate
+    // (qfn_topk_gate vs captures) caught it - lesson 3 again: every piece needs a forward reference, not only FD.
+    ggml_tensor * gated = ggml_mul(c, xn, ggml_sigmoid(c, ggml_reshape_3d(c, ggml_cont(c, gate), D, hc, T)));
     // collapse the streams by their mean (same loop as the model's hc_stream_mean: views over dim1)
     ggml_tensor * mixed = ggml_cont(c, ggml_view_2d(c, gated, D, T, (size_t) D * hc * sizeof(float), 0));
     for (int64_t s = 1; s < hc; ++s)

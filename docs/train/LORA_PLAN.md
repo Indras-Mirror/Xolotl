@@ -315,3 +315,16 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   broadcast, NOT the GDN tiling), scale 1/sqrt(256). The head mixer `output_hc_*` has no inject. So a top-k LoRA with a
   CE loss can be trained on captured L<48-k> inputs; above 2048 positions the QSA selection must be replayed
   (STRATA_QSA_DUMP exists in prefill.cpp:4083) as a constant mask.
+- 21 Nov 09:30: **C++ TOP-STACK FORWARD GATE ON REAL DATA - and a real bug it caught.**
+  `tools/train/qfn_topk.hpp` (pack loader keeping stored types, BF16->F32 since OUT_PROD cannot read BF16; QSA dense
+  block; MoE + shared expert; head) + `qfn_topk_gate.cpp`. First run was garbage (head on the CAPTURED final gave
+  CE 11.6): **`qfn_hc_mix` was missing the sigmoid on the gate** (`xn * gate` instead of `xn * sigmoid(gate)`).
+  The HC FD gate verified this morning passed WITH the bug, because analytic and numeric were consistently wrong;
+  there was no forward reference for HC. Lesson 3, again. Fixed in qfn_layer_train.hpp. (A second near-miss: moe_route
+  wants logits e*T+t, ggml's mul_mat gives t*E+e - transposed in the gate.)
+  After the fix, chained 44 -> 47 -> head from captured L44, quantized weights, 16 threads, ~1 s total:
+    44 GDN update err 1.48e-2 cos 0.999891 (76 experts) | 45 1.70e-2 0.999856 (70) | 46 2.45e-2 0.999701 (62)
+    47 QSA 4.00e-2 cos 0.999205 (67) | logits rel 1.8e-2, top-1 agree 25/25
+    CE ours 0.8229 vs head(captured final) 0.8290; 23/25 positions predict the actual next token
+  The extra error vs numpy (0.3-1 %) is ggml CPU quantizing the activations for Q8_0/IQ4 matmuls (Q8 src1), the same
+  class of noise the engine has; routing agrees with numpy except one flip at layer 46.
