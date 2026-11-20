@@ -382,3 +382,10 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   /media/Crucial1TB/xolotl-train/runs/smoke-r16-loss.png. llama-completion --lora load test still TODO (needs the
   card free of captures; the 73 GB pack wants the GPU + RAM).
   Captures of 40 more windows started (unit qfn-harness-cap, log harness/cap-run2.log, ~67 s/window at 1.4K tokens).
+- 21 Nov ~08:05: **PROOF RUN: the harness LoRA generalises to held-out windows.** proof-r16: 14 captured windows
+  (12 train, 12,917 loss tokens; 2 held out), rank 16, alpha 32, lr 2e-4, warmup 4, 36 steps (3 epochs), ~6 min:
+    held-out CE 1.4116 (base) -> 1.3345 (step 12) -> 1.3214 (24) -> 1.3197 (36): -6.5 %, on windows it never saw
+    the same train window each epoch (w02284, 2784 loss tokens): 1.947 -> 1.895 -> 1.872
+  adapter passes lora_loader_check. Graph: /media/Crucial1TB/xolotl-train/runs/proof-r16-loss.png.
+  Slow captures stopped at 14 windows (Mal: lean, share the GPU). Serve-mode capture (a622a956c) built, PARKED, gate
+  not run. No full run today (Mal). Still open: llama-completion --lora load test; behavioural eval.
