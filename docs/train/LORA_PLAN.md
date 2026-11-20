@@ -119,3 +119,9 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   `!node->view_src || ...` assert and prints one `SUM ... MAA` FAIL - BOTH reproduce with the three Xolotl hunks
   reverted (verified 20 Nov 21:4x), so they predate this work and are harness/in-place artifacts. MUL_MAT_HADAMARD
   grad fails with MAA = 1.0 because it has no backward rule (also pre-existing).
+- 20 Nov 21:35: **QFN layer map written** (`docs/train/QFN_LAYER_MAP.md`). Op-gap list verified by grep of
+  ggml_compute_backward: MUL_MAT_ID has NO backward and no decomposed fallback (rebuild the expert loop Hy4-style);
+  SET_ROWS has no rule (QSA mask scatter + KV writes); LIGHTNING_INDEXER is fused with no fallback but its weights are
+  a constant fill(1/sqrt(idx_dim)) and it only feeds zero-grad selection - needs a test, not an assumption. The private
+  tree already carries `cparams.training` (llama-cparams.h:58, set by llama_opt_init) and a dense-attention training
+  bypass (llama-graph.cpp:3258), so llama.cpp's own finetune path is a second possible route (time-boxed probe).
