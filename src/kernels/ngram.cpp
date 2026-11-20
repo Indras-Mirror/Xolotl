@@ -330,13 +330,39 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     // The table's type is looked up in the format list (ple_formats()): IQ4_NL (ISTA-DASLab's shard 2, the original's
     // own GGUF), Q5_0 (#296: OrcaRouter's GGUF), or the FP8 table as shipped: I8 bytes marked strata.ple.format =
     // f8_e4m3 with strata.ple.scale (tools/ple_fp8_pack.py)
-    const PleFormatInfo* fmt = nvfp4x16 ? &ple_format_info(PleFormat::NVFP4) : ple_format_for_type(t->type_name());
+    // Upstream's FP8 table (llama.cpp #32476, convert_hf_to_gguf on a Qwen4-Exp FP8 checkpoint): GGML type F8_E4M3 -
+    // the checkpoint's bytes, our FP8 row - with its one scale in an F32 tensor beside it instead of the metadata.
+    const bool f8_upstream = std::strcmp(t->type_name(), "F8_E4M3") == 0;
+    const PleFormatInfo* fmt = nvfp4x16      ? &ple_format_info(PleFormat::NVFP4)
+                               : f8_upstream ? &ple_format_info(PleFormat::F8_E4M3)
+                                             : ple_format_for_type(t->type_name());
     if (fmt == nullptr) {
         err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not " + ple_format_list();
         close();
         return false;
     }
-    if (fmt->needs_scale) {
+    if (f8_upstream) {
+        // per_layer_token_embd.scale: F32, one value (the converter writes it whenever the checkpoint has a scale; a
+        // table without one is unscaled). The metadata form (tools/ple_fp8_pack.py) is honoured too when present.
+        impl_->scale = 1.0f;
+        const MetaValue* ms = impl_->file->get("strata.ple.scale");
+        if (const TensorInfo* st = impl_->file->find("per_layer_token_embd.scale")) {
+            if (std::strcmp(st->type_name(), "F32") != 0 || st->elements() != 1 ||
+                impl_->file->data_start() + st->offset + 4 > impl_->file->file_size()) {
+                err = "per_layer_token_embd.scale must be one F32 value inside " + gguf_path;
+                close();
+                return false;
+            }
+            std::memcpy(&impl_->scale, impl_->file->tensor_data(*st), 4);
+        } else if (ms != nullptr) {
+            impl_->scale = (float) ms->num();
+        }
+        if (!(impl_->scale > 0.0f) || !std::isfinite(impl_->scale)) {
+            err = "per_layer_token_embd.scale is not a positive finite number in " + gguf_path;
+            close();
+            return false;
+        }
+    } else if (fmt->needs_scale) {
         const MetaValue* f = impl_->file->get("strata.ple.format");
         const MetaValue* s = impl_->file->get("strata.ple.scale");
         const char* want = nvfp4x16 ? "nvfp4x16" : "f8_e4m3";

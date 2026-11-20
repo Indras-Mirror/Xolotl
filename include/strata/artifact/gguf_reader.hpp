@@ -52,6 +52,11 @@
 
 namespace strata {
 
+/// Strata's own id for upstream's GGML_TYPE_F8_E4M3 (43): GgufFile retags a type-43 tensor whose size is one byte a
+/// value to this (resolve_type43), because 43 also names MXFP8 in older DeepSeek-V4.1 GGUFs. Outside ggml's range and
+/// the APR fork ids (143-149); it never reaches ggml (only the n-gram table reads it, on the CPU).
+inline constexpr uint32_t kTypeF8E4M3 = 243;
+
 // ---- ggml type ids we care about. 42 = Q2_0, the PrismML ternary 2-bit encoding this engine targets.
 inline const char* ggml_type_name(uint32_t t) {
     switch (t) {
@@ -138,6 +143,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "TQP6";
     case 149:
         return "TQP7";
+    case kTypeF8E4M3:   // upstream's F8_E4M3 (43), told apart from MXFP8 by size (GgufFile::resolve_type43)
+        return "F8_E4M3";
     default:
         return "?";
     }
@@ -267,6 +274,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 43:   // MXFP8: one E8M0 scale + 32 E4M3 codes (the Engram tables of Unsloth's DeepSeek-V4.1 UD-Q8_K_XL)
         elems = 32;
         bytes = 33;
+        return true;
+    case kTypeF8E4M3:   // F8_E4M3: one E4M3 (fn) byte a value, the tensor's scale stored beside it
+        elems = 1;
+        bytes = 1;
         return true;
     // APR trellis types: 128 values = fp16 scale + 32 steps of K bits (K = 8 TQ2_T, 6 TQK6, 7 TQK7);
     // PTQ1_0 = 26 B of base-3 digits + fp16 scale
@@ -556,6 +567,31 @@ private:
             // `file_size() - data_start()` (the payload checks downstream) at 0 instead of wrapping.
             if (n_tensors != 0) throw std::runtime_error("GGUF: data section starts past EOF");
             data_start_ = size_;
+        }
+        resolve_type43();
+    }
+
+    // GGML type 43 means two things in files that exist: MXFP8 (llama.cpp #30817, closed unmerged; 33 bytes per 32
+    // values - Unsloth's DeepSeek-V4.1 UD-Q8_K_XL Engram tables) and, upstream since then, F8_E4M3 (one byte a value -
+    // the FP8 tensors convert_hf_to_gguf keeps as they ship, e.g. a Qwen4-Exp FP8 checkpoint's n-gram table, llama.cpp
+    // #32476). The two sizes differ, so the gap to the next tensor (GGUF aligns every tensor) says which one a tensor is:
+    // an F8_E4M3 one is retagged to kTypeF8E4M3, an MXFP8 one keeps 43 (every MXFP8 reader stays as it was). A tensor
+    // whose gap fits neither is left alone for the size checks downstream to refuse.
+    void resolve_type43() {
+        std::vector<TensorInfo*> ordered;
+        for (auto& t : tensors_) ordered.push_back(&t);
+        std::sort(ordered.begin(), ordered.end(), [](auto a, auto b) { return a->offset < b->offset; });
+        const uint64_t payload = size_ - data_start_;
+        for (size_t i = 0; i < ordered.size(); ++i) {
+            TensorInfo* t = ordered[i];
+            if (t->type != 43) continue;
+            const uint64_t n = t->elements();
+            const uint64_t end = i + 1 < ordered.size() ? ordered[i + 1]->offset : payload;
+            if (end < t->offset) continue;
+            const uint64_t gap = end - t->offset, pad = alignment_;
+            const bool fits_f8 = n <= gap && gap < n + pad;
+            const bool fits_mx = n % 32 == 0 && n / 32 * 33 <= gap && gap < n / 32 * 33 + pad;
+            if (fits_f8 && !fits_mx) t->type = kTypeF8E4M3;
         }
     }
 

@@ -6,6 +6,7 @@
 //
 // Every row the synthetic table holds encodes its own index, so a wrong offset, a straddle mishandled or a
 // dedup slot mixed up shows as a mismatch rather than as plausible data.
+#include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -438,7 +439,75 @@ void table_is_consistent_under_concurrent_use(const std::string& dir) {
     if (g_fail == 0) std::printf("ple table shared by a prompt thread, a decode window and a single gather, 9 reader configurations, vs the mapped reader: OK\n");
 }
 
+/// UPSTREAM'S FP8 TABLE (llama.cpp #32476): convert_hf_to_gguf keeps a Qwen4-Exp FP8 checkpoint's n-gram table as
+/// GGML type 43 (F8_E4M3, one byte a value) and writes its scale as a one-value F32 tensor `per_layer_token_embd.scale`,
+/// with no strata.* metadata. 43 is MXFP8 in older DeepSeek-V4.1 GGUFs, so the reader must tell them apart by size:
+/// the table is retagged F8_E4M3 and read with the tensor's scale; an MXFP8-sized type-43 tensor stays MXFP8.
+void upstream_f8_table(const std::string& dir) {
+    const auto le = [](auto value, int bytes) {
+        std::string s((size_t) bytes, '\0');
+        for (int i = 0; i < bytes; ++i) s[(size_t) i] = (char) ((value >> (8 * i)) & 0xff);
+        return s;
+    };
+    const auto str = [&](const char* s) { return le((uint64_t) std::strlen(s), 8) + std::string(s); };
+    const uint32_t rows = 777;   // 777 x 160 bytes: not a multiple of 33/32 x 32, so the gap can only fit F8_E4M3
+    const uint64_t table = (uint64_t) rows * k::PLE_HEAD_DIM, scale_off = (table + 31) / 32 * 32;
+    const uint64_t mx_off = scale_off + 32, mx_n = 64;   // a 64-value MXFP8 tensor: 2 blocks, 66 bytes
+    const float scale = 0.0390625f;
+    uint32_t sb;
+    std::memcpy(&sb, &scale, 4);
+    const std::string path = dir + "/ple_upstream_f8.gguf";
+    {
+        std::ofstream out(path, std::ios::binary);
+        std::string head = "GGUF" + le(3u, 4) + le(3ull, 8) + le(1ull, 8);
+        head += str("general.architecture") + le(8u, 4) + str("qwen4exp");
+        head += str("per_layer_token_embd.weight") + le(2u, 4) + le((uint64_t) k::PLE_HEAD_DIM, 8) + le((uint64_t) rows, 8) +
+                le(43u, 4) + le(0ull, 8);
+        head += str("per_layer_token_embd.scale") + le(1u, 4) + le(1ull, 8) + le(0u, 4) + le(scale_off, 8);   // 0 = F32
+        head += str("blk.0.engram.mx") + le(1u, 4) + le(mx_n, 8) + le(43u, 4) + le(mx_off, 8);
+        while (head.size() % 32) head += '\0';
+        std::string data((size_t) (mx_off + mx_n / 32 * 33), '\0');
+        for (uint32_t i = 0; i < rows; ++i) expected_row(i, k::PLE_ROW_BYTES_FP8, (uint8_t*) &data[(size_t) i * k::PLE_HEAD_DIM]);
+        std::memcpy(&data[(size_t) scale_off], &sb, 4);
+        out.write(head.data(), (std::streamsize) head.size());
+        out.write(data.data(), (std::streamsize) data.size());
+        CHECK((bool) out, "upstream f8: cannot write %s", path.c_str());
+    }
+    {
+        strata::GgufFile g(path);
+        const strata::TensorInfo* t = g.find("per_layer_token_embd.weight");
+        const strata::TensorInfo* m = g.find("blk.0.engram.mx");
+        CHECK(t && std::strcmp(t->type_name(), "F8_E4M3") == 0, "upstream f8: the table reads as %s, not F8_E4M3",
+              t ? t->type_name() : "(missing)");
+        CHECK(m && std::strcmp(m->type_name(), "MXFP8") == 0, "upstream f8: the MXFP8-sized tensor reads as %s",
+              m ? m->type_name() : "(missing)");
+    }
+    const k::PleFormatInfo& f8 = k::ple_format_info(k::PleFormat::F8_E4M3);
+    for (k::PleIo mode : {k::PleIo::Direct, k::PleIo::Mmap}) {
+        k::PleTable t;
+        std::string err;
+        k::PleIoOptions io;
+        io.mode = mode;
+        io.max_inflight = 8;
+        io.cache_rows = 0;
+        CHECK(t.open(path, err, io), "upstream f8: open: %s", err.c_str());
+        if (g_fail) return;
+        CHECK(std::strcmp(t.format(), "F8_E4M3") == 0, "upstream f8: format() says %s", t.format());
+        CHECK(t.rows() == rows, "upstream f8: rows %llu", (unsigned long long) t.rows());
+        std::vector<uint8_t> raw(k::PLE_ROW_BYTES_FP8);
+        float got[k::PLE_HEAD_DIM], ref[k::PLE_HEAD_DIM];
+        for (uint32_t r : {0u, 1u, 400u, rows - 1}) {
+            t.read_row(r, got);
+            expected_row(r, k::PLE_ROW_BYTES_FP8, raw.data());
+            f8.dequant(raw.data(), scale, ref);
+            CHECK(std::memcmp(got, ref, sizeof got) == 0, "upstream f8: row %u is not the FP8 row x the tensor's scale", r);
+        }
+    }
+    if (g_fail == 0) std::printf("upstream F8_E4M3 table (type 43 + scale tensor) vs MXFP8 by size: OK\n");
+}
+
 void all_formats_round_trip(const std::string& dir) {
+    upstream_f8_table(dir);
     bf16_widening_is_exact();                      // BF16's own claim: a shift, exact for every pattern
     bad_sizes_are_refused(dir);
     prefetched_keys_are_reused(dir);
