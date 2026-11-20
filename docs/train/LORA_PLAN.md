@@ -329,7 +329,7 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   The extra error vs numpy (0.3-1 %) is ggml CPU quantizing the activations for Q8_0/IQ4 matmuls (Q8 src1), the same
   class of noise the engine has; routing agrees with numpy except one flip at layer 46.
 - 21 Nov 10:30: **HARNESS LoRA (QFN) - data + design.**
-  * The corpus logs (chats.jsonl, xq/tools/cdmem/chats.py) have messages + tool calls but NOT the system prompt or
+  * The corpus logs (chats.jsonl, a format-neutral export of our own transcripts) have messages + tool calls but NOT the system prompt or
     tool schemas. Captured one real QuetzaCodetl request with `tools/train/harness_capture_server.py` (fake
     /v1/messages endpoint, Quetza run once in -p mode with xol-qfn's env): 14 tools, system 33K chars, tools 42K chars.
     Rendered by serve's own path (frontend.anthropic_to_messages -> pack chat_template.jinja, cache marker stripped,
@@ -389,7 +389,7 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   adapter passes lora_loader_check. Graph: /media/Crucial1TB/xolotl-train/runs/proof-r16-loss.png.
   Slow captures stopped at 14 windows (Mal: lean, share the GPU). Serve-mode capture (a622a956c) built, PARKED, gate
   not run. No full run today (Mal). Still open: llama-completion --lora load test; behavioural eval.
-- 21 Nov ~08:20: **FAST (serve-mode) CAPTURE RUNS BUT DOES NOT MATCH THE COLD CAPTURE - kept off main.**
+- 21 Nov ~08:20: **FAST (serve-mode) CAPTURE RUNS BUT DOES NOT MATCH THE COLD CAPTURE - shipped as an opt-in, noted.**
   harness_capture_serve.py with STRATA_KVA_CAPTURE_PER_REQ (a622a956c): engine READY 39 s, then 2.6-3.6 s per window
   (vs 66-137 s cold), reads resume at the root checkpoint 20135 as designed. harness_capture_compare.py vs cap1 (4
   windows): prefix rows bit-identical (diff 0), but EVERY window row differs - x44 median per-row rel 0.12-0.13, worst
