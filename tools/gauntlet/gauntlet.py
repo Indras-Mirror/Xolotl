@@ -19,6 +19,9 @@ chain of thought too: the first calibration used 4096 and 47 of its 118 steps we
 never wrote a file), so a step that ends on finish_reason "length" is counted per task and shown by `score`.
 reasoning_content is passed back on every assistant turn, as DeepSeek's thinking-mode tool-call protocol requires
 (serve_ds41's encoding renders it the same way).
+Traces: every step (thinking, answer, calls, usage) is appended to <outdir>/trace.jsonl the moment it returns, and
+gauntlet.json is rewritten after every task. For the step still in flight, serve the model with STRATA_TRACE_DIR=<dir>
+(serve.server writes each request's thinking live, one text file per request).
 
 The workspace may not decide the grade: write_file refuses the names below (see _write_refusal), anything planted
 another way is stripped before the hidden run (_strip_grading_names), and every subprocess that runs model-supplied
@@ -271,6 +274,10 @@ def run_task(url: str, task: Path) -> dict:
         log.append({"content": m.get("content"), "calls": calls, "reasoning": m.get("reasoning_content"),
                     "finish": j["choices"][0].get("finish_reason"), "secs": round(j["_secs"], 2), "usage": us,
                     "timings": tm})
+        if TRACE_PATH:  # every step's full record (thinking included) on disk at once: a stopped run keeps its traces
+            with open(TRACE_PATH, "a", encoding="utf-8") as tf:
+                tf.write(json.dumps({"task": meta["id"], "step": len(log), "at": time.strftime("%F %T"),
+                                     **log[-1]}, ensure_ascii=False) + "\n")
         if os.environ.get("GAUNTLET_QUIET") is None:  # one live line per step: prefill (new/reused), decode, thinking
             print(f"  [{meta['id'][:2]} step {len(log):2d}] {j['_secs']:6.1f}s  prompt {us.get('prompt_tokens', 0):6d} "
                   f"(reused {tm.get('cache_n', (us.get('prompt_tokens_details') or {}).get('cached_tokens', 0))}, "
@@ -354,8 +361,13 @@ def run_task(url: str, task: Path) -> dict:
             "hidden_output": out[-1500:], "log": log, "chat_error": chat_error}
 
 
+TRACE_PATH = None  # <outdir>/trace.jsonl while run() runs (set there)
+
+
 def run(url, out, only):
+    global TRACE_PATH
     os.makedirs(out, exist_ok=True)
+    TRACE_PATH = os.path.join(out, "trace.jsonl")
     tasks = sorted(p for p in (HERE / "tasks").iterdir() if p.is_dir() and (not only or p.name[:2] in only))
     res = []
     for t in tasks:
@@ -370,7 +382,8 @@ def run(url, out, only):
               f"partial {r.get('partial', 0):.2f}, progress {r.get('progress', 0):.2f}, solved at turn "
               f"{r.get('solved_turn') or '-'}, curve {[f for _, f in r.get('curve', [])]}, "
               f"truncated {r.get('truncated', 0)})", flush=True)
-    json.dump({"tasks": res, "timings": T.TIMINGS}, open(os.path.join(out, "gauntlet.json"), "w"), indent=1)
+        # after EVERY task, not only at the end: a run stopped part-way is still scored on the tasks it finished
+        json.dump({"tasks": res, "timings": T.TIMINGS}, open(os.path.join(out, "gauntlet.json"), "w"), indent=1)
 
 
 def score(dirs):

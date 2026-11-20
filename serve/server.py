@@ -6803,8 +6803,11 @@ class Service:
         if ka is not None:
             ka.acquire()
         reasoning, content, calls = [], [], []
+        trace = LiveTrace.open(ids, thinking, max_new)
         try:
             for item in self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only):
+                if trace is not None and not trace.add(item):
+                    trace = None
                 if item[0] == "event" and item[1].kind in ("reasoning", "content"):
                     (reasoning if item[1].kind == "reasoning" else content).append(item[1].text or "")
                 elif item[0] == "event" and item[1].kind == "tool_call" and item[1].call is not None:
@@ -6813,6 +6816,8 @@ class Service:
                     self._remember_reasoning(ids, thinking, "".join(content), calls, "".join(reasoning).strip())
                 yield item
         finally:
+            if trace is not None:
+                trace.close()
             if ka is not None:
                 ka.release()
 
@@ -7479,6 +7484,58 @@ class Service:
         if rejected:
             done["rejected_tool_calls"] = rejected
         yield "done", done
+
+
+class LiveTrace:
+    """Opt-in live trace of every generation (STRATA_TRACE_DIR=<dir>): one plain-text file per request, written as the
+    tokens arrive, so a test's thinking can be read (tail -f) while it runs and survives a run that is stopped or
+    killed. Thinking, answer text and tool calls in order, then the finish line. Off (None) unless the variable names a
+    directory; a write that fails turns the trace off for that request and never fails the request."""
+    _seq = itertools.count(1)
+
+    def __init__(self, path: Path, head: str):
+        self.path, self.kind, self.f = path, None, open(path, "w", encoding="utf-8")
+        self.f.write(head + "\n")
+        self.f.flush()
+
+    @classmethod
+    def open(cls, ids, thinking, max_new):
+        d = os.environ.get("STRATA_TRACE_DIR", "").strip()
+        if not d:
+            return None
+        try:
+            Path(d).mkdir(parents=True, exist_ok=True)
+            n = next(cls._seq)
+            return cls(Path(d) / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{n:04d}.txt",
+                       f"# request {n} at {time.strftime('%F %T')}: prompt {len(ids)} tokens, "
+                       f"thinking {'on' if thinking else 'off'}, max_new {max_new}")
+        except OSError as e:
+            print(f"[strata] STRATA_TRACE_DIR: cannot write a trace in {d}: {e}", flush=True)
+            return None
+
+    def add(self, item) -> bool:
+        try:
+            kind, x = item
+            if kind == "event" and x.kind in ("reasoning", "content"):
+                if x.kind != self.kind:
+                    self.f.write(f"\n=== {'thinking' if x.kind == 'reasoning' else 'answer'} ===\n")
+                    self.kind = x.kind
+                self.f.write(x.text or "")
+            elif kind == "event" and x.kind == "tool_call" and x.call is not None:
+                self.f.write(f"\n=== tool call: {x.call.name} {json.dumps(x.call.arguments, ensure_ascii=False)}\n")
+                self.kind = None
+            elif kind == "done":
+                self.f.write(f"\n=== done: finish {x.get('finish')}, {x.get('completion_tokens')} tokens "
+                             f"({x.get('reasoning_tokens')} thinking) at {time.strftime('%T')}\n")
+            self.f.flush()
+            return True
+        except Exception:
+            self.close()
+            return False
+
+    def close(self):
+        with contextlib.suppress(Exception):
+            self.f.close()
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:

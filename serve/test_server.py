@@ -4412,6 +4412,24 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(code, 200, b)
         self.assertTrue(b["choices"][0]["message"]["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:20] + "\n"))
 
+    def test_strata_trace_dir_writes_the_thinking_live_and_the_finish(self):
+        """STRATA_TRACE_DIR: one text file per request with the thinking, the answer and the finish line (a Gauntlet run
+        stopped mid-thought kept no trace of what the model was doing); unset, nothing is written."""
+        d = tempfile.mkdtemp(prefix="strata-trace-test-")
+        self.addCleanup(shutil.rmtree, d, True)
+        with mock.patch.dict(os.environ, {"STRATA_TRACE_DIR": d}):
+            code, b = self.openai(max_tokens=3000, reasoning_effort="high")
+        self.assertEqual(code, 200, b)
+        files = sorted(Path(d).iterdir())
+        self.assertEqual(len(files), 1)
+        text = files[0].read_text()
+        self.assertTrue(text.startswith("# request "), text[:80])
+        self.assertIn("=== thinking ===\n" + ThinkingEngine.THOUGHT[:20], text)
+        self.assertIn("=== done: finish ", text)
+        with mock.patch.dict(os.environ, {"STRATA_TRACE_DIR": ""}):
+            self.openai(max_tokens=3000, reasoning_effort="high")
+        self.assertEqual(len(list(Path(d).iterdir())), 1)
+
     def test_the_thinking_progress_line_shows_the_budget_not_max_tokens(self):
         """#984: 'thinking: x of max 6400' read as if the budget was ignored; while a budget applies the line shows it."""
         st = {"phase": "thinking", "generated": 10, "first_token": time.time() - 1, "started": time.time() - 2,
