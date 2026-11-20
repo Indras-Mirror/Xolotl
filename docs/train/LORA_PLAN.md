@@ -125,3 +125,9 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   a constant fill(1/sqrt(idx_dim)) and it only feeds zero-grad selection - needs a test, not an assumption. The private
   tree already carries `cparams.training` (llama-cparams.h:58, set by llama_opt_init) and a dense-attention training
   bypass (llama-graph.cpp:3258), so llama.cpp's own finetune path is a second possible route (time-boxed probe).
+- 20 Nov 22:05: GDN gate re-run at the PACK's own geometry (`ssm.state_size` 128, 16 k heads, 48 v heads): T=64
+  (1 chunk) forward 1.9e-9 abs / 6.8e-7 rel, FD rel 4e-6..1.3e-5; T=128 (2 chunks, state path) forward 1.6e-9 /
+  5.5e-7 rel, FD rel 7e-6..1.9e-5 (dg sampled only idx 0, both sides 0). Head expansion rule verified: llama.cpp
+  `ggml_repeat_4d` TILES, so v head j reads k head j % n_k_heads (16) - recorded in the header and QFN_LAYER_MAP.md.
+  `test_gdn_chunked` gained an input-scale arg so the loss stays O(1) at production dims (unscaled it reaches 1e12 and
+  every metric is relative).
