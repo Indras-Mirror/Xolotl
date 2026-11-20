@@ -244,7 +244,9 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   What is actually known:
   * the SMALL configuration completes: D=4 hc=2 hd=2, with `ggml_graph_compute` at **nth=1** - forward graph, backward
     graph and compute all finish and the loss prints;
-  * at **nth=8** the same case deadlocks - 8 threads spinning, ~140 min CPU over 17 min wall, no progress;
+  * at **nth=8** the same case deadlocks - 8 threads spinning, ~140 min CPU over 17 min wall, no progress
+    (NOTE: part of that repeated burn was my own: a file restore silently put `nth=8` back, so I re-ran the case I had
+    already diagnosed. Check the thread argument before re-running a "hang".);
   * at D=8 hc=3 hd=4 it spins single-threaded at 100% CPU for 10 min with no output - an infinite loop the small case
     does not hit. Not yet localised (candidates: the hand-rolled `ggml_view_2d` strides in `qfn_hc_mix`, the
     `ggml_repeat_4d` broadcast in `qfn_hc_combine`, or the rms_norm+MUL chain in backward).
@@ -252,3 +254,8 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   GDN -> gated norm -> out proj, and the MoE) do not include them.
   Lesson: run every new gate at a SMALL shape with nth=1 first, then scale - two of these failures were threading,
   not maths.
+  **Bisected since (bisect_hc.cpp): both halves are individually FINE.** `qfn_hc_mix` alone (D8 hc3 lr6 T8, nth=1):
+  forward graph, backward graph and compute all complete, loss -0.008787. `qfn_hc_combine` alone, same shape,
+  completes, loss -0.032751. So neither op is broken on its own; the hang appears only in the CHAINED sequence
+  (mix -> block -> combine -> mix -> MLP -> combine), at nth=1, at both hc=2 and hc=3. Next step is mechanical: add
+  one stage at a time to bisect_hc.cpp rather than guessing which line is slow.
