@@ -24,9 +24,9 @@ from pathlib import Path
 
 import numpy as np
 
-R = Path("/home/mal/AI/Xolotl")
-NATIVE = "/media/mal/SSD NVME/Xolotl/qfn45/Swift1.5-QFN-XQ-45GB.gguf"
-PACK = "/media/mal/NVME1TB/Xolotl/qfn45/pack"
+R = Path(__file__).resolve().parents[2]   # the Xolotl checkout
+NATIVE = os.environ.get("QFN_NATIVE") or sys.exit("set QFN_NATIVE (the QFN native GGUF, shard 1)")
+PACK = os.environ.get("QFN_PACK") or sys.exit("set QFN_PACK (the QFN pack directory)")
 ROW = 4 * 2560                     # hc * n_embd
 QSA_LAYER_INDEX = 11               # blk 47 is the 12th full-attention layer ((il + 1) % 4 == 0)
 PAD_TOKEN = 248046                 # any token: it is the verify window, never prefilled

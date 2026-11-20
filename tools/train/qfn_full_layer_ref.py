@@ -23,7 +23,7 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, "/media/Crucial1TB/xolotl-train/llama.cpp/gguf-py")
+sys.path.insert(0, os.environ.get("GGUF_PY", os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../third_party/llama.cpp/gguf-py")))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gguf import GGUFReader  # noqa: E402
 from gguf.quants import dequantize  # noqa: E402

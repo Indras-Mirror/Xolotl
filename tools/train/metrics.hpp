@@ -1,5 +1,5 @@
 // Per-step training metrics for the loss graphs (tools/train/lossplot.py reads RUNS/<run>/metrics.jsonl).
-//   xolotl::train::Metrics m("/media/Crucial1TB/xolotl-train/runs", "qfn-harness-r16", config_json);
+//   xolotl::train::Metrics m("runs", "qfn-harness-r16", config_json);
 //   m.log(step, {{"loss", l}, {"lr", lr}, {"gnorm", g}, {"tokens", (double) tok}});   // "t" (seconds) is added
 // One JSON object per line, flushed every line, so the page can be regenerated while the run is going.
 #pragma once

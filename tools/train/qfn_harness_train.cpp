@@ -19,7 +19,7 @@
 // Metrics -> RUNS/<run>/metrics.jsonl (tools/train/lossplot.py draws them); adapter -> RUNS/<run>/adapter.gguf.
 //
 // env: QFN_LR (2e-4) QFN_RANK (16) QFN_ALPHA (32) QFN_WARMUP (20) QFN_PREFIX_EVERY (50) QFN_EVAL_EVERY (25)
-//      QFN_EVAL_N (2: windows held out) QFN_CLIP (1.0) QFN_SAVE_EVERY (100) QFN_RUNS (/media/Crucial1TB/xolotl-train/runs)
+//      QFN_EVAL_N (2: windows held out) QFN_CLIP (1.0) QFN_SAVE_EVERY (100) QFN_RUNS (runs)
 //      QFN_ROPE_SCALE (2: the served YaRN) QFN_SEED (1)
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -537,7 +537,7 @@ int main(int argc, char ** argv) {
     };
 
     // ---- run
-    const std::string runs = env("QFN_RUNS", "/media/Crucial1TB/xolotl-train/runs");
+    const std::string runs = env("QFN_RUNS", "runs");
     char cfg[1024];
     std::snprintf(cfg, sizeof cfg, "{\"model\": \"Swift1.5-QFN-XQ-45GB\", \"layers\": \"%lld-%lld\", \"rank\": %lld, \"alpha\": %.0f, "
                   "\"lr\": %g, \"warmup\": %d, \"steps\": %d, \"train_windows\": %zu, \"eval_windows\": %zu, \"rope_scale\": \"%s\", "

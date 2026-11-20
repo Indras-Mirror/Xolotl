@@ -20,14 +20,14 @@ TOK=${1:?usage: $0 <tokens-file> <out-dir> [split] [strata args...]}
 OUT=${2:?usage: $0 <tokens-file> <out-dir> [split] [strata args...]}
 SPLIT=${3:-44}
 shift 3 2>/dev/null || shift $#
-R=/home/mal/AI/Xolotl
-N="/media/mal/SSD NVME/Xolotl/qfn45/Swift1.5-QFN-XQ-45GB.gguf"
+R=$(cd "$(dirname "$0")/../.." && pwd)
+N="${QFN_NATIVE:?set QFN_NATIVE to the QFN native GGUF}"
 mkdir -p "$OUT"
 rm -f "$OUT"/L*.bin "$OUT"/final.bf16
 STRATA_KVA_CAPTURE="$OUT" STRATA_KVA_CAPTURE_FP32=1 STRATA_KVA_SPLIT="$SPLIT" \
 STRATA_PREFILL_DUMP_R_ALL="$OUT/final.bf16" STRATA_PREFILL_CPU_SHARE=${STRATA_PREFILL_CPU_SHARE:-0} \
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} "$R/build-xolotl/strata" \
-    --pack /media/mal/NVME1TB/Xolotl/qfn45/pack --native "$N" --ple-gguf "$N" --ple-io direct \
+    --pack "${QFN_PACK:?set QFN_PACK to the QFN pack directory}" --native "$N" --ple-gguf "$N" --ple-io direct \
     --expert-profile "$R/data/expert-profile.bin" --expert-cache auto \
     --prefill 256 --spec 2 --max-context 8192 --kv int8 \
     --tokens-file "$TOK" --max-new 1 --greedy "$@" > "$OUT/strata.log" 2>&1

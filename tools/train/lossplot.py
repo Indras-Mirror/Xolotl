@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Loss graphs for Xolotl training runs.
 
-usage: lossplot.py [RUNS_DIR=/media/Crucial1TB/xolotl-train/runs] [--png FILE] [--watch]
+usage: lossplot.py [RUNS_DIR=runs] [--png FILE] [--watch]
 
 Every trainer writes RUNS_DIR/<run>/metrics.jsonl, one JSON object per line:
     {"step": 12, "loss": 1.84, "eval_loss": 1.91 (optional), "lr": 2e-4, "gnorm": 0.8, "tokens": 51200, "t": 812.4, ...}
@@ -9,7 +9,7 @@ and RUNS_DIR/<run>/config.json (whatever the trainer was started with).
 
 This writes RUNS_DIR/index.html: one self-contained page (no network, no libraries) with every run overlaid -
 train loss (raw + EMA-smoothed), eval loss, learning rate, gradient norm - against step or tokens, a run picker, and
-a 15 s auto-refresh while a run is going. Open it in a browser: file:///media/Crucial1TB/xolotl-train/runs/index.html
+a 15 s auto-refresh while a run is going. Open it in a browser: file://<RUNS_DIR>/index.html
 --png FILE also renders a static PNG (matplotlib) for a quick look in a terminal session.
 --watch regenerates the page every 15 s until interrupted.
 """
@@ -151,7 +151,7 @@ def write(root: Path, png=None):
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    root = Path(args[0] if args else "/media/Crucial1TB/xolotl-train/runs")
+    root = Path(args[0] if args else "runs")
     root.mkdir(parents=True, exist_ok=True)
     png = sys.argv[sys.argv.index("--png") + 1] if "--png" in sys.argv else None
     if "--watch" in sys.argv:

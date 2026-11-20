@@ -7,7 +7,7 @@ usage (Xolotl's venv: serve + tools on the path):
         [--max-conv-tokens 2048] [--producers REGEX] [--limit N] [--sources quetza,quetza-conductor]
 
 Inputs
-  chats.jsonl  the format-neutral corpus (xq/tools/cdmem/chats.py build). It has messages and tool calls but NOT the
+  chats.jsonl  your own agent transcripts, one conversation per line (messages + tool calls, format-neutral). It has messages and tool calls but NOT the
                system prompt or the tool schemas - Claude-Code-style logs never store those.
   req-001.json one real request QuetzaCodetl sent to a local model (harness_capture_server.py): the CURRENT system
                prompt (~33K chars) and the 14 tool schemas (~42K chars). Every example uses them, so the rendered
@@ -32,17 +32,18 @@ AFTER the prefix, loss mask), stats.json.
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
-XOL = Path("/home/mal/AI/Xolotl")
+XOL = Path(__file__).resolve().parents[2]   # the Xolotl checkout
 sys.path.insert(0, str(XOL / "tools"))
 sys.path.insert(0, str(XOL))
 from serve.frontend import ChatTemplate, anthropic_to_messages  # noqa: E402
 import strata_tokenizer as ST  # noqa: E402
 
-TOKDIR = Path("/media/mal/NVME1TB/Xolotl/qfn45/pack/tokenizer")
+TOKDIR = Path(os.environ.get("QFN_PACK", "pack")) / "tokenizer"   # QFN_PACK: the QFN pack directory
 DEFAULT_PRODUCERS = r"deepseek|claude-opus|claude-fable|kimi|glm-5|qwen3\.7|qwen4-max"
 
 
