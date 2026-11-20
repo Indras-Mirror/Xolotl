@@ -73,9 +73,13 @@ QFN45 (512 experts per layer, 48 layers), office profile, held-out gate:
 
 | Keep per layer | Routed mass kept (profile set) | KL vs full model | Top-1 agreement | Verdict |
 | --- | --- | --- | --- | --- |
-| 384 of 512 | 98.9 % (worst layer 96.3 %) | not gated yet | not gated yet | current choice, after the task runs below |
+| 384 of 512 | 98.9 % (worst layer 96.3 %) | 0.057 | 94.9 % | current choice |
 | 320 of 512 | 96.5 % (worst layer 91.2 %) | 0.080 | 93.9 % | passed the gate, but see the task runs |
 | 256 of 512 | - | 0.159 | 90.8 % | too far |
+
+The gate set is small (two held-out exchanges, 1,338 reply tokens), so read it as a direction, not a precise
+number. keep-384 also cuts the extra loss per token (dNLL +0.031 -> +0.007) and the "unsure" tokens (17 -> 9 per
+1,000).
 
 A keep-all list (every expert listed) matches the unmasked output within normal run-to-run variation, which is a
 quick way to check the plumbing before testing a real list.
