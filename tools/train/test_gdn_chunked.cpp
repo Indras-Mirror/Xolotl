@@ -1,4 +1,4 @@
-// test_gdn_chunked [S] [H] [T] [eps] [stride] [dump.bin]
+// test_gdn_chunked [S] [H] [T] [eps] [stride] [dump.bin] [input_scale]
 // Gate for tools/train/gdn_train.hpp (differentiable chunked gated delta net):
 //   1) forward: o = gdn_chunked(q, k, v, g, b, I)  (dumped for the numpy reference, tools/train/gdn_ref.py)
 //   2) backward: loss = sum(o * R), analytic (ggml autodiff through SOLVE_TRI/TRI/CUMSUM/PAD/...) vs central
@@ -73,14 +73,15 @@ int main(int argc, char ** argv) {
     const float eps = argc > 4 ? (float) atof(argv[4]) : 1e-2f;
     const int stride = argc > 5 ? atoi(argv[5]) : 1;
     const char * dump = argc > 6 ? argv[6] : nullptr;
+    const float scale = argc > 7 ? (float) atof(argv[7]) : 1.0f;   // input scale (<1 keeps the loss O(1) at S=128 H=48)
     std::mt19937 rng(11);
     std::uniform_real_distribution<float> U(-1, 1);
     Inputs in;
     in.q.resize((size_t) S * H * T); in.k.resize(in.q.size()); in.v.resize(in.q.size()); in.r.resize(in.q.size());
     in.g.resize((size_t) H * T); in.b.resize(in.g.size());
-    for (auto & x : in.q) x = U(rng);
-    for (auto & x : in.k) x = U(rng);
-    for (auto & x : in.v) x = U(rng);
+    for (auto & x : in.q) x = scale * U(rng);
+    for (auto & x : in.k) x = scale * U(rng);
+    for (auto & x : in.v) x = scale * U(rng);
     for (auto & x : in.r) x = 0.5f * U(rng);
     for (auto & x : in.g) x = -0.3f * std::fabs(U(rng));          // log decay, <= 0
     for (auto & x : in.b) x = 0.5f + 0.4f * U(rng);               // beta after sigmoid, in (0, 1)

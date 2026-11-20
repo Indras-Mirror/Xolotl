@@ -10,6 +10,9 @@
 // Gate: tools/train/test_gdn_chunked.cpp (forward vs tools/train/gdn_ref.py, central-FD gradients on q,k,v,g,b).
 //
 //   q, k : [S_k, H, n_tokens, 1]       v : [S_v, H, n_tokens, 1]  (S_k == S_v; q/k already expanded to the v heads)
+//   Expansion rule (QFN: 16 k heads, 48 v heads): llama.cpp does ggml_repeat_4d(q_conv, head_dim, n_v_heads, T, S), which
+//   TILES - v head j uses k head j % n_k_heads (verified: repeat(3 -> 9) gives 10 20 30 10 20 30 10 20 30). Do the same
+//   here and let REPEAT's backward sum the copies.
 //   g    : [1, H_v, n_tokens, 1]  (log decay, <= 0)    b : [1, H_v, n_tokens, 1] (beta, after sigmoid)
 //   ident: [CS, CS] F32 identity (CS = 64)
 // returns o : [S_v, H_v, n_tokens, 1]  (q is scaled by 1/sqrt(S_k) inside, as llama.cpp)

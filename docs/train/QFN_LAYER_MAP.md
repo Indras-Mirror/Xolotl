@@ -40,6 +40,22 @@ numbers come from a read-only mapping pass and were spot-checked, not all read l
   SET_ROWS (no backward rule). Either add such a bypass (use k_cur/v_cur + a plain mask in training) or write the
   SET_ROWS rule for the mask use.
 
+## QFN geometry and the GDN head expansion (verified against the pack)
+
+`qwen4exp.ssm.state_size = 128` (head dim, k and v), `ssm.group_count = 16` (k heads), `ssm.time_step_rank = 48`
+(v heads), `ssm.inner_size = 6144 = 48 x 128`, `ssm.conv_kernel = 4`; attention 24 heads / 2 kv, indexer 4 heads x
+128 keys, indexer top_k 2048, compress ratio 4 every 4th layer, 512 experts top-10, latent/ffn 640, PLE ngram 3 with
+16 heads.
+
+The GDN graph (`tools/train/gdn_train.hpp`) requires q/k already at the v-head count. `qwen4exp.cpp:1212-1216` does
+`ggml_repeat_4d(q_conv, head_dim, num_v_heads, T, S)` when the counts differ - ggml's repeat TILES, so **v head j uses
+k head j % 16** (verified numerically: repeat(3->9) = 10 20 30 10 20 30 10 20 30). Any trainer port must use the same
+mapping or gradients will be assigned to the wrong k heads.
+
+Gate at production geometry (S=128, H=48, T=64, inputs scaled 0.125): forward vs the numpy reference 1.9e-9 abs
+(6.8e-7 rel), FD gradients dq 3.9e-8, dk 1.6e-7, dv 2.8e-8, dg 7.2e-8, db 5.9e-8 against |g| ~2-8e-3, i.e. 4e-6..1.3e-5
+relative - FD noise.
+
 ## Two possible routes
 
 1. **Our own per-layer trainer** (Hy4 style, what `hy4_train.cpp` does): full control, expert loop instead of
