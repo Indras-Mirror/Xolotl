@@ -1,0 +1,21 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index fe3a67c64..6c9c686a3 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11541,6 +11541,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // Xolotl (LoRA training): mul_mat backward through a frozen quantized weight = out_prod(W, dy^T), weight-shaped.
++    // m 4096 x k 20000 makes the CUDA path dequantize in two row chunks (256 MiB of F32 each).
++    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_XS,
++                             GGML_TYPE_MXFP4, GGML_TYPE_Q2_K, GGML_TYPE_F16, GGML_TYPE_BF16}) {
++        for (bool tb : {false, true}) {
++            test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 1536, 7, 3072, {1, 1}, {1, 1}, tb));
++            test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 4096, 8, 20000, {1, 1}, {1, 1}, tb));
++        }
++    }
++
+     // ne2 sweep to cover the cublasSgemmStridedBatched path (dps2 == 1, ne2 > 1)
+     for (int64_t ne2 : {1, 8, 16, 32}) {
+         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,

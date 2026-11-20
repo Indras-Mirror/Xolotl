@@ -80,13 +80,19 @@ namespace {
 #endif
 }
 
-constexpr int kMaxParts = 8;   ///< the grouped kernel's group/entry cap; top-k 6 needs no more
+/// The most experts one token routes to (the grouped launches' group/entry cap and every per-routing-index array).
+/// DS4 (top-6) builds keep 8; a top-16 model (Hy4) builds this file with -DDS41_MOE_MAX_K=16.
+#ifndef DS41_MOE_MAX_K
+#define DS41_MOE_MAX_K 8
+#endif
+constexpr int kMaxParts = DS41_MOE_MAX_K;   ///< the grouped kernel's group/entry cap; top-k 6 needs no more
+static_assert(kMaxParts >= 8 && kMaxParts <= 16, "DS41_MOE_MAX_K: 8..16 (cpu::Pool::kMaxSplit is 16)");
 constexpr int kMaxTok = Ds41MoeTier::kMaxMulti;   ///< tokens one run_multi call takes (a verify pass: 5-6 at depth 4)
 /// A pool job carries at most cpu::MAXT tokens (the CPU kernels' register tiles); an expert that more of a call's
 /// tokens route to becomes up to this many jobs, each its own slice of the tokens (every row is computed on its own,
 /// so the outputs are the same as one job's).
 constexpr int kJobSplit = (kMaxTok + strata::kernels::cpu::MAXT - 1) / strata::kernels::cpu::MAXT;
-constexpr int kMaxEnt = kMaxTok * 8;   ///< (expert, token) entries and distinct experts of one run_multi call
+constexpr int kMaxEnt = kMaxTok * kMaxParts;   ///< (expert, token) entries and distinct experts of one run_multi call
 /// File-tier misses one gpu_run_n_ex call runs on the card (FILEG) - kMaxParts per cpu::MAXT tokens, as when a 16-row
 /// pass was two calls - and the blobs h_fstage holds (gpu_run uses the first kMaxParts)
 constexpr int kMaxFg = kMaxParts * kJobSplit;
@@ -101,7 +107,7 @@ constexpr size_t kMetaBytes = 65536;   ///< one call's grouped-launch metadata (
 constexpr size_t kHitPtr = 0, kHitStart = 8 * kMaxParts, kHitNg = kHitStart + 4 * (kMaxParts + 1), kHitDst = kHitNg + 4,
                  kHitTok = kHitDst + 4 * kMaxParts, kHitSg = kHitTok + 4 * kMaxParts, kHitStamp = kHitSg + 4,
                  kHitPtr2 = (kHitStamp + 4 + 7) & ~(size_t) 7, kHitNg2 = kHitPtr2 + 8 * kMaxParts, kHitDst2 = kHitNg2 + 4,
-                 kHitWrec = kHitDst2 + 4 * kMaxParts, kHitMetaBytes = 512;
+                 kHitWrec = kHitDst2 + 4 * kMaxParts, kHitMetaBytes = 64 * kMaxParts;
 static_assert(kHitWrec + 12 <= kHitMetaBytes, "d_hit layout");
 constexpr int kMetaSites = 3;   ///< gpu_run's grouped-launch sites: the VRAM hits, the PCIe share, the file misses
 constexpr int kMetaClsMax = 9;  ///< DS4 is per_expert = 9 format classes, each getting a fixed metadata slot (slice B)
@@ -2056,8 +2062,9 @@ bool ds41_moe_blob_layout(const Ds41MoeGeom& g, cpu::NativeFmt& f, std::string& 
         err = "geometry has a non-positive dimension";
         return false;
     }
-    if (g.top_k < 1 || g.top_k > cpu::MAXT) {
-        err = "top_k " + std::to_string(g.top_k) + " is outside 1.." + std::to_string((int) cpu::MAXT);
+    if (g.top_k < 1 || g.top_k > kMaxParts) {   // (kMaxParts, not cpu::MAXT: that caps a pool job's TOKENS)
+        err = "top_k " + std::to_string(g.top_k) + " is outside 1.." + std::to_string(kMaxParts) +
+              " (build with -DDS41_MOE_MAX_K=" + std::to_string(g.top_k) + ")";
         return false;
     }
     if (g.per_expert()) {   // the largest class's layout: what every per-call buffer is sized by
@@ -2111,8 +2118,9 @@ bool ds41_moe_layer_layout(const Ds41MoeGeom& g, int64_t l, cpu::NativeFmt& f, s
         err = "layer " + std::to_string(l) + " has no routed experts";
         return false;
     }
-    if (g.top_k < 1 || g.top_k > cpu::MAXT) {
-        err = "top_k " + std::to_string(g.top_k) + " is outside 1.." + std::to_string((int) cpu::MAXT);
+    if (g.top_k < 1 || g.top_k > kMaxParts) {   // (kMaxParts, not cpu::MAXT: that caps a pool job's TOKENS)
+        err = "top_k " + std::to_string(g.top_k) + " is outside 1.." + std::to_string(kMaxParts) +
+              " (build with -DDS41_MOE_MAX_K=" + std::to_string(g.top_k) + ")";
         return false;
     }
     std::string e;

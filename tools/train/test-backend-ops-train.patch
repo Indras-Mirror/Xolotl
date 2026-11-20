@@ -1,0 +1,97 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index fe3a67c64..0a55046fd 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4723,6 +4723,8 @@ struct test_ssm_conv : public test_case {
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
+         ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
++        ggml_set_param(a);   // Xolotl: SSM_CONV backward
++        ggml_set_param(b);
+         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
+         return out;
+     }
+@@ -8400,6 +8402,7 @@ struct test_pad : public test_case {
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
++        if (!circular) ggml_set_param(a);   // Xolotl: PAD backward (crop); circular has none
+         ggml_set_name(a, "a");
+ 
+         ggml_tensor * out = circular
+@@ -9040,8 +9043,9 @@ struct test_solve_tri : public test_case {
+     const ggml_type              type;
+     const std::array<int64_t, 4> ne_lhs;
+     const std::array<int64_t, 4> ne_rhs;
++    const bool                   upper;   // Xolotl: upper-triangular A (back substitution, the backward's A^T solve)
+ 
+-    std::string vars() override { return VARS_TO_STR3(type, ne_lhs, ne_rhs); }
++    std::string vars() override { return VARS_TO_STR4(type, ne_lhs, ne_rhs, upper); }
+ 
+     uint64_t op_flops(ggml_tensor * t) override {
+         GGML_UNUSED(t);
+@@ -9054,9 +9058,10 @@ struct test_solve_tri : public test_case {
+ 
+     test_solve_tri(ggml_type type = GGML_TYPE_F32,
+             std::array<int64_t, 4> ne_lhs = { 10, 10, 4, 3 },
+-            std::array<int64_t, 4> ne_rhs = { 3, 10, 4, 3 }
++            std::array<int64_t, 4> ne_rhs = { 3, 10, 4, 3 },
++            bool upper = false
+         )
+-        : type(type), ne_lhs(ne_lhs), ne_rhs(ne_rhs) {}
++        : type(type), ne_lhs(ne_lhs), ne_rhs(ne_rhs), upper(upper) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne_lhs[0], ne_lhs[1], ne_lhs[2], ne_lhs[3]);
+@@ -9067,7 +9072,7 @@ struct test_solve_tri : public test_case {
+         ggml_set_param(b);
+         ggml_set_name(b, "b");
+ 
+-        ggml_tensor * out = ggml_solve_tri(ctx, a, b, true, true, false);
++        ggml_tensor * out = ggml_solve_tri(ctx, a, b, true, !upper, false);
+         ggml_set_name(out, "out");
+ 
+         return out;
+@@ -9078,6 +9083,15 @@ struct test_solve_tri : public test_case {
+             if (strcmp(t->name, "a") == 0) {
+                 // note: avoid zeros in the diagonal
+                 init_tensor_tril(t, 0.1, 1.0f);
++                if (upper) {   // transpose each matrix: lower -> upper
++                    std::vector<float> d(ggml_nelements(t)), u(d.size());
++                    ggml_backend_tensor_get(t, d.data(), 0, ggml_nbytes(t));
++                    const int64_t n = t->ne[0];
++                    for (int64_t m = 0; m < t->ne[2] * t->ne[3]; ++m)
++                        for (int64_t i = 0; i < n; ++i)
++                            for (int64_t j = 0; j < n; ++j) u[(size_t) (m * n * n + i * n + j)] = d[(size_t) (m * n * n + j * n + i)];
++                    ggml_backend_tensor_set(t, u.data(), 0, ggml_nbytes(t));
++                }
+             } else {
+                 init_tensor_uniform(t, -1.0f, 1.0f);
+             }
+@@ -11541,6 +11555,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // Xolotl (LoRA training): mul_mat backward through a frozen quantized weight = out_prod(W, dy^T), weight-shaped.
++    // m 4096 x k 20000 makes the CUDA path dequantize in two row chunks (256 MiB of F32 each).
++    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_XS,
++                             GGML_TYPE_MXFP4, GGML_TYPE_Q2_K, GGML_TYPE_F16, GGML_TYPE_BF16}) {
++        for (bool tb : {false, true}) {
++            test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 1536, 7, 3072, {1, 1}, {1, 1}, tb));
++            test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 4096, 8, 20000, {1, 1}, {1, 1}, tb));
++        }
++    }
++
+     // ne2 sweep to cover the cublasSgemmStridedBatched path (dps2 == 1, ne2 > 1)
+     for (int64_t ne2 : {1, 8, 16, 32}) {
+         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
+@@ -12018,6 +12042,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 256, 1, 8, 16 }));
+ 
+     test_cases.emplace_back(new test_solve_tri());
++    test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 10, 10, 4, 3 }, { 3, 10, 4, 3 }, true));   // Xolotl: upper
++    test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 64, 64, 4, 2 }, { 64, 64, 4, 2 }, true));
++    test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 30, 30, 7, 1 }, { 8, 30, 7, 1 }, true));
+     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 11, 11, 1, 1 }, { 5, 11, 1, 1 }));
+     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 17, 17, 2, 4 }, { 9, 17, 2, 4 }));
+     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 30, 30, 7, 1 }, { 8, 30, 7, 1 }));
