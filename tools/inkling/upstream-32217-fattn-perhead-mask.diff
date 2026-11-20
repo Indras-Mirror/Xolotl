@@ -1,0 +1,328 @@
+commit 5c008e00085f4d3e394f9a1be649284999de1326
+Author: Piotr Wilkin (ilintar) <piotr.wilkin@syndatis.com>
+Date:   Sun Nov 15 00:51:31 2026 +0100
+
+    feat: add Inkling 2 support (text + vision) (#32217)
+    
+    * convert : add Inkling2 text GGUF conversion
+    
+    Assisted-by: Codex
+    
+    * llama : implement Inkling2 text inference
+    
+    Assisted-by: Codex
+    
+    * tests : cover Inkling2 text support
+    
+    Assisted-by: Codex
+    
+    * conversion : dequantize packed Inkling2 experts in row chunks
+    
+    Decode per-layer NVFP4 and MXFP8 schemes, validate companions, and use stored scale shapes with a warning for the declared MXFP8 [32,32] grid. Reorder packed w13 rows and their scale rows together. Keep normal GGUF outtype selection and 3D expert tensors.
+    
+    Stream 128 rows per expert through LazyChunkedTensor. Real w13 (384x4608x4608) needs a 2.25 MiB F32 chunk instead of a 30.375 GiB expanded layer. Real-shaped sparse probes peak below 5.8 MiB of Python/NumPy chunk allocations, plus 5.2 MiB of callback metadata: budget about 16 MiB per projection including mapped pages, excluding runtime, other tensors and OS cache. Full-model chunk metadata is roughly 370 MiB.
+    
+    Packed synthetic GGUF weights match the independent pinned vLLM decode bit-for-bit. CPU prefill/decode logits remain within 3.1e-6 absolute error, with 100% argmax agreement. Float fixtures, original-name conversion and CPU architecture checks pass. Real checkpoint conversion remains untested.
+    
+    Assisted-by: Codex
+    
+    * convert : add Inkling2 vision mmproj support
+    
+    Assisted-by: Codex
+    
+    * mtmd : implement Inkling2 still-image encoder
+    
+    Assisted-by: Codex
+    
+    * inkling2 : scope image loading
+    
+    Assisted-by: Codex
+    
+    * inkling2 : enable flash attention with folded bias and sinks
+    
+    Assisted-by: Codex
+    
+    * cuda : route per-head flash attention masks through vec
+    
+    Assisted-by: Codex
+    
+    * mtmd : support Inkling2 temporal frame means
+    
+    Assisted-by: Codex
+    
+    * style : restore shared image comment
+    
+    Assisted-by: Codex
+    
+    * tests : enlarge Inkling2 context fixture
+    
+    Assisted-by: Codex
+    
+    * inkling2 : load per-layer expert feed-forward widths
+    
+    Assisted-by: Codex
+    
+    * tests : add Inkling2 Metal fusion baselines
+    
+    Assisted-by: Codex
+    
+    * inkling2 : group and align registry entries
+    
+    Assisted-by: Fable
+    
+    * convert : regenerate the Inkling2 tokenizer hash with the update script
+    
+    Assisted-by: Fable
+    
+    * conversion : revert the print_registered_models change
+    
+    Assisted-by: Fable
+    
+    * conversion : sort the Inkling2 model map entries
+    
+    Assisted-by: Fable
+    
+    * convert : map Inkling2 vision checkpoint names in the tensor table
+    
+    Assisted-by: Fable
+    
+    * convert : map Inkling2 text checkpoint names in the tensor table
+    
+    Assisted-by: Fable
+    
+    * tests : document the Inkling2 packed expert conversion test
+    
+    Assisted-by: Fable
+    
+    * tests : cover Inkling2 checkpoint and transformers tensor names
+    
+    Assisted-by: Fable
+    
+    * llama : place Inkling2 fields and list entries by file convention
+    
+    Assisted-by: Fable
+    
+    * gguf-py : align Inkling2 tensor mapping comments
+    
+    Assisted-by: Fable
+    
+    * mtmd : place Inkling2 entries by file convention
+    
+    Assisted-by: Fable
+    
+    * tests : place Inkling2 cases after the existing ones
+    
+    Assisted-by: Fable
+    
+    * cuda : index per-head flash attention masks in the tile and mma kernels
+    
+    Assisted-by: Claude
+    Claude-Session: https://claude.ai/code/session_01GbYSza1yxgmTz8wdr6uV8Q
+    
+    * inkling2 : project the relative bias before the gather, drop arch branches
+    
+    Assisted-by: Claude
+    Claude-Session: https://claude.ai/code/session_01GbYSza1yxgmTz8wdr6uV8Q
+    
+    * convert : require Inkling2 hparams, add inkling2 pre-tokenizer
+    
+    Assisted-by: Claude
+    Claude-Session: https://claude.ai/code/session_01GbYSza1yxgmTz8wdr6uV8Q
+    
+    * mtmd : cap Inkling2 image size, drop video frame averaging
+    
+    Assisted-by: Claude
+    Claude-Session: https://claude.ai/code/session_01GbYSza1yxgmTz8wdr6uV8Q
+    
+    * inkling2 : fix CI build, Meta device assert and Windows conversion test
+    
+    Assisted-by: Claude
+    
+    * tests : use the default sliding window for the Inkling2 test model
+    
+    Assisted-by: Claude
+    
+    * simplify mtmd part
+    
+    * give _v arch for vision
+    
+    * remove alpha channel handling, it should be a follow up
+    
+    * explicit rule about audio + vision models
+    
+    * add audio support
+    
+    * rm audio
+    
+    * rm gguf mtmd rope base
+    
+    * address review comment
+    
+    * nits
+    
+    * do not normalize embd from mtmd
+    
+    ---------
+    
+    Co-authored-by: Xuan Son Nguyen <son@huggingface.co>
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 6667ca40..0e78b9a5 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -40,7 +40,7 @@ typedef void (* fattn_kernel_t)(
+                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
+-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
++                            const int32_t nb31, const int64_t nb32, const int64_t nb33);
+ 
+ typedef float (*vec_dot_KQ_t)(
+     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
+@@ -1170,7 +1170,7 @@ void launch_fattn(
+     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
+     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
+     //     multiple sequences of possibly different lengths, or kv_rows lists that end with padding.
+-    const bool scan_mask = !use_sparse && mask && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
++    const bool scan_mask = !use_sparse && mask && mask->ne[2] == 1 && n_kv_cols % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || kv_rows);
+     if (scan_mask) {
+         const int64_t s31 = mask->nb[1] / sizeof(half2);
+         const int64_t s33 = mask->nb[3] / sizeof(half2);
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 07a6db84..f4c09684 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -1930,7 +1930,7 @@ static __global__ void flash_attn_ext_f16(
+                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
+-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
++                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
+     ggml_cuda_pdl_sync(); // TODO optimize placement
+ #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
+     const char * GGML_CUDA_RESTRICT Q              = Q_ptr;
+@@ -2033,7 +2033,7 @@ static __global__ void flash_attn_ext_f16(
+         const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
+         const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
+         const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
+-            (const half *) (mask + nb33*(sequence % ne33));
++            (const half *) (mask + nb33*(sequence % ne33) + nb32*(zt_Q % ne32));
+         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
+ 
+         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
+@@ -2083,7 +2083,7 @@ static __global__ void flash_attn_ext_f16(
+     const float2 * Q_f2   = (const float2 *) (Q + nb03*sequence + nb02*zt_Q);
+     const half2  * K_h2   = (const half2  *) (K + nb13*sequence + nb12*z_KV);
+     const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
+-        (const half *) (mask + nb33*(sequence % ne33));
++        (const half *) (mask + nb33*(sequence % ne33) + nb32*(zt_Q % ne32));
+     float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
+ 
+     const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index ba4628fe..177b2f06 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -812,7 +812,7 @@ static __global__ void flash_attn_tile(
+                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
+-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
++                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
+ #ifdef FLASH_ATTN_AVAILABLE
+     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
+     const char * GGML_CUDA_RESTRICT K        = K_ptr;
+@@ -859,7 +859,7 @@ static __global__ void flash_attn_tile(
+     const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
+     const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
+ 
+-    const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
++    const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33) + nb32*(head0 % ne32)) : nullptr;
+ 
+     const int stride_K2   = nb11 / sizeof(half2);
+     const int stride_V2   = nb21 / sizeof(half2);
+@@ -1252,7 +1252,8 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
+     const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
+-    const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
++    // a mask with a head dimension is not shared by the Q heads of a K/V head
++    const bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
+     if constexpr (DKQ == 320) {
+         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 02c3c327..5077b1ce 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -40,7 +40,7 @@ static __global__ void flash_attn_ext_vec(
+                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
+-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
++                            const int32_t nb31, const int64_t nb32, const int64_t nb33) {
+     ggml_cuda_pdl_lc();
+ #ifdef FLASH_ATTN_AVAILABLE
+     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
+@@ -112,7 +112,7 @@ static __global__ void flash_attn_ext_vec(
+     K += nb13*sequence + nb12*(head / gqa_ratio);
+     V += nb23*sequence + nb22*(head / gqa_ratio);
+ 
+-    const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
++    const half * maskh  = mask ? (const half  *) (mask + nb33*(sequence % ne33) + nb32*(head % ne32) + nb31*ic0) : nullptr;
+ 
+     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
+ 
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index cf44ab4f..4e4ed086 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -224,7 +224,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
+ 
+     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
+     //     are put into the template specialization without GQA optimizations.
+-    bool use_gqa_opt = mask && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
++    // a mask with a head dimension is not shared by the Q heads of a K/V head
++    bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+     for (const ggml_tensor * t : {Q, K, V, mask}) {
+         if (t == nullptr || ggml_is_quantized(t->type)) {
+             continue;
+@@ -607,8 +608,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+ 
+     // The effective batch size for the kernel can be increased by gqa_ratio.
+-    // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
+-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
++    // The kernel versions without this optimization are also used for ALiBi, if there is no mask, if the mask has a head dimension,
++    //     or if the KV cache is not padded,
++    bool gqa_opt_applies = gqa_ratio >= 2 && mask && mask->ne[2] == 1 && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+     for (const ggml_tensor * t : {Q, K, V, mask}) {
+         if (t == nullptr || ggml_is_quantized(t->type)) {
+             continue;
+@@ -677,7 +679,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     }
+ 
+     if (mask && mask->ne[2] != 1) {
+-        return BEST_FATTN_KERNEL_NONE;
++        // the kv_rows mask is compacted per sequence, it has no head dimension
++        if (kv_rows) {
++            return BEST_FATTN_KERNEL_NONE;
++        }
++        // the logit softcap kernels are compiled for these head sizes only
++        float logit_softcap;
++        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
++        if (logit_softcap != 0.0f && Q->ne[0] != 128 && Q->ne[0] != 256) {
++            return BEST_FATTN_KERNEL_NONE;
++        }
+     }
+ 
+     // only the MMA kernel reads K/V through kv_rows
+@@ -722,7 +733,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+ 
+     const int ncols2_max = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 192) ? 16 : 8);
+     int gqa_ratio_eff = 1;
+-    while (max_bias == 0.0f && gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
++    while (max_bias == 0.0f && (!mask || mask->ne[2] == 1) && gqa_ratio % (2*gqa_ratio_eff) == 0 && gqa_ratio_eff < ncols2_max) {
+         gqa_ratio_eff *= 2;
+     }
+ 

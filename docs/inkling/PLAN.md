@@ -74,3 +74,16 @@ Mini is not on OpenRouter (21 Nov), so there is no API run; the comparison is lo
   The engine's own GGUF should carry layers 20-23 as Xolotl MXFP8 (type 43, exact) -> ~18.9 GB, all on the GPU.
 - Prompting: the template has no generation prompt; the model writes `<|message_model|>` itself. Golden prompts in
   `.../inkling-2-mini/golden/` (p0 plain, p1 chat effort 0.2, p2 code effort 0).
+- **Reference bug found + fixed (PR #32694 + NVFP4-kept GGUF):** `load_arch_tensors` copies physical layers 6-17 into loop
+  slots 24-47 before `llama_model_base::load_tensors` attaches `.scale` tensors by slot index, so passes 2-3 ran their
+  experts unscaled (~1e4x) -> garbage text. Fix = attach the scales to the physical layers first
+  (`tools/inkling/ref-loop-expert-scale-fix.patch`, reference tree 622e494b). Upstream never hits it (its converter
+  dequantizes). Worth reporting upstream - on Mal's word.
+- **S0 gate PASSED (21 Nov 07:55):** coherent greedy on p0 (Tokyo), p1 (Rayleigh scattering), p2 (fib). Golden dumps in
+  `.../inkling-2-mini/golden/p{0,1,2}/`: ids.txt, logits.f32 [n_tok x 200058], l_out-<slot>.f32 (48 slots), result_norm.
+- Attention: the reference uses flash attention with the rel-pos bias + sink folded into a PER-HEAD mask; the CUDA
+  dispatch for per-head masks is #32217's ggml change (`tools/inkling/upstream-32217-fattn-perhead-mask.diff`, 27 lines) -
+  must go into `tools/xolotl/ggml/xolotl-ggml.patch` for S2.
+- Loop semantics (easy to get wrong): every pass restarts from the PRELUDE output (layers 0-5) and the prelude blocks;
+  passes 2-3 get messages = mix(bank, bank_out, msg_query) where bank = the previous pass's blocks after its first core
+  block, bank_out = its output. Slot order: 0-5, pass1 6-17, pass2 24-35, pass3 36-47, tail 18-23.
