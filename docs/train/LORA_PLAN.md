@@ -140,3 +140,5 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   dg 1.8e-6, db 9.8e-7; mean relative 1.6e-5..6.7e-5. The FD alone would only prove the graph is self-consistent,
   hence the reference - together they prove the graph IS the model's layer core.
   `gdn_ref.py` now exposes `gdn_forward(...)` (the chunk loop, reused by the layer reference).
+  Exhaustive re-run (stride 1, S8/nk2/nv6/T96): all 7,920 x elements + all c/g/b: dx 2.6e-4 (|g| 0.23), dc 2.0e-4
+  (|g| 0.31), dg 2.2e-6, db 1.5e-6; mean relative 1.5e-5..6.0e-5; forward 1.9e-8 abs / 3.8e-7 rel.
