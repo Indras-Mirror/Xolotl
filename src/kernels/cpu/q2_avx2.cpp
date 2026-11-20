@@ -34,18 +34,23 @@ inline float h2f(const uint8_t* p) {
     return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int) h)));
 }
 
+// 8 bytes of 2-bit codes -> 32 codes in value order: byte j widens to dword lane j, then two shift-ORs put its four
+// 2-bit fields in that lane's four bytes (b&3, b>>2&3, b>>4&3, b>>6&3 = values 4j..4j+3) and one AND clears the rest.
+// The overlapping copies only ever land in masked-off bits.  Unpack from llama.cpp #30447 (homeofe, ggml-cpu: add AVX2
+// dot product for Q2_0, MIT): 7 ops per 32 codes against ~8.5 for the bit-plane split + three interleaves it replaces;
+// the same codes in the same order, so every integer sum and every result is bit-identical (2026-11-16 A/B: 8,000
+// row x NT cases identical; one token 1.28-1.58x faster per row on a Ryzen 7 5700X, NT=3 1.06-1.18x).
+inline __m256i unpack32(const uint8_t* codes) {
+    __m256i v = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) codes));
+    v = _mm256_or_si256(v, _mm256_slli_epi32(v, 12));
+    v = _mm256_or_si256(v, _mm256_slli_epi32(v, 6));
+    return _mm256_and_si256(v, _mm256_set1_epi32(0x03030303));
+}
+
 // 16 bytes of 2-bit codes (value i in byte i/4, bits 2*(i%4)) -> 64 codes in value order, two 32-byte vectors
 inline void unpack64(const uint8_t* codes, __m256i& lo, __m256i& hi) {
-    const __m128i b = _mm_loadu_si128((const __m128i*) codes);
-    const __m128i m3 = _mm_set1_epi8(3);
-    const __m128i c0 = _mm_and_si128(b, m3);
-    const __m128i c1 = _mm_and_si128(_mm_srli_epi16(b, 2), m3);
-    const __m128i c2 = _mm_and_si128(_mm_srli_epi16(b, 4), m3);
-    const __m128i c3 = _mm_and_si128(_mm_srli_epi16(b, 6), m3);
-    const __m128i a0 = _mm_unpacklo_epi8(c0, c1), a1 = _mm_unpacklo_epi8(c2, c3);   // bytes 0..7
-    const __m128i b0 = _mm_unpackhi_epi8(c0, c1), b1 = _mm_unpackhi_epi8(c2, c3);   // bytes 8..15
-    lo = _mm256_set_m128i(_mm_unpackhi_epi16(a0, a1), _mm_unpacklo_epi16(a0, a1));  // values 0..31
-    hi = _mm256_set_m128i(_mm_unpackhi_epi16(b0, b1), _mm_unpacklo_epi16(b0, b1));  // values 32..63
+    lo = unpack32(codes);       // values 0..31
+    hi = unpack32(codes + 8);   // values 32..63
 }
 
 // ---- the row kernel, twice: the AVX2 form and the AVX-VNNI one (q2_avx2_rows.inl)
