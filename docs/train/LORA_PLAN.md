@@ -328,3 +328,23 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
     CE ours 0.8229 vs head(captured final) 0.8290; 23/25 positions predict the actual next token
   The extra error vs numpy (0.3-1 %) is ggml CPU quantizing the activations for Q8_0/IQ4 matmuls (Q8 src1), the same
   class of noise the engine has; routing agrees with numpy except one flip at layer 46.
+- 21 Nov 10:30: **HARNESS LoRA (QFN) - data + design.**
+  * The corpus logs (chats.jsonl, xq/tools/cdmem/chats.py) have messages + tool calls but NOT the system prompt or
+    tool schemas. Captured one real QuetzaCodetl request with `tools/train/harness_capture_server.py` (fake
+    /v1/messages endpoint, Quetza run once in -p mode with xol-qfn's env): 14 tools, system 33K chars, tools 42K chars.
+    Rendered by serve's own path (frontend.anthropic_to_messages -> pack chat_template.jinja, cache marker stripped,
+    strata_tokenizer - ids checked equal to llama-tokenize) the shared prefix is **20,135 tokens**, identical for
+    every example. The QFN template keeps all reasoning in history, so one render supervises every assistant turn.
+  * `tools/train/harness_build.py`: windows (first user msg + segments starting at an assistant turn, <= 2048 conv
+    tokens), loss on assistant spans (thinking + calls + <|im_end|>) from strong producers whose calls use a tool
+    AND arguments in Quetza's current schemas; sources quetza, quetza-conductor, claude-code, claude-data (Quetza is a
+    Claude Code fork: 99 % of Claude Code calls fit the Quetza schemas). Corpus size: ~86M tokens (QFN tokenizer);
+    ~48M Quetza sessions. Two builds merged by id (the 21 Nov rebuild lost conductor histories cleaned on 14-15 Nov).
+  * Trainer design: the prefix is constant -> layers 44-47 run it ONCE without gradient (refresh every N steps) and
+    hand each window the GDN states + conv tails + layer-47 K/V; gradients only through the window. The served config
+    uses **YaRN x2 (orig 262144)**: captures must use the serve's rope flags and layer 47's rope must match (TODO gate).
+    Layer 47 beyond 2048 cells: replay the engine's QSA selection (STRATA_QSA_DUMP) as a constant mask.
+  * GPU: every op of the QFN backward graph has a CUDA kernel in the private ggml (and OUT_PROD dequantizes quantized
+    src0 on the device); top-4 layers + head ~7 GB quantized -> the trainer goes on the 4090 like hy4_train.
+  * `gdn_chunked` gained s0 (initial state, constant) / s_out; gate `test_gdn_state.cpp`: one pass == prefix + carried
+    state + suffix, max err 0 at a chunk boundary, <= 8.3e-7 inside a chunk (splits 128/100/37/64).

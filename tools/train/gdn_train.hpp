@@ -30,8 +30,12 @@ inline ggml_tensor * gdn_slice(ggml_context * c, ggml_tensor * t, int64_t chunk)
     return ggml_view_4d(c, t, t->ne[0], t->ne[1], 1, t->ne[3], t->nb[1], t->nb[2], t->nb[3], (size_t) chunk * t->nb[2]);
 }
 
+// s0: optional initial recurrent state [S_v, S_v, 1, H_v] (the state a shared prefix leaves; a constant input - no
+// gradient flows into the prefix). Same layout as the running state `s` below. nullptr = zero (a sequence from 0).
+// s_out: optional, receives the state after the last chunk (for computing a prefix state itself).
 inline ggml_tensor * gdn_chunked(ggml_context * c, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, ggml_tensor * g,
-                                 ggml_tensor * b, ggml_tensor * ident) {
+                                 ggml_tensor * b, ggml_tensor * ident, ggml_tensor * s0 = nullptr,
+                                 ggml_tensor ** s_out = nullptr) {
     const int64_t S_k = q->ne[0], H_k = q->ne[1], n_tokens = q->ne[2];
     const int64_t S_v = v->ne[0], H_v = v->ne[1];
     GGML_ASSERT(S_k == S_v && H_v == H_k && q->ne[3] == 1);   // caller expands q/k to the v heads (model-specific mapping)
@@ -89,7 +93,7 @@ inline ggml_tensor * gdn_chunked(ggml_context * c, ggml_tensor * q, ggml_tensor 
     ggml_tensor * kg_t = ggml_cont(c, ggml_transpose(c, kg));                               // [CS, S_k, n_chunks, H_v]
     ggml_tensor * v_t = ggml_cont(c, ggml_transpose(c, v));                                   // [CS, S_v, n_chunks, H_v]
 
-    ggml_tensor * s = nullptr;   // [S_v, S_v, 1, H_v]; zero before the first chunk
+    ggml_tensor * s = s0;        // [S_v, S_v, 1, H_v]; zero (nullptr) before the first chunk unless a prefix state is given
     ggml_tensor * out = nullptr;
     for (int64_t ch = 0; ch < n_chunks; ++ch) {
         ggml_tensor * c_v_t = gdn_slice(c, v_t, ch);
@@ -103,12 +107,15 @@ inline ggml_tensor * gdn_chunked(ggml_context * c, ggml_tensor * q, ggml_tensor 
             o = ggml_mul_mat(c, ggml_cont(c, v_new), c_kq);
         }
         out = out ? ggml_concat(c, out, o, 2) : o;                                            // [S_v, CS, ch+1, H_v]
-        if (ch + 1 < n_chunks) {
+        if (ch + 1 < n_chunks || s_out) {
             ggml_tensor * kgv = ggml_mul_mat(c, gdn_slice(c, kg_t, ch), ggml_cont(c, v_new));  // [S_k, S_v, 1, H_v]
             ggml_tensor * gl = gdn_slice(c, g_last_exp_t, ch);
             s = s ? ggml_add(c, ggml_mul(c, s, ggml_repeat_4d(c, gl, S_v, S_v, 1, H_v)), kgv) : kgv;
         }
     }
+    // padded rows have k = 0 and g = 0, so they add nothing to the state and do not decay it: s_out is the state after
+    // the last REAL token for any n_tokens (gate: test_gdn_state.cpp, split at a chunk boundary and inside a chunk)
+    if (s_out) *s_out = s;
     // [S_v, CS*n_chunks, H_v] -> drop the padding -> [S_v, H_v, n_tokens]
     out = ggml_reshape_3d(c, ggml_cont(c, out), S_v, CS * n_chunks, H_v);
     out = ggml_view_3d(c, out, S_v, n_tokens, H_v, out->nb[1], out->nb[2], 0);
