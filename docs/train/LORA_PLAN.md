@@ -111,3 +111,7 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   broadcast because it never trains); (2) PERMUTE/TRANSPOSE backward returned bare strided views, which the binary-op
   CPU kernel rejects as src0 (nb00 != 4) - both now ggml_cont; (3) SCALE backward hit the same thing via a permuted
   grad - it conts when !ggml_is_padded_1d.
+  Gate build: `L=/media/Crucial1TB/xolotl-train; g++ -std=c++20 -O2 -I tools/train -I $L/llama.cpp/ggml/include
+  tools/train/test_gdn_chunked.cpp -L$L/build-cuda/bin -lggml-cpu -lggml-base -lggml -Wl,-rpath,$L/build-cuda/bin
+  -lpthread -o $L/bin/test_gdn_chunked` then `test_gdn_chunked S H T 1e-2 <stride> /tmp/g.bin` + `python3
+  tools/train/gdn_ref.py /tmp/g.bin` (needs the rebuilt libggml-base/libggml-cpu: the backward fixes are in them).
