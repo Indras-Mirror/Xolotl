@@ -227,3 +227,14 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   Geometry from the pack: `block_count` 48, `hyper_connection.count` 4, `embedding_length` 2560 ->
   **2.01 MB per position** (501,760 floats); 200 decoded tokens would be ~400 MB.
   Not yet run: the 4090 is in use by chronos-qx's arm series (verified: their strata --serve holds ~8.5 GiB).
+- 21 Nov 05:45: **real-activation capture is BLOCKED in this build - verified in source and on the GPU.**
+  `strata --dump-layers` cannot coexist with the native (IQ) pack this model is served from:
+  (a) a native pack requires `--spec T` with T >= 2 (`generate.cpp:4394-4400`);
+  (b) `--spec` needs the token graph, and `generate.cpp:8335`/`8400` build that graph only when
+  `layer_dump == nullptr && half_dump == nullptr` - i.e. arming either dump removes exactly what `--spec` needs.
+  Four runs on the real pack (now with the 4090 released by chronos-qx) each stopped at a different link in that chain:
+  `--prefill auto` refused (needs a chunk), `--prefill 2048` OOM'd in device buffers (361 MiB free),
+  `--prefill 256 --spec 2` prefilled fine then died on "--spec needs the device residency table ... and the token
+  graph", and `--prefill 256` without `--spec` was refused up front. `--dump-halves` has the identical condition.
+  Recorded in `tools/train/qfn_dump_layers.sh` so nobody re-burns a GPU slot: the next step is an ENGINE change
+  (keep the token graph while dumping, or allow a dumped non-spec run on a native pack), not a flag combination.

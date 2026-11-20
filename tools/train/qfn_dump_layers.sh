@@ -16,6 +16,19 @@
 #   * Size per position: (n_layers + 1) * hc * n_embd floats = 49 * 4 * 2560 * 4 B = 2.0 MB for QFN (48 layers,
 #     hc 4, n_embd 2560).  A 1-token prompt is ~2 MB; 200 decoded tokens are ~400 MB.
 #
+# BLOCKED (verified 21 Nov, on the real pack): a native (IQ) pack REQUIRES `--spec T` with T >= 2
+# (generate.cpp:4394-4400), and `--spec` needs the token graph, which the build does NOT construct when a layer or
+# half dump is armed (`generate.cpp:8335` and `8400`: `... && layer_dump == nullptr && half_dump == nullptr`).
+# So `--dump-layers` and `--spec` are mutually exclusive, and this pack needs `--spec`.  Same for `--dump-halves`.
+# Attempts on the real pack and what each returned:
+#   * --prefill auto            -> refused: the pack wants an explicit --prefill CHUNK
+#   * --prefill 2048            -> "prefill: device buffers for a chunk of 2048 tokens do not fit" (361 MiB free)
+#   * --prefill 256 --spec 2    -> prefill OK (12 tokens, 375 ms), then "--spec needs the device residency table
+#                                  (--expert-profile, --expert-cache and the token graph)"
+#   * --prefill 256 (no --spec) -> refused up front: a native pack needs --spec >= 2
+# Getting real activations out therefore needs a code change in the engine (capture the ladder with the token graph
+# up, or allow a dumped non-spec run on a native pack), not more flags.  Do not re-burn a GPU slot on this.
+#
 # The GPU: this needs the 4090 for the engine (~8-24 GB depending on the expert tier).  Ask on the relay first if a
 # peer is using it - see the etiquette in the relay skill.
 set -euo pipefail
@@ -60,7 +73,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} "$EXE" \
     --ple-io direct \
     --expert-profile "$PROFILE" \
     --expert-cache auto \
-    --prefill auto \
+    --prefill 256 \
     --max-context 4096 \
     --kv int8 \
     --tokens-file "$TOKENS_FILE" \

@@ -50,8 +50,8 @@ inline ggml_tensor * qfn_linear(ggml_context * c, ggml_tensor * W, ggml_tensor *
     return y;
 }
 
-// returns [D, T]
-inline ggml_tensor * qfn_gdn_layer(ggml_context * c, ggml_tensor * cur /* [D, T] */, const QfnLayer & w,
+// The layer's own contribution to the residual (no residual add), [D, T].
+inline ggml_tensor * qfn_gdn_block(ggml_context * c, ggml_tensor * cur /* [D, T] */, const QfnLayer & w,
                                    int64_t hd, int64_t nk, int64_t nv, int64_t d_conv, float rms_eps) {
     const int64_t D = cur->ne[0], T = cur->ne[1];
     const int64_t n_qkv = 2 * hd * nk + hd * nv, channels = n_qkv, n_z = hd * nv;
@@ -98,8 +98,64 @@ inline ggml_tensor * qfn_gdn_layer(ggml_context * c, ggml_tensor * cur /* [D, T]
     ggml_tensor * on = ggml_mul(c, ggml_rms_norm(c, o, rms_eps), ggml_repeat_4d(c, w.norm_w, hd, nv, T, 1));
     on = ggml_mul(c, on, ggml_sigmoid(c, z));
     ggml_tensor * flat = ggml_reshape_2d(c, on, hd * nv, T);
-    ggml_tensor * out = qfn_linear(c, w.w_out, flat, w.lora_a_out, w.lora_b_out, w.lora_alpha, w.lora_rank);  // [D, T]
-    return ggml_add(c, cur, out);
+    return qfn_linear(c, w.w_out, flat, w.lora_a_out, w.lora_b_out, w.lora_alpha, w.lora_rank);  // [D, T]
+}
+
+// returns [D, T] - the block plus a plain residual (the single-stream form, no hyper-connections)
+inline ggml_tensor * qfn_gdn_layer(ggml_context * c, ggml_tensor * cur /* [D, T] */, const QfnLayer & w,
+                                   int64_t hd, int64_t nk, int64_t nv, int64_t d_conv, float rms_eps) {
+    return ggml_add(c, cur, qfn_gdn_block(c, cur, w, hd, nk, nv, d_conv, rms_eps));
 }
 
 }  // namespace xolotl::train
+
+// ---------------------------------------------------------------------------------------------------------------
+// Hyper-connections (qwen4exp.cpp build_hc_mix 347-414 / build_hc_combine 416-444, NON-fused paths).
+// The model keeps hc parallel residual streams [n_embd, hc, T]; every layer mixes them to one stream, runs its
+// block, and scatters the result back into the streams. This is the form the served engine dumps per layer
+// (--dump-layers hardware slot = hc x n_embd), so the trainer needs it to consume real activations.
+// ---------------------------------------------------------------------------------------------------------------
+struct QfnHc {
+    ggml_tensor * norm   = nullptr;   // [D, hc]   gamma, per stream (stored [D*hc], created ne [D, hc])
+    ggml_tensor * down   = nullptr;   // [D*hc, hc_lr]
+    ggml_tensor * up     = nullptr;   // [hc_lr, D*hc]
+    ggml_tensor * inject = nullptr;   // [D*hc, hc]
+};
+
+// x [D, hc, T] -> mixed [D, T]; *inject_out gets the [hc, T] scatter weights (nullptr to skip)
+inline ggml_tensor * qfn_hc_mix(ggml_context * c, ggml_tensor * x, const QfnHc & w, int64_t hc, float rms_eps,
+                                ggml_tensor ** inject_out) {
+    const int64_t D = x->ne[0], T = x->ne[2];
+    const int64_t hc_dim = D * hc;
+
+    // grouped RMSNorm: rms over ONE stream (dim0 = D), then the [D, hc] gamma
+    ggml_tensor * xn = ggml_mul(c, ggml_rms_norm(c, x, rms_eps), w.norm);          // [D, hc, T]
+    ggml_tensor * xn2 = ggml_reshape_2d(c, ggml_cont(c, xn), hc_dim, T);           // [D*hc, T]
+
+    ggml_tensor * lo = ggml_scale(c, ggml_mul_mat(c, w.down, xn2), 1.0f / (float) hc);
+    lo = ggml_silu(c, lo);                                                          // [hc_lr, T]
+    ggml_tensor * gate = ggml_mul_mat(c, w.up, lo);                                 // [D*hc, T]
+
+    ggml_tensor * gated = ggml_mul(c, xn, ggml_reshape_3d(c, ggml_cont(c, gate), D, hc, T));
+    // collapse the streams by their mean (same loop as the model's hc_stream_mean: views over dim1)
+    ggml_tensor * mixed = ggml_cont(c, ggml_view_2d(c, gated, D, T, (size_t) D * hc * sizeof(float), 0));
+    for (int64_t s = 1; s < hc; ++s)
+        mixed = ggml_add(c, mixed, ggml_view_2d(c, gated, D, T, (size_t) D * hc * sizeof(float), (size_t) s * D * sizeof(float)));
+    mixed = ggml_scale(c, mixed, 1.0f / (float) hc);                                // [D, T]
+
+    if (inject_out)
+        *inject_out = ggml_scale(c, ggml_mul_mat(c, w.inject, xn2), 1.0f / (float) hc);   // [hc, T]
+    return mixed;
+}
+
+// residual [D, hc, T], block_out [D, T], inject [hc, T] -> [D, hc, T]
+// 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add.
+inline ggml_tensor * qfn_hc_combine(ggml_context * c, ggml_tensor * residual, ggml_tensor * block_out,
+                                    ggml_tensor * inject, int64_t hc) {
+    const int64_t D = residual->ne[0], T = residual->ne[2];
+    ggml_tensor * wt = ggml_scale(c, ggml_sigmoid(c, inject), 2.0f);                 // [hc, T]
+    wt = ggml_reshape_3d(c, ggml_cont(c, wt), 1, hc, T);
+    ggml_tensor * b = ggml_reshape_3d(c, block_out, D, 1, T);
+    b = ggml_repeat_4d(c, b, D, hc, T, 1);
+    return ggml_add(c, residual, ggml_mul(c, b, wt));
+}
