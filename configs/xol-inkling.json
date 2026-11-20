@@ -6,7 +6,8 @@
     "The chat template has no generation prompt: the model writes <|message_model|> itself, and the thinking",
     "effort is a template variable (a short prompt system message). Sampling: the model's generation_config.json",
     "(temperature 1.0, do_sample). The 'tokenizer' folder is the pack (vocab.json, merges.txt, token_type.json,",
-    "tokenizer.json with special_ids); until that pack is generated, the server refuses to start and says so."
+    "tokenizer.json with pre=inkling2 and special_ids), exported from the checkpoint by tools/inkling/export_tokenizer.py;",
+    "without it the server refuses to start and says so."
   ],
 
   "arch": "inkling2_loop",
@@ -20,7 +21,7 @@
     "32768"
   ],
 
-  "tokenizer": "/media/mal/NVME1TB/Xolotl/inkling-2-mini/Inkling-2-Mini",
+  "tokenizer": "/media/mal/NVME1TB/Xolotl/inkling-2-mini/pack/tokenizer",
   "model_name": "inkling-2-mini",
   "log": "xol-inkling.log",
   "port": 8134,

@@ -114,11 +114,15 @@ GPT4O_PATTERN = (
 )
 
 # pre type -> the pattern list llama.cpp applies, in order.  The `pre` string in GGUF metadata selects it.
+# `inkling2` is Inkling-2-Mini's name for the GPT-4o (o200k) pattern: its tokenizer.json's pre_tokenizer is
+# GPT4O_PATTERN verbatim, and the HF conversion's ignore_merges changes no id (the merges are complete: measured,
+# 0 differences on 200 strings), so the pack and the GGUF's `tokenizer.ggml.pre` can both say it.
 PRE_PATTERNS = {
     "qwen35": [QWEN35_PATTERN],
     "joyai-llm": JOYAI_LLM_PATTERNS,
     "lfm2": [LLAMA3_PATTERN],
     "llama4": [GPT4O_PATTERN],
+    "inkling2": [GPT4O_PATTERN],
 }
 IGNORE_MERGES = {"lfm2"}   # llama.cpp's ignore_merges: a whole piece found in the vocabulary is taken as it is
 
