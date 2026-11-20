@@ -304,3 +304,14 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   The residual error is the engine's quantized-activation noise (Q8 activations, int8 KV, CPU share on in the smoke).
   So the trainer's model of a QFN GDN layer is the served model's. Next: the QSA layer (47) reference + head, then the
   C++ trainer forward of the top-k stack checked against these captures, then CE on harness transcripts.
+- 21 Nov 08:40: **TOP-4 STACK + HEAD REPRODUCE THE SERVED MODEL ON REAL DATA.** `qfn_full_layer_ref.py ... 44
+  --to-final --tokens smoke.tok` chains OUR outputs (not the captures) through layers 44-47 and the head:
+    44 GDN update err 2.85e-3 cos 0.999996 | 45 GDN 2.32e-3 0.999997 | 46 GDN 4.48e-3 0.999990
+    47 QSA (dense path, T <= indexer top_k 2048) 1.18e-2 cos 0.999930 vs final.bf16 (bf16-rounded target)
+    logits ours vs from the captured final: rel 6.4e-3, top-1 agree 25/25
+    next-token CE over the prompt: ours 0.8275 vs captured-final 0.8271; 23/25 positions predict the actual next token
+  QSA facts: per head Q = [256 q | 256 gate] (gate -> sigmoid on the attention output), q/k RMS norm, IMRoPE == NEOX on
+  the first 64 dims for text (all sections share the position), GQA 24/2 with q head h -> kv head h // 12 (ggml
+  broadcast, NOT the GDN tiling), scale 1/sqrt(256). The head mixer `output_hc_*` has no inject. So a top-k LoRA with a
+  CE loss can be trained on captured L<48-k> inputs; above 2048 positions the QSA selection must be replayed
+  (STRATA_QSA_DUMP exists in prefill.cpp:4083) as a constant mask.
