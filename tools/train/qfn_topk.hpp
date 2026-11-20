@@ -192,27 +192,40 @@ struct QsaLoras { Lora q, k, v, o; };
 struct QsaCarry {
     ggml_tensor * k_in = nullptr, * v_in = nullptr;
     ggml_tensor * k_out = nullptr, * v_out = nullptr;
+    // the engine's QSA selection replayed (STRATA_QSA_DUMP): additive mask [n_past + T, T], 0 on each query's selected
+    // cells and -inf elsewhere (constant: the selection is zero-grad in the model too). nullptr = dense causal.
+    ggml_tensor * sel_mask = nullptr;
 };
+
+// q (normed, rotated), gate, k (normed, rotated), v of the full-attention layer: x [D, T] -> q,gate [hd, H, T], k,v [hd, HK, T]
+inline void qfn_qsa_qkv(ggml_context * c, ggml_tensor * x, const PackTensors & p, int64_t l, const QfnGeom & G,
+                        ggml_tensor * pos, const QsaLoras * lo, float ls, ggml_tensor ** q_out, ggml_tensor ** gate_out,
+                        ggml_tensor ** k_out, ggml_tensor ** v_out) {
+    const std::string b = "blk." + std::to_string((long long) l) + ".";
+    const int64_t T = x->ne[1], H = G.n_head, HK = G.n_kv, hd = G.ahd;
+    const size_t es = sizeof(float);
+    if (q_out || gate_out) {
+        ggml_tensor * qf = lin(c, p.get(b + "attn_q.weight"), x, lo ? &lo->q : nullptr, ls);     // [2*hd*H, T]
+        ggml_tensor * q = ggml_view_3d(c, qf, hd, H, T, 2 * hd * es, 2 * hd * H * es, 0);
+        if (gate_out) *gate_out = ggml_view_3d(c, qf, hd, H, T, 2 * hd * es, 2 * hd * H * es, hd * es);
+        q = ggml_mul(c, ggml_rms_norm(c, ggml_cont(c, q), G.eps), ggml_repeat_4d(c, p.get(b + "attn_q_norm.weight"), hd, H, T, 1));
+        if (q_out) *q_out = ggml_rope_ext(c, q, pos, nullptr, (int) G.n_rot, GGML_ROPE_TYPE_NEOX, G.rope_orig_ctx, G.rope_base,
+                                          G.rope_freq_scale, G.rope_ext, 1.0f, 32.0f, 1.0f);
+    }
+    ggml_tensor * k = ggml_reshape_3d(c, lin(c, p.get(b + "attn_k.weight"), x, lo ? &lo->k : nullptr, ls), hd, HK, T);
+    k = ggml_mul(c, ggml_rms_norm(c, k, G.eps), ggml_repeat_4d(c, p.get(b + "attn_k_norm.weight"), hd, HK, T, 1));
+    *k_out = ggml_rope_ext(c, k, pos, nullptr, (int) G.n_rot, GGML_ROPE_TYPE_NEOX, G.rope_orig_ctx, G.rope_base,
+                           G.rope_freq_scale, G.rope_ext, 1.0f, 32.0f, 1.0f);
+    *v_out = ggml_reshape_3d(c, lin(c, p.get(b + "attn_v.weight"), x, lo ? &lo->v : nullptr, ls), hd, HK, T);
+}
 
 inline ggml_tensor * qfn_qsa_dense_block(ggml_context * c, ggml_tensor * x, const PackTensors & p, int64_t l,
                                          const QfnGeom & G, ggml_tensor * pos, const QsaLoras * lo, float ls,
                                          QsaCarry * carry = nullptr) {
     const std::string b = "blk." + std::to_string((long long) l) + ".";
     const int64_t T = x->ne[1], H = G.n_head, HK = G.n_kv, hd = G.ahd;
-    ggml_tensor * qf = lin(c, p.get(b + "attn_q.weight"), x, lo ? &lo->q : nullptr, ls);     // [2*hd*H, T]
-    const size_t es = sizeof(float);
-    ggml_tensor * q = ggml_view_3d(c, qf, hd, H, T, 2 * hd * es, 2 * hd * H * es, 0);
-    ggml_tensor * gate = ggml_view_3d(c, qf, hd, H, T, 2 * hd * es, 2 * hd * H * es, hd * es);
-    q = ggml_mul(c, ggml_rms_norm(c, ggml_cont(c, q), G.eps), ggml_repeat_4d(c, p.get(b + "attn_q_norm.weight"), hd, H, T, 1));
-    ggml_tensor * k = ggml_reshape_3d(c, lin(c, p.get(b + "attn_k.weight"), x, lo ? &lo->k : nullptr, ls), hd, HK, T);
-    k = ggml_mul(c, ggml_rms_norm(c, k, G.eps), ggml_repeat_4d(c, p.get(b + "attn_k_norm.weight"), hd, HK, T, 1));
-    ggml_tensor * v = ggml_reshape_3d(c, lin(c, p.get(b + "attn_v.weight"), x, lo ? &lo->v : nullptr, ls), hd, HK, T);
-
-    q = ggml_rope_ext(c, q, pos, nullptr, (int) G.n_rot, GGML_ROPE_TYPE_NEOX, G.rope_orig_ctx, G.rope_base,
-                      G.rope_freq_scale, G.rope_ext, 1.0f, 32.0f, 1.0f);
-    k = ggml_rope_ext(c, k, pos, nullptr, (int) G.n_rot, GGML_ROPE_TYPE_NEOX, G.rope_orig_ctx, G.rope_base,
-                      G.rope_freq_scale, G.rope_ext, 1.0f, 32.0f, 1.0f);
-
+    ggml_tensor *q, *gate, *k, *v;
+    qfn_qsa_qkv(c, x, p, l, G, pos, lo, ls, &q, &gate, &k, &v);
     if (carry) { carry->k_out = k; carry->v_out = v; }
     int64_t n_past = 0;
     if (carry && carry->k_in) {                                            // prefix cells first, then the window's
@@ -234,7 +247,10 @@ inline ggml_tensor * qfn_qsa_dense_block(ggml_context * c, ggml_tensor * x, cons
     ggml_tensor * kp = ggml_cont(c, ggml_permute(c, k, 0, 2, 1, 3));      // [hd, TK, H]
     ggml_tensor * vt = ggml_cont(c, ggml_permute(c, v, 1, 2, 0, 3));      // [TK, hd, H]
     ggml_tensor * kq = ggml_mul_mat(c, kp, qp);                            // [TK, T_q, H]
-    kq = ggml_soft_max(c, ggml_diag_mask_inf(c, ggml_scale(c, kq, 1.0f / std::sqrt((float) hd)), (int) n_past));
+    if (carry && carry->sel_mask)
+        kq = ggml_soft_max_ext(c, kq, carry->sel_mask, 1.0f / std::sqrt((float) hd), 0.0f);   // the replayed selection
+    else
+        kq = ggml_soft_max(c, ggml_diag_mask_inf(c, ggml_scale(c, kq, 1.0f / std::sqrt((float) hd)), (int) n_past));
     ggml_tensor * o = ggml_mul_mat(c, vt, kq);                             // [hd, T_q, H]
     o = ggml_cont(c, ggml_permute(c, o, 0, 2, 1, 3));                      // [hd, H, T]
     o = ggml_mul(c, o, ggml_sigmoid(c, ggml_cont(c, gate)));
