@@ -259,3 +259,16 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   completes, loss -0.032751. So neither op is broken on its own; the hang appears only in the CHAINED sequence
   (mix -> block -> combine -> mix -> MLP -> combine), at nth=1, at both hc=2 and hc=3. Next step is mechanical: add
   one stage at a time to bisect_hc.cpp rather than guessing which line is slow.
+- 21 Nov 06:40: **HC bisect advanced (stage gating).** `test_qfn_hc` now takes `HC_STAGES=1..6` (env) and builds the
+  chain one stage at a time - 1 mix, 2 +block, 3 +combine, 4 +mix2, 5 +mlp, 6 +combine2 - printing `[stage] N ... built`
+  so a hang is located, not guessed. Results at D8/hc3/lr6/T8, nth=1:
+  * stage 3 SEGFAULTS (139). Cause is believed to be the harness, not the model: stages that leave some `ggml_set_param`
+    tensors unused give a NULL `ggml_graph_get_grad`, and `grab()` assigns from it. Fix = guard `grab` on null.
+  * stage 6 BUILDS all six stages then runs without finishing (281,440 `run()` calls logged in 60 s with
+    stride=100000, which should be ~27) - so the FD driver loop itself is looping, independent of the graph.
+    That is a SECOND harness bug and it means the earlier "the chain hangs" conclusion was measuring the driver.
+  * stage 1/2/4/5 aborted on `ggml_can_repeat` because a partial stage yields [D,1,T] while the reference is
+    [D,hc,T]; now fixed with a repeat so every stage has a matching loss shape.
+  **So the honest status is: every HC op computes in isolation; the chained-graph question is still OPEN, and the
+  last two "hang" observations were harness bugs I introduced.** Next: guard grab() on null, then instrument the FD
+  loop counter, then re-run 3..6.

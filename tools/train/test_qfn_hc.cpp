@@ -75,18 +75,47 @@ static double run(int D, int hc, int lr, int hd, int nk, int nv, int hc2, const 
         ggml_set_param(g.wqkv); ggml_set_param(g.wgate); ggml_set_param(g.conv_w); ggml_set_param(g.w_ba);
         ggml_set_param(g.ssm_a); ggml_set_param(g.dt); ggml_set_param(g.norm_w); ggml_set_param(g.w_out);
     }
-    // attention half
-    ggml_tensor * inj1 = nullptr;
-    ggml_tensor * mixed = qfn_hc_mix(c, res, w1, hc, 1e-6f, &inj1);
-    ggml_tensor * a = qfn_gdn_block(c, mixed, g, hd, nk, nv, d_conv, 1e-6f);
-    ggml_tensor * res2 = qfn_hc_combine(c, res, a, inj1, hc);
+    // Stage-gated chain so a hang can be BISECTED instead of guessed at: HC_STAGES=1..6, default 6 (full).
+    // Every stage writes the shape it produces into `tout`, so the tail below is identical for all of them.
+    const int stages = getenv("HC_STAGES") ? atoi(getenv("HC_STAGES")) : 6;
+    fprintf(stderr, "[stage] running %d of 6\n", stages); fflush(stderr);
 
-    // FFN half (a plain gated MLP; the MoE has its own gate)
+    ggml_tensor * inj1 = nullptr;
+    ggml_tensor * cur = qfn_hc_mix(c, res, w1, hc, 1e-6f, &inj1);          // [D, T]
+    ggml_tensor * tout = ggml_reshape_3d(c, cur, D, 1, T);
+    ggml_tensor * res2 = res;
+    fprintf(stderr, "[stage] 1 mix1 built\n"); fflush(stderr);
+
+    if (stages >= 2) {
+        cur = qfn_gdn_block(c, cur, g, hd, nk, nv, d_conv, 1e-6f);        // [D, T]
+        tout = ggml_reshape_3d(c, cur, D, 1, T);
+        fprintf(stderr, "[stage] 2 block built\n"); fflush(stderr);
+    }
+    if (stages >= 3) {
+        res2 = qfn_hc_combine(c, res, cur, inj1, hc);                     // [D, hc, T]
+        tout = res2;
+        fprintf(stderr, "[stage] 3 combine1 built\n"); fflush(stderr);
+    }
     ggml_tensor * inj2 = nullptr;
-    ggml_tensor * m2 = qfn_hc_mix(c, ggml_reshape_3d(c, res2, D, hc, T), w2, hc, 1e-6f, &inj2);
-    ggml_tensor * gu = ggml_mul(c, ggml_mul_mat(c, fu, m2), ggml_silu(c, ggml_mul_mat(c, fg, m2)));
-    ggml_tensor * f = ggml_mul_mat(c, fd, gu);
-    ggml_tensor * out = qfn_hc_combine(c, res2, f, inj2, hc);
+    ggml_tensor * f = nullptr;
+    if (stages >= 4) {
+        cur = qfn_hc_mix(c, ggml_reshape_3d(c, res2, D, hc, T), w2, hc, 1e-6f, &inj2);   // [D, T]
+        tout = ggml_reshape_3d(c, cur, D, 1, T);
+        fprintf(stderr, "[stage] 4 mix2 built\n"); fflush(stderr);
+    }
+    if (stages >= 5) {
+        ggml_tensor * gu = ggml_mul(c, ggml_mul_mat(c, fu, cur), ggml_silu(c, ggml_mul_mat(c, fg, cur)));
+        f = ggml_mul_mat(c, fd, gu);
+        tout = ggml_reshape_3d(c, f, D, 1, T);
+        fprintf(stderr, "[stage] 5 mlp built\n"); fflush(stderr);
+    }
+    if (stages >= 6) {
+        tout = qfn_hc_combine(c, res2, f, inj2, hc);
+        fprintf(stderr, "[stage] 6 combine2 built\n"); fflush(stderr);
+    }
+    // partial stages produce [D,1,T]; the reference tensor is [D,hc,T] - repeat so the loss shape always matches
+    if (tout->ne[1] != hc) tout = ggml_repeat_4d(c, tout, D, hc, T, 1);
+    ggml_tensor * out = tout;
 
     ggml_tensor * loss = ggml_sum(c, ggml_mul(c, out, rr));
     ggml_set_loss(loss);
