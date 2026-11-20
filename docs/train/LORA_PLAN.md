@@ -222,7 +222,7 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
 - 21 Nov 05:25: **real-activation capture prepared** - `tools/train/qfn_dump_layers.sh <tokens-file> <out.bin>` runs
   the engine once in generate mode with `--dump-layers` and checks the output size against the pack's own geometry.
   Two source facts it encodes: (1) `--dump-layers` is written by `session_loop`, so `--no-capture` / `--no-pool` must
-  not be set; (2) ARRING `--dump-layers` TURNS FUSED GR OFF (`generate.cpp:4579`), so its numbers come from the
+  not be set; (2) ARMING `--dump-layers` TURNS FUSED GR OFF (`generate.cpp:4579`), so its numbers come from the
   non-fused path - never compare them against a fused-GR run without accounting for that.
   Geometry from the pack: `block_count` 48, `hyper_connection.count` 4, `embedding_length` 2560 ->
   **2.01 MB per position** (501,760 floats); 200 decoded tokens would be ~400 MB.
