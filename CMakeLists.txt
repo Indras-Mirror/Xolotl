@@ -3137,3 +3137,11 @@ if(STRATA_DENSE AND TARGET ggml-cuda AND TARGET strata_kernels)
   target_include_directories(xolotl-glimmer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(xolotl-glimmer PRIVATE strata_kernels ggml ggml-cuda ggml-cpu ggml-base ${_strata_gpu_runtime_target})
 endif()
+
+# Inkling-2-Mini (thinkingmachines, 26B-A3B looped MoE) behind the serve protocol: the Inkling 2 graph (llama.cpp PR
+# #32694, MIT) on ggml-backend (CUDA + CPU fallback), src/program/inkling_main.cpp (the xolotl-glimmer skeleton).
+if(STRATA_DENSE AND TARGET ggml-cuda AND TARGET strata_kernels)
+  add_executable(xolotl-inkling src/program/inkling_main.cpp)
+  target_include_directories(xolotl-inkling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_link_libraries(xolotl-inkling PRIVATE strata_kernels ggml ggml-cuda ggml-cpu ggml-base ${_strata_gpu_runtime_target})
+endif()
