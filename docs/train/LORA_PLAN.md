@@ -369,3 +369,16 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   Per-layer error is ~1.5-1.7x the 25-token smoke gate at EVERY layer (1.5/1.7/2.45/4.0e-2 there) - uniform growth
   from longer chained accumulation, not an L47-specific defect; the CE agreement (3e-4) is the decisive number. So the
   20K-prefix GDN carry, the YaRN rope and the QSA selection replay are all right on real data.
+- 21 Nov ~07:25: **GPU TRAINER SMOKE PASSES (qfn_harness_train on the 4090, 9b5168f59).** First runs needed three
+  fixes: (1) G1 graphs on one shared ggml_gallocr instead of alloc_ctx_tensors (17.7 / 28 GB -> 14.8 GiB peak
+  compute, ~23 GB card total at W = 3063); (2) CUDA OUT_PROD: src1 views with an ld cuBLAS rejects (degenerate
+  one-column stride rewritten, exact; else a contiguous copy); (3) CUDA REPEAT_BACK in grid-z slabs (layer 47's GQA
+  expand over ~16K+ union cells > 32768). Both CUDA fixes are in tools/xolotl/ggml/xolotl-ggml.patch.
+  Run smoke-r16 (rank 16, alpha 32, lr 2e-4, warmup 2, 1 train window w02284 / 1 held out w07038, 20 steps):
+    step-0 eval CE 1.7780 (= base; CPU long gate 1.7798, head on captured final 1.7795) -> prefix carry 12 s
+    train loss 2.025 -> 1.531 (20 steps, 19.5-20 s/step at 3063 tokens, 2784 loss tokens)
+    eval 1.778 -> 1.681 (5) -> 1.633 (10) -> 1.651 (15) -> 1.664 (20): one-window overfit, as expected
+  adapter.gguf (13 tensors, 7.7 MB) passes lora_loader_check.py (llama.cpp accept rules). Loss PNG:
+  /media/Crucial1TB/xolotl-train/runs/smoke-r16-loss.png. llama-completion --lora load test still TODO (needs the
+  card free of captures; the 73 GB pack wants the GPU + RAM).
+  Captures of 40 more windows started (unit qfn-harness-cap, log harness/cap-run2.log, ~67 s/window at 1.4K tokens).
