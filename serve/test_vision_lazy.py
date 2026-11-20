@@ -148,6 +148,18 @@ class Config(unittest.TestCase):
             self.assertTrue(v["lazy"])
             self.assertEqual(said, "")
 
+    def test_resident_low_ram_mode_starts_the_encoder_with_the_model(self):
+        # its expert cache holds experts RAM does not, so even an elastic one cannot make room (503 OOM, 20 Nov 2026)
+        cfg = {"vram_elastic": True, "args": ["--resident-experts"]}
+        for vcfg in ({"gpu": True, "lazy": True}, {"gpu": True, "elastic": True}):
+            v, said = self.quiet(cfg, vcfg)
+            self.assertFalse(v.get("lazy"))
+            self.assertFalse(v.get("elastic"))
+            self.assertIn("--resident-experts", said)
+        v, said = self.quiet(cfg, {"lazy": True})            # a CPU encoder takes no VRAM
+        self.assertTrue(v["lazy"])
+        self.assertEqual(said, "")
+
     def test_lazy_on_the_cpu_needs_nothing(self):
         v, said = self.quiet({"args": []}, {"lazy": True})
         self.assertTrue(v["lazy"])

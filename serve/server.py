@@ -3438,6 +3438,12 @@ def on_demand_vision(cfg: dict, vcfg: dict) -> dict:
     upstream's "elastic" (Service._vision_up), and the local "lazy" (Service.start_lazy_vision), whose encoder found the
     card full without it - its cudaMalloc failed and the first picture's request got no answer."""
     elastic_cache = cfg.get("vram_elastic") is True or "--vram-elastic" in (cfg.get("args") or [])
+    # the resident low-RAM mode's expert cache holds experts RAM does not, so it cannot shrink for the encoder either
+    # (the engine logs "not with the resident low-RAM mode"; the first picture got a 503 OOM, 20 Nov 2026)
+    if "--resident-experts" in (cfg.get("args") or []) and (vcfg.get("lazy") or vcfg.get("elastic") is True) and vcfg.get("gpu"):
+        print('[strata] --resident-experts: the expert cache cannot shrink for an on-demand vision encoder (it holds '
+              "experts RAM does not): the encoder starts with the model instead", flush=True)
+        return {**vcfg, "lazy": False, "elastic": False}
     if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
         print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
               "encoder its VRAM): the encoder starts with the model instead", flush=True)
