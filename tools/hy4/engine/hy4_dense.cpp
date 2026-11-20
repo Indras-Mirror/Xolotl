@@ -44,6 +44,11 @@ struct Layer {
     ggml_tensor *e_kv = nullptr, *e_kv_b = nullptr, *e_gate = nullptr, *e_lookup_norm = nullptr, *e_pre_gamma = nullptr,
                 *e_hc_scale = nullptr;
     ggml_tensor * kcache = nullptr;   ///< [kv_lora + rope, ctx_max] F32
+    // k-pool indexer (DSA layers): weights, the per-position value|gate rows and the pooled keys of complete groups
+    ggml_tensor *ix_k = nullptr, *ix_k_norm = nullptr, *ix_val = nullptr, *ix_gate = nullptr, *ix_ape = nullptr,
+                *ix_cnorm = nullptr, *ix_qb = nullptr, *ix_proj = nullptr;
+    ggml_tensor * vg = nullptr;       ///< [2 * idx_dim, ctx_max]
+    ggml_tensor * pooled = nullptr;   ///< [idx_dim, ctx_max / kpool]
 };
 
 }  // namespace
@@ -201,8 +206,84 @@ struct Hy4Dense::Impl {
         return ggml_add(c, x, delta);
     }
 
+    // ref: build_indexer_rope - rotate only the trailing d_rope of each indexer head ([idx_dim, heads, n])
+    ggml_tensor * idx_rope(ggml_context * c, ggml_tensor * x, ggml_tensor * p, float base) {
+        const int64_t nr = G.d_rope, nf = G.idx_dim - nr;
+        ggml_tensor * front = ggml_view_3d(c, x, nf, x->ne[1], x->ne[2], x->nb[1], x->nb[2], 0);
+        ggml_tensor * back = ggml_view_3d(c, x, nr, x->ne[1], x->ne[2], x->nb[1], x->nb[2], ggml_row_size(x->type, nf));
+        back = ggml_rope_ext(c, ggml_cont(c, back), p, nullptr, (int) nr, GGML_ROPE_TYPE_NORMAL, 0, base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        return ggml_concat(c, ggml_cont(c, front), back, 0);
+    }
+    // the groups of kpool positions this pass completes: [g0, g1)
+    void new_groups(int64_t & g0, int64_t & g1) const {
+        // a group g is completed by this pass when its last member kp*g + kp - 1 lies in [pos0, pos0 + n)
+        const int64_t kp = G.idx_kpool;
+        g0 = (pos0 + 1) / kp + ((pos0 + 1) % kp != 0 ? 0 : 0);
+        while (g0 * kp + kp - 1 < pos0) ++g0;
+        while (g0 > 0 && (g0 - 1) * kp + kp - 1 >= pos0) --g0;
+        g1 = std::max(g0, (int64_t) (pos0 + n) / kp);
+    }
+    // ref: build_kpool_select, the cache half: value|gate rows of this pass, then pool the groups it completes
+    void kpool_maintain(Graph & g, int il, ggml_tensor * cur) {
+        ggml_context * c = g.ctx;
+        const Layer & ly = L[(size_t) il];
+        const int64_t di = G.idx_dim, kp = G.idx_kpool, nt = n;
+        const float base = (float) (G.swa(il) ? G.rope_base_swa : G.rope_base);
+        ggml_tensor * ik = rms(c, ggml_mul_mat(c, ly.ix_k, cur), ly.ix_k_norm);             // [di, n]
+        ggml_tensor * vgr = ggml_concat(c, ggml_mul_mat(c, ly.ix_val, ik), ggml_mul_mat(c, ly.ix_gate, ik), 0);   // [2di, n]
+        ggml_tensor * dst = ggml_view_2d(c, ly.vg, 2 * di, nt, ly.vg->nb[1], (size_t) pos0 * ly.vg->nb[1]);
+        ggml_build_forward_expand(g.gf, ggml_cpy(c, vgr, dst));
+        int64_t g0, g1;
+        new_groups(g0, g1);
+        if (g1 <= g0) return;
+        const int64_t ng = g1 - g0;
+        ggml_tensor * rows = ggml_view_3d(c, ly.vg, 2 * di, kp, ng, ly.vg->nb[1], ly.vg->nb[1] * kp, (size_t) (g0 * kp) * ly.vg->nb[1]);
+        ggml_tensor * pk = ggml_view_3d(c, rows, di, kp, ng, rows->nb[1], rows->nb[2], 0);
+        ggml_tensor * pg = ggml_view_3d(c, rows, di, kp, ng, rows->nb[1], rows->nb[2], ggml_row_size(rows->type, di));
+        ggml_tensor * lg = ggml_cont(c, ggml_permute(c, ggml_add(c, pg, ly.ix_ape), 1, 0, 2, 3));   // [kp, di, ng]
+        ggml_tensor * pr = ggml_reshape_3d(c, ggml_soft_max(c, ggml_reshape_2d(c, lg, kp, di * ng)), kp, di, ng);
+        ggml_tensor * pkt = ggml_cont(c, ggml_permute(c, pk, 1, 0, 2, 3));
+        ggml_tensor * pooled = ggml_reshape_2d(c, ggml_sum_rows(c, ggml_mul(c, pr, pkt)), di, ng);
+        pooled = rms(c, pooled, ly.ix_cnorm);
+        std::vector<int32_t> pp((size_t) ng);
+        for (int64_t i = 0; i < ng; ++i) pp[(size_t) i] = (int32_t) ((g0 + i) * kp);   // rotated at the first member
+        ggml_tensor * ppos = ggml_new_tensor_1d(c, GGML_TYPE_I32, ng);
+        ggml_set_input(ppos);
+        g.in.emplace_back(ppos, std::vector<uint8_t>((uint8_t *) pp.data(), (uint8_t *) pp.data() + pp.size() * 4));
+        pooled = ggml_reshape_2d(c, idx_rope(c, ggml_reshape_3d(c, pooled, di, 1, ng), ppos, base), di, ng);
+        ggml_tensor * pdst = ggml_view_2d(c, ly.pooled, di, ng, ly.pooled->nb[1], (size_t) g0 * ly.pooled->nb[1]);
+        ggml_build_forward_expand(g.gf, ggml_cpy(c, pooled, pdst));
+    }
+    // ref: build_kpool_select, the scoring half: top (top_k / kpool - 1) visible pools per token -> host (top [K, n])
+    ggml_tensor * kpool_score(Graph & g, int il, ggml_tensor * cur, ggml_tensor * qr, int64_t n_pool, int64_t K) {
+        ggml_context * c = g.ctx;
+        const Layer & ly = L[(size_t) il];
+        const int64_t di = G.idx_dim, nh = G.idx_heads, kp = G.idx_kpool, nt = n;
+        const float base = (float) (G.swa(il) ? G.rope_base_swa : G.rope_base);
+        ggml_tensor * iq = idx_rope(c, ggml_reshape_3d(c, ggml_mul_mat(c, ly.ix_qb, qr), di, nh, nt), pos, base);   // [di, nh, n]
+        ggml_tensor * w = ggml_scale(c, ggml_mul_mat(c, ly.ix_proj, cur), 1.0f / std::sqrt((float) (di * nh)));     // [nh, n]
+        ggml_tensor * pk = ggml_view_2d(c, ly.pooled, di, n_pool, ly.pooled->nb[1], 0);
+        ggml_tensor * kq = ggml_mul_mat(c, pk, ggml_permute(c, iq, 0, 2, 1, 3));                  // [P, n, nh]
+        kq = ggml_cont(c, ggml_permute(c, kq, 2, 1, 0, 3));                                       // [nh, n, P]
+        ggml_tensor * sc = ggml_sum_rows(c, ggml_mul(c, ggml_relu(c, kq), w));                     // [1, n, P]
+        sc = ggml_cont(c, ggml_permute(c, sc, 2, 1, 0, 3));                                       // [P, n, 1]
+        sc = ggml_reshape_2d(c, sc, n_pool, nt);
+        std::vector<float> pm((size_t) (n_pool * nt));
+        for (int64_t t = 0; t < nt; ++t) {
+            const int64_t vis = (pos0 + t) / kp;   // pools ending before the token (ref: lower_bound on pool_end)
+            for (int64_t q = 0; q < n_pool; ++q) pm[(size_t) (t * n_pool + q)] = q < vis ? 0.0f : -INFINITY;
+        }
+        sc = ggml_add(c, sc, input(g, GGML_TYPE_F32, n_pool, nt, pm.data(), pm.size() * 4));
+        tap(g, sc, "indexer_score");
+        ggml_tensor * top = ggml_top_k(c, sc, (int) K);                                            // [K, n] I32
+        ggml_set_output(top);
+        ggml_build_forward_expand(g.gf, top);
+        (void) kp;
+        return top;
+    }
+
     // ref: build_attention (no indexer: full causal on DSA layers, see the header)
-    ggml_tensor * attention(Graph & g, int il, ggml_tensor * cur) {
+    ggml_tensor * attention(Graph & g, int il, ggml_tensor * cur, const std::vector<float> * sel_mask, bool maintain) {
         ggml_context * c = g.ctx;
         const Layer & ly = L[(size_t) il];
         const int64_t H = G.heads(il), dk = G.d_qk, dr = G.d_rope, dn = G.d_nope(), kvl = G.kv_lora, nt = n;
@@ -211,6 +292,7 @@ struct Hy4Dense::Impl {
         const float base = (float) (G.swa(il) ? G.rope_base_swa : G.rope_base);
 
         ggml_tensor * qr = rms(c, ggml_mul_mat(c, ly.wq_a, cur), ly.q_a_norm);    // q_resid [q_lora, n]
+        if (G.indexed(il) && maintain) kpool_maintain(g, il, cur);
         ggml_tensor * q = ggml_mul_mat(c, ly.wq_b, qr);                           // [H*dk, n]
         const size_t es = ggml_element_size(q);
         ggml_tensor * q_nope = ggml_view_3d(c, q, dn, H, nt, es * dk, es * dk * H, 0);
@@ -236,7 +318,8 @@ struct Hy4Dense::Impl {
 
         // mask [n_kv, n]: causal, and the sliding window on window layers (ref: LLAMA_SWA_TYPE_STANDARD, p - pk >= n_swa)
         std::vector<float> m((size_t) (n_kv * nt));
-        for (int64_t t = 0; t < nt; ++t) {
+        if (sel_mask) m = *sel_mask;
+        else for (int64_t t = 0; t < nt; ++t) {
             const int64_t p = pos0 + t;
             for (int64_t k = 0; k < n_kv; ++k) {
                 bool ok = k <= p;
@@ -341,6 +424,12 @@ bool Hy4Dense::init(const std::string & gguf, const Hy4DenseConfig & cfg, std::s
             y.routed_down = W(p + "ffn_routed_down.weight"); y.routed_up = W(p + "ffn_routed_up.weight");
             y.sh_gate = W(p + "ffn_gate_shexp.weight"); y.sh_up = W(p + "ffn_up_shexp.weight"); y.sh_down = W(p + "ffn_down_shexp.weight");
         }
+        if (G.indexed(l)) {
+            y.ix_k = W(p + "indexer.attn_k.weight"); y.ix_k_norm = W(p + "indexer.k_norm.weight");
+            y.ix_val = W(p + "indexer_compressor_value.weight"); y.ix_gate = W(p + "indexer_compressor_gate.weight");
+            y.ix_ape = W(p + "indexer_compressor_ape.weight"); y.ix_cnorm = W(p + "indexer_compressor_norm.weight");
+            y.ix_qb = W(p + "indexer.attn_q_b.weight"); y.ix_proj = W(p + "indexer.proj.weight");
+        }
         if (G.engram_slot(l) >= 0) {
             y.e_kv = W(p + "engram_kv.weight"); y.e_kv_b = W(p + "engram_kv_b.weight"); y.e_gate = W(p + "engram_gate.weight");
             y.e_lookup_norm = W(p + "engram_lookup_norm.weight"); y.e_pre_gamma = W(p + "engram_pre_gamma.weight");
@@ -356,7 +445,14 @@ bool Hy4Dense::init(const std::string & gguf, const Hy4DenseConfig & cfg, std::s
     // ---- K caches
     ggml_init_params cp = { ggml_tensor_overhead() * 256, nullptr, true };
     im.cctx = ggml_init(cp);
-    for (auto & y : im.L) y.kcache = ggml_new_tensor_2d(im.cctx, GGML_TYPE_F32, G.kv_lora + G.d_rope, cfg.ctx_max);
+    for (size_t l = 0; l < im.L.size(); ++l) {
+        Layer & y = im.L[l];
+        y.kcache = ggml_new_tensor_2d(im.cctx, GGML_TYPE_F32, G.kv_lora + G.d_rope, cfg.ctx_max);
+        if (G.indexed((int64_t) l)) {
+            y.vg = ggml_new_tensor_2d(im.cctx, GGML_TYPE_F32, 2 * G.idx_dim, cfg.ctx_max);
+            y.pooled = ggml_new_tensor_2d(im.cctx, GGML_TYPE_F32, G.idx_dim, cfg.ctx_max / G.idx_kpool + 1);
+        }
+    }
     im.cbuf = ggml_backend_alloc_ctx_tensors(im.cctx, im.be);
     if (!im.cbuf) { err = "cannot allocate the K caches"; return false; }
     ggml_backend_buffer_clear(im.cbuf, 0);
@@ -383,8 +479,9 @@ bool Hy4Dense::begin(const int * tids, int n, int pos0) {
     const Hy4Geometry & G = im.G;
     if (n <= 0 || n > im.cfg.max_pass) return im.fail("pass size out of range");
     if (pos0 < 0 || pos0 + n > im.cfg.ctx_max) return im.fail("position past ctx_max");
-    if (pos0 + n > kpool_exact_limit())
-        return im.fail("position " + std::to_string(pos0 + n) + " needs the k-pool indexer (not ported yet; exact below " +
+    static const bool sparse_ok = std::getenv("HY4_SPARSE") && std::getenv("HY4_SPARSE")[0] == '1';
+    if (pos0 + n > kpool_exact_limit() && !sparse_ok)
+        return im.fail("position " + std::to_string(pos0 + n) + " needs the k-pool selection (ported, not yet checked against the reference: HY4_SPARSE=1 to use it; exact below " +
                        std::to_string(kpool_exact_limit()) + ")");
     im.n = n;
     im.pos0 = pos0;
@@ -472,6 +569,44 @@ bool Hy4Dense::attn_router(int il, int * ids, float * wts, const float ** fn_hos
     const Hy4Geometry & G = im.G;
     const Layer & ly = im.L[(size_t) il];
     const int n = im.n;
+    // DSA layer with more visible pools than the selection keeps: a pre-graph maintains the k-pool cache and picks the
+    // top pools; the attention mask is then those pools' members + the current group (ref: tail_idxs, select_tail)
+    std::vector<float> sel;
+    const int64_t kp = G.idx_kpool, K = G.idx_topk / kp - (G.idx_select_tail ? 1 : 0);
+    if (G.indexed(il) && (im.pos0 + n - 1) / kp > K) {
+        Impl::Graph pg;
+        im.new_graph(pg);
+        ggml_context * c = pg.ctx;
+        ggml_tensor * x = im.x;
+        const int64_t e = G.engram_slot(il);
+        if (e >= 0) x = im.engram(c, ly, x, im.e_rows[(size_t) e], im.e_valid[(size_t) e]);
+        ggml_tensor * post_a = nullptr;
+        ggml_tensor * cur = im.rms(c, im.hc_pre(c, x, ly.hc_attn_fn, ly.hc_attn_scale, ly.hc_attn_base, &post_a), ly.attn_norm);
+        ggml_tensor * qr = im.rms(c, ggml_mul_mat(c, ly.wq_a, cur), ly.q_a_norm);
+        im.kpool_maintain(pg, il, cur);
+        const int64_t n_pool = (im.pos0 + n - 1) / kp;   // the most any token of the pass can see
+        ggml_tensor * top = im.kpool_score(pg, il, cur, qr, n_pool, K);
+        if (!im.run(pg)) return false;
+        std::vector<int32_t> tk((size_t) (K * n));
+        ggml_backend_tensor_get(top, tk.data(), 0, tk.size() * 4);
+        const int64_t n_kv = im.pos0 + n;
+        sel.assign((size_t) (n_kv * n), -INFINITY);
+        for (int t = 0; t < n; ++t) {
+            const int64_t p = im.pos0 + t, vis = p / kp;
+            float * row = &sel[(size_t) (t * n_kv)];
+            if (vis <= K) {
+                for (int64_t k = 0; k <= p; ++k) row[k] = 0.0f;
+                continue;
+            }
+            for (int64_t j = 0; j < K; ++j) {
+                const int64_t q = tk[(size_t) (t * K + j)];
+                if (q < 0 || q >= vis) continue;   // never a pool the token cannot see (they carry -inf scores)
+                for (int64_t k = q * kp; k < q * kp + kp; ++k) row[k] = 0.0f;
+            }
+            for (int64_t k = vis * kp; k <= p; ++k) row[k] = 0.0f;   // the tail: the current group up to the token
+        }
+    }
+
     Impl::Graph g;
     im.new_graph(g);
     ggml_context * c = g.ctx;
@@ -485,7 +620,7 @@ bool Hy4Dense::attn_router(int il, int * ids, float * wts, const float ** fn_hos
     ggml_tensor * post_a = nullptr;
     ggml_tensor * cur = im.rms(c, im.hc_pre(c, x, ly.hc_attn_fn, ly.hc_attn_scale, ly.hc_attn_base, &post_a), ly.attn_norm);
     im.tap(g, cur, "attn_norm");
-    cur = im.attention(g, il, cur);
+    cur = im.attention(g, il, cur, sel.empty() ? nullptr : &sel, sel.empty());
     ggml_tensor * xm = im.hc_post(c, cur, x, post_a);
     im.tap(g, xm, "hc_attn_out");
     ggml_tensor * post_f = nullptr;
