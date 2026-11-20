@@ -479,10 +479,6 @@ bool Hy4Dense::begin(const int * tids, int n, int pos0) {
     const Hy4Geometry & G = im.G;
     if (n <= 0 || n > im.cfg.max_pass) return im.fail("pass size out of range");
     if (pos0 < 0 || pos0 + n > im.cfg.ctx_max) return im.fail("position past ctx_max");
-    static const bool sparse_ok = std::getenv("HY4_SPARSE") && std::getenv("HY4_SPARSE")[0] == '1';
-    if (pos0 + n > kpool_exact_limit() && !sparse_ok)
-        return im.fail("position " + std::to_string(pos0 + n) + " needs the k-pool selection (ported, not yet checked against the reference: HY4_SPARSE=1 to use it; exact below " +
-                       std::to_string(kpool_exact_limit()) + ")");
     im.n = n;
     im.pos0 = pos0;
     for (int i = 0; i < n; ++i) im.hist[(size_t) (pos0 + i)] = tids[i];

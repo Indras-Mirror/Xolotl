@@ -12,9 +12,10 @@
 //   finish(il, routed_latent_sum): routed_up + shared -> post_ffw_norm -> hc_post
 // then logits().  Every layer keeps its own latent K cache [kv_lora + rope, ctx_max].
 //
-// NOT YET (P2b): the DSA layers' k-pool indexer.  It selects the top 511 pools of 4 + the current group, which is every
-// earlier position while fewer than 512 groups exist, so attention is exact full-causal below position 2044 and the
-// engine refuses positions past that (kpool_exact_limit()) instead of silently running a different model.
+// The DSA layers' k-pool indexer (P2b): the top 511 pools of 4 + the current group.  Below position 2048 every pool is
+// selected (exact full-causal); past it the selection runs (kpool_maintain / kpool_score).  Checked 20 Nov against
+// llama.cpp on a 3407-token prompt: layer-0 selection 99.9 % Jaccard, deeper layers 92-99.8 % (activation drift),
+// prefill argmax match KL 5e-5, the 24 greedy tokens identical.
 #pragma once
 
 #include "ggml.h"
@@ -48,7 +49,7 @@ public:
     bool init(const std::string & gguf, const Hy4DenseConfig & cfg, std::string & err);
     const Hy4Geometry & geom() const;
     const GgufModel & model() const;
-    /// Highest position (exclusive) at which the missing k-pool selection is still exact (all pools selected).
+    /// Highest position (exclusive) at which every pool is selected (the k-pool selection changes nothing below it).
     int64_t kpool_exact_limit() const;
 
     /// Start a pass: tokens tids[0..n) at positions pos0...  Embeddings, Engram rows (the hash reads the 2 tokens
