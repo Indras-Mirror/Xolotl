@@ -127,7 +127,8 @@ static double run(int D, int hc, int lr, int hd, int nk, int nv, int hc2, const 
     if (out_o) out_o->assign((float *) out->data, (float *) out->data + (size_t) D * hc * T);
     if (want) {
         auto grab = [&](ggml_tensor * t, std::vector<float> * dst) {
-            ggml_tensor * q = ggml_graph_get_grad(gf, t);
+            ggml_tensor * q = ggml_graph_get_grad(gf, t);   // NULL when a partial stage never uses the tensor
+            if (!q) { dst->assign(ggml_nelements(t), 0.0f); return; }
             dst->assign((float *) q->data, (float *) q->data + ggml_nelements(t));
         };
         grab(res, g_res); grab(w1.norm, g_nrm); grab(w1.down, g_down); grab(w1.up, g_up); grab(w1.inject, g_inj);
@@ -147,7 +148,8 @@ int main(int argc, char ** argv) {
     const int eps_i = argc > 8 ? 8 : 8;
     (void) eps_i;
     const float eps = argc > 8 ? (float) atof(argv[8]) : 1e-2f;
-    const int stride = argc > 9 ? atoi(argv[9]) : 1;
+    int stride = argc > 9 ? atoi(argv[9]) : 1;
+    if (stride < 1) { std::fprintf(stderr, "[warn] stride %d -> 1 (i += 0 would loop forever)\n", stride); stride = 1; }
     const char * dump = argc > 10 ? argv[10] : nullptr;
     const int T = 8;
 
@@ -156,9 +158,9 @@ int main(int argc, char ** argv) {
     Inputs in;
     in.res.assign((size_t) D * hc * T, 0.0f);  for (auto & v : in.res) v = 0.5f * U(rng);
     in.nrm.assign((size_t) D * hc, 1.0f);      for (auto & v : in.nrm) v = 1.0f + 0.2f * U(rng);
-    in.down.assign((size_t) D * hc * lr, 0.0f);  for (auto & v : in.down) v = 0.3f * U(rng) / std::sqrt((float) (D * hc));
-    in.up.assign((size_t) lr * D * hc, 0.0f);    for (auto & v : in.up) v = 0.3f * U(rng) / std::sqrt((float) lr);
-    in.inj.assign((size_t) D * hc * hc, 0.0f);   for (auto & v : in.inj) v = 0.3f * U(rng) / std::sqrt((float) (D * hc));
+    in.down.assign((size_t) D * hc * lr, 0.0f);  for (auto & v : in.down) v = 2.0f * U(rng) / std::sqrt((float) (D * hc));
+    in.up.assign((size_t) lr * D * hc, 0.0f);    for (auto & v : in.up) v = 2.0f * U(rng) / std::sqrt((float) lr);
+    in.inj.assign((size_t) D * hc * hc, 0.0f);   for (auto & v : in.inj) v = 2.0f * U(rng) / std::sqrt((float) (D * hc));
     in.ffn_g.assign((size_t) D * 2 * D, 0.0f);   for (auto & v : in.ffn_g) v = 0.3f * U(rng) / std::sqrt((float) D);
     in.ffn_u.assign((size_t) D * 2 * D, 0.0f);   for (auto & v : in.ffn_u) v = 0.3f * U(rng) / std::sqrt((float) D);
     in.ffn_d.assign((size_t) 2 * D * D, 0.0f);   for (auto & v : in.ffn_d) v = 0.3f * U(rng) / std::sqrt((float) (2 * D));

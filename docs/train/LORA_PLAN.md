@@ -272,3 +272,17 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   **So the honest status is: every HC op computes in isolation; the chained-graph question is still OPEN, and the
   last two "hang" observations were harness bugs I introduced.** Next: guard grab() on null, then instrument the FD
   loop counter, then re-run 3..6.
+- 21 Nov 06:55: **HYPER-CONNECTIONS VERIFIED - the earlier "hang" was a test bug, twice over.**
+  Root cause: `test_qfn_hc` takes `... [nv] [hc2] [eps] [stride] [dump]` - I was invoking it WITHOUT `hc2`, so every
+  argument shifted by one and `stride` received the dump path, `atoi` gave **0**, and the FD loop's `i += stride`
+  spun forever. That single missing argument produced every "hang" I chased (plus the 8-thread one, which was real but
+  separate). `stride < 1` is now forced to 1 with a warning.
+  With correct arguments (D8 hc3 lr6 T8, HC_STAGES=6, nth=1, eps 1e-2, stride 4, 48 elements per input):
+  dres max abs err 5.1e-6 (|g| 0.49), dhc_norm 5.6e-6, dhc_down 5.9e-6, dhc_up 5.9e-6, dhc_inject 7.2e-6,
+  dffn_gate 6.8e-6, dffn_up 8.1e-6, dffn_down 5.2e-6 - a flat ~5e-6 across every input, i.e. the central-difference
+  noise floor at eps 1e-2, against gradients of 6e-5..5e-4 (weights) and 0.49 (residual).
+  The chained graph mix -> GDN block -> combine -> mix -> MLP -> combine therefore forward-propagates and
+  back-propagates correctly, including the 4-stream scatter.
+  Component gates still hold individually (bisect_hc: mix loss -0.008787, combine loss -0.032751).
+  LESSON (again): a "hang" in a numerical harness is usually an argument/loop bug - check the parsed parameters and
+  print an effective-config line before suspecting the maths. Two of the three HC "failures" were mine.
