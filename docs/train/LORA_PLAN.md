@@ -362,3 +362,10 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   2048-position chunks): L44 cos 0.999758, L45 0.999673, L46 0.999202, L47 0.997584;
   **CE over 885 real loss tokens: trainer 1.7798 (top-1 567) vs the engine's final residual 1.7795 (top-1 568).**
   So the training forward is the served model to 3e-4 nats on real data. Next: GPU smoke of qfn_harness_train.
+- 21 Nov ~07:15: **LONG-CONTEXT GATE PASSES (real harness window w07038, 21,686 positions, served YaRN x2,
+  layer-47 engine selection replayed).** `qfn_topk_long`, CPU, 812 s, layers chained from captured x44:
+    44 GDN err 2.20e-2 cos 0.999758 | 45 2.56e-2 0.999673 | 46 4.00e-2 0.999202 | 47 QSA 6.95e-2 cos 0.997584
+    CE over 885 loss tokens: ours 1.7798 (top-1 567) vs head(captured final) 1.7795 (top-1 568)
+  Per-layer error is ~1.5-1.7x the 25-token smoke gate at EVERY layer (1.5/1.7/2.45/4.0e-2 there) - uniform growth
+  from longer chained accumulation, not an L47-specific defect; the CE agreement (3e-4) is the decisive number. So the
+  20K-prefix GDN carry, the YaRN rope and the QSA selection replay are all right on real data.
