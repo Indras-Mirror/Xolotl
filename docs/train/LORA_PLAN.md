@@ -286,3 +286,21 @@ Out of scope for v1: LoRA on the routed experts (per-expert adapters), full fine
   Component gates still hold individually (bisect_hc: mix loss -0.008787, combine loss -0.032751).
   LESSON (again): a "hang" in a numerical harness is usually an argument/loop bug - check the parsed parameters and
   print an effective-config line before suspecting the maths. Two of the three HC "failures" were mine.
+- 21 Nov 08:10 (fresh session): **REAL ACTIVATIONS UNBLOCKED, NO ENGINE CHANGE.** Two findings:
+  * `--dump-layers` can never fire on a native pack, whatever the token-graph conditions: the per-token loop hands a
+    native pack straight to verify windows (`generate.cpp:18390`, `if (native_pack) { spec_pos = pos; break; }`)
+    before the dump write at 18486. The earlier "relax 8335/8400" fix would not have helped.
+  * The prefill already has the taps: `STRATA_KVA_CAPTURE=<dir>` (+ `_FP32=1`, `STRATA_KVA_SPLIT=s`) writes the
+    residual ENTERING every layer >= s as `L<l>.bin` [T, hc*n_embd]; `STRATA_PREFILL_DUMP_R_ALL` writes the final
+    residual (bf16). Both are in the production binary. Smoke on the real pack (`--prefill 256 --spec 2`, 25-token
+    prompt): L44..L47 + final written, 25 positions, no NaN, output unchanged (" Madrid"), 1.5 s of GPU.
+    Script: `tools/train/qfn_capture.sh` (replaces `qfn_dump_layers.sh`).
+  **WHOLE-LAYER GATE ON REAL DATA PASSES.** `tools/train/qfn_full_layer_ref.py` recomputes a full GDN layer from the
+  dequantized pack exactly as `qwen4exp.cpp` builds it (hc_mix -> GDN -> hc_combine -> hc_mix -> MoE top-10 softmax
+  renorm + sigmoid-gated shared expert -> hc_combine) from captured L<l> and compares with captured L<l+1>:
+    layer 44: update rel err 2.85e-3, cos 0.999996 (identity baseline 0.535), 76 experts touched
+    layer 45: update rel err 1.35e-3, cos 0.999999 (identity 0.597)
+    layer 46: update rel err 3.42e-3, cos 0.999994 (identity 0.547)
+  The residual error is the engine's quantized-activation noise (Q8 activations, int8 KV, CPU share on in the smoke).
+  So the trainer's model of a QFN GDN layer is the served model's. Next: the QSA layer (47) reference + head, then the
+  C++ trainer forward of the top-k stack checked against these captures, then CE on harness transcripts.
