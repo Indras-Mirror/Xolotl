@@ -84,6 +84,8 @@ struct Hy4Dense::Impl {
 
     ~Impl() {
         if (galloc) ggml_gallocr_free(galloc);
+        if (lbuf) ggml_backend_buffer_free(lbuf);
+        if (lctx) ggml_free(lctx);
         if (pbuf) ggml_backend_buffer_free(pbuf);
         if (pctx) ggml_free(pctx);
         if (cbuf) ggml_backend_buffer_free(cbuf);
@@ -93,6 +95,20 @@ struct Hy4Dense::Impl {
     }
 
     bool fail(const std::string & e) { err = e; std::fprintf(stderr, "hy4_dense: %s\n", e.c_str()); return false; }
+
+    // ---- LoRA adapters (W x -> W x + s B (A x)); A / B live on the backend, F32
+    struct Lora { std::string name; ggml_tensor *W = nullptr, *A = nullptr, *B = nullptr; float s = 0; int layer = -1; };
+    std::vector<Lora> lora;
+    std::map<const ggml_tensor *, int> lora_of;
+    ggml_context * lctx = nullptr;
+    ggml_backend_buffer_t lbuf = nullptr;
+    ggml_tensor * mm(ggml_context * c, ggml_tensor * W, ggml_tensor * x) {
+        ggml_tensor * y = ggml_mul_mat(c, W, x);
+        auto it = lora_of.find(W);
+        if (it == lora_of.end()) return y;
+        const Lora & l = lora[(size_t) it->second];
+        return ggml_add(c, y, ggml_scale(c, ggml_mul_mat(c, l.B, ggml_mul_mat(c, l.A, x)), l.s));
+    }
 
     // ---- one graph = a fresh context + the shared allocator
     struct Graph {
@@ -179,7 +195,7 @@ struct Hy4Dense::Impl {
         return out;
     }
     ggml_tensor * swiglu_ffn(ggml_context * c, ggml_tensor * x, ggml_tensor * g, ggml_tensor * u, ggml_tensor * d) {
-        return ggml_mul_mat(c, d, ggml_swiglu_split(c, ggml_mul_mat(c, g, x), ggml_mul_mat(c, u, x)));
+        return mm(c, d, ggml_swiglu_split(c, mm(c, g, x), mm(c, u, x)));
     }
 
     // ref: build_engram
@@ -291,13 +307,13 @@ struct Hy4Dense::Impl {
         const float kq_scale = 1.0f / std::sqrt((float) dk);
         const float base = (float) (G.swa(il) ? G.rope_base_swa : G.rope_base);
 
-        ggml_tensor * qr = rms(c, ggml_mul_mat(c, ly.wq_a, cur), ly.q_a_norm);    // q_resid [q_lora, n]
+        ggml_tensor * qr = rms(c, mm(c, ly.wq_a, cur), ly.q_a_norm);              // q_resid [q_lora, n]
         if (G.indexed(il) && maintain) kpool_maintain(g, il, cur);
-        ggml_tensor * q = ggml_mul_mat(c, ly.wq_b, qr);                           // [H*dk, n]
+        ggml_tensor * q = mm(c, ly.wq_b, qr);                                     // [H*dk, n]
         const size_t es = ggml_element_size(q);
         ggml_tensor * q_nope = ggml_view_3d(c, q, dn, H, nt, es * dk, es * dk * H, 0);
         ggml_tensor * q_pe = ggml_view_3d(c, q, dr, H, nt, es * dk, es * dk * H, es * dn);
-        ggml_tensor * kvp = ggml_mul_mat(c, ly.wkv_a, cur);                       // [krow, n]
+        ggml_tensor * kvp = mm(c, ly.wkv_a, cur);                                 // [krow, n]
         ggml_tensor * kv_c = ggml_view_2d(c, kvp, kvl, nt, kvp->nb[1], 0);
         ggml_tensor * k_pe = ggml_view_3d(c, kvp, dr, 1, nt, kvp->nb[1], kvp->nb[1], es * kvl);
         q_pe = ggml_rope_ext(c, ggml_cont(c, q_pe), pos, nullptr, (int) dr, GGML_ROPE_TYPE_NORMAL, 0, base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
@@ -338,10 +354,44 @@ struct Hy4Dense::Impl {
         a = ggml_cont(c, ggml_permute(c, a, 0, 2, 1, 3));                         // [d_v, H, n]
         a = ggml_reshape_2d(c, a, G.d_v * H, nt);
         tap(g, a, "attn_kqv");
-        a = ggml_mul(c, a, ggml_sigmoid(c, ggml_mul_mat(c, ly.wgate, cur)));
-        ggml_tensor * o = rms(c, ggml_mul_mat(c, ly.wo, a), ly.post_attn_norm);
+        a = ggml_mul(c, a, ggml_sigmoid(c, mm(c, ly.wgate, cur)));
+        ggml_tensor * o = rms(c, mm(c, ly.wo, a), ly.post_attn_norm);
         tap(g, o, "attn_out");
         return o;
+    }
+
+    // training: the same attention over the whole sequence of the pass (no cache: K / V are this pass's rows), `mask`
+    // [n, n] = causal + sliding window (every DSA pool is selected below kpool_exact_limit)
+    ggml_tensor * attention_train(ggml_context * c, int il, ggml_tensor * cur, ggml_tensor * mask) {
+        const Layer & ly = L[(size_t) il];
+        const int64_t H = G.heads(il), dk = G.d_qk, dr = G.d_rope, dn = G.d_nope(), kvl = G.kv_lora, nt = n;
+        const int64_t krow = kvl + dr;
+        const float kq_scale = 1.0f / std::sqrt((float) dk);
+        const float base = (float) (G.swa(il) ? G.rope_base_swa : G.rope_base);
+        ggml_tensor * qr = rms(c, mm(c, ly.wq_a, cur), ly.q_a_norm);
+        ggml_tensor * q = mm(c, ly.wq_b, qr);
+        const size_t es = ggml_element_size(q);
+        ggml_tensor * q_nope = ggml_view_3d(c, q, dn, H, nt, es * dk, es * dk * H, 0);
+        ggml_tensor * q_pe = ggml_view_3d(c, q, dr, H, nt, es * dk, es * dk * H, es * dn);
+        ggml_tensor * kvp = mm(c, ly.wkv_a, cur);
+        ggml_tensor * kv_c = ggml_view_2d(c, kvp, kvl, nt, kvp->nb[1], 0);
+        ggml_tensor * k_pe = ggml_view_3d(c, kvp, dr, 1, nt, kvp->nb[1], kvp->nb[1], es * kvl);
+        q_pe = ggml_rope_ext(c, ggml_cont(c, q_pe), pos, nullptr, (int) dr, GGML_ROPE_TYPE_NORMAL, 0, base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        k_pe = ggml_rope_ext(c, ggml_cont(c, k_pe), pos, nullptr, (int) dr, GGML_ROPE_TYPE_NORMAL, 0, base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        kv_c = rms(c, ggml_cont(c, kv_c), ly.kv_a_norm);
+        ggml_tensor * qa = ggml_mul_mat(c, ly.wk_b, ggml_cont(c, ggml_permute(c, ggml_cont(c, q_nope), 0, 2, 1, 3)));   // [kvl, n, H]
+        qa = ggml_permute(c, qa, 0, 2, 1, 3);
+        ggml_tensor * Q = ggml_concat(c, ggml_cont(c, qa), q_pe, 0);                               // [krow, H, n]
+        ggml_tensor * K = ggml_reshape_2d(c, ggml_concat(c, ggml_reshape_3d(c, kv_c, kvl, 1, nt), k_pe, 0), krow, nt);
+        ggml_tensor * Vt = ggml_cont(c, ggml_transpose(c, kv_c));                                   // [n, kvl]
+        ggml_tensor * kq = ggml_mul_mat(c, K, ggml_cont(c, ggml_permute(c, Q, 0, 2, 1, 3)));       // [n, n, H]
+        kq = ggml_soft_max_ext(c, kq, mask, kq_scale, 0.0f);
+        ggml_soft_max_add_sinks(kq, ly.sinks);
+        ggml_tensor * kqv = ggml_mul_mat(c, Vt, kq);                                               // [kvl, n, H]
+        ggml_tensor * a = ggml_mul_mat(c, ly.wv_b, kqv);                                           // [d_v, n, H]
+        a = ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, a, 0, 2, 1, 3)), G.d_v * H, nt);
+        a = ggml_mul(c, a, ggml_sigmoid(c, mm(c, ly.wgate, cur)));
+        return rms(c, mm(c, ly.wo, a), ly.post_attn_norm);
     }
 };
 
@@ -578,7 +628,7 @@ bool Hy4Dense::attn_router(int il, int * ids, float * wts, const float ** fn_hos
         if (e >= 0) x = im.engram(c, ly, x, im.e_rows[(size_t) e], im.e_valid[(size_t) e]);
         ggml_tensor * post_a = nullptr;
         ggml_tensor * cur = im.rms(c, im.hc_pre(c, x, ly.hc_attn_fn, ly.hc_attn_scale, ly.hc_attn_base, &post_a), ly.attn_norm);
-        ggml_tensor * qr = im.rms(c, ggml_mul_mat(c, ly.wq_a, cur), ly.q_a_norm);
+        ggml_tensor * qr = im.rms(c, im.mm(c, ly.wq_a, cur), ly.q_a_norm);
         im.kpool_maintain(pg, il, cur);
         const int64_t n_pool = (im.pos0 + n - 1) / kp;   // the most any token of the pass can see
         ggml_tensor * top = im.kpool_score(pg, il, cur, qr, n_pool, K);
@@ -634,7 +684,7 @@ bool Hy4Dense::attn_router(int il, int * ids, float * wts, const float ** fn_hos
         ggml_build_forward_expand(g.gf, ggml_cpy(c, im.hc_post(c, f, xm, post_f), im.x));
     } else {
         // ref: build_latent_moe + build_moe_ffn (SIGMOID gating, exp_probs_b for selection only, norm_w, w_scale)
-        ggml_tensor * logits = ggml_mul_mat(c, ly.router, fin);                 // [n_expert, n]
+        ggml_tensor * logits = im.mm(c, ly.router, fin);                       // [n_expert, n]
         ggml_tensor * probs = ggml_sigmoid(c, logits);
         ggml_tensor * sel = ly.probs_b ? ggml_add(c, probs, ly.probs_b) : probs;
         o_ids = ggml_top_k(c, sel, (int) G.n_used);                            // [n_used, n] I32
@@ -643,7 +693,7 @@ bool Hy4Dense::attn_router(int il, int * ids, float * wts, const float ** fn_hos
         if (G.weights_norm) w = ggml_div(c, w, ggml_clamp(c, ggml_sum_rows(c, w), 6.103515625e-5f, INFINITY));
         if (G.weights_scale != 0.0 && G.weights_scale != 1.0) w = ggml_scale(c, w, (float) G.weights_scale);
         o_wts = w;
-        o_fn = ggml_mul_mat(c, ly.routed_down, fin);                            // [n_latent, n]
+        o_fn = im.mm(c, ly.routed_down, fin);                                  // [n_latent, n]
         ggml_build_forward_expand(g.gf, ggml_cpy(c, im.swiglu_ffn(c, fin, ly.sh_gate, ly.sh_up, ly.sh_down), im.shexp));
         ggml_build_forward_expand(g.gf, ggml_cpy(c, xm, im.x_mid));
         ggml_build_forward_expand(g.gf, ggml_cpy(c, post_f, im.post_ffn));
@@ -668,7 +718,7 @@ bool Hy4Dense::finish(int il, const float * routed) {
     im.new_graph(g);
     ggml_context * c = g.ctx;
     ggml_tensor * r = im.input(g, GGML_TYPE_F32, G.n_latent, im.n, routed, (size_t) (G.n_latent * im.n) * 4);
-    ggml_tensor * f = ggml_add(c, ggml_mul_mat(c, ly.routed_up, r), im.shexp);
+    ggml_tensor * f = ggml_add(c, im.mm(c, ly.routed_up, r), im.shexp);
     f = im.rms(c, f, ly.post_ffn_norm);
     im.tap(g, f, "ffn_out");
     ggml_build_forward_expand(g.gf, ggml_cpy(c, im.hc_post(c, f, im.x_mid, im.post_ffn), im.x));
@@ -691,7 +741,7 @@ bool Hy4Dense::logits(int row0, int nrows, float * out) {
     pre = ggml_scale_bias(c, pre, 1.0f, (float) G.hc_eps);
     ggml_tensor * h = im.rms(c, im.hc_reduce(c, x, pre), im.out_norm);
     im.tap(g, h, "result_norm");
-    ggml_tensor * lg = ggml_mul_mat(c, im.output, h);
+    ggml_tensor * lg = im.mm(c, im.output, h);
     ggml_set_output(lg);
     ggml_build_forward_expand(g.gf, lg);
     if (!im.run(g)) return false;
@@ -709,6 +759,268 @@ bool Hy4Dense::read_state(std::vector<float> & x) {
 bool Hy4Dense::write_state(const float * x) {
     Impl & im = *p_;
     ggml_backend_tensor_set(im.x, x, 0, ggml_nbytes(im.x));
+    return true;
+}
+
+// ================================ LoRA ================================
+
+bool Hy4Dense::lora_add(const std::vector<std::string> & names, int rank, float alpha, uint64_t seed, std::string & err) {
+    Impl & im = *p_;
+    if (im.lctx) { err = "lora_add: adapters are already set"; return false; }
+    if (rank <= 0 || names.empty()) { err = "lora_add: rank and names required"; return false; }
+    ggml_init_params ip = { ggml_tensor_overhead() * (2 * names.size() + 8), nullptr, true };
+    im.lctx = ggml_init(ip);
+    for (const auto & nm : names) {
+        ggml_tensor * W = ggml_get_tensor(im.wctx, nm.c_str());
+        if (!W || ggml_n_dims(W) != 2) { err = "lora_add: no 2-D dense weight " + nm; return false; }
+        Impl::Lora l;
+        l.name = nm;
+        l.W = W;
+        l.A = ggml_new_tensor_2d(im.lctx, GGML_TYPE_F32, W->ne[0], rank);
+        l.B = ggml_new_tensor_2d(im.lctx, GGML_TYPE_F32, rank, W->ne[1]);
+        ggml_set_name(l.A, (nm + ".lora_a").c_str());
+        ggml_set_name(l.B, (nm + ".lora_b").c_str());
+        l.s = alpha / (float) rank;
+        l.layer = nm.rfind("blk.", 0) == 0 ? std::atoi(nm.c_str() + 4) : -1;
+        im.lora_of[W] = (int) im.lora.size();
+        im.lora.push_back(l);
+    }
+    im.lbuf = ggml_backend_alloc_ctx_tensors(im.lctx, im.be);
+    if (!im.lbuf) { err = "lora_add: cannot allocate the adapters"; return false; }
+    // A ~ U(-1/sqrt(in), 1/sqrt(in)), B = 0 (the usual LoRA start: the adapted model starts as the base)
+    uint64_t st = seed * 6364136223846793005ull + 1442695040888963407ull;
+    auto u01 = [&]() { st = st * 6364136223846793005ull + 1442695040888963407ull; return (double) (st >> 11) / 9007199254740992.0; };
+    for (auto & l : im.lora) {
+        const double b = 1.0 / std::sqrt((double) l.A->ne[0]);
+        std::vector<float> a((size_t) ggml_nelements(l.A)), z((size_t) ggml_nelements(l.B), 0.0f);
+        for (auto & v : a) v = (float) ((u01() * 2.0 - 1.0) * b);
+        ggml_backend_tensor_set(l.A, a.data(), 0, a.size() * 4);
+        ggml_backend_tensor_set(l.B, z.data(), 0, z.size() * 4);
+    }
+    return true;
+}
+int Hy4Dense::lora_count() const { return (int) p_->lora.size(); }
+const std::string & Hy4Dense::lora_name(int i) const { return p_->lora[(size_t) i].name; }
+int Hy4Dense::lora_layer(int i) const { return p_->lora[(size_t) i].layer; }
+void Hy4Dense::lora_shape(int i, int64_t & n_in, int64_t & n_out, int64_t & rank) const {
+    const auto & l = p_->lora[(size_t) i];
+    n_in = l.A->ne[0];
+    rank = l.A->ne[1];
+    n_out = l.B->ne[1];
+}
+void Hy4Dense::lora_get(int i, std::vector<float> & A, std::vector<float> & B) const {
+    const auto & l = p_->lora[(size_t) i];
+    A.resize((size_t) ggml_nelements(l.A));
+    B.resize((size_t) ggml_nelements(l.B));
+    ggml_backend_tensor_get(l.A, A.data(), 0, A.size() * 4);
+    ggml_backend_tensor_get(l.B, B.data(), 0, B.size() * 4);
+}
+void Hy4Dense::lora_set(int i, const float * A, const float * B) {
+    const auto & l = p_->lora[(size_t) i];
+    ggml_backend_tensor_set(l.A, A, 0, ggml_nbytes(l.A));
+    ggml_backend_tensor_set(l.B, B, 0, ggml_nbytes(l.B));
+}
+
+// ================================ training ================================
+
+namespace {
+
+// one training graph: a no-alloc context, every tensor allocated at once on the backend (no reuse: a training graph
+// is built per step, its size is the step's), host inputs uploaded after the allocation
+struct TrainGraph {
+    ggml_context * c = nullptr;
+    ggml_cgraph * gf = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    std::vector<std::pair<ggml_tensor *, std::vector<uint8_t>>> host;   // owned copies
+    std::vector<std::pair<ggml_tensor *, const void *>> ptr;            // borrowed (valid until compute)
+    ~TrainGraph() { if (buf) ggml_backend_buffer_free(buf); if (c) ggml_free(c); }
+    void init(size_t n_tensors, size_t n_nodes) {
+        ggml_init_params ip = { ggml_tensor_overhead() * n_tensors + ggml_graph_overhead_custom(n_nodes, true), nullptr, true };
+        c = ggml_init(ip);
+        gf = ggml_new_graph_custom(c, n_nodes, true);
+    }
+    template <class T> ggml_tensor * input(ggml_type t, int64_t n0, int64_t n1, int64_t n2, const T * d, size_t count) {
+        ggml_tensor * x = ggml_new_tensor_3d(c, t, n0, n1, n2);
+        host.emplace_back(x, std::vector<uint8_t>((const uint8_t *) d, (const uint8_t *) d + count * sizeof(T)));
+        return x;
+    }
+    bool run(ggml_backend_t be, ggml_tensor * loss) {
+        ggml_set_loss(loss);
+        ggml_build_forward_expand(gf, loss);
+        ggml_build_backward_expand(c, gf, nullptr);
+        buf = ggml_backend_alloc_ctx_tensors(c, be);
+        if (!buf) return false;
+        for (auto & h : host) ggml_backend_tensor_set(h.first, h.second.data(), 0, h.second.size());
+        for (auto & h : ptr) ggml_backend_tensor_set(h.first, h.second, 0, ggml_nbytes(h.first));
+        ggml_graph_reset(gf);
+        return ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS;
+    }
+};
+
+void add_grad(ggml_cgraph * gf, ggml_tensor * t, std::vector<float> & acc) {
+    ggml_tensor * g = ggml_graph_get_grad(gf, t);
+    if (!g) return;   // the adapter is not on this graph's path
+    std::vector<float> v((size_t) ggml_nelements(t));
+    ggml_backend_tensor_get(g, v.data(), 0, v.size() * 4);
+    acc.resize(v.size(), 0.0f);
+    for (size_t i = 0; i < v.size(); ++i) acc[i] += v[i];
+}
+
+}  // namespace
+
+bool Hy4Dense::train_layer(int il, const float * x_in, const float * g_out, const int * ids, float * g_in,
+                           std::vector<std::vector<float>> & gA, std::vector<std::vector<float>> & gB) {
+    Impl & im = *p_;
+    const Hy4Geometry & G = im.G;
+    const Layer & ly = im.L[(size_t) il];
+    const int64_t n = im.n, D = G.n_embd, HC = G.hc;
+    if (n <= 0 || im.pos0 != 0) return im.fail("train_layer: begin() the whole sequence first (pos0 0)");
+    if (n > kpool_exact_limit()) return im.fail("train_layer: the sequence is longer than the exact k-pool limit");
+    const bool moe = G.moe(il);
+    // the routing of the forward: (token, k) pairs grouped by expert
+    std::vector<std::vector<int32_t>> tok, pair;
+    std::vector<int32_t> flat;
+    if (moe) {
+        tok.assign((size_t) G.n_expert, {});
+        pair.assign((size_t) G.n_expert, {});
+        flat.resize((size_t) (n * G.n_used));
+        for (int64_t t = 0; t < n; ++t)
+            for (int64_t k = 0; k < G.n_used; ++k) {
+                const int e = ids[t * G.n_used + k];
+                if (e < 0 || e >= G.n_expert) return im.fail("train_layer: routing id out of range");
+                flat[(size_t) (t * G.n_used + k)] = (int32_t) (t * G.n_expert + e);
+                tok[(size_t) e].push_back((int32_t) t);
+                pair[(size_t) e].push_back((int32_t) (t * G.n_used + k));
+            }
+    }
+    int64_t n_used_e = 0;
+    for (const auto & v : tok) n_used_e += !v.empty();
+
+    TrainGraph tg;
+    tg.init((size_t) (4096 + 64 * n_used_e), (size_t) (32768 + 96 * n_used_e));
+    ggml_context * c = tg.c;
+    ggml_tensor * x = tg.input(GGML_TYPE_F32, D, HC, n, x_in, (size_t) (D * HC * n));
+    ggml_set_param(x);
+    ggml_tensor * gout = tg.input(GGML_TYPE_F32, D, HC, n, g_out, (size_t) (D * HC * n));
+    for (auto & l : im.lora) if (l.layer == il) { ggml_set_param(l.A); ggml_set_param(l.B); }
+    std::vector<float> m((size_t) (n * n));
+    for (int64_t t = 0; t < n; ++t)
+        for (int64_t k = 0; k < n; ++k)
+            m[(size_t) (t * n + k)] = k <= t && !(G.swa(il) && t - k >= G.n_swa) ? 0.0f : -INFINITY;
+    ggml_tensor * mask = tg.input(GGML_TYPE_F32, n, n, 1, m.data(), m.size());
+    mask = ggml_reshape_2d(c, mask, n, n);
+
+    ggml_tensor * xx = x;
+    const int64_t e = G.engram_slot(il);
+    if (e >= 0) xx = im.engram(c, ly, x, im.e_rows[(size_t) e], im.e_valid[(size_t) e]);
+    ggml_tensor * post_a = nullptr;
+    ggml_tensor * cur = im.rms(c, im.hc_pre(c, xx, ly.hc_attn_fn, ly.hc_attn_scale, ly.hc_attn_base, &post_a), ly.attn_norm);
+    cur = im.attention_train(c, il, cur, mask);
+    ggml_tensor * xm = im.hc_post(c, cur, xx, post_a);
+    ggml_tensor * post_f = nullptr;
+    ggml_tensor * fin = im.rms(c, im.hc_pre(c, xm, ly.hc_ffn_fn, ly.hc_ffn_scale, ly.hc_ffn_base, &post_f), ly.ffn_norm);
+    ggml_tensor * f = nullptr;
+    if (!moe) {
+        f = im.rms(c, im.swiglu_ffn(c, fin, ly.ffn_gate, ly.ffn_up, ly.ffn_down), ly.post_ffn_norm);
+    } else {
+        ggml_tensor * probs = ggml_sigmoid(c, im.mm(c, ly.router, fin));                           // [E, n]
+        ggml_tensor * idf = ggml_reshape_1d(c, tg.input(GGML_TYPE_I32, n * G.n_used, 1, 1, flat.data(), flat.size()), n * G.n_used);
+        ggml_tensor * w = ggml_get_rows(c, ggml_reshape_2d(c, probs, 1, G.n_expert * n), idf);   // [1, K*n]
+        w = ggml_reshape_2d(c, w, G.n_used, n);
+        if (G.weights_norm) w = ggml_div(c, w, ggml_clamp(c, ggml_sum_rows(c, w), 6.103515625e-5f, INFINITY));
+        if (G.weights_scale != 0.0 && G.weights_scale != 1.0) w = ggml_scale(c, w, (float) G.weights_scale);
+        ggml_tensor * wf = ggml_reshape_2d(c, ggml_cont(c, w), 1, n * G.n_used);
+        ggml_tensor * fn = im.mm(c, ly.routed_down, fin);                                         // [L, n]
+        // this layer's used experts: their GGUF slices, uploaded for the step
+        const GgufModel & M = *im.model;
+        const char * role[3] = { "gate", "up", "down" };
+        const uint8_t * base[3];
+        ggml_type type[3];
+        int64_t ne0[3], ne1[3];
+        size_t slice[3];
+        for (int r = 0; r < 3; ++r) {
+            size_t sh = 0;
+            const std::string nm = "blk." + std::to_string(il) + ".ffn_" + role[r] + "_exps.weight";
+            const TensorInfo * ti = M.find(nm, &sh);
+            if (!ti) return im.fail("train_layer: missing " + nm);
+            base[r] = M.shard(sh).tensor_data(*ti);
+            type[r] = (ggml_type) ti->type;
+            ne0[r] = (int64_t) ti->shape[0];
+            ne1[r] = (int64_t) ti->shape[1];
+            slice[r] = ggml_row_size(type[r], ne0[r]) * (size_t) ne1[r];
+        }
+        const double lim = (size_t) il < G.swiglu_clamp.size() ? G.swiglu_clamp[(size_t) il] : 0.0;
+        ggml_tensor * routed = nullptr;
+        for (int64_t ex = 0; ex < G.n_expert; ++ex) {
+            const int64_t ne = (int64_t) tok[(size_t) ex].size();
+            if (ne == 0) continue;
+            ggml_tensor * W[3];
+            for (int r = 0; r < 3; ++r) {
+                W[r] = ggml_new_tensor_2d(c, type[r], ne0[r], ne1[r]);
+                tg.ptr.emplace_back(W[r], base[r] + (size_t) ex * slice[r]);
+            }
+            ggml_tensor * ie = ggml_reshape_1d(c, tg.input(GGML_TYPE_I32, ne, 1, 1, tok[(size_t) ex].data(), (size_t) ne), ne);
+            ggml_tensor * pe = ggml_reshape_1d(c, tg.input(GGML_TYPE_I32, ne, 1, 1, pair[(size_t) ex].data(), (size_t) ne), ne);
+            ggml_tensor * xe = ggml_get_rows(c, fn, ie);                                          // [L, ne]
+            ggml_tensor * gt = ggml_mul_mat(c, W[0], xe), * up = ggml_mul_mat(c, W[1], xe);
+            ggml_tensor * a = lim > 1e-6 ? ggml_swiglu_clamp(c, gt, up, (float) lim) : ggml_swiglu_split(c, gt, up);
+            ggml_tensor * ye = ggml_mul(c, ggml_mul_mat(c, W[2], a), ggml_reshape_2d(c, ggml_get_rows(c, wf, pe), 1, ne));
+            ggml_tensor * sc = ggml_get_rows_back(c, ye, ie, fn);
+            routed = routed ? ggml_add(c, routed, sc) : sc;
+        }
+        f = ggml_add(c, im.mm(c, ly.routed_up, routed), im.swiglu_ffn(c, fin, ly.sh_gate, ly.sh_up, ly.sh_down));
+        f = im.rms(c, f, ly.post_ffn_norm);
+    }
+    ggml_tensor * out = im.hc_post(c, f, xm, post_f);
+    ggml_tensor * loss = ggml_sum(c, ggml_mul(c, out, gout));   // the surrogate: d loss / d (params) = the layer's VJP
+    if (!tg.run(im.be, loss)) return im.fail("train_layer: graph allocation or compute failed");
+    ggml_backend_tensor_get(ggml_graph_get_grad(tg.gf, x), g_in, 0, (size_t) (D * HC * n) * 4);
+    gA.resize(im.lora.size());
+    gB.resize(im.lora.size());
+    for (size_t i = 0; i < im.lora.size(); ++i)
+        if (im.lora[i].layer == il) { add_grad(tg.gf, im.lora[i].A, gA[i]); add_grad(tg.gf, im.lora[i].B, gB[i]); }
+    for (auto & l : im.lora) if (l.layer == il) { l.A->flags &= ~GGML_TENSOR_FLAG_PARAM; l.B->flags &= ~GGML_TENSOR_FLAG_PARAM; }
+    return true;
+}
+
+bool Hy4Dense::train_head(const float * x_last, const int * targets, float * loss_out, float * g_x,
+                          std::vector<std::vector<float>> & gA, std::vector<std::vector<float>> & gB) {
+    Impl & im = *p_;
+    const Hy4Geometry & G = im.G;
+    const int64_t n = im.n, D = G.n_embd, HC = G.hc;
+    std::vector<int32_t> at;
+    for (int64_t t = 0; t < n; ++t) if (targets[t] >= 0) at.push_back((int32_t) t);
+    if (at.empty()) return im.fail("train_head: no target positions");
+    const int64_t mcount = (int64_t) at.size();
+    std::vector<float> lab((size_t) (G.vocab * mcount), 0.0f);
+    for (int64_t j = 0; j < mcount; ++j) {
+        const int tg_id = targets[at[(size_t) j]];
+        if (tg_id >= G.vocab) return im.fail("train_head: target id out of range");
+        lab[(size_t) (j * G.vocab + tg_id)] = 1.0f;
+    }
+    TrainGraph tg;
+    tg.init(4096, 16384);
+    ggml_context * c = tg.c;
+    ggml_tensor * x = tg.input(GGML_TYPE_F32, D, HC, n, x_last, (size_t) (D * HC * n));
+    ggml_set_param(x);
+    for (auto & l : im.lora) if (l.layer < 0) { ggml_set_param(l.A); ggml_set_param(l.B); }
+    // ref: build_hc_head (as logits())
+    ggml_tensor * flat = ggml_rms_norm(c, ggml_reshape_2d(c, x, HC * D, n), (float) G.rms_eps);
+    ggml_tensor * pre = ggml_sigmoid(c, ggml_add(c, ggml_mul(c, ggml_mul_mat(c, im.head_fn, flat), im.head_scale), im.head_base));
+    pre = ggml_scale_bias(c, pre, 1.0f, (float) G.hc_eps);
+    ggml_tensor * h = im.rms(c, im.hc_reduce(c, x, pre), im.out_norm);
+    ggml_tensor * rows = ggml_reshape_1d(c, tg.input(GGML_TYPE_I32, mcount, 1, 1, at.data(), at.size()), mcount);
+    ggml_tensor * lg = im.mm(c, im.output, ggml_get_rows(c, h, rows));                            // [V, m]
+    ggml_tensor * labels = ggml_reshape_2d(c, tg.input(GGML_TYPE_F32, G.vocab, mcount, 1, lab.data(), lab.size()), G.vocab, mcount);
+    ggml_tensor * loss = ggml_cross_entropy_loss(c, lg, labels);
+    if (!tg.run(im.be, loss)) return im.fail("train_head: graph allocation or compute failed");
+    ggml_backend_tensor_get(loss, loss_out, 0, 4);
+    ggml_backend_tensor_get(ggml_graph_get_grad(tg.gf, x), g_x, 0, (size_t) (D * HC * n) * 4);
+    gA.resize(im.lora.size());
+    gB.resize(im.lora.size());
+    for (size_t i = 0; i < im.lora.size(); ++i)
+        if (im.lora[i].layer < 0) { add_grad(tg.gf, im.lora[i].A, gA[i]); add_grad(tg.gf, im.lora[i].B, gB[i]); }
+    for (auto & l : im.lora) if (l.layer < 0) { l.A->flags &= ~GGML_TENSOR_FLAG_PARAM; l.B->flags &= ~GGML_TENSOR_FLAG_PARAM; }
     return true;
 }
 

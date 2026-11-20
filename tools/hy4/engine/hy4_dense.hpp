@@ -72,6 +72,30 @@ public:
     const std::map<std::string, std::vector<float>> & taps() const;
     const std::string & last_error() const;
 
+    // ---- LoRA (docs/train/LORA_PLAN.md).  Adapters on 2-D dense weights by GGUF tensor name: W x -> W x + s B (A x),
+    // s = alpha / rank, A [in, rank] small uniform, B [rank, out] zero (an untrained adapter changes nothing).  Every
+    // graph (inference and training) applies them.  Call once, after init.
+    bool lora_add(const std::vector<std::string> & names, int rank, float alpha, uint64_t seed, std::string & err);
+    int  lora_count() const;
+    const std::string & lora_name(int i) const;
+    void lora_shape(int i, int64_t & n_in, int64_t & n_out, int64_t & rank) const;
+    int  lora_layer(int i) const;   ///< blk.N -> N, -1 for a non-layer weight
+    void lora_get(int i, std::vector<float> & A, std::vector<float> & B) const;
+    void lora_set(int i, const float * A, const float * B);
+
+    // ---- training (LoRA).  The sequence = the last begin() (positions 0..n-1, n <= kpool_exact_limit(): full causal,
+    // sliding window on window layers, every DSA pool selected).
+    /// Layer il as ONE differentiable graph, the routed experts inside it (their GGUF slices uploaded for the step):
+    /// x_in = the layer's input saved by the forward (n * hc * n_embd), g_out = d loss / d layer output, ids = the
+    /// forward's routing (n * n_used).  Out: g_in = d loss / d x_in; gA / gB[i] += the gradient of every adapter of
+    /// this layer (sized by the caller to the adapters' A / B).
+    bool train_layer(int il, const float * x_in, const float * g_out, const int * ids, float * g_in,
+                     std::vector<std::vector<float>> & gA, std::vector<std::vector<float>> & gB);
+    /// The head: x_last (the state after the last layer), targets[t] = the token expected at t + 1 (-1 = no loss there).
+    /// Out: the mean cross-entropy over the counted positions and g_x = d loss / d x_last.
+    bool train_head(const float * x_last, const int * targets, float * loss, float * g_x,
+                    std::vector<std::vector<float>> & gA, std::vector<std::vector<float>> & gB);
+
 private:
     std::unique_ptr<Impl> p_;
 };

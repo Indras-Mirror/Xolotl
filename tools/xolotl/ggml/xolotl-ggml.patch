@@ -2720,7 +2720,7 @@ index 33936acae..cb6ff367c 100644
                  }
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index ed8554b14..9ac7aa68c 100644
+index ed8554b14..238be358d 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1093,6 +1093,15 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -3023,7 +3023,21 @@ index ed8554b14..9ac7aa68c 100644
              }
          } break;
          case GGML_OP_SQR: {
-@@ -7161,6 +7394,12 @@ static void ggml_compute_backward(
+@@ -7094,10 +7327,11 @@ static void ggml_compute_backward(
+             // same as cpy
+             if (src0_needs_grads) {
+                 GGML_ASSERT(!cgraph->grads[isrc0] || ggml_is_contiguous(cgraph->grads[isrc0]));
+-                GGML_ASSERT(ggml_is_contiguous(grad));
++                // Xolotl: a cont() feeding a permute/view gets a permuted gradient; make it contiguous (a no-op in value)
++                struct ggml_tensor * gc = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+                 GGML_ASSERT(ggml_nelements(tensor) == ggml_nelements(src0));
+                 ggml_add_or_set(ctx, cgraph, isrc0,
+-                    ggml_are_same_shape(tensor, src0) ? grad : ggml_reshape(ctx, grad, src0));
++                    ggml_are_same_shape(tensor, src0) ? gc : ggml_reshape(ctx, gc, src0));
+             }
+         } break;
+         case GGML_OP_RESHAPE: {
+@@ -7161,6 +7395,12 @@ static void ggml_compute_backward(
                  // noop
              }
          } break;
@@ -3036,7 +3050,7 @@ index ed8554b14..9ac7aa68c 100644
          case GGML_OP_DIAG_MASK_INF: {
              if (src0_needs_grads) {
                  /* ggml_diag_mask_inf_impl() shouldn't be here */
-@@ -7270,6 +7509,12 @@ static void ggml_compute_backward(
+@@ -7270,6 +7510,12 @@ static void ggml_compute_backward(
                          ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, grad, src0));
                      }
                  } break;
@@ -3049,7 +3063,7 @@ index ed8554b14..9ac7aa68c 100644
                  case GGML_UNARY_OP_EXP: {
                      if (src0_needs_grads) {
                          ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, tensor, grad));
-@@ -7309,11 +7554,50 @@ static void ggml_compute_backward(
+@@ -7309,11 +7555,50 @@ static void ggml_compute_backward(
                          ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
                      }
                  } break;
@@ -3100,7 +3114,7 @@ index ed8554b14..9ac7aa68c 100644
          case GGML_OP_NONE: {
              // noop
          } break;
-@@ -7494,6 +7778,17 @@ void ggml_build_backward_expand(
+@@ -7494,6 +7779,17 @@ void ggml_build_backward_expand(
                  ignore_src[1] = true;
                  break;
  
