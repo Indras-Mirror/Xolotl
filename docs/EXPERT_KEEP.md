@@ -18,7 +18,7 @@ STRATA_EXPERT_KEEP=/path/to/keep.txt build-xolotl/strata --serve ...
 The file lists, per MoE layer, the experts that **stay**:
 
 ```
-# keep 320 of 512, office profile
+# keep 384 of 512, office profile
 0: 0 1 3 4 5 7 8 9 10 12 15 ...
 1: 0 1 3 4 5 6 10 11 12 14 ...
 ...
@@ -71,10 +71,11 @@ The method, in four steps:
 
 QFN45 (512 experts per layer, 48 layers), office profile, held-out gate:
 
-| Keep per layer | KL vs full model | Top-1 agreement | Verdict |
-| --- | --- | --- | --- |
-| 320 of 512 | 0.080 | 93.9 % | used |
-| 256 of 512 | 0.159 | 90.8 % | too far |
+| Keep per layer | Routed mass kept (profile set) | KL vs full model | Top-1 agreement | Verdict |
+| --- | --- | --- | --- | --- |
+| 384 of 512 | 98.9 % (worst layer 96.3 %) | not gated yet | not gated yet | current choice, after the task runs below |
+| 320 of 512 | 96.5 % (worst layer 91.2 %) | 0.080 | 93.9 % | passed the gate, but see the task runs |
+| 256 of 512 | - | 0.159 | 90.8 % | too far |
 
 A keep-all list (every expert listed) matches the unmasked output within normal run-to-run variation, which is a
 quick way to check the plumbing before testing a real list.
@@ -96,14 +97,22 @@ QFN45 is our 45 GB Qwen3.8 MoE quant. Throughput on a 13.8K-token prompt (`tools
   22.7 -> 11.9 s) and brings prefill up to normal-mode speed.
 
 **On real tasks.** Two multi-step spreadsheet jobs (read a cable cutsheet, find and fix planted errors, build label
-sheets), each scored against a fixed set of checks, with the mask in normal mode:
+sheets), each scored against a fixed set of checks:
 
-- Job time went from 480 s (no mask) to 382-404 s.
-- One job: 12/12 with the mask.
-- The other: 8/12, 12/12 and 11/12 over three masked runs, against 12/12 in its last three unmasked runs. The 8/12
-  was one wrong decision that did not come back in the two repeats. But one specific false alarm (reporting a
-  problem that isn't there) showed up in 2 of the 3 masked runs and in none of 5 unmasked runs. Three runs is not
-  enough to be sure, but it may be what keep-320 costs on that job. A wider list (keep-384) is the next test.
+| Job B runs | Checks | Job time |
+| --- | --- | --- |
+| No mask, last three runs | 12/12, 12/12, 12/12 | 480 s (last run) |
+| keep-320, low-RAM mode | 8/12 | 433 s |
+| keep-320, normal mode | 12/12, 11/12 | 382 s, 404 s |
+| keep-384, normal mode | 12/12 | 500 s |
+
+- Job A: 12/12 with keep-320.
+- On job B the 8/12 was one wrong decision that did not come back in later runs. One specific false alarm
+  (reporting a problem that isn't there) showed up in 2 of the 3 keep-320 runs and in none of 5 unmasked runs. The
+  keep-384 run did not raise it. That is one run, so it is a lead, not proof; keep-384 keeps more of the routing
+  (98.9 % vs 96.5 %) for a smaller speed gain, which is the safer side.
+- Job time follows how many steps the model takes more than engine speed: the keep-384 run made 88 requests and
+  wrote ~50K tokens, the keep-320 runs ~61 requests and ~41K tokens each, at the same ~152 tok/s decode.
 
 ## Caveats
 
