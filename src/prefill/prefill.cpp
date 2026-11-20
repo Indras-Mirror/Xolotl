@@ -3438,6 +3438,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (kva_skips_layer(l)) continue;   // no transfer for a layer whose MoE half is skipped
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                    // STRATA_EXPERT_KEEP: a pruned expert is never routed (its logit is masked before the top-k), so
+                    // streaming it moved bytes nothing reads - with keep-320 of 512 that was ~40 % of each chunk's
+                    // PCIe traffic, and the masked prefill was no faster than the unmasked one (20 Nov 2026)
+                    if (!strata::kernels::expert_keep_kept(l, e)) continue;
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
@@ -4321,6 +4325,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (k - k0 == per) break;
                                     blob[e - b.e0] = m.stage_dev[k % (size_t) m.ring];
                                     ++k;
+                                } else if (!strata::kernels::expert_keep_kept(l, e)) {
+                                    blob[e - b.e0] = nullptr;   // pruned (STRATA_EXPERT_KEEP): never routed, so no tiles read it
                                 } else {                  // not streamed: resident (the walk streams all others)
                                     blob[e - b.e0] = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
                                     // counted whether routed or not (the routing stays on the GPU): at a streamed

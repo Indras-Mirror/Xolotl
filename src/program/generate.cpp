@@ -8702,8 +8702,16 @@ int main(int argc, char** argv) {
             !strata::prefill::Prefill::ring_bytes_enabled())
             return chunk;
         const auto& lay = strata::kernels::cpu::expert_layout();
+        // STRATA_EXPERT_KEEP: pruned experts are never routed, so they are not part of what a prompt can read (the GPU
+        // cache and the RAM copy hold kept experts only); counting them priced a phantom 13.9 GiB file tier of the
+        // pruned bytes (low-RAM + keep-320, 20 Nov 2026). That plan input was wrong but not the slowdown seen there:
+        // that was the stream walk copying pruned experts (prefill.cpp, stream_all)
         uint64_t total = 0;
-        for (int64_t l = 0; l < g.n_layers; ++l) total += (uint64_t) lay.blob_bytes(l) * (uint64_t) g.n_expert;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            int64_t kept = 0;
+            for (int64_t e = 0; e < g.n_expert; ++e) kept += strata::kernels::expert_keep_kept(l, e) ? 1 : 0;
+            total += (uint64_t) lay.blob_bytes(l) * (uint64_t) kept;
+        }
         if (total == 0 || gpu_cache_bytes >= total) return chunk;   // the GPU holds every expert: no file tier
         const auto hm = strata::core::sample_host_memory();
         if (!hm) return chunk;
