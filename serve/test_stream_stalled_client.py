@@ -8,7 +8,9 @@ STREAM_WRITE_TIMEOUT_S ends the request as a disconnect (the engine is stopped, 
 No GPU: the engine is a MockEngine that streams a lot of tokens.
 """
 import json
+import os
 import socket
+import subprocess
 import sys
 import time
 import unittest
@@ -56,14 +58,17 @@ class StalledClient(unittest.TestCase):
             httpd.server_close()
 
     def test_the_timeout_can_be_turned_off(self):
-        """STRATA_STREAM_WRITE_TIMEOUT_S=0 restores the old behaviour (no socket timeout at all)."""
-        with mock.patch.dict("os.environ", {"STRATA_STREAM_WRITE_TIMEOUT_S": "0"}):
-            import importlib
-            importlib.reload(server)
-            try:
-                self.assertEqual(server.STREAM_WRITE_TIMEOUT_S, 0)
-            finally:
-                importlib.reload(server)
+        """STRATA_STREAM_WRITE_TIMEOUT_S=0 restores the old behaviour (no socket timeout at all).
+
+        A fresh interpreter reads the variable, not importlib.reload(server): a reload re-executes serve/server.py in
+        the same module object and rebinds every class in it, and a module that did `from serve.server import
+        EngineDied` keeps the old class - its assertRaises(EngineDied) then misses the exception the reloaded code
+        raises (test_vram.test_refused_and_died, test_vision_elastic's 503 test, under discover)."""
+        out = subprocess.run([sys.executable, "-c", "import serve.server as s; print(s.STREAM_WRITE_TIMEOUT_S)"],
+                             cwd=str(ROOT), capture_output=True, text=True, timeout=120,
+                             env={**os.environ, "STRATA_STREAM_WRITE_TIMEOUT_S": "0"})
+        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+        self.assertEqual(float(out.stdout.strip().splitlines()[-1]), 0.0)
 
 
 if __name__ == "__main__":
