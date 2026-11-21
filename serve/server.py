@@ -1769,6 +1769,27 @@ class StrataEngine:
             if acquired:
                 ctl.release()
 
+    def encode_image(self, image: str, out: str, timeout: float = 120.0) -> str:
+        """`ENC <image> <out>` to an engine started with --mmproj (its own vision tower): the reply line,
+        "OK <n> <nx> <ny> <ms>" or "ERR ...".  The caller holds the FIFO (one exchange at a time), as for HAVE."""
+        proc, born, lines = self.proc, getattr(self, "gen", None), self.lines
+        self._send(f"ENC {image} {out}")
+        deadline = time.time() + timeout
+        while True:
+            if self.proc is not proc or getattr(self, "gen", None) != born:
+                raise EngineDied("the engine changed during its ENC answer")
+            try:
+                line = lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer ENC") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith(("OK", "ERR")):
+                return line
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer ENC in time")
+
     def _have_idle(self, keys: list[str], timeout: float = 30.0) -> list[tuple[int, int, int] | None]:
         """`HAVE <key,...>` between requests (the caller holds the FIFO): which pictures the engine holds by their keys
         (img_refs engines) -> (n, nx, ny) or None for each."""
@@ -3481,7 +3502,11 @@ class Vision:
         return Path(tempfile.mkdtemp(prefix="strata-vision-"))
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
-        args = self.reader_args(cfg)
+        # xolotl: "in_engine": true - the ENGINE's own tower (started with --mmproj) reads the pictures; there is no
+        # strata-vision process, and main() binds `engine` once the engine exists (encode_keyed asks it over ENC)
+        self.in_engine = bool(cfg.get("in_engine"))
+        self.engine = None
+        args = [] if self.in_engine else self.reader_args(cfg)
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.persistence_requested = bool((env if env is not None else os.environ).get("STRATA_PREFIX_CACHE_DIR"))
@@ -3509,7 +3534,7 @@ class Vision:
         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
         # xolotl: both on-demand modes - the local "lazy" (Service.start_lazy_vision) and upstream 0.1.44's
         # "elastic" (Service._vision_up / _vision_idle_down); a config picks one, neither = the resident encoder
-        if not lazy and not self.lazy_vision and not self.elastic:
+        if not lazy and not self.lazy_vision and not self.elastic and not self.in_engine:
             self._start()
 
     # What a picture may become when the config does not say (setup writes the same numbers, setup.VISION): an old, hand-edited or migrated
@@ -3681,6 +3706,8 @@ class Vision:
             raise RuntimeError(f"{what}: it said nothing for {timeout:.0f} s") from None
 
     def alive(self) -> bool:
+        if self.in_engine:
+            return getattr(self, "engine", None) is not None and getattr(self.engine, "proc", None) is not None
         return self.proc is not None and not self.stopped and self.proc.poll() is None
 
     def unload(self):
@@ -3830,7 +3857,7 @@ class Vision:
             if key in self.cache:
                 self.cache[key] = self.cache.pop(key)                  # most recently used last
                 return self.cache[key]
-            if (self.proc is None or self.proc.stdin is None) and not getattr(self, "lazy_vision", False):   # an elastic encoder not started yet, or one that was unloaded (xolotl: a lazy one starts below)
+            if not self.in_engine and (self.proc is None or self.proc.stdin is None) and not getattr(self, "lazy_vision", False):   # an elastic encoder not started yet, or one that was unloaded (xolotl: a lazy one starts below)
                 raise ValueError("the picture reader is not running")
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             self.last_used = time.time()
@@ -3841,13 +3868,16 @@ class Vision:
                 self._start()
             img.write_bytes(data)
             try:
-                self.proc.stdin.write(f"ENC {img.name} {out.name}\n")      # relative to the encoder's cwd (#480)
-                self.proc.stdin.flush()
-                try:
-                    line = self._readline(VISION_ENCODE_S, "the image could not be read").strip()
-                except RuntimeError as e:                 # silent for VISION_ENCODE_S: the encoder was ended (#1317)
-                    self.stopped = True                   # alive() is False, so the next request starts it again
-                    raise ValueError(str(e)) from None
+                if self.in_engine:      # the engine's own tower (--mmproj): absolute paths, the engine's cwd is its own
+                    line = self.engine.encode_image(str(img), str(out), timeout=VISION_ENCODE_S)
+                else:
+                    self.proc.stdin.write(f"ENC {img.name} {out.name}\n")  # relative to the encoder's cwd (#480)
+                    self.proc.stdin.flush()
+                    try:
+                        line = self._readline(VISION_ENCODE_S, "the image could not be read").strip()
+                    except RuntimeError as e:             # silent for VISION_ENCODE_S: the encoder was ended (#1317)
+                        self.stopped = True               # alive() is False, so the next request starts it again
+                        raise ValueError(str(e)) from None
             finally:                                                   # #352: also when the encoder's pipe is gone
                 img.unlink(missing_ok=True)
             if not line.startswith("OK"):
@@ -11095,6 +11125,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         engine.deep_sleep = sleep_mode
+        if vision is not None and getattr(vision, "in_engine", False):
+            # xolotl: the engine's own tower (--mmproj) reads the pictures over the line protocol, no second process
+            vision.engine = engine
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups and not split else None

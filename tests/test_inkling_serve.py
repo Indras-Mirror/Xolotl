@@ -337,6 +337,36 @@ class ImagePartTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             svc.expand_image_tokens(ids, [])
 
+    def test_in_engine_vision_asks_the_engine(self):
+        """vision: {"in_engine": true} - no strata-vision process; ENC goes to the engine (--mmproj)."""
+        from serve.server import Vision
+        import struct
+        asked = []
+
+        class FakeEngine:
+            proc = object()          # alive() only checks that the engine has a process
+
+            def encode_image(self, image, out, timeout=120.0):
+                asked.append((Path(image).read_bytes(), out))
+                with open(out, "wb") as f:
+                    f.write(struct.pack("<5i", 0x31455653, 4, 4, 1, 2304) + b"\0" * (4 * 2304 * 4))
+                return "OK 4 4 1 12"
+
+        import io
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (40, 40), (10, 200, 30)).save(buf, format="PNG")
+        data = buf.getvalue()
+
+        v = Vision({"in_engine": True, "max_tokens": 1024})
+        self.assertIsNone(v.proc)
+        v.engine = FakeEngine()
+        out, n = v.encode(data)
+        self.assertEqual(n, 4)
+        self.assertTrue(Path(out).read_bytes().startswith(struct.pack("<i", 0x31455653)))
+        self.assertEqual(asked[0][0], v.normalize(data))
+        v.close()
+
 
 if __name__ == "__main__":
     unittest.main()

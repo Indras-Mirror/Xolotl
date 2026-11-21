@@ -10,10 +10,14 @@
     "without it the server refuses to start and says so.",
     "Pictures: image_pad/vision_start below are the model's own markers (serve/inkling.py writes",
     "<|content_image|><|unused_200054|> for an image part; server.py expands the pad to one token per encoder row,",
-    "which the engine's GENI replaces). To read pictures, add a 'vision' section (its own mmproj file; the engine",
-    "loads it): { \"vision\": { \"exe\": \"build-vision/bin/strata-vision\", \"mmproj\": \"<mmproj-Inkling-2-Mini-F16.gguf>\",",
-    "\"model\": \"<the same GGUF as --native, for the vocabulary>\", \"gpu\": false, \"max_tokens\": 1024 } }. Leave it out",
-    "for text only; the encoder is ~0.4B and runs on the CPU in about a second for a 640x480 picture."
+    "which the engine's GENI replaces). Two ways to read them, both with the inkling2v mmproj (convert_hf_to_gguf.py",
+    "--mmproj; F16 is the ship default, BF16 drifts ~4x more):",
+    "  in the engine (preferred): add \"--mmproj <mmproj-Inkling-2-Mini-F16.gguf>\" to args, and",
+    "  \"vision\": { \"in_engine\": true, \"max_tokens\": 1024 } - no second process; ~640 MB of VRAM per picture,",
+    "  released after it.",
+    "  as a sidecar: \"vision\": { \"exe\": \"build-vision/bin/strata-vision\", \"mmproj\": \"<mmproj.gguf>\",",
+    "  \"model\": \"<the same GGUF as --native, for the vocabulary>\", \"gpu\": false, \"max_tokens\": 1024 }.",
+    "Leave the section out for text only; the encoder is ~0.4B and runs on the CPU in about a second for 640x480."
   ],
 
   "arch": "inkling2_loop",
