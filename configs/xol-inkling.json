@@ -8,7 +8,13 @@
     "(temperature 1.0, top_p 1.0, no top-k; 64 is the engine maximum (a request top_k of 0 maps to it).",
     "A small top-k such as 20 makes the thinking loop, a known model-card limitation), do_sample. The 'tokenizer' folder is the pack (vocab.json, merges.txt, token_type.json,",
     "tokenizer.json with pre=inkling2 and special_ids), exported from the checkpoint by tools/inkling/export_tokenizer.py;",
-    "without it the server refuses to start and says so."
+    "without it the server refuses to start and says so.",
+    "Pictures: image_pad/vision_start below are the model's own markers (serve/inkling.py writes",
+    "<|content_image|><|unused_200054|> for an image part; server.py expands the pad to one token per encoder row,",
+    "which the engine's GENI replaces). To read pictures, add a 'vision' section (its own mmproj file; the engine",
+    "loads it): { \"vision\": { \"exe\": \"build-vision/bin/strata-vision\", \"mmproj\": \"<mmproj-Inkling-2-Mini-F16.gguf>\",",
+    "\"model\": \"<the same GGUF as --native, for the vocabulary>\", \"gpu\": false, \"max_tokens\": 1024 } }. Leave it out",
+    "for text only; the encoder is ~0.4B and runs on the CPU in about a second for a 640x480 picture."
   ],
 
   "arch": "inkling2_loop",
@@ -23,6 +29,8 @@
   ],
 
   "tokenizer": "/media/mal/NVME1TB/Xolotl/inkling-2-mini/pack/tokenizer",
+  "image_pad": "<|unused_200054|>",
+  "vision_start": "<|content_image|>",
   "model_name": "inkling-2-mini",
   "log": "xol-inkling.log",
   "port": 8134,
