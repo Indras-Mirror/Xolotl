@@ -274,5 +274,69 @@ class FamilyHookTest(unittest.TestCase):
         self.assertIn("Thinking effort level: 0", prompt)
 
 
+INKLING_PACK = Path(os.environ.get(
+    "INKLING_TOKENIZER", "/media/mal/NVME1TB/Xolotl/inkling-2-mini/pack/tokenizer"))
+IMAGE_PAD = "<|unused_200054|>"
+VISION_START = "<|content_image|>"
+
+
+def load_pack():
+    """The Inkling tokenizer pack's tokenizer (the same construction serve/server.py does for this config)."""
+    try:
+        import strata_tokenizer as ST
+    except ImportError:
+        return None
+    vocab = json.loads((INKLING_PACK / "vocab.json").read_text(encoding="utf-8"))
+    tokens = [None] * len(vocab)
+    for t, i in vocab.items():
+        tokens[i] = t
+    merges = (INKLING_PACK / "merges.txt").read_text(encoding="utf-8").split("\n")
+    types = json.loads((INKLING_PACK / "token_type.json").read_text())
+    tcfg = json.loads((INKLING_PACK / "tokenizer.json").read_text(encoding="utf-8"))
+    return ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None)
+
+
+class ImagePartTest(unittest.TestCase):
+    """serve/inkling.py's image part and server.py's expansion: one `<|unused_200054|>` per encoder row."""
+
+    def setUp(self):
+        import serve.server as server
+        self.server = server
+        self.old = (server.IMAGE_PAD, server.VISION_START)
+        server.IMAGE_PAD, server.VISION_START = IMAGE_PAD, VISION_START
+        self.tok = load_pack() if INKLING_PACK.exists() else None
+
+    def tearDown(self):
+        self.server.IMAGE_PAD, self.server.VISION_START = self.old
+
+    def test_render_writes_the_vision_marker_before_the_pad(self):
+        prompt = render([{"role": "user", "content": [
+            {"type": "text", "text": "What is in this chart?"},
+            {"type": "image", "image": "chart.png"}]}], None, None)
+        self.assertIn(VISION_START + IMAGE_PAD, prompt)
+
+    def test_expand_gives_one_pad_per_row(self):
+        if self.tok is None:
+            self.skipTest("the tokenizer pack or strata_tokenizer is not available")
+        svc = Service.__new__(Service)
+        svc.tok = self.tok
+        pad = self.tok.encode(IMAGE_PAD, parse_special=True)
+        self.assertEqual(len(pad), 1, "the pack must spell the image pad as one token")
+        self.assertEqual(pad[0], 200054)
+        self.assertEqual(self.tok.encode(VISION_START, parse_special=True), [200005])
+        prompt = render([{"role": "user", "content": [
+            {"type": "text", "text": "What is in this chart?"},
+            {"type": "image", "image": "chart.png"}]}], None, None)
+        ids = self.tok.encode(prompt, parse_special=True)
+        ends = []
+        out = svc.expand_image_tokens(ids, [("key", 192)], ends)
+        self.assertEqual(out.count(200054), 192)
+        self.assertEqual(len(out), len(ids) - 1 + 192)
+        # `ends` is the picture's end inside the expanded prompt: right after its last pad row
+        self.assertEqual(ends, [out.index(200054) + 192])
+        with self.assertRaises(ValueError):
+            svc.expand_image_tokens(ids, [])
+
+
 if __name__ == "__main__":
     unittest.main()

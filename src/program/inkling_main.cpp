@@ -11,7 +11,14 @@
 // through its unchanged StrataEngine:
 //   out INFO ... | READY <context> stop | PP <pos> <prompt> <ms> <tok/s> | T <id> | SCORE ... |
 //       DONE <generated> <prompt> <prompt ms> <decode ms> <stop|length|cancel> 0 0 <reused>
-//   in  GEN <max_new> [key=value ...] id,id,... | STOP | QUIT | PARK | VRAM [mib]
+//   in  GEN <max_new> [key=value ...] id,id,... | GENI <max_new> [key=value ...] <embeddings file> id,id,... |
+//       STOP | QUIT | PARK | VRAM [mib]
+//
+// GENI carries an image: the file is strata-vision's records (int32 'SVE1', n, nx, ny, n_embd followed by
+// float32 [n][n_embd], in prompt order) and its rows replace the embeddings of the prompt's image tokens
+// (`<|unused_200054|>`, one row per token).  The reference skips the token-embedding norm for image rows, so they are
+// fed raw while text rows keep the rms*norm (llama.cpp inkling2.cpp: "do not normalize raw embeddings input"); each
+// image token is one position, as in llama.cpp's mtmd (Inkling has no M-RoPE).
 //
 // The model (GGUF arch `inkling2_loop`, or `inkling2` without the loop): 24 physical layers; layers [loop.start,
 // loop.end) (6-17) run loop.count (3) passes, so a token sees 48 layer applications and the state has 48 cache slots
@@ -212,10 +219,10 @@ struct Model {
     size_t weight_bytes = 0, host_bytes = 0, state_bytes = 0;
     ggml_type kv_k = GGML_TYPE_F16, kv_v = GGML_TYPE_F16;   // the full-context K/V cache types
     struct Step* last = nullptr;     // the last built + allocated graph, reused while its shape holds
-    int64_t last_key[7] = {-1, -1, -1, -1, -1, -1, -1};
+    int64_t last_key[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
     Dspark* dspark = nullptr;        // --dspark: the drafter (its own K/V caches); spec = conv history + taps allocated
     bool spec = false;
-    struct GSlot { ggml_backend_t gpu = nullptr; ggml_backend_sched_t sched = nullptr; struct Step* last = nullptr; int64_t key[7] = {-1, -1, -1, -1, -1, -1, -1}; std::vector<uint8_t> buf; };
+    struct GSlot { ggml_backend_t gpu = nullptr; ggml_backend_sched_t sched = nullptr; struct Step* last = nullptr; int64_t key[8] = {-1, -1, -1, -1, -1, -1, -1, -1}; std::vector<uint8_t> buf; };
     std::vector<GSlot> vg;           // --dspark: one cached graph (+ its own scheduler) per verify length 2..kSpecT
     uint8_t* host_w = nullptr;       // pinned copy of the GPU weights (park / unpark)
     std::vector<size_t> host_w_at;
@@ -459,6 +466,7 @@ struct Step {
     ggml_context* ctx = nullptr;
     ggml_cgraph* gf = nullptr;
     ggml_tensor *tokens = nullptr, *posf = nullptr;
+    ggml_tensor *media = nullptr, *media_sel = nullptr;   // GENI: encoder rows [n_embd, T] and where they go [1, T]
     std::vector<ChunkIn> ck_full, ck_swa;   // the visible window in cell chunks (one entry when it fits the budget)
     ggml_tensor *out_ids = nullptr, *logits = nullptr;
     ggml_tensor *idx_full = nullptr, *idx_swa = nullptr;   // the cells this step writes (set_rows: fixed pointers -> CUDA graphs)
@@ -737,7 +745,7 @@ int64_t attn_cell_chunk(const Model& m, int T, int64_t nk, int nh) {
 }
 
 // T tokens at positions p0 .. p0+T-1; logits for the last n_out of them
-Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = false) {
+Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = false, bool vision = false) {
     const Hp& h = m.hp;
     Step s;
     ggml_init_params ip{m.graph_buf.size(), m.graph_buf.data(), true};
@@ -750,6 +758,10 @@ Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = fals
 
     s.tokens = ggml_new_tensor_1d(c, GGML_TYPE_I32, T); ggml_set_input(s.tokens);
     s.posf = ggml_new_tensor_1d(c, GGML_TYPE_F32, T); ggml_set_input(s.posf);
+    if (vision) {
+        s.media = ggml_new_tensor_2d(c, GGML_TYPE_F32, h.n_embd, T); ggml_set_input(s.media);
+        s.media_sel = ggml_new_tensor_2d(c, GGML_TYPE_F32, 1, T); ggml_set_input(s.media_sel);
+    }
     s.n_kv_full = std::min<int64_t>(m.n_ctx, ((p0 + T + 255) / 256) * 256);
     {
         int64_t hi = -1;
@@ -786,7 +798,15 @@ Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = fals
     g.tau = ggml_reshape_3d(c, ggml_scale_bias(c, tau, h.log_alpha, 1.0f), 1, 1, T);
 
     ggml_tensor* cur = ggml_get_rows(c, m.tok_embd, s.tokens);
-    cur = g.rms(cur, m.tok_norm);
+    if (s.media) {
+        // text rows: rms_norm * tok_norm; image rows: the projector's output raw (the reference's normed-embedding
+        // table IS normed, then the image rows overwrite it, so never normalize them - llama.cpp inkling2.cpp)
+        ggml_tensor* normed = g.rms(cur, m.tok_norm);
+        ggml_tensor* sel = s.media_sel;                                        // [1, T], broadcasts over n_embd
+        cur = ggml_add(c, ggml_mul(c, normed, ggml_sub(c, ggml_fill(c, sel, 1.0f), sel)), ggml_mul(c, s.media, sel));
+    } else {
+        cur = g.rms(cur, m.tok_norm);
+    }
     std::vector<ggml_tensor*> blocks;
     const int start = h.n_pass > 1 ? h.loop_start : h.n_phys, end = h.n_pass > 1 ? h.loop_end : h.n_phys;
     for (int il = 0; il < start; ++il) cur = g.layer(il, il, cur, blocks, nullptr);
@@ -880,7 +900,8 @@ void drop_graph(Model& m) {
 }
 
 void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::vector<float>& logits,
-             std::vector<std::vector<float>>* taps = nullptr, std::vector<float>* dtap = nullptr) {
+             std::vector<std::vector<float>>* taps = nullptr, std::vector<float>* dtap = nullptr,
+             const float* media_rows = nullptr, const float* media_sel = nullptr) {
     static const bool dbg = std::getenv("XOLOTL_INKLING_DEBUG") != nullptr;
     // speculative verify chunks keep their own graph per length, so a changing draft length never rebuilds a graph
     Model::GSlot* gs = nullptr;
@@ -896,7 +917,7 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
     }
     struct SlotSwap {
         Model& m; Model::GSlot* g;
-        void sw() { std::swap(m.sched, g->sched); std::swap(m.last, g->last); std::swap_ranges(m.last_key, m.last_key + 7, g->key); m.graph_buf.swap(g->buf); }
+        void sw() { std::swap(m.sched, g->sched); std::swap(m.last, g->last); std::swap_ranges(m.last_key, m.last_key + 8, g->key); m.graph_buf.swap(g->buf); }
         SlotSwap(Model& mm, Model::GSlot* gg) : m(mm), g(gg) { if (g) sw(); }
         ~SlotSwap() { if (g) sw(); }
     } slot_swap{m, gs};
@@ -909,21 +930,26 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
         for (int t = 0; t < T; ++t) hi = std::max<int64_t>(hi, (p0 + t) % m.ring);
         n_kv_swa = std::min<int64_t>(m.ring, ((hi + 1 + 255) / 256) * 256);
     }
-    const int64_t key[7] = {T, n_out, n_kv_full, n_kv_swa, taps != nullptr, m.st != nullptr, dtap != nullptr};
+    const bool vision = media_rows != nullptr;
+    const int64_t key[8] = {T, n_out, n_kv_full, n_kv_swa, taps != nullptr, m.st != nullptr, dtap != nullptr, vision};
     const auto tb = Clock::now();
-    const bool reuse = m.last && std::equal(key, key + 7, m.last_key);
+    const bool reuse = m.last && std::equal(key, key + 8, m.last_key);
     if (!reuse) {
         drop_graph(m);
-        m.last = new Step(build(m, T, p0, n_out, taps != nullptr, dtap != nullptr));
+        m.last = new Step(build(m, T, p0, n_out, taps != nullptr, dtap != nullptr, vision));
         ggml_backend_sched_reset(m.sched);
         if (!ggml_backend_sched_alloc_graph(m.sched, m.last->gf)) { drop_graph(m); throw AllocFail(); }
-        std::copy(key, key + 7, m.last_key);
+        std::copy(key, key + 8, m.last_key);
     }
     Step& s = *m.last;
     const double ms_build = ms_since(tb);
     const double ms_alloc = 0;
     const auto tc = Clock::now();
     ggml_backend_tensor_set(s.tokens, ids, 0, (size_t) T * sizeof(int32_t));
+    if (s.media) {
+        ggml_backend_tensor_set(s.media, media_rows, 0, (size_t) T * m.hp.n_embd * sizeof(float));
+        ggml_backend_tensor_set(s.media_sel, media_sel, 0, (size_t) T * sizeof(float));
+    }
     {
         std::vector<float> pf(T);
         for (int t = 0; t < T; ++t) pf[t] = (float) (p0 + t);
@@ -1189,6 +1215,29 @@ bool parse_ids(const char* p, std::vector<int32_t>& ids) {
         else break;
     }
     return !ids.empty();
+}
+
+// The encoder's file (tools/vision, llama.cpp's mtmd): records of int32 {tag, n, nx, ny, n_embd} + float32 [n][n_embd],
+// 'SVE1' an image, in prompt order.  Rows are kept as float32; the graph blends them into the token embeddings.
+bool read_media(const std::string& path, int n_embd, std::vector<float>& rows, std::string& err) {
+    rows.clear();
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open the embeddings file " + path; return false; }
+    for (;;) {
+        int32_t hd[5];
+        const size_t got = std::fread(hd, sizeof(int32_t), 5, f);
+        if (got == 0) break;
+        if (got != 5 || hd[0] != 0x31455653 || hd[1] <= 0 || hd[4] != n_embd) {
+            std::fclose(f);
+            err = "bad embeddings record (want SVE1 with n_embd " + std::to_string(n_embd) + ")";
+            return false;
+        }
+        const size_t n = (size_t) hd[1] * (size_t) n_embd, at = rows.size();
+        rows.resize(at + n);
+        if (std::fread(rows.data() + at, sizeof(float), n, f) != n) { std::fclose(f); err = "short embeddings record"; return false; }
+    }
+    std::fclose(f);
+    return true;
 }
 
 std::vector<int32_t> token_ids_named(const Model& m, std::initializer_list<const char*> names) {
@@ -1507,6 +1556,10 @@ int main(int argc, char** argv) {
     reader.detach();
 
     std::vector<int32_t> fed;     // every token the state has consumed
+    // the image token: the chat template writes `<|content_image|>` then one `<|unused_200054|>` per encoder row
+    const std::vector<int32_t> media_ids = token_ids_named(m, {"<|unused_200054|>"});
+    auto is_media = [&](int32_t t) { return std::find(media_ids.begin(), media_ids.end(), t) != media_ids.end(); };
+    size_t fed_media = SIZE_MAX;  // the first image token the state has read (its rows are not in `fed`)
     Ckpt ck;
     std::vector<float> lg;
     std::string line;
@@ -1554,13 +1607,14 @@ int main(int argc, char** argv) {
         }
         try { do_unpark(); } catch (const std::exception& e) { std::printf("ERR %s\n", e.what()); std::fflush(stdout); continue; }
         in.stop.store(false);
-        if (line.rfind("GEN ", 0) != 0) {
-            std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n");
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        if (!geni && line.rfind("GEN ", 0) != 0) {
+            std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...> or GENI <max_new> [key=value ...] <embeddings file> <id,id,...>\n");
             std::fflush(stdout);
             continue;
         }
         char* endp = nullptr;
-        const long long max_new = std::strtoll(line.c_str() + 4, &endp, 10);
+        const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
         strata::kernels::SamplerParams sp;
         sp.top_k = 20; sp.top_p = 1.0f; sp.temperature = 0.0f; sp.greedy = true;
         unsigned long long seed = 0;
@@ -1591,6 +1645,14 @@ int main(int argc, char** argv) {
             }
         }
         if (score_bad) { std::printf("ERR score: expected 1-64 token ids below the vocabulary size\n"); std::fflush(stdout); continue; }
+        std::string media_path;
+        if (geni) {
+            while (*endp == ' ') ++endp;
+            const char* start = endp;
+            while (*endp != '\0' && *endp != ' ') ++endp;
+            media_path.assign(start, (size_t) (endp - start));
+            if (media_path.empty()) { std::printf("ERR bad request: GENI wants an embeddings file\n"); std::fflush(stdout); continue; }
+        }
         std::vector<int32_t> ids;
         if (max_new < 1 || !parse_ids(endp, ids)) { std::printf("ERR bad request\n"); std::fflush(stdout); continue; }
         if ((long long) ids.size() + 1 > m.n_ctx) {
@@ -1600,12 +1662,33 @@ int main(int argc, char** argv) {
         }
         sp.seed = seed;
 
+        // ---- the image rows (GENI): one per image token, in prompt order
+        std::vector<float> media;
+        std::vector<int64_t> media_row(ids.size(), -1);
+        size_t first_media = ids.size();
+        if (geni) {
+            std::string err;
+            if (!read_media(media_path, m.hp.n_embd, media, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); continue; }
+            int64_t k = 0;
+            for (size_t i = 0; i < ids.size(); ++i)
+                if (is_media(ids[i])) { media_row[i] = k++; first_media = std::min(first_media, i); }
+            if ((size_t) k * m.hp.n_embd != media.size()) {
+                std::printf("ERR the prompt has %lld image tokens but the embeddings file %zu rows\n", (long long) k, media.size() / m.hp.n_embd);
+                std::fflush(stdout);
+                continue;
+            }
+        }
+
         // ---- what of the state can be kept (the conv state is recurrent: append, or the checkpoint, or restart)
         size_t common = 0;
         {
             const size_t lim = std::min(fed.size(), ids.size());
             while (common < lim && fed[common] == ids[common]) ++common;
         }
+        // the state's token history does not carry the encoder rows: only reuse up to the first image token and up to
+        // the first media token the state already read (a new picture with the same pad ids is a different prompt)
+        common = std::min(common, first_media);
+        common = std::min(common, fed_media);
         size_t resume = 0;
         try {
             if (!fed.empty() && fed.size() < ids.size() && common == fed.size()) resume = fed.size();
@@ -1618,11 +1701,28 @@ int main(int argc, char** argv) {
             state_reset(m); dspark_reset(*m.dspark); resume = 0; fed.clear(); spec_ok = true;
         }
         std::vector<float> dt_pp;
+        fed_media = first_media < ids.size() ? first_media : SIZE_MAX;
 
         // ---- the prompt (a chunk whose compute buffer does not fit is read in halves)
+        std::vector<float> chunk_media, chunk_sel;
         std::function<void(size_t, int)> run = [&](size_t at, int T) {
             try {
-                forward(m, ids.data() + at, T, (int64_t) at, 1, lg, nullptr, spec_ok ? &dt_pp : nullptr);
+                bool any = false;
+                for (int t = 0; t < T && !any; ++t) any = media_row[at + t] >= 0;
+                if (!any) {
+                    forward(m, ids.data() + at, T, (int64_t) at, 1, lg, nullptr, spec_ok ? &dt_pp : nullptr);
+                } else {
+                    const int ne = m.hp.n_embd;
+                    chunk_media.assign((size_t) T * ne, 0.0f);
+                    chunk_sel.assign(T, 0.0f);
+                    for (int t = 0; t < T; ++t)
+                        if (media_row[at + t] >= 0) {
+                            std::memcpy(chunk_media.data() + (size_t) t * ne, media.data() + (size_t) media_row[at + t] * ne, (size_t) ne * sizeof(float));
+                            chunk_sel[t] = 1.0f;
+                        }
+                    forward(m, ids.data() + at, T, (int64_t) at, 1, lg, nullptr, spec_ok ? &dt_pp : nullptr,
+                            chunk_media.data(), chunk_sel.data());
+                }
                 if (spec_ok) dspark_add_ctx(*m.dspark, dt_pp.data(), T, (int64_t) at);
             } catch (const AllocFail&) {
                 if (T <= 16) throw;
