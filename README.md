@@ -12,99 +12,28 @@
 
 ## Latest
 
-- **21 Nov (evening)** - **Inkling-2-Mini decode 67 -> 93 tok/s** on the RTX 4090 (the 14 GB XQ quant, 256-token
-  greedy; 93-96 tok/s in served evals): the depthwise conv step, SiTU and the residual-stream stack are one CUDA
-  kernel each (bit-identical logits to the op chains they replace), q/rel/gate are one stacked mat-vec per token, and
-  the loop controllers run as one batched chain. Needs the updated ggml patch (one new hook, no effect on other
-  engines): `bash tools/xolotl/fetch-llama.sh <your ggml dir>`, then rebuild. Quick quality screen of the released
-  quant against its parents (greedy, thinking off): MMLU-100 76 % (original 73 %, abliterated parent 74 %),
-  HumanEval-21 19-21/21 for all three, tool choice 8/10 and agent loops 3/3 for all three. Worth knowing for anyone
-  measuring this model: its logits are chaotic at the rounding level (near-tied expert picks flip), so any engine
-  change - even a different prefill chunk size - moves held-out KL by ~0.005 over 2K tokens.
-- **21 Nov (out now)** - **Inkling-2-Mini XQ, abliterated**: 13.93 GB, passed its quality gates against the
-  abliterated parent (held-out KL 0.013, top-1 96.3 %) and refuses 4/100 harmful prompts (1/100 harmless). On one RTX
-  4090 through Xolotl's server: **1,162 tok/s prefill at 8K, 59.7 tok/s decode**, the same as the 22.9 GB parent.
-  On [IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored)
-  with the model's DSpark (MTP) drafter and vision projector as optional files; the agentic Gauntlet is running.
-  Engine: speculative decoding with the DSpark drafter (`--dspark`, experimental)
-  and quantised K/V caches (`--kv-type q8_0|k8v4`). Decode is kernel-launch bound (16.7 ms a token against a ~3.4 ms
-  memory floor), so kernel fusion toward 100+ tok/s is next, then vision (first step: 93 tok/s, above).
-- **21 Nov (Inkling)** - [Inkling-2-Mini](docs/INKLING.md) (Thinking Machines, 26B looped MoE, 5.4B active per token) on
-  its own engine, `xolotl-inkling`: **57 tok/s decode, 1.1K tok/s prefill** on the RTX 4090 from the exact NVFP4
-  checkpoint, greedy output matching the llama.cpp reference. The graph is ported from llama.cpp PR #32694 by Pedro
-  Cuenca (MIT); a loop-pass expert-scale bug in it is fixed here. First numbers: fused kernels, flash attention
-  and MTP drafting are next.
-- **21 Nov (later)** - LoRA training **proven end to end**: a QFN adapter trained on the RTX 4090 from the served
-  engine's own activations lowers the loss on held-out agent transcripts 1.4116 -> 1.3197 (-6.5 %) in ~6 min. How to
-  train LoRAs on the big MoE models with Xolotl's engine: [docs/LORA_TRAINING.md](docs/LORA_TRAINING.md). Option, not
-  yet matching: fast capture through `--serve` (~3 s per window).
+- **21 Nov** - **[Inkling-2-Mini](docs/INKLING.md)** (Thinking Machines, 26B looped MoE, 5.4B active per token) on
+  its own engine, `xolotl-inkling`: **93 tok/s decode** on one RTX 4090 after kernel fusion (from 57), 1.1K+ tok/s
+  prefill. Our abliterated 13.93 GB XQ quant matches its parents (MMLU-100 76 %, HumanEval, tool use) and refuses
+  4/100 harmful prompts: [IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored).
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-decode-67---93-toks-fused-conv-situ-and-stream-stack-kernels-21-nov-evening).
+- **21 Nov** - LoRA training on the served MoE models, **proven end to end** on QFN (-6.5 % held-out loss in ~6 min
+  on a 4090): [docs/LORA_TRAINING.md](docs/LORA_TRAINING.md).
   [CHANGELOG](docs/xolotl/CHANGELOG.md#lora-training-proven-end-to-end-on-qfn-a-harness-adapter-trained-from-the-served-engines-activations-21-nov-later).
-- **21 Nov** - LoRA training, **experimental**: backward kernels and training graphs for adapters on the served MoE
-  models (base frozen, quantized as served), a Hy4-flash trainer and QFN trainers on real weights, adapters in llama.cpp's
-  format. Real fine-tuning is not proven yet. Also: the Hy4-flash engine, FP8 Qwen4-Exp GGUFs from upstream's converter,
-  and the Windows build fix (#143). [docs/LORA_TRAINING.md](docs/LORA_TRAINING.md),
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#lora-training-experimental-the-hy4-flash-engine-fp8-qwen4-exp-n-gram-tables-windows-build-fix-21-nov).
-- **19 Nov** - DeepSeek-V4.1 decodes faster by default: Keisawaakira's decode switches cut the verify pass 98.8 -> 89.1
-  ms (-10 %) on an 8K probe and lift fast-mode agent tasks from ~40 to **42.7 tok/s** (+5-8 %) on one 4090, quality
-  inside the noise. Also new, opt-in: two-layers-ahead NVMe reads (TokenWing's idea) and GLM-5.3-Flash on a second
-  card. [CHANGELOG](docs/xolotl/CHANGELOG.md#deepseek-v41-decode-switches-on-by-default-agent-tasks-427-toks-19-nov).
-- **18 Nov** - The dense engine runs looped transformers: SenseNova-Loop-9B (layers 4-27 twice, two mHC streams) at
-  Q8_0 matches the reference within Q8_0 error, prompt 3,027 tok/s and decode 45 tok/s on a 4090. Opt-in FP32
-  activations halve its KL against FP32. [CHANGELOG](docs/xolotl/CHANGELOG.md#looped-transformers-in-the-dense-engine-sensenova-loop-9b-18-nov).
-- **17 Nov** - Keenable joins the web search choices in Settings > Tools and is the first that works with no key (its
-  public endpoint; an optional key lifts the rate limits). DuckDuckGo stays the default. Proposed by KGKallasmaa (#139).
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#keenable-as-a-web-search-choice-with-or-without-a-key-17-nov).
-- **14 Nov** - Qwen3.8-27B with DFlash2: the 8-token verify pass got cheaper, **171 -> 204 tok/s** on a best-case 2K
-  prompt (our 13.7 GiB XQ quant, one 4090). The dense engine now reads one position of all 8 drafted tokens per load
-  and uses the multi-column layout the other engines already had. Same text, bit for bit; default on. Real agent-task
-  numbers next. [CHANGELOG](docs/xolotl/CHANGELOG.md#qwen38-27b-with-dflash2-the-8-token-verify-gets-cheaper-171---204-toks-14-nov).
-- **13 Nov** - [Muse Glimmer 30B](docs/GLIMMER.md) (Meta, dense) natively at its full 512K context on one 24 GB
-  card: 47 tok/s decode, 1.3-8x faster with Meta's DFlash drafter (up to 379 tok/s), 3,100 tok/s prefill, tool calls, reasoning and pictures through the usual server.
+- **19 Nov** - DeepSeek-V4.1 decode switches on by default: fast-mode agent tasks ~40 -> **42.7 tok/s**.
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#deepseek-v41-decode-switches-on-by-default-agent-tasks-427-toks-19-nov).
+- **18 Nov** - Looped transformers in the dense engine (SenseNova-Loop-9B, 3,027 tok/s prompt, 45 tok/s decode).
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#looped-transformers-in-the-dense-engine-sensenova-loop-9b-18-nov).
+- **14 Nov** - Qwen3.8-27B with DFlash2: **171 -> 204 tok/s**, same text bit for bit.
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#qwen38-27b-with-dflash2-the-8-token-verify-gets-cheaper-171---204-toks-14-nov).
+- **13 Nov** - [Muse Glimmer 30B](docs/GLIMMER.md) natively at 512K on one 24 GB card, up to 379 tok/s with DFlash.
   [CHANGELOG](docs/xolotl/CHANGELOG.md#muse-glimmer-30b-natively-at-512k-13-nov).
-- **13 Nov** - Keirolabs joins Exa, Perplexity and DeepSeek as a keyed web search choice in Settings > Tools (your own
-  key; nothing changes without one). By Manasbh (#136).
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#keirolabs-as-a-keyed-web-search-service-13-nov).
-- **11 Nov** - An NVIDIA L20 (Ada, 92 SMs) now takes row tables measured on itself instead of an RTX 4070/4080's (`891`):
-  15 multi-column cells and two one-column cells it wins with, and a card that stops running 22 splits it loses with. Same
-  text, bit for bit; default on, `STRATA_MMVQ_IL_891=0` turns it off.
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#an-nvidia-l20-gets-row-tables-it-was-measured-on-11-nov).
-- **11 Nov** - Qwen3.8-27B reads prompts 19-29 % faster with its draft head on (30K prompt: 1,067 -> 1,394 tok/s):
-  a prompt token now leaves only its K/V rows in the draft block instead of running the whole block. Same text, bit for
-  bit; default on. [CHANGELOG](docs/xolotl/CHANGELOG.md#qwen38-27b-reads-prompts-19-29--faster-with-its-draft-head-on-11-nov).
-- **10-11 Nov** - Eleven fixes: a Pillow JPEG 2000 security hole closed for picture requests, two prompt-path faults
-  (`Xid 31` on long prompts, an expert read before its upload landed), NaN routers, misspelt tool-call openers, a hung
-  streaming client no longer blocking the queue, the sm_70 build.
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#fixes-ported-10-11-nov-correctness-security-tool-calls).
-- **11 Nov** - Opt-in `"reasoning_loop_recovery": "wrap"`: thinking that repeats whole passages is closed and the
-  model answers, on any model (the older modes did nothing on DeepSeek-V4.1 or ended with no answer). Not yet measured
-  on a model.
-- **10 Nov** - `xolotl-dense` runs the gated residual (hyper-connections), the Qwen4 generation's replacement for every
-  layer norm - the piece the dense engine was missing for a Qwen4-27B dense file, built and checked before that file
-  exists. Same kernels the MoE path uses, plain-residual models untouched, and a file carrying a feature the engine
-  lacks (a QSA indexer, PLE) is refused by name. Bit-identical across batching on a synthetic model; parity against a
-  reference forward pass needs the weights, which do not exist yet.
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#xolotl-dense-runs-the-gated-residual-hyper-connections-10-nov).
-- **8 Nov** - Short agent turns (a tool result on a long conversation) are faster on DeepSeek-V4.1 (4.40 -> 3.83 s for
-  161 tokens) and GLM-5.3-Flash (5.47 -> 4.63 s for 246 tokens): the CPU computes some of the experts while the card
-  runs the rest, and the CPU's i-quant kernels now decode an expert once for all its tokens (-32 % at 4-8 tokens).
-  GLM-5.3-Flash decode is 28.5-29 tok/s since the RAM upgrade. Default on; numbers in the
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#cpu-i-quant-down-rows-one-decode-for-every-token-8-nov).
-- **8 Nov** - Qwen3.8-27B decode: MTP now stays on with thinking off (52 -> 111 tok/s), one-pass verify attention
-  (+7-10 %) and an n-gram draft chain (`--ngram-chain`: 137 -> 173 tok/s when rewriting a file). Same text, bit for bit.
-- **8 Nov** - [Gauntlet v3](#what-one-pc-can-do) is the main table: every model on the same 6 hard agentic tasks. Our DeepSeek-V4.1 and Qwen3.8-Flash-Next builds score at or above their own full-precision APIs on it.
-- **8 Nov** - The Qwen3.8-27B dense engine is `xolotl-dense` now (built on Mirko Perrone's dense port); `strata-dense`
-  stays as a symlink, so nothing breaks.
-- **7 Nov** - [DeepSeek-V4.1 fast mode](#fast-mode-deepseek-v41) (opt-in): 41 tok/s on real agent tasks against 32.6,
-  the same Gauntlet score.
-- **7 Nov** - [Xolotl Direct](docs/XOLOTL_DIRECT.md) (Linux, experimental): the NVMe drive writes experts straight into
-  a GeForce card's VRAM, 3.1 ms per expert instead of 11.
-- **7 Nov** - DeepSeek-V4.1 loads in 44 s instead of 96, same output.
-- **6 Nov** - +8 % decode on RTX 40 cards, +13-17 % prefill on IQ1_M layers, +11 % DeepSeek-V4.1 long-prompt prefill
-  (ideas from Basalt). All on by default and bit-exact.
-- **2-3 Nov** - [LFM3-Omni-2B](docs/LFM3.md) natively (text, pictures, audio and video in, speech out), and as the
-  ears and voice of Qwen3.8-Flash-Next on one 4090.
+- **8 Nov** - [Gauntlet v3](#what-one-pc-can-do) is the main table: every model on the same hard agentic tasks.
+- **7 Nov** - [DeepSeek-V4.1 fast mode](#fast-mode-deepseek-v41) (41 tok/s on agent tasks, same score) and
+  [Xolotl Direct](docs/XOLOTL_DIRECT.md) (NVMe straight into VRAM, experimental).
 
-Everything else, with PR numbers and who did it: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
+Everything else, in full, with PR numbers and who did it: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md)
+(web search choices, the L20 tables, the 10-11 Nov fixes, CPU expert splits, LFM3-Omni and more).
 
 ## Fast mode (DeepSeek-V4.1)
 
