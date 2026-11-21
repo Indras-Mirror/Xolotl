@@ -12,6 +12,15 @@
 
 ## Latest
 
+- **21 Nov (evening)** - **Inkling-2-Mini decode 67 -> 93 tok/s** on the RTX 4090 (the 14 GB XQ quant, 256-token
+  greedy; 93-96 tok/s in served evals): the depthwise conv step, SiTU and the residual-stream stack are one CUDA
+  kernel each (bit-identical logits to the op chains they replace), q/rel/gate are one stacked mat-vec per token, and
+  the loop controllers run as one batched chain. Needs the updated ggml patch (one new hook, no effect on other
+  engines): `bash tools/xolotl/fetch-llama.sh <your ggml dir>`, then rebuild. Quick quality screen of the released
+  quant against its parents (greedy, thinking off): MMLU-100 76 % (original 73 %, abliterated parent 74 %),
+  HumanEval-21 19-21/21 for all three, tool choice 8/10 and agent loops 3/3 for all three. Worth knowing for anyone
+  measuring this model: its logits are chaotic at the rounding level (near-tied expert picks flip), so any engine
+  change - even a different prefill chunk size - moves held-out KL by ~0.005 over 2K tokens.
 - **21 Nov (out now)** - **Inkling-2-Mini XQ, abliterated**: 13.93 GB, passed its quality gates against the
   abliterated parent (held-out KL 0.013, top-1 96.3 %) and refuses 4/100 harmful prompts (1/100 harmless). On one RTX
   4090 through Xolotl's server: **1,162 tok/s prefill at 8K, 59.7 tok/s decode**, the same as the 22.9 GB parent.
@@ -19,7 +28,7 @@
   with the model's DSpark (MTP) drafter and vision projector as optional files; the agentic Gauntlet is running.
   Engine: speculative decoding with the DSpark drafter (`--dspark`, experimental)
   and quantised K/V caches (`--kv-type q8_0|k8v4`). Decode is kernel-launch bound (16.7 ms a token against a ~3.4 ms
-  memory floor), so kernel fusion toward 100+ tok/s is next, then vision.
+  memory floor), so kernel fusion toward 100+ tok/s is next, then vision (first step: 93 tok/s, above).
 - **21 Nov (Inkling)** - [Inkling-2-Mini](docs/INKLING.md) (Thinking Machines, 26B looped MoE, about 3B active) on
   its own engine, `xolotl-inkling`: **57 tok/s decode, 1.1K tok/s prefill** on the RTX 4090 from the exact NVFP4
   checkpoint, greedy output matching the llama.cpp reference. The graph is ported from llama.cpp PR #32694 by Pedro
