@@ -12,10 +12,10 @@
 
 ## Latest
 
-- **21 Nov (uploading now)** - **Inkling-2-Mini XQ, abliterated**: 13.93 GB, passed its quality gates against the
+- **21 Nov (out now)** - **Inkling-2-Mini XQ, abliterated**: 13.93 GB, passed its quality gates against the
   abliterated parent (held-out KL 0.013, top-1 96.3 %) and refuses 4/100 harmful prompts (1/100 harmless). On one RTX
   4090 through Xolotl's server: **1,162 tok/s prefill at 8K, 59.7 tok/s decode**, the same as the 22.9 GB parent.
-  Going up to [IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored)
+  On [IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored)
   with the model's DSpark (MTP) drafter and vision projector as optional files; the agentic Gauntlet is running.
   Engine: speculative decoding with the DSpark drafter (`--dspark`, experimental)
   and quantised K/V caches (`--kv-type q8_0|k8v4`). Decode is kernel-launch bound (16.7 ms a token against a ~3.4 ms
