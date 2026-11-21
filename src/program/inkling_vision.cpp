@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -141,6 +142,14 @@ ggml_tensor* patch_merge(ggml_context* c, ggml_tensor* cur, int n_embd, int widt
     return ggml_cont_2d(c, cur, cur->ne[0], cur->ne[1] * cur->ne[2]);
 }
 
+// Flash attention in the tower: XOLOTL_VISION_FA=1 always, =0 never (the plain path's score tensor may not fit),
+// default = only when the f32 scores of one layer would pass 512 MiB (n_pos > ~2,900, i.e. pictures over ~725 tokens).
+// Smaller pictures keep the plain softmax path, so their rows stay byte-identical to the gated reference dumps.
+bool use_flash_attn(int64_t n_pos, int n_head) {
+    if (const char* s = std::getenv("XOLOTL_VISION_FA")) return std::atoi(s) != 0;
+    return (double) n_pos * (double) n_pos * n_head * 4.0 > 512.0 * 1024 * 1024;
+}
+
 // the graph for one picture: [W, H] pixels -> [n_out, rows]
 ggml_tensor* build_graph(Encoder& e, ggml_context* c, ggml_cgraph* gf, int W, int H, ggml_tensor** inp,
                          ggml_tensor** pos_w_in, ggml_tensor** pos_h_in, int* rows_out) {
@@ -148,6 +157,7 @@ ggml_tensor* build_graph(Encoder& e, ggml_context* c, ggml_cgraph* gf, int W, in
     const int n_pos = pw * ph + 1;                     // + the CLS row
     const int64_t E = e.n_embd;
     const float kq_scale = 1.0f / std::sqrt((float) e.d_head);
+    const bool fa = use_flash_attn(n_pos, e.n_head);
 
     *inp = ggml_new_tensor_4d(c, GGML_TYPE_F32, W, H, 3, 1);
     ggml_set_name(*inp, "inp_raw");
@@ -186,11 +196,22 @@ ggml_tensor* build_graph(Encoder& e, ggml_context* c, ggml_cgraph* gf, int W, in
         k = rope_2d(c, k, *pos_w_in, *pos_h_in, 10000.0f);
         ggml_tensor* qp = ggml_permute(c, q, 0, 2, 1, 3);               // [d_head, n_pos, n_head]
         ggml_tensor* kp = ggml_permute(c, k, 0, 2, 1, 3);
-        ggml_tensor* vp = ggml_cont(c, ggml_permute(c, v, 1, 2, 0, 3)); // [n_pos, d_head, n_head]
-        ggml_tensor* kq = ggml_mul_mat(c, kp, qp);
-        kq = ggml_soft_max_ext(c, kq, nullptr, kq_scale, 0.0f);
-        ggml_tensor* kqv = ggml_mul_mat(c, vp, kq);                    // [d_head, n_pos, n_head]
-        ggml_tensor* attn = ggml_cont_2d(c, ggml_permute(c, kqv, 0, 2, 1, 3), (int64_t) e.d_head * e.n_head, n_pos);
+        ggml_tensor* attn = nullptr;
+        if (fa) {
+            // flash attention: no [n_pos, n_pos, n_head] score tensor (a 3840x2160 screenshot at the 4096-token cap
+            // has 16,385 positions -> 16.6 GiB of f32 scores on the plain path). K/V in f16 as ggml-cuda's FA wants.
+            ggml_tensor* kf = ggml_cast(c, kp, GGML_TYPE_F16);
+            ggml_tensor* vf = ggml_cast(c, ggml_permute(c, v, 0, 2, 1, 3), GGML_TYPE_F16);
+            ggml_tensor* o = ggml_flash_attn_ext(c, qp, kf, vf, nullptr, kq_scale, 0.0f, 0.0f);   // [d_head, n_head, n_pos]
+            ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+            attn = ggml_reshape_2d(c, o, (int64_t) e.d_head * e.n_head, n_pos);
+        } else {
+            ggml_tensor* vp = ggml_cont(c, ggml_permute(c, v, 1, 2, 0, 3)); // [n_pos, d_head, n_head]
+            ggml_tensor* kq = ggml_mul_mat(c, kp, qp);
+            kq = ggml_soft_max_ext(c, kq, nullptr, kq_scale, 0.0f);
+            ggml_tensor* kqv = ggml_mul_mat(c, vp, kq);                    // [d_head, n_pos, n_head]
+            attn = ggml_cont_2d(c, ggml_permute(c, kqv, 0, 2, 1, 3), (int64_t) e.d_head * e.n_head, n_pos);
+        }
         attn = ggml_mul_mat(c, L.o_w, attn);
         if (L.o_b) attn = ggml_add(c, attn, L.o_b);
         if (L.ls1) attn = ggml_mul(c, attn, L.ls1);
