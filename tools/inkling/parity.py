@@ -47,7 +47,7 @@ def main():
             gen = [ln for ln in r.stdout.splitlines() if ln.startswith("GEN")]
             print(f"== {p}: {n} tokens")
             first_bad = None
-            for d, s in enumerate(ORDER):
+            for d, s in enumerate(ORDER if os.path.exists(os.path.join(gd, "l_out-0.f32")) else []):
                 ref = np.fromfile(os.path.join(gd, f"l_out-{s}.f32"), dtype=np.float32).reshape(n, N_EMBD)
                 our = np.fromfile(os.path.join(od, f"l_out-{s}.f32"), dtype=np.float32).reshape(n, N_EMBD)
                 rel = float(np.linalg.norm(our - ref) / (np.linalg.norm(ref) + 1e-12))
@@ -62,7 +62,7 @@ def main():
             lr, lo = logsoftmax(ref), logsoftmax(our)
             kl = (np.exp(lr) * (lr - lo)).sum(-1)
             top = (ref.argmax(-1) == our.argmax(-1)).mean()
-            print(f"  logits: KL mean {kl.mean():.2e} max {kl.max():.2e}, top-1 {top * 100:.1f} %, last-pos ref top "
+            print(f"  logits: KL mean {kl.mean():.2e} p99 {np.percentile(kl, 99):.2e} max {kl.max():.2e}, top-1 {top * 100:.2f} %, last-pos ref top "
                   f"{int(ref[-1].argmax())} ours {int(our[-1].argmax())}")
             if gen: print("  ", gen[0][:400])
     print(f"worst slot rel {worst:.2e}")

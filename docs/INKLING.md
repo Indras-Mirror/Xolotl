@@ -22,8 +22,38 @@ OpenAI- and Anthropic-compatible server.
 | parity vs the llama.cpp reference | logits KL 2e-4 and top-1 100 % on a short prompt; KL 3e-3, top-1 97.7 % teacher-forced over 1.6K tokens of text; 64 greedy tokens identical on 2 of 3 prompts, the third splits at a near tie after 215 of 248 characters |
 | VRAM | 20.5 GiB weights + 0.75 GiB state at 16K context (token table in RAM) |
 
-Speed work is ongoing (fused kernels, flash attention with the relative bias, MTP drafting); these are the first
-numbers, not the ceiling.
+Speed work is ongoing (fused kernels, flash attention with the relative bias, faster speculative decoding); these
+are the first numbers, not the ceiling.
+
+## Speculative decoding with the DSpark (MTP) drafter (experimental, opt-in)
+
+Inkling ships a block drafter in `mtp.safetensors`: 3 dense layers that read the target's hidden states at layer
+visits 5, 23, 41 and the final norm, and propose up to 7 tokens per step through a rank-256 Markov head.
+`--dspark <drafter.gguf>` turns it on (the GGUF is the `dspark/` file of
+[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)); `xolotl-inkling-dspark` runs the
+drafter alone against saved target taps.
+
+- Greedy requests decode speculatively; sampled requests decode normally and keep the drafter fed.
+- The short convolutions make the model recurrent, so a rejected draft is undone exactly: every verify keeps its
+  `[conv state ; chunk inputs]` and the state after the accepted prefix is copied back (no second forward). Sliding
+  ring cells of rejected positions are marked empty; global K/V is positional.
+- Draft length is dynamic: drafting stops when the cumulative top-1 probability falls below
+  `XOLOTL_DSPARK_TAU` (default 0.35), at most `XOLOTL_DSPARK_MAXD` (7). Each verify length keeps its own graph.
+- The drafter's Markov head, context projection, softcap and argmax over the 200K vocabulary run on the GPU
+  (draft 25 ms -> 4 ms per step).
+- Correctness: verify lengths 1, 5, 6 and 7 are bit-identical to plain decoding. Lengths 2 to 4 use a different
+  reduction order in ggml's quantised mat-vec, so a greedy near-tie can flip after a few hundred tokens (rounding,
+  not a logic error). `XOLOTL_SPEC_EXACT=1` pads those lengths for gates.
+- Speed is still being tuned: on a test quant, a fixed 3-token verify gives 76.5 tok/s vs 65.4 plain. Each token
+  picks 8 of 128 experts, so a verify chunk reads the union of its tokens' experts; a grouped MoE kernel for
+  verify is the next lever.
+
+## K/V cache types
+
+`--kv-type f16|q8_0|k8v4` sets the cache of the global (full-context) layers; the sliding-window rings stay f16.
+Attention over a quantised cache dequantises per chunk with an online softmax, so memory stays bounded at long
+context. Against f16 on the parent: q8_0 KL 3.6e-4 with identical greedy output, k8v4 (q8_0 keys, q4_0 values)
+KL 8e-4. f16 is bit-identical to before.
 
 ## Get a GGUF
 
@@ -38,7 +68,7 @@ numbers, not the ceiling.
 ## Build and run
 
 ```bash
-ninja -C build-xolotl xolotl-inkling            # configured as in AGENTS.md
+ninja -C build-xolotl xolotl-inkling xolotl-inkling-dspark   # configured as in AGENTS.md
 python tools/inkling/export_tokenizer.py <Inkling-2-Mini HF dir> <pack dir>   # once: the server's tokenizer pack
 # edit configs/xol-inkling.json (gguf path, tokenizer pack, context), then:
 .venv/bin/python -m serve.server --engine strata --config configs/xol-inkling.json --port 8134
@@ -55,4 +85,5 @@ Thinking effort follows `reasoning_effort` (the chat template's effort line); sa
   dequantised GGUFs never hit it); `tools/inkling/ref-loop-expert-scale-fix.patch` is the fix for the reference.
 - The conv state is recurrent, so a request resumes by appending to what the engine read, or from the checkpoint
   one token before the end of the previous prompt (sliding rings + conv states), else from token 0.
-- Not yet: vision (the model has a vision tower), flash attention, MTP drafting.
+- Not yet: vision (the model has a 23-layer vision tower; in progress), flash attention (the pinned ggml has no
+  flash-attention kernel for per-head masks, which the relative bias needs).
