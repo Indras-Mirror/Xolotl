@@ -12,13 +12,14 @@
 
 ## Latest
 
-- **21 Nov (in the works, a few hours away)** - **Inkling-2-Mini XQ, abliterated**: the abliterated model is done and
-  gated (6/100 harmful, 1/100 harmless refused) and the XQ quant is being made now, statistics from the model itself
-  run through `xolotl-inkling`. ~14 GB (predicted MoE output error 0.28 %), aiming at **512K context on one RTX
-  4090**. Upload projected tonight (AEDT) once it passes the quality gates against the parent, to
-  [IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored).
-  Engine work landed: speculative decoding with the model's own DSpark (MTP) drafter (`--dspark`, exact rollback of
-  the recurrent conv state, experimental) and quantised K/V caches (`--kv-type q8_0|k8v4`). Vision is next.
+- **21 Nov (uploading now)** - **Inkling-2-Mini XQ, abliterated**: 13.93 GB, passed its quality gates against the
+  abliterated parent (held-out KL 0.013, top-1 96.3 %) and refuses 4/100 harmful prompts (1/100 harmless). On one RTX
+  4090 through Xolotl's server: **1,162 tok/s prefill at 8K, 59.7 tok/s decode**, the same as the 22.9 GB parent.
+  Going up to [IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored)
+  with the model's DSpark (MTP) drafter and vision projector as optional files; the agentic Gauntlet is running.
+  Engine: speculative decoding with the DSpark drafter (`--dspark`, experimental)
+  and quantised K/V caches (`--kv-type q8_0|k8v4`). Decode is kernel-launch bound (16.7 ms a token against a ~3.4 ms
+  memory floor), so kernel fusion toward 100+ tok/s is next, then vision.
 - **21 Nov (Inkling)** - [Inkling-2-Mini](docs/INKLING.md) (Thinking Machines, 26B looped MoE, about 3B active) on
   its own engine, `xolotl-inkling`: **57 tok/s decode, 1.1K tok/s prefill** on the RTX 4090 from the exact NVFP4
   checkpoint, greedy output matching the llama.cpp reference. The graph is ported from llama.cpp PR #32694 by Pedro
