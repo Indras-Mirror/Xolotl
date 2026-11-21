@@ -62,6 +62,7 @@ namespace inkling_stats { enum { ST_Q = 0, ST_K, ST_V, ST_O, ST_F, ST_ACT, ST_ID
 #endif
 #include "inkling_fused.h"
 #include "inkling_dspark.h"    // --dspark: the DSpark block drafter (speculative decoding)
+#include "inkling_vision.h"    // --mmproj: the inkling2v image encoder, in-process (GENI/ENC)
 
 #include <signal.h>
 #include <unistd.h>
@@ -2464,6 +2465,12 @@ void usage() {
                  "  pinned host RAM, so a 12 GB card runs the 14 GB quant; the loop core (visited 3x) is kept first.\n"
                  "  --kv-type quantises the full-context K/V cache (k8v4 = K q8_0, V q4_0; the sliding-window rings stay f16).\n"
                  "  --attn-budget caps one prefill chunk's n_kv*T scores and sizes the attention cell chunks (default 33554432).\n"
+                 "       [--mmproj <mmproj.gguf> [--vision-device gpu|cpu]]\n"
+                 "  --mmproj loads Inkling-2-Mini's image tower (convert_hf_to_gguf.py --mmproj, inkling2v) and answers\n"
+                 "  `ENC <image> <out>` (\"OK <n> <nx> <ny> <ms>\") with the SVE1 records a GENI request reads; ~640 MB\n"
+                 "  of VRAM while one picture is encoded, released after.  --vision-device cpu keeps it off the GPU.\n"
+                 "       xolotl-inkling --encode <image> <out.sve1> --mmproj <mmproj.gguf> [--vision-device cpu|gpu]\n"
+                 "  One picture through the in-process encoder, no model: the gate for the tower alone.\n"
                  "       xolotl-inkling --dump <inkling-2-mini.gguf> --ids a,b,c,... --out-dir DIR [--gen N]\n"
                  "  Inkling-2-Mini behind Xolotl's server protocol.  --cpu-exps 20-23 keeps those physical layers' experts in\n"
                  "  host RAM (the CPU computes them).  --dump writes logits.f32 [T][n_vocab] and l_out-<slot>.f32 [T][n_embd]\n"
@@ -2481,6 +2488,8 @@ void usage() {
 int main(int argc, char** argv) {
     std::string gguf_path, ids_arg, out_dir, cpu_exps, dspark_path, dspark_prefix;
     bool mtp = false;   // --mtp: the DSpark (MTP) drafter built into the model GGUF (tools/inkling/embed_dspark.py)
+    std::string mmproj_path, vision_device = "auto";   // --mmproj: the image tower
+    std::vector<std::string> encode_imgs, encode_outs;   // --encode pairs (one Encoder, N pictures)
     bool serve = false, dump = false, park_copy = true;
     ggml_type kv_k = GGML_TYPE_F16, kv_v = GGML_TYPE_F16;
     int64_t ctx = 0, attn_budget = 1 << 25;
@@ -2533,6 +2542,12 @@ int main(int argc, char** argv) {
         else if (a == "--peer-vram") peer_vram = val();
         else if (a == "--no-park-copy") park_copy = false;
         else if (a == "--route-log") route_log = val();
+        else if (a == "--mmproj") mmproj_path = val();
+        else if (a == "--vision-device") {
+            vision_device = val();
+            if (vision_device != "cpu" && vision_device != "gpu" && vision_device != "auto") { std::fprintf(stderr, "xolotl-inkling: --vision-device takes cpu or gpu\n"); return 2; }
+        }
+        else if (a == "--encode") { encode_imgs.push_back(val()); encode_outs.push_back(val()); }
         else if (a == "--ids") ids_arg = val();
         else if (a == "--out-dir") out_dir = val();
         else if (a == "--gen") gen_n = std::atoi(val().c_str());
@@ -2547,6 +2562,28 @@ int main(int argc, char** argv) {
         }
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else std::fprintf(stderr, "xolotl-inkling: ignoring unknown option %s\n", a.c_str());
+    }
+    // --encode: the image tower alone (no model, no GPU unless asked): its own CPU/gpu backends
+    if (!encode_imgs.empty() || !encode_outs.empty()) {
+        if (encode_imgs.size() != encode_outs.size() || mmproj_path.empty()) { usage(); return 2; }
+        ggml_backend_t cpu = ggml_backend_cpu_init();
+        // the tower alone defaults to the CPU: this mode is also the gate that must run beside a busy card
+        ggml_backend_t gpu = vision_device == "gpu" ? ggml_backend_cuda_init(0) : nullptr;
+        std::string verr;
+        inkling_vision::Encoder* ve = inkling_vision::load(mmproj_path, gpu, cpu, gpu != nullptr, verr);
+        if (!ve) { std::printf("ERR %s\n", verr.c_str()); return 1; }
+        int rc = 0;
+        for (size_t i = 0; i < encode_imgs.size(); ++i) {
+            const auto t0 = Clock::now();
+            const int rows = inkling_vision::encode(*ve, encode_imgs[i], encode_outs[i], 0, verr);
+            if (rows <= 0) { std::printf("ERR %s\n", verr.c_str()); rc = 1; break; }
+            std::printf("OK %d %d 1 %.0f\n", rows, rows, ms_since(t0));
+            std::fflush(stdout);
+        }
+        inkling_vision::free(ve);
+        if (gpu) ggml_backend_free(gpu);
+        ggml_backend_free(cpu);
+        return rc;
     }
     if (gguf_path.empty() || (!serve && !dump && !stats)) { usage(); return 2; }
     if (stats && (tokens_path.empty() || stats_out.empty())) { usage(); return 2; }
@@ -2861,6 +2898,17 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // --mmproj: the image tower, in-process (an `ENC <image> <out>` line answers `OK <n> <nx> <ny> <ms>` and writes
+    // the SVE1 record the next GENI reads)
+    inkling_vision::Encoder* vis = nullptr;
+    if (!mmproj_path.empty()) {
+        std::string verr;
+        const bool use_gpu = vision_device != "cpu";
+        vis = inkling_vision::load(mmproj_path, m.gpu, m.cpu, use_gpu, verr);
+        if (!vis) { std::printf("ERR %s\n", verr.c_str()); std::fflush(stdout); return 1; }
+        std::fprintf(stderr, "xolotl-inkling: image tower loaded (%s, %s)\n", mmproj_path.c_str(),
+                     use_gpu ? "GPU per picture" : "CPU");
+    }
     std::printf("INFO engine=inkling-0.1 model=%s layers=%d slots=%d n_embd=%d weights_mib=%llu host_mib=%llu kv_mib=%llu kv_type=%s-%s "
                 "context=%lld ubatch=%d ring=%lld cpu_exps=%s vram_free_mib=%zu\n",
                 m.arch.c_str(), m.hp.n_phys, m.hp.n_slot, m.hp.n_embd, (unsigned long long) (m.weight_bytes >> 20),
@@ -2955,6 +3003,21 @@ int main(int argc, char** argv) {
             break;
         }
         if (line == "QUIT") { std::fflush(stdout); std::fflush(stderr); std::_Exit(0); }
+        if (line.rfind("ENC ", 0) == 0) {   // the picture, read by the in-process tower (--mmproj)
+            if (!vis) { std::printf("ERR this engine was started without --mmproj\n"); std::fflush(stdout); continue; }
+            std::string img, out;
+            const size_t sp = line.find(' ', 4);
+            if (sp == std::string::npos) { std::printf("ERR expected: ENC <image> <output>\n"); std::fflush(stdout); continue; }
+            img = line.substr(4, sp - 4);
+            out = line.substr(sp + 1);
+            const auto t0 = Clock::now();
+            std::string verr;
+            const int rows = inkling_vision::encode(*vis, img, out, 0, verr);
+            if (rows <= 0) std::printf("ERR %s\n", verr.c_str());
+            else std::printf("OK %d %d 1 %.0f\n", rows, rows, ms_since(t0));
+            std::fflush(stdout);
+            continue;
+        }
         if (line == "PARK" || line.rfind("VRAM", 0) == 0) {
             try {
                 const bool want_park = line == "PARK" || std::atoll(line.c_str() + 4) > 0;
