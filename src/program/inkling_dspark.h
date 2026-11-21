@@ -40,6 +40,7 @@
 #include "ggml-backend.h"
 
 #include <cstdint>
+#include <vector>
 #include <string>
 
 struct ggml_tensor;
@@ -71,6 +72,17 @@ void dspark_reset(Dspark& d);
 // (it then cannot draft for this context until a reset).
 bool dspark_rewind(Dspark& d, int64_t p);
 int64_t dspark_ctx_end(const Dspark& d);
+
+// What a rewind cannot recover: the local layers' ring caches (later positions overwrite their cells) and the anchor
+// taps.  The global layer is positional (cells < p stay valid until rewritten), so it is not copied.  The server keeps
+// one per prompt checkpoint; restoring it puts the drafter exactly where it was at that position.
+struct DsparkSnap {
+    int64_t ctx_end = -1;
+    std::vector<std::vector<uint8_t>> k, v;
+    std::vector<float> anchor;
+};
+void dspark_snap(const Dspark& d, DsparkSnap& s);
+void dspark_restore(Dspark& d, const DsparkSnap& s);
 
 // Append the context K/V of committed positions p0 .. p0+T-1 from their target taps.  `taps` is
 // [T][4][n_embd] f32, row-major, tap order = dflash.target_layers (5, 23, 41, 48).

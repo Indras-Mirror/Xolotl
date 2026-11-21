@@ -563,6 +563,29 @@ bool dspark_rewind(Dspark& d, int64_t p) {
 
 int64_t dspark_ctx_end(const Dspark& d) { return d.ctx_end; }
 
+void dspark_snap(const Dspark& d, DsparkSnap& s) {
+    s.ctx_end = d.ctx_end;
+    s.k.resize(kLayers); s.v.resize(kLayers);
+    for (size_t l = 0; l < (size_t) kLayers; ++l) {
+        if (!d.L[l].local) { s.k[l].clear(); s.v[l].clear(); continue; }
+        s.k[l].resize(ggml_nbytes(d.L[l].k_cache)); s.v[l].resize(ggml_nbytes(d.L[l].v_cache));
+        ggml_backend_tensor_get(d.L[l].k_cache, s.k[l].data(), 0, s.k[l].size());
+        ggml_backend_tensor_get(d.L[l].v_cache, s.v[l].data(), 0, s.v[l].size());
+    }
+    s.anchor = d.anchor_taps;
+}
+
+void dspark_restore(Dspark& d, const DsparkSnap& s) {
+    if (s.ctx_end < 0 || s.k.size() != (size_t) kLayers) dfail("dspark_restore: empty or foreign snapshot");
+    for (size_t l = 0; l < (size_t) kLayers; ++l) {
+        if (!d.L[l].local) continue;
+        ggml_backend_tensor_set(d.L[l].k_cache, s.k[l].data(), 0, s.k[l].size());
+        ggml_backend_tensor_set(d.L[l].v_cache, s.v[l].data(), 0, s.v[l].size());
+    }
+    d.anchor_taps = s.anchor;
+    d.ctx_end = s.ctx_end;
+}
+
 void dspark_reset(Dspark& d) {
     if (d.sbuf) ggml_backend_buffer_clear(d.sbuf, 0);   // the K/V caches only; the folded LM head survives
     d.ctx_end = 0;

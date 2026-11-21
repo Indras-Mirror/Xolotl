@@ -880,6 +880,10 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
         const std::string p = "blk." + std::to_string(l) + ".";
         y.wq = get(m, p + "attn_q.weight"); y.wk = get(m, p + "attn_k.weight"); y.wv = get(m, p + "attn_v.weight");
         y.wo = get(m, p + "attn_output.weight"); y.gate = get(m, p + "attn_gate.weight");
+        y.wo_b = get(m, p + "attn_output.bias", false);   // optional steering bias baked into a release file (a side
+                                                          // file's bias of the same layer still replaces it)
+        if (y.wo_b && (y.wo_b->type != GGML_TYPE_F32 || ggml_nelements(y.wo_b) != h.n_embd))
+            die(p + "attn_output.bias must be F32 [n_embd]");
         y.q_clip = get(m, p + "attn_q_clip.weight"); y.sink_proj = get(m, p + "attn_sink_proj.weight");
         y.rel = get(m, p + "attn_rel.weight"); y.rel_bias = get(m, p + "attn_rel_bias.weight"); y.rel_clip = get(m, p + "attn_rel_clip.weight");
         y.k_conv = get(m, p + "attn_k_conv.weight"); y.v_conv = get(m, p + "attn_v_conv.weight");
@@ -2120,7 +2124,8 @@ void conv_rollback(Model& m, int n) {
     cudaDeviceSynchronize();
 }
 
-struct SpecStats { long long steps = 0, drafted = 0, accepted = 0; long long hist[kSpecT + 1] = {}; double ms_draft = 0, ms_verify = 0, ms_post = 0; };
+struct SpecStats { long long steps = 0, drafted = 0, accepted = 0; long long hist[kSpecT + 1] = {}; double ms_draft = 0, ms_verify = 0, ms_post = 0;
+                   long long plain = 0, switches = 0; double ms_plain = 0; };
 
 // One verify step.  `fed` = committed tokens (positions 0..P-1, the drafter holds their taps); `next` = the target's
 // greedy token at P, not yet fed.  Commits next + the accepted drafts to `fed`, returns how many (>= 1), and leaves
@@ -2173,6 +2178,84 @@ int spec_step(Model& m, std::vector<int32_t>& fed, int32_t next, std::vector<flo
     return n;
 }
 
+// Adaptive drafting (XOLOTL_DSPARK_ADAPT=1, opt-in; default drafts every step).  A verify step pays the drafter and the
+// post step (~4.5 ms on the 4090) plus ~2 ms per extra verified row (each row routes to new experts), so it only wins
+// when enough drafts are accepted: on wiki prose every draft cap lost to plain decode (t17, 22 Nov: 91-96 vs 109 tok/s)
+// while code kept +20 %.  The policy measures committed tokens per ms of both modes (EMA) and runs plain steps while
+// they are faster, probing the drafter again after 16, 32 .. 256 plain steps.  A plain step is a T = 1 forward that
+// still returns the drafter taps; they are queued and fed to the drafter in one batch before its next draft, so the
+// drafter never misses a position.  Output tokens are unchanged (greedy: the same argmax; sampled: the same sampler on
+// the same row - a plain step is the non-speculative decode).
+struct SpecPolicy {
+    // windowed rates (tokens and ms summed over the last kWin steps of each mode): one verify commits 1..8 tokens, so
+    // a per-step average swings far more than the difference it has to detect
+    static constexpr int kWin = 16, kProbe = 8;
+    struct Win {
+        double n[kWin] = {}, ms[kWin] = {}; int k = 0, len = 0;
+        void add(double tok, double t) { n[k] = tok; ms[k] = t; k = (k + 1) % kWin; len = std::min(len + 1, kWin); }
+        double rate() const { double a = 0, b = 0; for (int i = 0; i < len; ++i) { a += n[i]; b += ms[i]; } return b > 0 ? a / b : 0; }
+        void clear() { len = 0; k = 0; }
+    } spec, plain;
+    int plain_left = 0, probe_left = kProbe, backoff = 16;
+    long long spec_since_plain = 0;
+    bool plain_warm = false;                   // the first plain step builds its graph: not a rate sample
+    std::vector<float> pend;                   // queued taps [n][4][n_embd] of plain steps
+    int64_t pend_p0 = -1;
+    int pend_n = 0;
+};
+
+static void spec_flush(Model& m, SpecPolicy& pol) {
+    if (pol.pend_n == 0) return;
+    dspark_add_ctx(*m.dspark, pol.pend.data(), pol.pend_n, pol.pend_p0);
+    pol.pend.clear(); pol.pend_n = 0; pol.pend_p0 = -1;
+}
+
+int adaptive_step(Model& m, std::vector<int32_t>& fed, int32_t next, std::vector<float>& lg, SpecStats& ss, SpecPolicy& pol,
+                  const std::function<int32_t(const float*)>& pick = nullptr, int32_t* resample = nullptr) {
+    // opt-in: t22 (22 Nov, 4096 greedy thinking tokens) always-on 127.7 tok/s, adaptive 125.9, plain 113.3; it only
+    // helped prose (106 vs 101, plain 111) - drafting every step stays the default until a policy wins everywhere
+    static const bool on = std::getenv("XOLOTL_DSPARK_ADAPT") && std::string(std::getenv("XOLOTL_DSPARK_ADAPT")) == "1";
+    static const bool dbg = std::getenv("XOLOTL_DSPARK_ADAPT_DEBUG") != nullptr;
+    if (!on) return spec_step(m, fed, next, lg, ss, pick, resample);
+    const int64_t P = (int64_t) fed.size();
+    if (pol.plain_left > 0) {
+        if (resample) *resample = -1;
+        const auto t0 = Clock::now();
+        std::vector<float> lgs, dt;
+        forward(m, &next, 1, P, 1, lgs, nullptr, &dt);
+        if (pol.pend_n == 0) pol.pend_p0 = P;
+        pol.pend.insert(pol.pend.end(), dt.begin(), dt.end());
+        if (++pol.pend_n >= 16) spec_flush(m, pol);
+        fed.push_back(next);
+        lg.swap(lgs);
+        const double ms = ms_since(t0);
+        if (pol.plain_warm) pol.plain.add(1, ms);
+        pol.plain_warm = true;
+        ++ss.plain; ss.ms_plain += ms;
+        if (--pol.plain_left == 0) { pol.probe_left = SpecPolicy::kProbe; pol.spec.clear(); pol.spec_since_plain = 0; }
+        return 1;
+    }
+    const auto t0 = Clock::now();
+    spec_flush(m, pol);
+    const int n = spec_step(m, fed, next, lg, ss, pick, resample);
+    pol.spec.add(n, ms_since(t0));
+    ++pol.spec_since_plain;
+    if (pol.probe_left > 0 && --pol.probe_left > 0) return n;
+    if (pol.plain.len == 0 || pol.spec_since_plain >= 512) {   // (re)measure plain decode: 4 steps (5 the first time)
+        pol.plain_left = pol.plain_warm ? 4 : 5; pol.spec_since_plain = 0;
+        return n;
+    }
+    const double rs = pol.spec.rate(), rp = pol.plain.rate();
+    if (rs < 0.95 * rp) {
+        if (dbg) std::fprintf(stderr, "dspark adapt @%lld: spec %.1f < plain %.1f tok/s -> %d plain steps\n", (long long) P,
+                              rs * 1e3, rp * 1e3, pol.backoff);
+        pol.plain_left = pol.backoff; pol.backoff = std::min(256, pol.backoff * 2); ++ss.switches;
+    } else if (rs > 1.05 * rp) {
+        pol.backoff = 16;
+    }
+    return n;
+}
+
 // the longest chunk at p whose attention scores fit the budget (global slots read p + T cells)
 int chunk_len(const Model& m, int64_t p, int64_t left) {
     int T = (int) std::min<int64_t>(m.ubatch, left);
@@ -2187,6 +2270,11 @@ struct Ckpt {
     int64_t pos = -1;
     std::vector<std::vector<uint8_t>> k, v, cv;
     std::vector<int64_t> ring_pos;
+    // serve: the tokens 0..pos-1 the checkpoint stands for, the drafter at that position, and an LRU stamp
+    std::vector<int32_t> toks;
+    DsparkSnap ds;
+    bool has_ds = false;
+    uint64_t used = 0;
 };
 void ckpt_take(Model& m, Ckpt& c, int64_t pos) {
     c.pos = pos;
@@ -2586,6 +2674,7 @@ int main(int argc, char** argv) {
                 std::vector<float> row(lg.end() - n_vocab, lg.end());
                 std::vector<int32_t> fed(ids.begin(), ids.end());
                 SpecStats ss;
+                SpecPolicy pol;
                 std::printf("GEN");
                 const auto t1 = Clock::now();
                 int out = 0;
@@ -2593,7 +2682,7 @@ int main(int argc, char** argv) {
                 while (out < gen_n && !stop) {
                     const int32_t nx = (int32_t) (std::max_element(row.begin(), row.end()) - row.begin());
                     const size_t f0 = fed.size();
-                    spec_step(m, fed, nx, row, ss);
+                    adaptive_step(m, fed, nx, row, ss, pol);
                     for (size_t k = f0; k < fed.size() && out < gen_n; ++k) {
                         std::printf(" %d", fed[k]); ++out;
                         if (fed[k] == 200006) { stop = true; break; }
@@ -2605,8 +2694,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "xolotl-inkling: %d tokens in %lld verify steps, %.1f tok/s, %.2f accepted drafts/step, "
                              "commit histogram", out, ss.steps, out * 1000.0 / ms, ss.steps ? (double) ss.accepted / ss.steps : 0.0);
                 for (int k = 1; k <= kSpecT; ++k) std::fprintf(stderr, " %d:%lld", k, ss.hist[k]);
-                std::fprintf(stderr, " | per step ms: draft %.2f verify %.2f post %.2f, drafted %.2f\n", ss.ms_draft / ss.steps,
-                             ss.ms_verify / ss.steps, ss.ms_post / ss.steps, (double) ss.drafted / ss.steps);
+                std::fprintf(stderr, " | per step ms: draft %.2f verify %.2f post %.2f, drafted %.2f | plain steps %lld (%.2f ms), "
+                             "switches %lld\n", ss.ms_draft / std::max(1LL, ss.steps), ss.ms_verify / std::max(1LL, ss.steps),
+                             ss.ms_post / std::max(1LL, ss.steps), (double) ss.drafted / std::max(1LL, ss.steps), ss.plain,
+                             ss.plain ? ss.ms_plain / ss.plain : 0.0, ss.switches);
             } else if (gen_n > 0) {   // greedy continuation (the parity text check)
                 std::vector<float> row(lg.end() - n_vocab, lg.end());
                 std::printf("GEN");
@@ -2747,7 +2838,36 @@ int main(int argc, char** argv) {
     reader.detach();
 
     std::vector<int32_t> fed;     // every token the state has consumed
-    Ckpt ck;
+    // Prompt checkpoints, several (XOLOTL_INKLING_CKPTS, default 4): a thinking turn closed by the budget sends a second
+    // request whose checkpoint replaced the only one, and the next turn (the history re-rendered) then resumed below it
+    // and read its whole prompt again (Gauntlet 22 Nov: a 38K prompt with 0 reused).  A checkpoint at pos stands for
+    // its tokens 0..pos-1; the global K/V caches are positional, so it stays valid only while cells 0..pos-1 hold those
+    // tokens - ck_settle() drops any whose cells a request rewrote with something else.
+    std::vector<Ckpt> cks;
+    const size_t ck_cap = (size_t) std::max(1, std::getenv("XOLOTL_INKLING_CKPTS") ? std::atoi(std::getenv("XOLOTL_INKLING_CKPTS")) : 4);
+    uint64_t ck_clock = 0;
+    auto ck_take = [&](const std::vector<int32_t>& toks, int64_t p, bool with_ds) {
+        Ckpt* t = nullptr;
+        for (Ckpt& c : cks) if (c.pos == p) { t = &c; break; }
+        if (!t && cks.size() < ck_cap) { cks.emplace_back(); t = &cks.back(); }
+        if (!t) { t = &cks[0]; for (Ckpt& c : cks) if (c.used < t->used) t = &c; }
+        ckpt_take(m, *t, p);
+        t->toks.assign(toks.begin(), toks.begin() + (long) p);
+        t->has_ds = with_ds && m.dspark;
+        if (t->has_ds) dspark_snap(*m.dspark, t->ds);
+        t->used = ++ck_clock;
+    };
+    // after a request wrote cells resume .. fed.size() (+ up to kSpecT rejected draft cells past it)
+    auto ck_settle = [&](size_t resume) {
+        std::vector<Ckpt> keep;
+        for (Ckpt& c : cks) {
+            const size_t q = (size_t) c.pos;
+            bool ok = c.pos > 0 && (q <= resume ||
+                      (q <= fed.size() && std::equal(c.toks.begin() + (long) resume, c.toks.begin() + (long) q, fed.begin() + (long) resume)));
+            if (ok) keep.push_back(std::move(c));
+        }
+        cks.swap(keep);
+    };
     std::vector<float> lg;
     std::string line;
     const size_t need_mib = (m.weight_bytes >> 20) + (m.state_bytes >> 20) + 1200;
@@ -2847,13 +2967,24 @@ int main(int argc, char** argv) {
             while (common < lim && fed[common] == ids[common]) ++common;
         }
         size_t resume = 0;
+        const DsparkSnap* ds_restored = nullptr;
         try {
             if (!fed.empty() && fed.size() < ids.size() && common == fed.size()) resume = fed.size();
-            else if (ck.pos > 0 && (size_t) ck.pos <= common && (size_t) ck.pos < ids.size()) { ckpt_restore(m, ck); resume = (size_t) ck.pos; }
-            else state_reset(m);
+            else {
+                Ckpt* best = nullptr;   // the furthest checkpoint inside the new prompt
+                for (Ckpt& c : cks)
+                    if (c.pos > 0 && (size_t) c.pos < ids.size() && (!best || c.pos > best->pos) &&
+                        std::equal(c.toks.begin(), c.toks.end(), ids.begin())) best = &c;
+                if (best) {
+                    ckpt_restore(m, *best); resume = (size_t) best->pos; best->used = ++ck_clock;
+                    if (best->has_ds) ds_restored = &best->ds;
+                } else state_reset(m);
+            }
         } catch (const std::exception& e) { std::printf("ERR %s\n", e.what()); std::fflush(stdout); continue; }
         fed.assign(ids.begin(), ids.begin() + (long) resume);
-        bool spec_ok = m.dspark && dspark_rewind(*m.dspark, (int64_t) resume);
+        bool spec_ok = false;
+        if (m.dspark && ds_restored) { dspark_restore(*m.dspark, *ds_restored); spec_ok = true; }   // the drafter as it was there
+        else spec_ok = m.dspark && dspark_rewind(*m.dspark, (int64_t) resume);
         if (m.dspark && !spec_ok) {   // the drafter is behind the target: restart both (rare: a drafter-less request ran)
             state_reset(m); dspark_reset(*m.dspark); resume = 0; fed.clear(); spec_ok = true;
         }
@@ -2882,12 +3013,12 @@ int main(int argc, char** argv) {
                     run(p, T - 1);
                     fed.insert(fed.end(), ids.begin() + (long) p, ids.begin() + (long) (p + T - 1));
                     p += T - 1;
-                    ckpt_take(m, ck, (int64_t) p);
+                    ck_take(ids, (int64_t) p, spec_ok);
                     run(p, 1);
                     fed.push_back(ids[p]);
                     p += 1;
                 } else {
-                    if (last) ckpt_take(m, ck, (int64_t) p);
+                    if (last) ck_take(ids, (int64_t) p, spec_ok);
                     run(p, T);
                     fed.insert(fed.end(), ids.begin() + (long) p, ids.begin() + (long) (p + T));
                     p += T;
@@ -2900,12 +3031,13 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             std::fprintf(stderr, "xolotl-inkling: %s\n", e.what());
             std::printf("ERR %s\n", e.what()); std::fflush(stdout);
-            fed.clear(); ck.pos = -1;
+            fed.clear(); cks.clear();
             failed = true;
         }
         if (failed) continue;
         const double prompt_ms = ms_since(t_prompt);
         if (in.stop.load()) {
+            ck_settle(resume);
             std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu\n", ids.size(), prompt_ms, resume);
             std::fflush(stdout);
             continue;
@@ -2945,12 +3077,13 @@ int main(int argc, char** argv) {
                     return (int32_t) t;
                 };
                 int32_t carry = -1;   // a rejected verify row's draw: it IS the next token
+                SpecPolicy pol;
                 for (;;) {
                     const int32_t nx = carry >= 0 ? carry
                                      : pick ? pick(lg.data()) : (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
                     if ((int64_t) fed.size() + 1 >= m.n_ctx) { std::printf("T %d\n", nx); ++gen; std::fflush(stdout); break; }
                     const size_t f0 = fed.size();
-                    spec_step(m, fed, nx, lg, ss, pick, &carry);
+                    adaptive_step(m, fed, nx, lg, ss, pol, pick, &carry);
                     bool end = false;
                     for (size_t k = f0; k < fed.size(); ++k) {
                         std::printf("T %d\n", fed[k]);
@@ -2962,8 +3095,8 @@ int main(int argc, char** argv) {
                     if (end) break;
                     if (in.stop.load()) { why = "cancel"; break; }
                 }
-                std::fprintf(stderr, "xolotl-inkling: spec %lld steps, %.2f accepted drafts/step\n", ss.steps,
-                             ss.steps ? (double) ss.accepted / ss.steps : 0.0);
+                std::fprintf(stderr, "xolotl-inkling: spec %lld steps, %.2f accepted drafts/step, plain %lld steps, %lld switches\n",
+                             ss.steps, ss.steps ? (double) ss.accepted / ss.steps : 0.0, ss.plain, ss.switches);
             } else for (;;) {
                 cudaMemcpy(d_logits, lg.data(), (size_t) n_vocab * sizeof(float), cudaMemcpyHostToDevice);
                 int hl = 0;
@@ -2989,9 +3122,10 @@ int main(int argc, char** argv) {
             }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "xolotl-inkling: %s\n", e.what());
-            fed.clear(); ck.pos = -1;
+            fed.clear(); cks.clear();
             why = "cancel";
         }
+        ck_settle(resume);
         std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu\n", gen, ids.size(), prompt_ms, ms_since(t_dec), why, resume);
         std::fflush(stdout);
     }
