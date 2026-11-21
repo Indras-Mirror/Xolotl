@@ -3141,7 +3141,8 @@ endif()
 # Inkling-2-Mini (thinkingmachines, 26B-A3B looped MoE) behind the serve protocol: the Inkling 2 graph (llama.cpp PR
 # #32694, MIT) on ggml-backend (CUDA + CPU fallback), src/program/inkling_main.cpp (the xolotl-glimmer skeleton).
 if(STRATA_DENSE AND TARGET ggml-cuda AND TARGET strata_kernels)
-  add_executable(xolotl-inkling src/program/inkling_main.cpp src/program/inkling_dspark.cpp)
+  add_executable(xolotl-inkling src/program/inkling_main.cpp src/program/inkling_dspark.cpp src/program/inkling_fused.cu)
+  set_source_files_properties(src/program/inkling_fused.cu PROPERTIES COMPILE_OPTIONS "-use_fast_math")   # == ggml-cuda's flags: same float results as the kernels it fuses
   target_include_directories(xolotl-inkling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(xolotl-inkling PRIVATE strata_kernels ggml ggml-cuda ggml-cpu ggml-base ${_strata_gpu_runtime_target})
   # the DSpark drafter alone, gated against target taps on disk (src/program/inkling_dspark.h, "-DXOLOTL_DSPARK_TOOL")

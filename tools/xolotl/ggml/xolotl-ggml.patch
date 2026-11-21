@@ -1,8 +1,8 @@
 diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
-index 1cd81eeae..93143c994 100644
+index 1cd81ee..f9d6602 100644
 --- a/ggml/include/ggml-cuda.h
 +++ b/ggml/include/ggml-cuda.h
-@@ -24,6 +24,25 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
+@@ -24,6 +24,35 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
  
  GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
  
@@ -24,6 +24,16 @@ index 1cd81eeae..93143c994 100644
 +// xolotl: the backend's main stream (a cudaStream_t), so work outside ggml can wait for its graphs or make it wait.
 +// Every graph ends on this stream (concurrent branches join back to it).  NULL when the backend is not CUDA.
 +GGML_BACKEND_API void * ggml_backend_cuda_get_stream(ggml_backend_t backend);
++
++// xolotl: a GGML_OP_CUSTOM node runs on this backend when its userdata points at a record with this magic; `cuda` is
++// called with the node and the backend's current stream (a cudaStream_t) and must only enqueue work on that stream
++// (CUDA-graph safe: no syncs, no allocations).  Without the record a custom op stays a CPU op as before.
++#define GGML_CUDA_CUSTOM_MAGIC 0x584c4355u
++struct ggml_cuda_custom_op {
++    uint32_t magic;
++    void (*cuda)(struct ggml_tensor * dst, void * stream, void * userdata);
++    void * userdata;
++};
 +
  // device buffer
  GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
@@ -1580,7 +1590,7 @@ index 3c5bea5f4..89e759fb2 100644
 +
 +void ggml_cuda_op_dsv41_kv_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index aff687a9a..d500c43fa 100644
+index aff687a..48ee6af 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -764,6 +764,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -1628,7 +1638,19 @@ index aff687a9a..d500c43fa 100644
  static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
      switch (dst->op) {
          case GGML_OP_ARGMAX:
-@@ -2605,6 +2636,35 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2569,6 +2600,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_SSM_CONV:
+             ggml_cuda_op_ssm_conv(ctx, dst);
+             break;
++        case GGML_OP_CUSTOM: {   // xolotl: a custom op with a CUDA implementation (ggml_cuda_custom_op)
++                const ggml_custom_op_params * p = (const ggml_custom_op_params *) dst->op_params;
++                const ggml_cuda_custom_op * co = (const ggml_cuda_custom_op *) p->userdata;
++                co->cuda(dst, ctx.stream(), co->userdata);
++            } break;
+         case GGML_OP_SSM_SCAN:
+             ggml_cuda_op_ssm_scan(ctx, dst);
+             break;
+@@ -2605,6 +2641,35 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_DSV4_HC_POST:
              ggml_cuda_op_dsv4_hc_post(ctx, dst);
              break;
@@ -1664,7 +1686,7 @@ index aff687a9a..d500c43fa 100644
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -2782,6 +2842,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -2782,6 +2847,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
      bool use_cuda_graph = true;
      // Loop over nodes in GGML graph to obtain info needed for CUDA graph
  
@@ -1677,7 +1699,7 @@ index aff687a9a..d500c43fa 100644
      for (int i = 0; i < cgraph->n_nodes; i++) {
          ggml_tensor * node = cgraph->nodes[i];
  
-@@ -2789,6 +2855,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -2789,6 +2860,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
              continue;
          }
  
@@ -1690,7 +1712,7 @@ index aff687a9a..d500c43fa 100644
          // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
          if (node->op == GGML_OP_MUL_MAT_ID) {
              const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -5395,6 +5467,60 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
+@@ -5395,6 +5472,60 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
      return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
  }
  
@@ -1751,7 +1773,7 @@ index aff687a9a..d500c43fa 100644
  int ggml_backend_cuda_get_device_count() {
      return ggml_cuda_info().device_count;
  }
-@@ -5783,8 +5909,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5783,8 +5914,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          return false;
                  }
              }
@@ -1764,7 +1786,7 @@ index aff687a9a..d500c43fa 100644
          case GGML_OP_GET_ROWS:
              {
                  switch (op->src[0]->type) {
-@@ -5815,6 +5943,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5815,6 +5948,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          return true;
                      case GGML_TYPE_IQ4_NL:
                      case GGML_TYPE_MXFP4:
@@ -1772,7 +1794,7 @@ index aff687a9a..d500c43fa 100644
                          // 32-value sub-blocks, the row size does not guarantee
                          // the QK_K super-blocks the get_rows kernel iterates on
                          return op->src[0]->ne[0] % QK_K == 0;
-@@ -5830,7 +5959,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5830,7 +5964,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                             (
                                 (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                                 op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q5_0 ||
@@ -1782,7 +1804,19 @@ index aff687a9a..d500c43fa 100644
                                 op->src[0]->type == GGML_TYPE_F32
                             ) || (
                                 op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F16
-@@ -6109,6 +6239,27 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6020,6 +6155,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                 return op->src[0]->ne[0] == 16 && op->src[0]->ne[1] == 1 && op->src[0]->ne[2] % 128 == 0 && op->src[4]->ne[1] == 1;
+             }
+         }
++        case GGML_OP_CUSTOM: {
++            const ggml_custom_op_params * p = (const ggml_custom_op_params *) op->op_params;
++            const ggml_cuda_custom_op * co = (const ggml_cuda_custom_op *) p->userdata;
++            return co != nullptr && co->magic == GGML_CUDA_CUSTOM_MAGIC && co->cuda != nullptr;
++        }
+         case GGML_OP_SSM_CONV: {
+             // assumes d_inner % threads == 0
+             return op->src[0]->ne[1] % 128 == 0;
+@@ -6109,6 +6249,27 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                  op->type == GGML_TYPE_F32;

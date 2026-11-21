@@ -55,7 +55,13 @@ struct DsparkTarget {
 // Loads the 54-tensor drafter GGUF into VRAM on `gpu` (~0.65 GiB) plus its K/V caches, and folds the target LM head
 // through the markov head's `dspark_hidden_out` once (the fold is what makes the per-slot markov bias one 256-wide
 // matvec instead of a full 2304-wide LM matmul).  `unembed` must already be allocated on `gpu`.
-Dspark* dspark_load(const std::string& path, ggml_backend_t gpu, const DsparkTarget& tgt, int64_t n_ctx);
+// `prefix` empty: `path` is the drafter's own GGUF (general.architecture dflash).  Non-empty: the drafter is built
+// into another GGUF (the model's own, tools/inkling/embed_dspark.py): its tensors are `<prefix><name>` and its
+// `dflash.*` keys sit beside the model's keys; only those tensors are loaded.
+Dspark* dspark_load(const std::string& path, ggml_backend_t gpu, const DsparkTarget& tgt, int64_t n_ctx,
+                    const std::string& prefix = "");
+// true when `path` carries a built-in drafter under `prefix` (metadata only, no tensor data is read)
+bool dspark_in_gguf(const std::string& path, const std::string& prefix = "dspark.");
 void dspark_free(Dspark* d);
 
 // Forget every committed position (the target's state was reset).  The folded LM head survives.

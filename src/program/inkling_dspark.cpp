@@ -146,8 +146,10 @@ ggml_tensor* need(ggml_context* c, const std::string& n) {
     return t;
 }
 
+std::string s_pfx;   // the tensor-name prefix of a drafter built into another GGUF (set by dspark_load)
+
 std::vector<uint8_t> read_bytes(gguf_context* g, FILE* f, const ggml_tensor* t) {
-    const int64_t idx = gguf_find_tensor(g, t->name);
+    const int64_t idx = gguf_find_tensor(g, (s_pfx + t->name).c_str());
     if (idx < 0) dfail(std::string("drafter tensor missing from file: ") + t->name);
     std::vector<uint8_t> b(ggml_nbytes(t));
     if (fseeko(f, (off_t) (gguf_get_data_offset(g) + gguf_get_tensor_offset(g, idx)), SEEK_SET) != 0 ||
@@ -266,7 +268,18 @@ void g_store_kv(ggml_context* c, ggml_cgraph* gf, ggml_tensor* src, ggml_tensor*
 }  // namespace
 
 // -------------------------------------------------------------------------------------------------------- load
-Dspark* dspark_load(const std::string& path, ggml_backend_t gpu, const DsparkTarget& tgt, int64_t n_ctx) {
+bool dspark_in_gguf(const std::string& path, const std::string& prefix) {
+    gguf_init_params gp{true, nullptr};
+    gguf_context* g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) return false;
+    const bool yes = gguf_find_tensor(g, (prefix + "markov_w1.weight").c_str()) >= 0 &&
+                     gguf_find_key(g, "dflash.block_count") >= 0;
+    gguf_free(g);
+    return yes;
+}
+
+Dspark* dspark_load(const std::string& path, ggml_backend_t gpu, const DsparkTarget& tgt, int64_t n_ctx,
+                    const std::string& prefix) {
     if (!gpu) dfail("dspark_load: no GPU backend");
     if (!tgt.embed || !tgt.embed_norm || !tgt.unembed) dfail("dspark_load: missing target tensors");
     Dspark* d = new Dspark();
@@ -277,12 +290,30 @@ Dspark* dspark_load(const std::string& path, ggml_backend_t gpu, const DsparkTar
     d->embed = tgt.embed; d->embed_norm = tgt.embed_norm; d->unembed = tgt.unembed;
 
     try {
-        gguf_init_params gp{true, &d->wctx};
+        s_pfx = prefix;
+        ggml_context* meta = nullptr;   // built-in drafter: every tensor of the host GGUF, metadata only
+        gguf_init_params gp{true, prefix.empty() ? &d->wctx : &meta};
         d->k.g = gguf_init_from_file(path.c_str(), gp);
         if (!d->k.g) dfail("cannot read the drafter GGUF " + path);
         gguf_context* g = d->k.g;
-        const std::string arch = gguf_get_val_str(g, d->k.key("general.architecture"));
-        if (arch != "dflash") dfail("not a DSpark drafter GGUF (general.architecture = " + arch + ")");
+        if (prefix.empty()) {
+            const std::string arch = gguf_get_val_str(g, d->k.key("general.architecture"));
+            if (arch != "dflash") dfail("not a DSpark drafter GGUF (general.architecture = " + arch + ")");
+        } else {   // keep only `<prefix>*`, under the drafter's own names
+            std::vector<ggml_tensor*> src;
+            for (int64_t i = 0; i < gguf_get_n_tensors(g); ++i) {
+                const char* nm = gguf_get_tensor_name(g, i);
+                if (std::strncmp(nm, prefix.c_str(), prefix.size()) == 0) src.push_back(ggml_get_tensor(meta, nm));
+            }
+            if (src.empty()) { ggml_free(meta); dfail("no built-in drafter (" + prefix + "*) in " + path); }
+            ggml_init_params ip{(src.size() + 1) * ggml_tensor_overhead(), nullptr, true};
+            d->wctx = ggml_init(ip);
+            for (ggml_tensor* t : src) {
+                ggml_tensor* c = ggml_new_tensor(d->wctx, t->type, GGML_MAX_DIMS, t->ne);
+                ggml_set_name(c, t->name + prefix.size());
+            }
+            ggml_free(meta);
+        }
         d->n_embd = (int) d->k.i("dflash.embedding_length");
         d->n_head = (int) d->k.i("dflash.attention.head_count");
         d->n_head_kv = (int) d->k.i("dflash.attention.head_count_kv");
@@ -357,7 +388,10 @@ Dspark* dspark_load(const std::string& path, ggml_backend_t gpu, const DsparkTar
             std::vector<uint8_t> buf;
             const size_t base = gguf_get_data_offset(g);
             for (int64_t i = 0; i < gguf_get_n_tensors(g); ++i) {
-                ggml_tensor* t = ggml_get_tensor(d->wctx, gguf_get_tensor_name(g, i));
+                const char* nm = gguf_get_tensor_name(g, i);
+                if (std::strncmp(nm, prefix.c_str(), prefix.size()) != 0) continue;   // the host model's own tensors
+                ggml_tensor* t = ggml_get_tensor(d->wctx, nm + prefix.size());
+                if (!t) dfail(std::string("drafter tensor not set up: ") + nm);
                 buf.resize(ggml_nbytes(t));
                 if (fseeko(f, (off_t) (base + gguf_get_tensor_offset(g, i)), SEEK_SET) != 0 ||
                     std::fread(buf.data(), 1, buf.size(), f) != buf.size()) {
