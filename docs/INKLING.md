@@ -1,12 +1,13 @@
 # Inkling-2-Mini on Xolotl
 
 Thinking Machines' [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Apache 2.0) is a 26B
-looped MoE with about 3B active parameters. `xolotl-inkling` is Xolotl's engine for it, behind the usual
+looped MoE with 5.4B active parameters per token (about 3.1B distinct weights; the 12-layer loop core runs
+3 times per token). `xolotl-inkling` is Xolotl's engine for it, behind the usual
 OpenAI- and Anthropic-compatible server.
 
 | | |
 |---|---|
-| parameters | 26B total, about 3B active |
+| parameters | 26B total, 5.4B active per token (about 3.1B distinct weights per token: 1.6B shared + 8 of 128 experts; layers 6-17 run 3 times) |
 | layers | 24 physical, 48 applications per token: layers 6 to 17 run 3 passes, with low-rank loop controllers |
 | experts | 128 routed, top-8, sigmoid router with a selection bias, SiTU activation, no shared expert |
 | attention | sliding window 1024, a global layer every 6th; no RoPE (learned relative-position bias, log-scaled positions on the global layers) |

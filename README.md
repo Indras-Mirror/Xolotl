@@ -29,7 +29,7 @@
   Engine: speculative decoding with the DSpark drafter (`--dspark`, experimental)
   and quantised K/V caches (`--kv-type q8_0|k8v4`). Decode is kernel-launch bound (16.7 ms a token against a ~3.4 ms
   memory floor), so kernel fusion toward 100+ tok/s is next, then vision (first step: 93 tok/s, above).
-- **21 Nov (Inkling)** - [Inkling-2-Mini](docs/INKLING.md) (Thinking Machines, 26B looped MoE, about 3B active) on
+- **21 Nov (Inkling)** - [Inkling-2-Mini](docs/INKLING.md) (Thinking Machines, 26B looped MoE, 5.4B active per token) on
   its own engine, `xolotl-inkling`: **57 tok/s decode, 1.1K tok/s prefill** on the RTX 4090 from the exact NVFP4
   checkpoint, greedy output matching the llama.cpp reference. The graph is ported from llama.cpp PR #32694 by Pedro
   Cuenca (MIT); a loop-pass expert-scale bug in it is fixed here. First numbers: fused kernels, flash attention
