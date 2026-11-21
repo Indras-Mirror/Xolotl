@@ -70,6 +70,7 @@ namespace inkling_stats { enum { ST_Q = 0, ST_K, ST_V, ST_O, ST_F, ST_ACT, ST_ID
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -171,6 +172,7 @@ struct Hp {
 
 struct Layer {                 // one physical layer
     ggml_tensor *wq = nullptr, *wk = nullptr, *wv = nullptr, *wo = nullptr, *gate = nullptr;
+    ggml_tensor* wo_b = nullptr;   // optional F32 [n_embd] attention-output bias, from the side file (steering edits)
     ggml_tensor *q_clip = nullptr, *sink_proj = nullptr, *rel = nullptr, *rel_bias = nullptr, *rel_clip = nullptr;
     ggml_tensor* rel_bias_pad = nullptr;   // rel_bias + a zero row (built at load; was a pad kernel per visit)
     // one-token decode: the projections that read the same input as one mat-vec (rows stacked at load, exact per row):
@@ -182,6 +184,13 @@ struct Layer {                 // one physical layer
     ggml_tensor *attn_res_query = nullptr, *ffn_res_query = nullptr;
     ggml_tensor *ffn_norm = nullptr, *gate_inp = nullptr, *probs_b = nullptr;
     ggml_tensor *gate_up_exps = nullptr, *down_exps = nullptr, *gate_up_s = nullptr, *down_s = nullptr;
+    // --vram-budget-mib: the gate/up and down arenas are split hot (VRAM) / cold (pinned host RAM); slot 0 of each
+    // arena is a zero expert ("not here").  All null when the cache is off, which is the untouched path.  The split
+    // moves expert BYTES only: ids, routing weights and the per-expert .scale stay the baseline's (so a layer with
+    // no .scale, 20-23 in this quant, never gets one invented for it).
+    ggml_tensor *gu_hot = nullptr, *gu_cold = nullptr, *dn_hot = nullptr, *dn_cold = nullptr;
+    ggml_tensor *hot_tab = nullptr, *cold_tab = nullptr;                  // I32 [n_expert] -> slot (+1) or 0
+    int n_hot = 0, n_cold = 0;
     // loop controllers (loop layers only): Q, K, V, FFN
     ggml_tensor *msg_query = nullptr, *ctrl_down[4] = {}, *ctrl_gain[4] = {}, *ctrl_forget[4] = {};
     // stacked loop controllers (built at load, exact): q/k/v down [2E, r, 3], q/k/v gain|forget [r, 2E, 3], q/k/v input norms [E, 1, 3]
@@ -207,7 +216,11 @@ struct Model {
     ggml_backend_t gpu = nullptr, cpu = nullptr;
     ggml_backend_buffer_t wbuf = nullptr, hbuf = nullptr, sbuf = nullptr;   // GPU weights, host weights, state
     ggml_context* xctx = nullptr; ggml_backend_buffer_t xbuf = nullptr;   // derived weights (stacked controllers)
+    ggml_context* bctx = nullptr; ggml_backend_buffer_t bbuf = nullptr;   // side-file biases (blk.N.attn_output.bias)
     ggml_context* pctx = nullptr; ggml_backend_buffer_t pbuf = nullptr;   // derived weights (padded rel bias tables)
+    bool ubatch_auto = false;   // --ubatch not given: load() sizes it from the free VRAM
+    size_t extra_vram = 0;      // VRAM that loads after load() (the DSpark drafter), for the auto ubatch
+    bool pattn_ok = false;   // every layer can take the prompt attention (padded bias tables built, hd 128, n_rel 16, 3 q heads per kv head)
     ggml_context* qctx = nullptr; ggml_backend_buffer_t qbuf = nullptr;   // derived weights (stacked projections)
     ggml_backend_sched_t sched = nullptr;
     ggml_tensor *tok_embd = nullptr, *tok_norm = nullptr, *output = nullptr, *output_norm = nullptr, *output_res_query = nullptr;
@@ -233,6 +246,16 @@ struct Model {
     std::vector<uint8_t> host_state;
     bool parked = false;
     inkling_stats::Stats* st = nullptr;   // --stats: accumulate from the graph's taps
+    FILE* route_fp = nullptr;        // --route-log: per-visit routing record sink (off: null, no tap, no cost)
+    int64_t route_records = 0;
+    // --vram-budget-mib
+    int64_t vram_budget_mib = 0;     // 0: off
+    ggml_context* ectx = nullptr;    // the hot + cold expert arenas and their tables/scales
+    ggml_context* ectx_host = nullptr;
+    ggml_backend_buffer_t ehot_buf = nullptr, ecold_buf = nullptr;
+    size_t ehot_bytes = 0, ecold_bytes = 0;
+    int64_t ehot_experts = 0, ecold_experts = 0;
+    std::vector<std::vector<int32_t>> ehot_of, ecold_of;   // [layer][expert] -> slot (+1) or -1
 };
 
 ggml_tensor* get(Model& m, const std::string& name, bool need = true) {
@@ -399,6 +422,401 @@ void build_stacked_proj(Model& m) {
                  ls.size(), bytes / 1048576.0);
 }
 
+// --vram-budget-mib: split every layer's experts into a hot VRAM arena and a cold pinned-host arena (slot 0 of each
+// is a zero expert, the "not here" destination of the remapped ids).  The selection is the top exp_probs_b.bias
+// experts per layer until a measured profile from --route-log replaces it; the loop core (visited 3x) is filled
+// first (see ~/.quetza-data/conductor/specs/ink-lowvram-SPEC.md).  False: the budget covers everything, cache off.
+bool setup_expert_cache(Model& m, const std::string& path) {
+    Hp& h = m.hp;
+    if (m.vram_budget_mib <= 0) return false;
+    const int64_t NE = h.n_expert;
+    // non-expert VRAM: every GPU weight except the expert tensors and the (always host) token table
+    size_t expert_bytes = 0;
+    for (int l = 0; l < h.n_phys; ++l) expert_bytes += ggml_nbytes(m.L[l].gate_up_exps) + ggml_nbytes(m.L[l].down_exps);
+    size_t other = 0;
+    for (ggml_tensor* t = ggml_get_first_tensor(m.wctx); t; t = ggml_get_next_tensor(m.wctx, t)) {
+        if (t == m.tok_embd) continue;
+        bool exp = false;
+        for (int l = 0; l < h.n_phys && !exp; ++l) exp = t == m.L[l].gate_up_exps || t == m.L[l].down_exps;
+        if (!exp) other += GGML_PAD(ggml_nbytes(t), 256);
+    }
+    // KV: the same shapes load() allocates (full slots take --kv-type; the sliding rings are f16)
+    size_t kv = 0;
+    {
+        const int64_t cells_ring = std::min<int64_t>(m.n_ctx, ((h.n_swa + m.ubatch + 255) / 256) * 256);
+        size_t kfull = ggml_row_size(m.kv_k, h.n_kgqa()), vfull = ggml_row_size(m.kv_v, h.n_kgqa());
+        size_t ksw = ggml_row_size(GGML_TYPE_F16, h.n_kgqa()), vsw = ksw;
+        int n_full = 0, n_swa = 0;
+        for (int s = 0; s < h.n_slot; ++s) (h.swa[h.phys_of(s)] ? n_swa : n_full)++;
+        kv = (size_t) n_full * (size_t) m.n_ctx * (kfull + vfull) + (size_t) n_swa * (size_t) cells_ring * (ksw + vsw);
+    }
+    const size_t total = (size_t) m.vram_budget_mib << 20;
+    const size_t reserve = 768ull << 20;   // stacked controllers/projections, CUDA context, graph + scratch
+    if (other + kv + reserve >= total) die("--vram-budget-mib: the budget leaves no room for experts (" +
+                                           std::to_string(other >> 20) + " MiB weights + " + std::to_string(kv >> 20) + " MiB KV + " +
+                                           std::to_string(reserve >> 20) + " MiB reserve)");
+    size_t hot_budget = total - other - kv - reserve;
+    if (hot_budget >= expert_bytes) {
+        std::fprintf(stderr, "xolotl-inkling: --vram-budget-mib %lld: all experts fit (%zu of %zu MiB) - cache off\n",
+                     (long long) m.vram_budget_mib, hot_budget >> 20, expert_bytes >> 20);
+        return false;
+    }
+
+    // the per-expert blob of each projection
+    std::vector<size_t> bgu(h.n_phys), bdn(h.n_phys);
+    for (int l = 0; l < h.n_phys; ++l) {
+        bgu[l] = ggml_nbytes(m.L[l].gate_up_exps) / NE;
+        bdn[l] = ggml_nbytes(m.L[l].down_exps) / NE;
+    }
+    // quotas: round-robin, loop core first (it is visited n_pass times), until the budget is spent
+    std::vector<int> q(h.n_phys, 0);
+    std::vector<int> order;
+    for (int l = h.loop_start; l < h.loop_end && h.n_pass > 1; ++l) order.push_back(l);
+    for (int l = 0; l < h.n_phys; ++l) if (!(h.n_pass > 1 && h.is_loop(l))) order.push_back(l);
+    auto fill_quotas = [&](size_t budget) {
+        q.assign(h.n_phys, 0);
+        size_t used = 0;
+        for (bool more = true; more;) {
+            more = false;
+            for (int l : order) {
+                if (q[l] >= NE) continue;
+                if (used + bgu[l] + bdn[l] > budget) continue;
+                ++q[l]; used += bgu[l] + bdn[l];
+                more = true;
+            }
+        }
+        return used;
+    };
+    size_t used = fill_quotas(hot_budget);
+    if (used == 0) die("--vram-budget-mib: too small for one expert");
+    {   // the staged path (T >= 2) needs a VRAM copy of ONE layer's cold arena at a time; take it out of the hot
+        // budget so the graph allocation cannot fail on it, then recompute the quotas once
+        size_t max_cold = 0;
+        for (int l = 0; l < h.n_phys; ++l) {
+            const int64_t nc = NE - q[l];
+            if (nc > 0) max_cold = std::max(max_cold, (size_t) (nc + 1) * (bgu[l] + bdn[l]));
+        }
+        if (max_cold > 0 && hot_budget > max_cold + (128ull << 20)) {
+            const size_t used2 = fill_quotas(hot_budget - max_cold - (32ull << 20));
+            std::fprintf(stderr, "xolotl-inkling: --vram-budget-mib: staging reserve %.0f MiB for one layer's cold arena "
+                         "(hot experts %zu -> %zu MiB)\n", max_cold / 1048576.0, used2 >> 20, used >> 20);
+            used = used2;
+        }
+    }
+
+    // exp_probs_b.bias -> the ranking (one 512-byte read per layer; the main loop reads the tensors themselves)
+    // XOLOTL_INKLING_ARENA_IDENTITY=1: slot = expert, everything hot.  A probe mode: the arena then computes the
+    // same graph as the baseline over different tensor objects, so a mismatch isolates the plumbing (buffer,
+    // scheduler, fill) from the permutation.
+    static const bool identity = std::getenv("XOLOTL_INKLING_ARENA_IDENTITY") != nullptr;
+    // XOLOTL_INKLING_COLD1=L,E: ONE expert cold (everything else hot, identity slots).  The isolation probe:
+    // if this faults at T >= 2, the fault is the cold mechanism; if it runs, it is a count/capacity effect.
+    int cold1_l = -1, cold1_e = -1;
+    if (const char* c1 = std::getenv("XOLOTL_INKLING_COLD1")) {
+        const char* comma = std::strchr(c1, ',');
+        if (comma) { cold1_l = std::atoi(c1); cold1_e = std::atoi(comma + 1); }
+    }
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) die("cannot open " + path);
+    std::vector<float> probe;
+    const size_t data_off = gguf_get_data_offset(m.gg.g);
+    for (int l = 0; l < h.n_phys; ++l) {
+        if (cold1_l >= 0) {   // one cold expert: slot = expert for all hot ones, the named one goes to the cold arena
+            std::vector<int32_t> hot_of(NE, -1), cold_of(NE, -1);
+            int nh = 0;
+            for (int e = 0; e < NE; ++e) {
+                if (l == cold1_l && e == cold1_e) cold_of[e] = 1;
+                else hot_of[e] = ++nh;
+            }
+            m.ehot_of.push_back(std::move(hot_of));
+            m.ecold_of.push_back(std::move(cold_of));
+            m.L[l].n_hot = nh;
+            m.L[l].n_cold = NE - nh;
+            continue;
+        }
+        if (identity) {
+            std::vector<int32_t> hot_of(NE), cold_of(NE, -1);
+            for (int e = 0; e < NE; ++e) hot_of[e] = e + 1;
+            m.ehot_of.push_back(std::move(hot_of));
+            m.ecold_of.push_back(std::move(cold_of));
+            m.L[l].n_hot = NE;
+            m.L[l].n_cold = 0;
+            continue;
+        }
+        const int64_t ti = m.L[l].probs_b ? gguf_find_tensor(m.gg.g, m.L[l].probs_b->name) : -1;
+        if (ti < 0) die("--vram-budget-mib needs blk.*.exp_probs_b.bias");
+        probe.resize(NE);
+        if (fseeko(f, (off_t) (data_off + gguf_get_tensor_offset(m.gg.g, ti)), SEEK_SET) != 0 ||
+            std::fread(probe.data(), sizeof(float), NE, f) != (size_t) NE)
+            die(std::string("--vram-budget-mib: short read on ") + m.L[l].probs_b->name);
+        std::vector<int> idx(NE);
+        for (int e = 0; e < NE; ++e) idx[e] = e;
+        std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return probe[a] > probe[b]; });
+        std::vector<int32_t> hot_of(NE, -1), cold_of(NE, -1);
+        for (int i = 0; i < q[l]; ++i) hot_of[idx[i]] = i + 1;   // slot 0 is the zero expert
+        for (int i = q[l]; i < NE; ++i) cold_of[idx[i]] = i - q[l] + 1;
+        m.ehot_of.push_back(std::move(hot_of));
+        m.ecold_of.push_back(std::move(cold_of));
+        m.L[l].n_hot = q[l];
+        m.L[l].n_cold = NE - q[l];
+    }
+    std::fclose(f);
+
+    // contexts: hot arenas + tables on the device, cold arenas in pinned host memory (CUDA host buft)
+    ggml_init_params dcp{(size_t) (h.n_phys * 4 + 8) * ggml_tensor_overhead(), nullptr, true};
+    ggml_init_params hcp{(size_t) (h.n_phys * 2 + 8) * ggml_tensor_overhead(), nullptr, true};
+    m.ectx = ggml_init(dcp);
+    ggml_context* hctx = ggml_init(hcp);
+    for (int l = 0; l < h.n_phys; ++l) {
+        Layer& y = m.L[l];
+        if (!y.gate_up_exps || (y.n_hot == 0 && y.n_cold == 0)) continue;
+        if (y.n_hot > 0) {
+            y.gu_hot = ggml_new_tensor_3d(m.ectx, y.gate_up_exps->type, y.gate_up_exps->ne[0], y.gate_up_exps->ne[1], y.n_hot + 1);
+            y.dn_hot = ggml_new_tensor_3d(m.ectx, y.down_exps->type, y.down_exps->ne[0], y.down_exps->ne[1], y.n_hot + 1);
+        }
+        y.hot_tab = ggml_new_tensor_1d(m.ectx, GGML_TYPE_I32, NE);
+        if (y.n_cold > 0) {
+            y.gu_cold = ggml_new_tensor_3d(hctx, y.gate_up_exps->type, y.gate_up_exps->ne[0], y.gate_up_exps->ne[1], y.n_cold + 1);
+            y.dn_cold = ggml_new_tensor_3d(hctx, y.down_exps->type, y.down_exps->ne[0], y.down_exps->ne[1], y.n_cold + 1);
+            y.cold_tab = ggml_new_tensor_1d(m.ectx, GGML_TYPE_I32, NE);
+        }
+    }
+    m.ehot_buf = ggml_backend_alloc_ctx_tensors(m.ectx, m.gpu);
+    ggml_backend_buffer_type_t host_bt = ggml_backend_cuda_host_buffer_type();
+    m.ecold_buf = ggml_backend_alloc_ctx_tensors_from_buft(hctx, host_bt);
+    // The CUDA host buft falls back to a PAGEABLE cpu buffer when cudaMallocHost fails (ggml-cuda.cu), and a
+    // pageable arena is not device-addressable - every read of it from a kernel would fault.  It also advertises
+    // get_max_size = 4 GiB while a 12 GB budget's cold tier can exceed that.  Say which one we actually got.
+    if (m.ecold_buf) {
+        const bool pinned = ggml_backend_buffer_get_type(m.ecold_buf) == host_bt;
+        std::fprintf(stderr, "xolotl-inkling: cold arena buffer: %s (%s)\n", ggml_backend_buffer_name(m.ecold_buf),
+                     pinned ? "CUDA host (pinned, device-addressable)" : "NOT the CUDA host buft - pageable fallback");
+        if (std::getenv("XOLOTL_INKLING_REQUIRE_PINNED") && !pinned)
+            die("--vram-budget-mib: the cold arena is not pinned memory; a kernel read of it would fault");
+    }
+    if (!m.ehot_buf || !m.ecold_buf) die("--vram-budget-mib: cannot allocate the expert arenas");
+    ggml_backend_buffer_set_usage(m.ehot_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_set_usage(m.ecold_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    m.ehot_bytes = ggml_backend_buffer_get_size(m.ehot_buf);
+    m.ecold_bytes = ggml_backend_buffer_get_size(m.ecold_buf);
+    for (int l = 0; l < h.n_phys; ++l) {
+        Layer& y = m.L[l];
+        if (y.gu_hot) m.ehot_experts += y.n_hot;
+        if (y.gu_cold) m.ecold_experts += y.n_cold;
+    }
+    std::fprintf(stderr, "xolotl-inkling: --vram-budget-mib %lld: %lld experts hot (%.0f MiB VRAM), %lld cold (%.0f MiB pinned RAM); "
+                 "budget hot %.0f of %.0f MiB experts\n",
+                 (long long) m.vram_budget_mib, (long long) m.ehot_experts, m.ehot_bytes / 1048576.0,
+                 (long long) m.ecold_experts, m.ecold_bytes / 1048576.0, hot_budget / 1048576.0, expert_bytes / 1048576.0);
+    // stash the cold context for the fill; freed with the model's lifetime
+    m.ectx_host = hctx;
+    return true;
+}
+
+// XOLOTL_INKLING_SELFTEST=1: does mul_mat_id over the arena reproduce mul_mat_id over the ORIGINAL expert tensor?
+// The original tensor is read into a throwaway device buffer for ONE layer (~4 MB), a random x and a fixed routing
+// row go through both, and the two outputs are compared.  Same kernel, same bytes => the only difference is the
+// remap, so a mismatch localizes the bug to the table/slot mapping rather than to the model graph.
+void arena_selftest(Model& m, FILE* f, size_t base, int l) {
+    const Hp& h = m.hp;
+    const int64_t E = h.n_embd, NE = h.n_expert, k = h.n_used, T = 2;
+    Layer& y = m.L[l];
+    if (!y.gu_hot) { std::fprintf(stderr, "selftest: blk.%d has no hot arena - skipped\n", l); return; }
+    const size_t blob = ggml_nbytes(y.gate_up_exps) / NE;
+    const int64_t ti = gguf_find_tensor(m.gg.g, y.gate_up_exps->name);
+    const size_t t_off = gguf_get_tensor_offset(m.gg.g, ti);
+
+    ggml_init_params op{(size_t) 16 * ggml_tensor_overhead(), nullptr, true};
+    ggml_context* oc = ggml_init(op);
+    ggml_tensor* orig = ggml_new_tensor_3d(oc, y.gate_up_exps->type, y.gate_up_exps->ne[0], y.gate_up_exps->ne[1], NE);
+    ggml_backend_buffer_t ob = ggml_backend_alloc_ctx_tensors(oc, m.gpu);
+    if (!ob) die("selftest: cannot allocate the reference tensor");
+    std::vector<uint8_t> b(blob);
+    for (int e = 0; e < NE; ++e) {
+        if (fseeko(f, (off_t) (base + t_off + (size_t) e * blob), SEEK_SET) != 0 || std::fread(b.data(), 1, blob, f) != blob)
+            die("selftest: short read");
+        ggml_backend_tensor_set(orig, b.data(), (size_t) e * blob, blob);
+    }
+
+    std::vector<uint8_t> gb(ggml_tensor_overhead() * 64 + ggml_graph_overhead());
+    ggml_init_params gp{gb.size(), gb.data(), true};
+    ggml_context* c = ggml_init(gp);
+    ggml_cgraph* gf = ggml_new_graph(c);
+    ggml_tensor* x = ggml_new_tensor_3d(c, GGML_TYPE_F32, E, 1, T);
+    ggml_tensor* idt = ggml_new_tensor_2d(c, GGML_TYPE_I32, k, T);
+    ggml_tensor* ref = ggml_mul_mat_id(c, orig, x, idt);
+    ggml_tensor* hid = ggml_reshape_2d(c, ggml_get_rows(c, ggml_reshape_2d(c, y.hot_tab, 1, NE),
+                                     ggml_reshape_2d(c, ggml_cont(c, idt), k * T, 1)), k, T);
+    ggml_tensor* tst = ggml_mul_mat_id(c, y.gu_hot, x, hid);
+    ggml_set_output(ref);
+    ggml_set_output(tst);
+    ggml_build_forward_expand(gf, ref);
+    ggml_build_forward_expand(gf, tst);
+
+    ggml_backend_t bes[2] = {m.gpu, m.cpu};
+    ggml_backend_sched_t sc = ggml_backend_sched_new(bes, nullptr, 2, 4096, false, true);
+    ggml_backend_sched_reset(sc);
+    if (!ggml_backend_sched_alloc_graph(sc, gf)) die("selftest: graph alloc failed");
+    std::vector<float> xv((size_t) E * T);
+    for (size_t i = 0; i < xv.size(); ++i) xv[i] = 0.05f * std::sin((float) i * 0.37f) + 0.01f * std::cos((float) i);
+    std::vector<int32_t> idv((size_t) k * T);
+    for (int t = 0; t < T; ++t)
+        for (int j = 0; j < k; ++j) idv[(size_t) j + (size_t) t * k] = (j * 17 + t * 5 + 3) % NE;   // spread over the table
+    ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * sizeof(float));
+    ggml_backend_tensor_set(idt, idv.data(), 0, idv.size() * sizeof(int32_t));
+    if (ggml_backend_sched_graph_compute(sc, gf) != GGML_STATUS_SUCCESS) die("selftest: compute failed");
+    std::vector<float> a((size_t) E * k * T), bb((size_t) E * k * T);
+    ggml_backend_tensor_get(ref, a.data(), 0, a.size() * sizeof(float));
+    ggml_backend_tensor_get(tst, bb.data(), 0, bb.size() * sizeof(float));
+    double mx = 0, mag = 0;
+    size_t first = SIZE_MAX;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const double d = std::fabs((double) a[i] - (double) bb[i]);
+        if (d > mx) { mx = d; }
+        if (d > 1e-6 && first == SIZE_MAX) first = i;
+        mag = std::max(mag, std::fabs((double) a[i]));
+    }
+    std::fprintf(stderr, "selftest blk.%d gate_up: arena vs original ids=%d,%d.. k=%lld: max|d| %.3e (|ref| %.3e) %s\n",
+                 l, idv[0], idv[1], (long long) k, mx, mag, mx == 0.0 ? "BIT-IDENTICAL" : (mx < 1e-5 ? "numerically equal" : "MISMATCH"));
+    if (first != SIZE_MAX) std::fprintf(stderr, "  first differing element %zu (expert j=%zu t=%zu channel=%zu)\n",
+                                        first, first % (size_t) k, (first / (size_t) k) % (size_t) T, first / ((size_t) k * T));
+    ggml_backend_sched_free(sc);
+    ggml_free(c);
+    ggml_backend_buffer_free(ob);
+    ggml_free(oc);
+}
+
+// `--arena-selftest <gguf>`: the remap question alone, without loading the model.  One layer's gate/up experts are
+// read into a throwaway device tensor (~4 MB), a permuted slot table is built, and mul_mat_id over the permuted
+// arena is compared with mul_mat_id over the original ids - both identity and reversed permutations.  This is the
+// probe that separates "storage/plumbing" from "remap" at a cost of a few MB of VRAM and one CUDA context.
+int arena_selftest_main(const std::string& path, int layer) {
+    ggml_backend_t gpu = ggml_backend_cuda_init(0);
+    if (!gpu) die("selftest: CUDA backend failed to start");
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    ggml_context* wctx = nullptr;
+    gguf_init_params gp{true, &wctx};
+    gguf_context* g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) die("selftest: cannot read " + path);
+    const std::string pre = "blk." + std::to_string(layer) + ".";
+    ggml_tensor* t = ggml_get_tensor(wctx, (pre + "ffn_gate_up_exps.weight").c_str());
+    if (!t) die("selftest: no " + pre + "ffn_gate_up_exps.weight");
+    const int64_t ne0 = t->ne[0], ne1 = t->ne[1], NE = t->ne[2];
+    const size_t blob = ggml_nbytes(t) / NE;
+    const int64_t ti = gguf_find_tensor(g, t->name);
+    const size_t t_off = gguf_get_tensor_offset(g, ti);
+    const size_t base = gguf_get_data_offset(g);
+    const int k = 8, T = 2;
+    std::fprintf(stderr, "selftest: blk.%d gate_up %lldx%lldx%lld type %s, blob %.1f MiB, k=%d T=%d\n", layer,
+                 (long long) ne0, (long long) ne1, (long long) NE, ggml_type_name(t->type), blob / 1048576.0, k, T);
+
+    ggml_init_params op{(size_t) 32 * ggml_tensor_overhead(), nullptr, true};
+    ggml_context* oc = ggml_init(op);
+    ggml_tensor* orig = ggml_new_tensor_3d(oc, t->type, ne0, ne1, NE);
+    ggml_tensor* hot = ggml_new_tensor_3d(oc, t->type, ne0, ne1, NE + 1);
+    ggml_tensor* tab = ggml_new_tensor_1d(oc, GGML_TYPE_I32, NE);
+    ggml_backend_buffer_t ob = ggml_backend_alloc_ctx_tensors(oc, gpu);
+    if (!ob) die("selftest: cannot allocate the probe tensors");
+    {   // both tensors get the SAME bytes: expert e at slot e (orig) and at slot e+1 (arena, slot 0 = zero expert)
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) die("selftest: cannot open " + path);
+        std::vector<uint8_t> b(blob);
+        for (int64_t e = 0; e < NE; ++e) {
+            if (fseeko(f, (off_t) (base + t_off + (size_t) e * blob), SEEK_SET) != 0 || std::fread(b.data(), 1, blob, f) != blob)
+                die("selftest: short read");
+            ggml_backend_tensor_set(orig, b.data(), (size_t) e * blob, blob);
+            ggml_backend_tensor_set(hot, b.data(), (size_t) (e + 1) * blob, blob);
+        }
+        std::fclose(f);
+    }
+    std::vector<uint8_t> zb(blob, 0);
+    ggml_backend_tensor_set(hot, zb.data(), 0, blob);
+
+    std::vector<uint8_t> gb(ggml_tensor_overhead() * 128 + ggml_graph_overhead());
+    ggml_init_params gip{gb.size(), gb.data(), true};
+    std::vector<float> xv((size_t) ne0 * T);
+    for (size_t i = 0; i < xv.size(); ++i) xv[i] = 0.05f * std::sin((float) i * 0.37f) + 0.01f * std::cos((float) i);
+    std::vector<int32_t> idv((size_t) k * T);
+    for (int tt = 0; tt < T; ++tt)
+        for (int j = 0; j < k; ++j) idv[(size_t) j + (size_t) tt * k] = (int) ((j * 17 + tt * 5 + 3) % NE);
+
+    int n_bad = 0;
+    for (int mode = 0; mode < 2; ++mode) {   // 0 = identity (slot = expert+1), 1 = reversed permutation
+        std::vector<int32_t> tb(NE);
+        if (mode == 0) for (int64_t e = 0; e < NE; ++e) tb[e] = (int32_t) (e + 1);
+        else {
+            // expert e lives in slot (NE - e): a permutation that keeps every expert in a valid, distinct slot
+            std::vector<int32_t> slot(NE);
+            for (int64_t e = 0; e < NE; ++e) slot[e] = (int32_t) (NE - e);
+            // rewrite the arena under the reversed layout so slot s holds the expert the table claims
+            ggml_backend_buffer_t ob2 = ob;   // reuse: refill hot with the permuted order
+            FILE* f = std::fopen(path.c_str(), "rb");
+            if (!f) die("selftest: cannot open " + path);
+            std::vector<uint8_t> b(blob);
+            for (int64_t e = 0; e < NE; ++e) {
+                if (fseeko(f, (off_t) (base + t_off + (size_t) e * blob), SEEK_SET) != 0 || std::fread(b.data(), 1, blob, f) != blob)
+                    die("selftest: short read");
+                ggml_backend_tensor_set(hot, b.data(), (size_t) slot[e] * blob, blob);
+            }
+            std::fclose(f);
+            ggml_backend_tensor_set(hot, zb.data(), 0, blob);
+            for (int64_t e = 0; e < NE; ++e) tb[e] = slot[e];
+            (void) ob2;
+        }
+        ggml_backend_tensor_set(tab, tb.data(), 0, (size_t) NE * sizeof(int32_t));
+
+        ggml_context* c = ggml_init(gip);
+        ggml_cgraph* gf = ggml_new_graph(c);
+        ggml_tensor* x = ggml_new_tensor_3d(c, GGML_TYPE_F32, ne0, 1, T);
+        ggml_tensor* idt = ggml_new_tensor_2d(c, GGML_TYPE_I32, k, T);
+        ggml_tensor* ref = ggml_mul_mat_id(c, orig, x, idt);
+        ggml_tensor* hid = ggml_reshape_2d(c, ggml_get_rows(c, ggml_reshape_2d(c, tab, 1, NE),
+                                         ggml_reshape_2d(c, ggml_cont(c, idt), k * T, 1)), k, T);
+        ggml_tensor* tst = ggml_mul_mat_id(c, hot, x, hid);
+        ggml_set_output(ref);
+        ggml_set_output(tst);
+        ggml_build_forward_expand(gf, ref);
+        ggml_build_forward_expand(gf, tst);
+        ggml_backend_t bes[2] = {gpu, cpu};
+        ggml_backend_sched_t sc = ggml_backend_sched_new(bes, nullptr, 2, 4096, false, true);
+        ggml_backend_sched_reset(sc);
+        if (!ggml_backend_sched_alloc_graph(sc, gf)) die("selftest: graph alloc failed");
+        ggml_backend_tensor_set(x, xv.data(), 0, xv.size() * sizeof(float));
+        ggml_backend_tensor_set(idt, idv.data(), 0, idv.size() * sizeof(int32_t));
+        if (ggml_backend_sched_graph_compute(sc, gf) != GGML_STATUS_SUCCESS) die("selftest: compute failed");
+        std::vector<float> a(xv.size() * k), bb(xv.size() * k);
+        ggml_backend_tensor_get(ref, a.data(), 0, a.size() * sizeof(float));
+        ggml_backend_tensor_get(tst, bb.data(), 0, bb.size() * sizeof(float));
+        double mx = 0, mag = 0;
+        size_t first = SIZE_MAX;
+        for (size_t i = 0; i < a.size(); ++i) {
+            const double d = std::fabs((double) a[i] - (double) bb[i]);
+            if (d > mx) mx = d;
+            if (d > 1e-6 && first == SIZE_MAX) first = i;
+            mag = std::max(mag, std::fabs((double) a[i]));
+        }
+        std::fprintf(stderr, "selftest %s: max|d| %.3e (|ref| %.3e) -> %s%s\n", mode == 0 ? "identity" : "reversed", mx, mag,
+                     mx == 0.0 ? "BIT-IDENTICAL" : (mx < 1e-5 ? "numerically equal" : "MISMATCH"),
+                     first != SIZE_MAX ? " (first diff shown next)" : "");
+        if (first != SIZE_MAX) {
+            std::fprintf(stderr, "  first differing element %zu: expert j=%zu t=%zu channel=%zu  ref %.6f arena %.6f\n",
+                         first, first % (size_t) k, (first / (size_t) k) % (size_t) T, first / ((size_t) k * T), a[first], bb[first]);
+            ++n_bad;
+        }
+        ggml_backend_sched_free(sc);
+        ggml_free(c);
+    }
+    ggml_backend_buffer_free(ob);
+    ggml_free(oc);
+    gguf_free(g);
+    ggml_free(wctx);
+    ggml_backend_free(cpu);
+    ggml_backend_free(gpu);
+    std::fprintf(stderr, "selftest: %s\n", n_bad ? "FAIL - the remap changes the result" : "PASS - the remap is transparent");
+    return n_bad ? 1 : 0;
+}
+
+inline bool prompt_attn_on();
 void load(Model& m, const std::string& path, int64_t want_ctx, int threads, const std::string& cpu_exps, bool park_copy) {
     gguf_init_params gp{true, &m.wctx};
     m.gg.g = gguf_init_from_file(path.c_str(), gp);
@@ -496,7 +914,13 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
     ggml_backend_cpu_set_n_threads(m.cpu, threads);
     std::vector<bool> host_exp(h.n_phys, false);
     for (int l : parse_layers(cpu_exps, h.n_phys)) host_exp[l] = true;
+    if (!host_exp.empty() && std::any_of(host_exp.begin(), host_exp.end(), [](bool b) { return b; }) && m.vram_budget_mib > 0)
+        die("--cpu-exps and --vram-budget-mib are mutually exclusive");
+    setup_expert_cache(m, path);   // --vram-budget-mib: hot VRAM + cold pinned-RAM arenas (off by default)
     for (ggml_tensor* t = ggml_get_first_tensor(m.wctx); t; t = ggml_get_next_tensor(m.wctx, t)) {
+        bool exp = false;
+        for (int l = 0; l < h.n_phys && !exp; ++l) exp = t == m.L[l].gate_up_exps || t == m.L[l].down_exps;
+        if (exp && m.ectx) continue;   // --vram-budget-mib: the arenas take these bytes (filled below)
         bool host = t == m.tok_embd;
         for (int l = 0; l < h.n_phys && !host; ++l)
             host = host_exp[l] && (t == m.L[l].gate_up_exps || t == m.L[l].down_exps);
@@ -541,6 +965,9 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
         }
         for (int64_t i = 0; i < gguf_get_n_tensors(m.gg.g); ++i) {
             ggml_tensor* t = ggml_get_tensor(m.wctx, gguf_get_tensor_name(m.gg.g, i));
+            bool exp = false;
+            for (int l = 0; l < h.n_phys && !exp; ++l) exp = t == m.L[l].gate_up_exps || t == m.L[l].down_exps;
+            if (exp && m.ectx) continue;   // --vram-budget-mib: read into the hot/cold arenas after this loop
             const size_t n = ggml_nbytes(t);
             uint8_t* dst = nullptr;
             if (is_host[i]) dst = (uint8_t*) t->data;                                  // straight into the host buffer
@@ -561,6 +988,30 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
         }
         std::fclose(f);
         if (ov) {
+            // extra tensors the base file lacks: blk.N.attn_output.bias (F32 [n_embd]), added to the attention output
+            // after its post-conv on every visit of layer N - an additive steering vector, still a weight in the side file
+            std::vector<std::pair<int, int64_t>> bl;
+            for (int l = 0; l < m.hp.n_phys; ++l) {
+                const int64_t oi = gguf_find_tensor(ov, ("blk." + std::to_string(l) + ".attn_output.bias").c_str());
+                if (oi < 0) continue;
+                if (gguf_get_tensor_type(ov, oi) != GGML_TYPE_F32 || gguf_get_tensor_size(ov, oi) != (size_t) m.hp.n_embd * 4)
+                    die("XOLOTL_INKLING_OVERRIDE: blk." + std::to_string(l) + ".attn_output.bias must be F32 [n_embd]");
+                bl.push_back({l, oi});
+            }
+            if (!bl.empty()) {
+                ggml_init_params sp{(bl.size() + 2) * ggml_tensor_overhead(), nullptr, true};
+                m.bctx = ggml_init(sp);
+                for (auto& [l, oi] : bl) m.L[l].wo_b = ggml_new_tensor_1d(m.bctx, GGML_TYPE_F32, m.hp.n_embd);
+                m.bbuf = ggml_backend_alloc_ctx_tensors(m.bctx, m.gpu);
+                if (!m.bbuf) die("XOLOTL_INKLING_OVERRIDE: cannot allocate the bias tensors");
+                std::vector<float> v(m.hp.n_embd);
+                for (auto& [l, oi] : bl) {
+                    if (fseeko(fo, (off_t) (gguf_get_data_offset(ov) + gguf_get_tensor_offset(ov, oi)), SEEK_SET) != 0 ||
+                        std::fread(v.data(), 4, v.size(), fo) != v.size()) die("XOLOTL_INKLING_OVERRIDE: short read on a bias");
+                    ggml_backend_tensor_set(m.L[l].wo_b, v.data(), 0, v.size() * 4);
+                }
+                std::fprintf(stderr, "xolotl-inkling: %zu attn_output biases from XOLOTL_INKLING_OVERRIDE\n", bl.size());
+            }
             std::fprintf(stderr, "xolotl-inkling: %d tensors from XOLOTL_INKLING_OVERRIDE (%lld in that file)\n", n_ov,
                          (long long) gguf_get_n_tensors(ov));
             std::fclose(fo);
@@ -569,13 +1020,105 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
         if (m.host_w)
             for (ggml_tensor* t : m.gpu_w) m.host_w_at.push_back(at_of[gguf_find_tensor(m.gg.g, t->name)]);
     }
+    if (m.ectx) {   // --vram-budget-mib: fill the hot (VRAM) and cold (pinned RAM) arenas expert by expert, write the
+                    // tables, zero slot 0 of every arena (the "not here" destination), then READ BACK a sample and
+                    // compare it to the file bytes - a slot table that is right about indices and wrong about bytes
+                    // produces a plausible token, which is the failure this project keeps paying for
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) die("cannot open " + path);
+        const size_t base = gguf_get_data_offset(m.gg.g);
+        std::vector<uint8_t> bounce, zeros;
+        int64_t n_checked = 0, n_bad = 0;
+        const int n_verify = std::getenv("XOLOTL_INKLING_VERIFY") ? std::atoi(std::getenv("XOLOTL_INKLING_VERIFY")) : 8;
+        for (int l = 0; l < h.n_phys; ++l) {
+            Layer& y = m.L[l];
+            for (int which = 0; which < 2; ++which) {
+                ggml_tensor* src = which == 0 ? y.gate_up_exps : y.down_exps;
+                ggml_tensor* hot = which == 0 ? y.gu_hot : y.dn_hot;
+                ggml_tensor* cold = which == 0 ? y.gu_cold : y.dn_cold;
+                const size_t blob = ggml_nbytes(src) / h.n_expert;
+                const int64_t ti = gguf_find_tensor(m.gg.g, src->name);
+                const size_t t_off = gguf_get_tensor_offset(m.gg.g, ti);
+                // per-layer blob sizes differ (NVFP4/Q2_0/IQ3_*/IQ4_*/Q8_0 in this file), so size the zero filler
+                // to THIS tensor, not once
+                if (zeros.size() != blob) zeros.assign(blob, 0);
+                for (int e = 0; e < h.n_expert; ++e) {
+                    const off_t at = (off_t) (base + t_off + (size_t) e * blob);
+                    if (fseeko(f, at, SEEK_SET) != 0) die(std::string("--vram-budget-mib: seek on ") + src->name);
+                    const int hs = m.ehot_of[l][e], cs = m.ecold_of[l][e];
+                    if (hs > 0 && hot) {
+                        bounce.resize(blob);
+                        if (std::fread(bounce.data(), 1, blob, f) != blob) die(std::string("--vram-budget-mib: short read on ") + src->name);
+                        ggml_backend_tensor_set(hot, bounce.data(), (size_t) hs * blob, blob);
+                    } else if (cs > 0 && cold) {
+                        if (std::fread((uint8_t*) cold->data + (size_t) cs * blob, 1, blob, f) != blob)
+                            die(std::string("--vram-budget-mib: short read on ") + src->name);
+                    }
+                }
+                if (hot) ggml_backend_tensor_set(hot, zeros.data(), 0, blob);
+                if (cold) ggml_backend_tensor_set(cold, zeros.data(), 0, blob);
+                // readback: the first n_verify experts of the layer, hot or cold, compared byte for byte to the file
+                std::vector<uint8_t> got;
+                for (int e = 0; e < std::min<int>(n_verify, h.n_expert); ++e) {
+                    const int hs = m.ehot_of[l][e], cs = m.ecold_of[l][e];
+                    bounce.resize(blob);
+                    if (fseeko(f, (off_t) (base + t_off + (size_t) e * blob), SEEK_SET) != 0 ||
+                        std::fread(bounce.data(), 1, blob, f) != blob) die(std::string("--vram-budget-mib: readback seek on ") + src->name);
+                    got.resize(blob);
+                    if (hs > 0 && hot) ggml_backend_tensor_get(hot, got.data(), (size_t) hs * blob, blob);
+                    else if (cs > 0 && cold) std::memcpy(got.data(), (const uint8_t*) cold->data + (size_t) cs * blob, blob);
+                    else { ++n_bad; continue; }
+                    ++n_checked;
+                    if (std::memcmp(got.data(), bounce.data(), blob) != 0) {
+                        size_t first = 0;
+                        while (first < blob && got[first] == bounce[first]) ++first;
+                        ++n_bad;
+                        std::fprintf(stderr, "xolotl-inkling: VERIFY FAIL blk.%d %s expert %d (slot %d): first diff at byte %zu of %zu\n",
+                                     l, which == 0 ? "gate_up" : "down", e, hs > 0 ? hs : cs, first, blob);
+                    }
+                }
+            }
+            // tables: expert -> slot (+1) or 0
+            std::vector<int32_t> htab(h.n_expert, 0), ctab(h.n_expert, 0);
+            for (int e = 0; e < h.n_expert; ++e) {
+                if (m.ehot_of[l][e] > 0) htab[e] = m.ehot_of[l][e];
+                if (m.ecold_of[l][e] > 0) ctab[e] = m.ecold_of[l][e];
+            }
+            ggml_backend_tensor_set(y.hot_tab, htab.data(), 0, (size_t) h.n_expert * sizeof(int32_t));
+            if (y.cold_tab) ggml_backend_tensor_set(y.cold_tab, ctab.data(), 0, (size_t) h.n_expert * sizeof(int32_t));
+            if (std::getenv("XOLOTL_INKLING_SELFTEST") && (l == 0 || l == h.loop_start)) arena_selftest(m, f, base, l);
+        }
+        std::fclose(f);
+        if (n_bad) die("--vram-budget-mib: " + std::to_string(n_bad) + " of " + std::to_string(n_checked) +
+                       " expert slots do not hold the bytes they claim");
+        std::fprintf(stderr, "xolotl-inkling: arena verify: %lld expert blobs read back, all match the file\n", (long long) n_checked);
+    }
     build_stacked_controllers(m);
     build_padded_rel_bias(m);
+    m.pattn_ok = h.hd == 128 && h.n_rel == 16 && h.n_head == 3 * h.n_head_kv;
+    for (int l = 0; l < h.n_phys; ++l) m.pattn_ok = m.pattn_ok && m.L[l].rel_bias_pad != nullptr;
     build_stacked_proj(m);
 
     // state
+    m.n_ctx = ((m.n_ctx + 255) / 256) * 256;   // first: positions run to the rounded n_ctx - 1, so a ring clamped to n_ctx never wraps
+    if (m.ubatch_auto) {
+        const size_t freeb = (size_t) vram_free_mib() << 20;
+        int n_full = 0, n_sw = 0;
+        for (int sl = 0; sl < h.n_slot; ++sl) (h.swa[h.phys_of(sl)] ? n_sw : n_full)++;
+        const size_t kfull = ggml_row_size(m.kv_k, h.n_kgqa()) + ggml_row_size(m.kv_v, h.n_kgqa());
+        const size_t ksw = 2 * ggml_row_size(GGML_TYPE_F16, h.n_kgqa());
+        int pick = 256;
+        for (int cand : {2048, 1024, 512}) {
+            if (cand > 512 && !prompt_attn_on()) continue;   // the chain's score tensors halve big chunks anyway
+            const int64_t ring_c = std::min<int64_t>(m.n_ctx, (((int64_t) h.n_swa + cand + 255) / 256) * 256);
+            const size_t need = (size_t) n_full * (size_t) m.n_ctx * kfull + (size_t) n_sw * (size_t) ring_c * ksw +
+                                (size_t) cand * (768u << 10) + m.extra_vram + (384ull << 20);   // t16: parent 16K at 512 keeps 656 MiB after an 8K prompt
+            if (freeb >= need) { pick = cand; break; }
+        }
+        m.ubatch = pick;
+        std::fprintf(stderr, "xolotl-inkling: auto ubatch %d (%zu MiB free after the weights)\n", pick, freeb >> 20);
+    }
     m.ring = std::min<int64_t>(m.n_ctx, (((int64_t) h.n_swa + m.ubatch + 255) / 256) * 256);
-    m.n_ctx = ((m.n_ctx + 255) / 256) * 256;
     m.ring_pos.assign(m.ring, -1);
     ggml_init_params sp{(size_t) (4 * h.n_slot + 4) * ggml_tensor_overhead(), nullptr, true};
     m.sctx = ggml_init(sp);
@@ -617,6 +1160,13 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
 // speculative verify, T <= 16) read the whole K/V window in place with ggml_flash_attn_ext, the relative bias folded
 // into a per-head f16 mask, instead of transposing/dequantising V every step. Prefill keeps the chunked path (its
 // per-head mask would be [cells, T, heads]).
+// XOLOTL_INKLING_WSUM_REF=1: the MoE weighted sum as the batched f32 mat-vec (the reference) instead of inkling_moe_wsum
+inline bool wsum_ref() { static const bool on = std::getenv("XOLOTL_INKLING_WSUM_REF") != nullptr; return on; }
+// prompt chunks through inkling_attn_prompt: default on (22 Nov S9: 8K prefill GPU 3.68 -> 1.40 s, 32K wall ~27 -> 6.1 s on a
+// 4090, prefill-path NLL vs the parent gated); XOLOTL_INKLING_PROMPT_ATTN=0 = the chain
+inline bool prompt_attn_on() { static const bool on = !(std::getenv("XOLOTL_INKLING_PROMPT_ATTN") && std::atoi(std::getenv("XOLOTL_INKLING_PROMPT_ATTN")) == 0); return on; }
+struct Model;
+bool pattn_use(const Model& m, int T);   // prompt_attn_on() and this model/chunk can take it (one predicate for build() and the layer)
 inline bool fa_on() { static const bool on = std::getenv("XOLOTL_INKLING_FA") && std::atoi(std::getenv("XOLOTL_INKLING_FA")) != 0; return on; }
 struct Model;
 bool fa_ok(const Model& m, int T);
@@ -637,6 +1187,10 @@ struct Step {
     std::vector<ggml_tensor*> taps;   // --dump: l_out of every slot
     std::vector<ggml_tensor*> st_taps;   // --stats: [slot][ST_NKIND] the tensors to accumulate
     std::vector<ggml_tensor*> dtaps;     // --dspark: l_out of slots 4, 28, 46 (visits 4, 22, 40) + result_norm, [n_embd, T]
+    std::vector<ggml_tensor*> rt_ids, rt_w;   // --route-log: the top-k ids (strided argsort view) and w, per slot
+    // --vram-budget-mib: tensors to force onto the CUDA backend.  cold_w = the pinned-host weight leaves,
+    // cold_ops = the mmid and (staged mode) its copy nodes, cold_stage = the graph-allocated VRAM staging tensors.
+    std::vector<ggml_tensor*> cold_ops, cold_w, cold_stage;
     bool hist = false;                   // --dspark verify chunk: every convolve() also saves [state ; inputs]
     int64_t n_kv_full = 0, n_kv_swa = 0;
 };
@@ -658,6 +1212,7 @@ struct G {                     // graph-building context
     int64_t p0;
     ggml_tensor* tau = nullptr;
     inkling_stats::Stats* st = nullptr;   // --stats: remember these tensors as graph outputs
+    bool route = false;                   // --route-log: keep the routing tensors readable after the compute
     int il_cur = 0;
 
     // --stats: keep a tensor alive past the graph so the host can read it back after the compute
@@ -684,6 +1239,12 @@ struct G {                     // graph-building context
     // attention over the depth: earlier streams + cur, normed, softmax-weighted by learned queries -> [n_embd, nq, T]
     ggml_tensor* mix(const std::vector<ggml_tensor*>& blocks, ggml_tensor* cur, ggml_tensor* query) {
         const int64_t E = h.n_embd;
+        static const bool mix_fused = std::getenv("XOLOTL_INKLING_MIX_REF") == nullptr;   // A/B: =1 keeps the op chain
+        if (fused_on() && mix_fused) {   // the whole depth attention as one kernel
+            std::vector<ggml_tensor*> v(blocks.rbegin(), blocks.rend());
+            v.push_back(cur);
+            if (ggml_tensor* r = inkling_mix(c, v.data(), (int) v.size(), query)) return r;
+        }
         ggml_tensor* st = nullptr;
         if (fused_on() && !blocks.empty() && blocks.size() + 1 <= GGML_MAX_SRC) {   // [b_n-1 .. b_0, cur] in one copy
             std::vector<ggml_tensor*> v(blocks.rbegin(), blocks.rend());
@@ -707,11 +1268,21 @@ struct G {                     // graph-building context
     // channel offset `off`; dyn (global K/V) adds input-dependent taps per head
     ggml_tensor* convolve(ggml_tensor* x, ggml_tensor* w, ggml_tensor* dyn, ggml_tensor* state, int64_t off) {
         const int64_t K = h.n_conv, C = x->ne[0];
-        if (fused_on() && !s.hist && K <= 8 && ggml_is_contiguous(x) && x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
+        // --dspark verify (s.hist): the fused kernel also writes [state ; inputs] into conv_hist (it used to drop the
+        // whole verify graph to the op chain: ~192 unfused convolutions per verify forward).  XOLOTL_INKLING_HIST_REF=1:
+        // the chain, as before.
+        static const bool hist_ref = std::getenv("XOLOTL_INKLING_HIST_REF") != nullptr;
+        ggml_tensor* hview = nullptr;
+        if (s.hist && !hist_ref) {
+            for (Slot& z : m.S) if (z.conv == state) { if (z.conv_hist) hview = ggml_view_2d(c, z.conv_hist, K - 1 + T, C, z.conv_hist->nb[1], (size_t) off * z.conv_hist->nb[1]); break; }
+        }
+        if (fused_on() && (!s.hist || hview) && K <= 8 && ggml_is_contiguous(x) && x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 &&
             ggml_is_contiguous(w) && (!dyn || (ggml_is_contiguous(dyn) && dyn->ne[0] % K == 0 && C % (dyn->ne[0] / K) == 0))) {
             ggml_tensor* st = ggml_view_2d(c, state, K - 1, C, state->nb[1], (size_t) off * state->nb[1]);
             const int nh = dyn ? (int) (dyn->ne[0] / K) : 0;
-            return inkling_conv_step(c, x, w, st, dyn, (int) K, nh, 1.0f / std::sqrt((float) ((dyn ? 2 : 1) * K + 1)));
+            ggml_tensor* y = inkling_conv_step(c, x, w, st, dyn, (int) K, nh, 1.0f / std::sqrt((float) ((dyn ? 2 : 1) * K + 1)), hview);
+            if (hview) ggml_build_forward_expand(gf, y);
+            return y;
         }
         ggml_tensor* past = ggml_view_3d(c, state, K - 1, C, 1, state->nb[1], state->nb[1] * C, (size_t) off * state->nb[1]);
         ggml_tensor* xt = T == 1 && ggml_is_contiguous(x) ? ggml_reshape_3d(c, x, 1, C, 1)   // one token: same memory
@@ -753,14 +1324,19 @@ struct G {                     // graph-building context
         return ggml_add(c, ggml_sub(c, cur, ggml_mul(c, forget, cur)), ggml_mul(c, gain, msg));
     }
 
-    void store_kv(ggml_tensor* src, ggml_tensor* dst, bool swa) {
-        ggml_tensor* d2 = ggml_reshape_2d(c, dst, dst->ne[0] * dst->ne[1], dst->ne[2]);
+    ggml_tensor* store_kv(ggml_tensor* src, ggml_tensor* dst, bool swa) {   // returns the store (a consumer that reads
+        ggml_tensor* d2 = ggml_reshape_2d(c, dst, dst->ne[0] * dst->ne[1], dst->ne[2]);   // the cache in place lists it as a src)
         ggml_tensor* s2 = ggml_reshape_2d(c, src, src->ne[0] * src->ne[1], T);
-        ggml_build_forward_expand(gf, ggml_set_rows(c, d2, s2, swa ? s.idx_swa : s.idx_full));
+        ggml_tensor* st = ggml_set_rows(c, d2, s2, swa ? s.idx_swa : s.idx_full);
+        ggml_build_forward_expand(gf, st);
+        return st;
     }
 
+    ggml_tensor *moe_d = nullptr, *moe_wk = nullptr;   // moe() -> layer(): the fused finish's inputs
+    bool want_finish = false;
     ggml_tensor* moe(ggml_tensor* x, const Layer& y) {
         const int64_t E = h.n_embd, NE = h.n_expert, k = h.n_used;
+        moe_d = moe_wk = nullptr;
         ggml_tensor* logits = ggml_mul_mat(c, y.gate_inp, x);                    // [NE, T] (router F32)
         ggml_tensor* probs = ggml_sigmoid(c, logits);
         ggml_tensor* sel = y.probs_b ? ggml_add(c, probs, y.probs_b) : probs;
@@ -775,12 +1351,81 @@ struct G {                     // graph-building context
         w = ggml_reshape_3d(c, w, 1, k, T);
         if (h.w_scale != 0.0f && h.w_scale != 1.0f) w = ggml_scale(c, w, h.w_scale);
         ggml_build_forward_expand(gf, w);
+        if (route) {   // --route-log: both are in the graph already; output keeps them readable after the compute
+            ggml_set_output(ids);
+            ggml_set_output(w);
+            s.rt_ids[il_cur] = ids;
+            s.rt_w[il_cur] = w;
+        }
         auto exp_scale = [&](ggml_tensor* r, ggml_tensor* sc) {                   // per-expert scale of NVFP4-kept experts
             if (!sc) return r;
-            ggml_tensor* s = ggml_repeat_4d(c, ggml_reshape_3d(c, sc, 1, NE, 1), 1, NE, T, 1);
+            // one token: the [1, NE, 1] scale is already the right shape (the repeat was a copy kernel per call)
+            ggml_tensor* s = T == 1 ? ggml_reshape_3d(c, sc, 1, NE, 1) : ggml_repeat_4d(c, ggml_reshape_3d(c, sc, 1, NE, 1), 1, NE, T, 1);
             return ggml_mul(c, r, ggml_get_rows(c, s, ids));
         };
-        ggml_tensor* gu = exp_scale(ggml_mul_mat_id(c, y.gate_up_exps, ggml_reshape_3d(c, x, E, 1, T), ids), y.gate_up_s);
+        // --vram-budget-mib: expert id -> arena slot (+1; 0 = the zero expert).  get_rows wants ne0 = the row width,
+        // so the table is read through a [1, NE] view and the ids flattened ([k*T, 1]); ids is a strided view over
+        // the full argsort when T > 1, hence the cont.
+        auto slot_ids = [&](ggml_tensor* tab) {
+            ggml_tensor* ic = ggml_cont(c, ids);
+            ggml_tensor* iflat = ggml_reshape_2d(c, ic, k * T, 1);
+            ggml_tensor* map = ggml_reshape_2d(c, tab, 1, NE);
+            return ggml_reshape_2d(c, ggml_get_rows(c, map, iflat), k, T);
+        };
+        // --vram-budget-mib, the cold arena and the two kernel regimes.  mul_mat_id uses MMVQ (reads each expert's
+        // weights in place) only up to a per-type batch cap (ggml-cuda/mmvq.cu:177); above it, grouped MMQ runs,
+        // and MMQ stages weight blocks through shared memory with async copies - it cannot read a pinned-host
+        // pointer (measured: illegal access in launch_mul_mat_q).  So:
+        //   T == 1 (decode, verify): zero-copy - the mmid reads the pinned arena over PCIe where it lies.
+        //   T >= 2 (prefill): stage that layer's cold arena into a VRAM tensor first.  The staged tensor is a GRAPH
+        //     tensor, so ggml-alloc hands the same memory to the next layer once this layer's nodes are done - one
+        //     layer's worth of scratch, not the whole cold set.  The copy is a plain cudaMemcpy (UVA pinned source
+        //     is device-addressable), and everything is pinned to CUDA so the scheduler inserts no second copy.
+        static const char* stage_env = std::getenv("XOLOTL_INKLING_STAGE");
+        const std::string stage_mode = stage_env ? stage_env : "";
+        const bool zero_copy = stage_mode == "always" ? false : (stage_mode == "never" ? true : T == 1);
+        // the tensor the cold mmid must read: the pinned arena itself (zero-copy) or its staged VRAM copy
+        auto cold_weights = [&](ggml_tensor* cold) -> ggml_tensor* {
+            s.cold_w.push_back(cold);
+            if (zero_copy) return cold;
+            ggml_tensor* st = ggml_new_tensor_3d(c, cold->type, cold->ne[0], cold->ne[1], cold->ne[2]);
+            ggml_tensor* cp = ggml_cpy(c, cold, st);   // returns a view of st: using it makes the order explicit
+            ggml_build_forward_expand(gf, cp);
+            s.cold_ops.push_back(cp);
+            s.cold_stage.push_back(st);
+            return cp;
+        };
+        // the mmid over a cold weight: recorded so forward() can pin it to CUDA
+        static const bool dbg_cold = std::getenv("XOLOTL_INKLING_DBG_COLD") != nullptr;
+        auto cold_mmid = [&](ggml_tensor* w, ggml_tensor* a, ggml_tensor* sid) {
+            ggml_tensor* r = ggml_mul_mat_id(c, w, a, sid);
+            if (dbg_cold) {   // confirms src0 really is what we think: the staged view (view_src set) or the arena
+                std::fprintf(stderr, "cold mmid T=%d slot=%d: src0=%s type=%s view_src=%p data=%p\n", T, il_cur,
+                             w->name, ggml_type_name(w->type), (void*) w->view_src, w->data);
+            }
+            s.cold_ops.push_back(r);
+            return r;
+        };
+        ggml_tensor* x3 = ggml_reshape_3d(c, x, E, 1, T);
+        ggml_tensor* gu = nullptr;
+        ggml_tensor* hid = nullptr, *cid = nullptr;
+        if (y.gu_hot || y.gu_cold) {
+            // The split moves expert BYTES; it changes nothing else.  Routing ids, w and the per-expert .scale are
+            // the baseline's ops over the baseline's ids - so layers 20-23 (no .scale in this quant) apply none,
+            // exactly as the baseline does, and the scale is never re-derived per slot.
+            if (y.gu_hot) {
+                hid = slot_ids(y.hot_tab);
+                gu = ggml_mul_mat_id(c, y.gu_hot, x3, hid);
+            }
+            if (y.gu_cold) {
+                cid = slot_ids(y.cold_tab);
+                ggml_tensor* gc = cold_mmid(cold_weights(y.gu_cold), x3, cid);
+                gu = gu ? ggml_add(c, gu, gc) : gc;
+            }
+            gu = exp_scale(gu, y.gate_up_s);
+        } else {
+            gu = exp_scale(ggml_mul_mat_id(c, y.gate_up_exps, x3, ids), y.gate_up_s);
+        }
         const int64_t F = gu->ne[0] / 2;
         ggml_tensor* act;
         if (fused_on() && ggml_is_contiguous(gu) && gu->type == GGML_TYPE_F32) {
@@ -799,7 +1444,20 @@ struct G {                     // graph-building context
             tap(ids, inkling_stats::ST_IDS);
             tap(w, inkling_stats::ST_W);
         }
-        ggml_tensor* d = ggml_mul_mat_id(c, y.down_exps, act, ids);                      // [E, k, T]
+        ggml_tensor* d = nullptr;
+        if (y.dn_hot || y.dn_cold) {
+            if (y.dn_hot) {
+                if (!hid) hid = slot_ids(y.hot_tab);
+                d = ggml_mul_mat_id(c, y.dn_hot, act, hid);
+            }
+            if (y.dn_cold) {
+                if (!cid) cid = slot_ids(y.cold_tab);
+                ggml_tensor* dc = cold_mmid(cold_weights(y.dn_cold), act, cid);
+                d = d ? ggml_add(c, d, dc) : dc;
+            }
+        } else {
+            d = ggml_mul_mat_id(c, y.down_exps, act, ids);                               // [E, k, T]
+        }
         static const bool views_sum = std::getenv("XOLOTL_INKLING_MOE_VIEWS") != nullptr;    // A/B: the reference's sum
         if (views_sum) {
             d = ggml_mul(c, exp_scale(d, y.down_s), w);
@@ -813,6 +1471,14 @@ struct G {                     // graph-building context
         }
         // the weighted sum over the k experts as one batched mat-vec; the per-expert down scale folds into the weights
         ggml_tensor* wk = y.down_s ? exp_scale(w, y.down_s) : w;                           // [1, k, T]
+        // fused finish (layer() does the weighted sum + ffn post-conv + residual in one kernel): hand d and wk over
+        static const bool finish_ref = std::getenv("XOLOTL_INKLING_MOE_FINISH_REF") != nullptr;
+        if (want_finish && fused_on() && !finish_ref && d->type == GGML_TYPE_F32 && ggml_is_contiguous(d) &&
+            wk->type == GGML_TYPE_F32 && ggml_is_contiguous(wk)) {
+            moe_d = d; moe_wk = wk;
+            return nullptr;
+        }
+        if (!wsum_ref() && fused_on()) if (ggml_tensor* ws = inkling_moe_wsum(c, d, wk)) return ws;
         ggml_tensor* dT = ggml_cont(c, ggml_permute(c, d, 1, 0, 2, 3));                    // [k, E, T]
         return ggml_reshape_2d(c, ggml_mul_mat(c, dT, ggml_reshape_3d(c, wk, k, 1, T)), E, T);
     }
@@ -875,34 +1541,120 @@ struct G {                     // graph-building context
         }
         if (!Kp) Kp = ggml_mul_mat(c, y.wk, in[1]);
         if (!Vp) Vp = ggml_mul_mat(c, y.wv, in[2]);
-        ggml_tensor* Kc = convolve(Kp, y.k_conv, swa ? nullptr : ggml_mul_mat(c, y.k_conv_proj, in[1]), z.conv, 0);
-        ggml_tensor* Vc = convolve(Vp, y.v_conv, swa ? nullptr : ggml_mul_mat(c, y.v_conv_proj, in[2]), z.conv, kgqa);
-        Q = clip(ggml_reshape_3d(c, Q, hd, nh, T), y.q_clip, h.qk_clip);
-        Kc = clip(ggml_reshape_3d(c, Kc, hd, nkv, T), nullptr, h.qk_clip);
-        Vc = ggml_rms_norm(c, ggml_reshape_3d(c, Vc, hd, nkv, T), h.eps);
-        R = clip(ggml_reshape_3d(c, R, h.n_rel, nh, T), y.rel_clip, h.rel_clip);
-        if (!swa) { Q = ggml_mul(c, Q, tau); R = ggml_mul(c, R, tau); }
-
-        store_kv(Kc, z.k_cache, swa);
-        store_kv(Vc, z.v_cache, swa);
+        // fused attention prepare (K/V conv + key clip + value rms + both cache writes, one kernel per visit);
+        // XOLOTL_INKLING_PREP_REF=1 keeps the chain.  The --stats path keeps the chain (it taps nothing here, but
+        // stays on the validated graph).
+        static const bool prep_ref = std::getenv("XOLOTL_INKLING_PREP_REF") != nullptr;
+        bool prepped = false;
+        ggml_tensor *Kc = nullptr, *Vc = nullptr;
+        if (fused_on() && !prep_ref && !st && T <= 16) {   // decode + verify (the per-token loop is serial in T)
+            ggml_tensor* dk = swa ? nullptr : ggml_mul_mat(c, y.k_conv_proj, in[1]);
+            ggml_tensor* dv = swa ? nullptr : ggml_mul_mat(c, y.v_conv_proj, in[2]);
+            ggml_tensor* hview = nullptr;
+            const bool hist_ok = !s.hist || (z.conv_hist && !std::getenv("XOLOTL_INKLING_HIST_REF"));
+            if (s.hist && hist_ok) hview = z.conv_hist;
+            const int64_t K = h.n_conv;
+            ggml_tensor* pr = hist_ok ? inkling_attn_prep(c, Kp, Vp, y.k_conv, y.v_conv, z.conv, (int) kgqa, dk, dv, (int) K,
+                                                          1.0f / std::sqrt((float) ((dk ? 2 : 1) * K + 1)), swa ? s.idx_swa : s.idx_full,
+                                                          z.k_cache, z.v_cache, h.qk_clip, h.eps, hview) : nullptr;
+            if (pr) { ggml_build_forward_expand(gf, pr); prepped = true; }
+            else {
+                Kc = convolve(Kp, y.k_conv, dk, z.conv, 0);
+                Vc = convolve(Vp, y.v_conv, dv, z.conv, kgqa);
+            }
+        } else {
+            Kc = convolve(Kp, y.k_conv, swa ? nullptr : ggml_mul_mat(c, y.k_conv_proj, in[1]), z.conv, 0);
+            Vc = convolve(Vp, y.v_conv, swa ? nullptr : ggml_mul_mat(c, y.v_conv_proj, in[2]), z.conv, kgqa);
+        }
+        {   // clip (+ the global layers' log-position scale) as one kernel each when fused; else the op chains
+            static const bool clip_ref = std::getenv("XOLOTL_INKLING_CLIP_REF") != nullptr;
+            ggml_tensor* tq = swa ? nullptr : tau;
+            ggml_tensor *Qf = nullptr, *Kf = nullptr, *Rf = nullptr;
+            if (fused_on() && !clip_ref) {
+                Qf = inkling_clip(c, ggml_reshape_3d(c, Q, hd, nh, T), y.q_clip, h.qk_clip, tq);
+                if (!prepped) Kf = inkling_clip(c, ggml_reshape_3d(c, Kc, hd, nkv, T), nullptr, h.qk_clip, nullptr);
+                Rf = inkling_clip(c, ggml_reshape_3d(c, R, h.n_rel, nh, T), y.rel_clip, h.rel_clip, tq);
+            }
+            Q = Qf ? Qf : clip(ggml_reshape_3d(c, Q, hd, nh, T), y.q_clip, h.qk_clip);
+            if (!prepped) Kc = Kf ? Kf : clip(ggml_reshape_3d(c, Kc, hd, nkv, T), nullptr, h.qk_clip);
+            R = Rf ? Rf : clip(ggml_reshape_3d(c, R, h.n_rel, nh, T), y.rel_clip, h.rel_clip);
+            if (!swa && !Qf) Q = ggml_mul(c, Q, tau);
+            if (!swa && !Rf) R = ggml_mul(c, R, tau);
+        }
+        ggml_tensor *kst = nullptr, *vst = nullptr;   // the cache stores (the prompt attention orders itself after them)
+        if (!prepped) {
+            Vc = ggml_rms_norm(c, ggml_reshape_3d(c, Vc, hd, nkv, T), h.eps);
+            kst = store_kv(Kc, z.k_cache, swa);
+            vst = store_kv(Vc, z.v_cache, swa);
+        }
         const std::vector<ChunkIn>& plan = swa ? s.ck_swa : s.ck_full;
 
         // relative bias: project R on the (zero-padded) bias table, subtract the per-query sink, gather by distance
         ggml_tensor* sinks = ggml_mul_mat(c, y.sink_proj, in[0]);                         // [nh, T]
-        ggml_tensor* table = ggml_mul_mat(c, y.rel_bias_pad ? y.rel_bias_pad : ggml_pad(c, y.rel_bias, 0, 1, 0, 0), R);   // [Ext+1, nh, T]
-        table = ggml_sub(c, table, ggml_reshape_3d(c, sinks, 1, nh, T));
-        table = ggml_cont(c, ggml_permute(c, table, 1, 0, 2, 3));                          // [nh, Ext+1, T]
+        ggml_tensor* table_raw = ggml_mul_mat(c, y.rel_bias_pad ? y.rel_bias_pad : ggml_pad(c, y.rel_bias, 0, 1, 0, 0), R);   // [Ext+1, nh, T]
+        // the per-head mask (bias + causal/window mask) as one kernel when fused (XOLOTL_INKLING_RELBIAS_REF=1: the chain)
+        static const bool relbias_ref = std::getenv("XOLOTL_INKLING_RELBIAS_REF") != nullptr;
+        ggml_tensor* table = nullptr;
+        auto get_table = [&]() {
+            if (!table) {
+                table = ggml_sub(c, table_raw, ggml_reshape_3d(c, sinks, 1, nh, T));
+                table = ggml_cont(c, ggml_permute(c, table, 1, 0, 2, 3));                  // [nh, Ext+1, T]
+            }
+            return table;
+        };
+        auto fused_mask = [&](const ChunkIn& ci, ggml_type ty) -> ggml_tensor* {
+            return fused_on() && !relbias_ref ? inkling_relbias(c, table_raw, sinks, ci.rp, ci.mask, ty) : nullptr;
+        };
         ggml_tensor* q = ggml_permute(c, Q, 0, 2, 1, 3);                                    // [hd, T, nh]
         // The visible window is read in cell chunks so the score tensor [cells, T, nh] and the per-head mask stay
         // bounded at 512K context. One chunk (short context) is the single-shot softmax the engine always used; more
         // than one runs an online softmax whose initial (max 0, sum 1) is exactly the zero sink logit.
         ggml_tensor *acc = nullptr, *lse = nullptr, *mx = nullptr;
         ggml_tensor* o = nullptr;
-        if (fa_ok(m, (int) T) && plan.size() == 1) {
+        // decode / verify (T <= 16): the split-K attention kernel reads the f16 K/V window in place (no V transpose
+        // copy per step).  Default on: quality-neutral vs the chain against the NVFP4 parent (paired NLL / KL-to-parent, 22 Nov S8); XOLOTL_INKLING_DECATTN=0 = the chain
+        bool gated = false;   // the output gate already applied inside the attention kernel
+        static const bool decattn = !(std::getenv("XOLOTL_INKLING_DECATTN") && std::atoi(std::getenv("XOLOTL_INKLING_DECATTN")) == 0);
+        // prompt chunks (T > 16): flash attention on the tensor cores over the whole f16 cache, bias and sink in-kernel
+        // (port of Basalt attn_prompt.cu) - no [cells, T, nh] scores, masks or V transposes. XOLOTL_INKLING_PROMPT_ATTN=1
+        if (pattn_use(m, (int) T) && kst && vst && y.rel_bias_pad && z.k_cache->type == GGML_TYPE_F16 && z.v_cache->type == GGML_TYPE_F16) {
+            ggml_tensor* pa = inkling_attn_prompt(c, Q, z.k_cache, z.v_cache, R, sinks, y.rel_bias_pad, kst, vst, p0,
+                                                  swa ? h.n_swa : 0, 1.0f / std::sqrt((float) hd));
+            if (pa) o = ggml_reshape_2d(c, pa, (int64_t) hd * nh, T);
+        }
+        if (!o && plan.empty()) GGML_ABORT("xolotl-inkling: prompt attention refused a layer that pattn_use() admitted (a bug; XOLOTL_INKLING_PROMPT_ATTN=0 works around it)");
+        if (decattn && !fa_ok(m, (int) T) && T <= 16 && plan.size() == 1 && !m.st &&
+            z.k_cache->type == GGML_TYPE_F16 && z.v_cache->type == GGML_TYPE_F16) {
             const ChunkIn& ci = plan[0];
-            ggml_tensor* kq_b = ggml_get_rows(c, table, ci.rp);                             // [nh, cells, T]
-            kq_b = ggml_permute(c, ggml_reshape_4d(c, kq_b, nh, ci.cells, T, 1), 2, 0, 1, 3);   // [cells, T, nh]
-            ggml_tensor* mask_h = ggml_cast(c, ggml_add(c, kq_b, ci.mask), GGML_TYPE_F16);   // per-head f16 mask
+            // the relative bias computed inside the attention kernel (no table mat-mul, no [cells, T, nh] mask);
+            // XOLOTL_INKLING_DECATTN_REL=0 keeps the relbias mask
+            static const bool rel_in = !(std::getenv("XOLOTL_INKLING_DECATTN_REL") && std::atoi(std::getenv("XOLOTL_INKLING_DECATTN_REL")) == 0);
+            static const bool gate_ref0 = std::getenv("XOLOTL_INKLING_DECATTN_GATE_REF") != nullptr;
+            if (rel_in && y.rel_bias_pad) {
+                ggml_tensor* Kd = ggml_view_3d(c, z.k_cache, hd, nkv, ci.cells, z.k_cache->nb[1], z.k_cache->nb[2], (size_t) ci.j0 * z.k_cache->nb[2]);
+                ggml_tensor* Vd = ggml_view_3d(c, z.v_cache, hd, nkv, ci.cells, z.v_cache->nb[1], z.v_cache->nb[2], (size_t) ci.j0 * z.v_cache->nb[2]);
+                ggml_tensor* Gt = gate_ref0 ? nullptr : (Gp ? Gp : ggml_mul_mat(c, y.gate, in[0]));
+                ggml_tensor* ad = inkling_attn_dec_rel(c, Q, Kd, Vd, y.rel_bias_pad, R, sinks, ci.rp, ci.mask, 1.0f / std::sqrt((float) hd), Gt);
+                if (ad) { o = ggml_reshape_2d(c, ad, (int64_t) hd * nh, T); gated = Gt != nullptr; }
+            }
+            ggml_tensor* mask_h = o ? nullptr : fused_mask(ci, GGML_TYPE_F32);
+            if (mask_h) {
+                ggml_tensor* Kd = ggml_view_3d(c, z.k_cache, hd, nkv, ci.cells, z.k_cache->nb[1], z.k_cache->nb[2], (size_t) ci.j0 * z.k_cache->nb[2]);
+                ggml_tensor* Vd = ggml_view_3d(c, z.v_cache, hd, nkv, ci.cells, z.v_cache->nb[1], z.v_cache->nb[2], (size_t) ci.j0 * z.v_cache->nb[2]);
+                static const bool gate_ref = std::getenv("XOLOTL_INKLING_DECATTN_GATE_REF") != nullptr;   // A/B: gate as ggml ops
+                ggml_tensor* Gt = gate_ref ? nullptr : (Gp ? Gp : ggml_mul_mat(c, y.gate, in[0]));
+                ggml_tensor* ad = inkling_attn_dec(c, Q, Kd, Vd, mask_h, 1.0f / std::sqrt((float) hd), Gt);
+                if (ad) { o = ggml_reshape_2d(c, ad, (int64_t) hd * nh, T); gated = Gt != nullptr; }
+            }
+        }
+        if (!o && fa_ok(m, (int) T) && plan.size() == 1) {
+            const ChunkIn& ci = plan[0];
+            ggml_tensor* mask_h = fused_mask(ci, GGML_TYPE_F16);
+            if (!mask_h) {
+                ggml_tensor* kq_b = ggml_get_rows(c, get_table(), ci.rp);                   // [nh, cells, T]
+                kq_b = ggml_permute(c, ggml_reshape_4d(c, kq_b, nh, ci.cells, T, 1), 2, 0, 1, 3);   // [cells, T, nh]
+                mask_h = ggml_cast(c, ggml_add(c, kq_b, ci.mask), GGML_TYPE_F16);           // per-head f16 mask
+            }
             ggml_tensor* Kv = ggml_permute(c, ggml_view_3d(c, z.k_cache, hd, nkv, ci.cells, z.k_cache->nb[1], z.k_cache->nb[2], 0), 0, 2, 1, 3);
             ggml_tensor* Vv = ggml_permute(c, ggml_view_3d(c, z.v_cache, hd, nkv, ci.cells, z.v_cache->nb[1], z.v_cache->nb[2], 0), 0, 2, 1, 3);
             ggml_tensor* fa = ggml_flash_attn_ext(c, q, Kv, Vv, mask_h, 1.0f / std::sqrt((float) hd), 0.0f, 0.0f);
@@ -912,9 +1664,12 @@ struct G {                     // graph-building context
         }
         for (const ChunkIn& ci : plan) {
             if (o) break;
-            ggml_tensor* kq_b = ggml_get_rows(c, table, ci.rp);                             // [nh, cells, T]
-            kq_b = ggml_cont(c, ggml_permute(c, ggml_reshape_4d(c, kq_b, nh, ci.cells, T, 1), 2, 0, 1, 3));   // [cells, T, nh]
-            ggml_tensor* mask_h = ggml_add(c, kq_b, ci.mask);
+            ggml_tensor* mask_h = fused_mask(ci, GGML_TYPE_F32);
+            if (!mask_h) {
+                ggml_tensor* kq_b = ggml_get_rows(c, get_table(), ci.rp);                   // [nh, cells, T]
+                kq_b = ggml_cont(c, ggml_permute(c, ggml_reshape_4d(c, kq_b, nh, ci.cells, T, 1), 2, 0, 1, 3));   // [cells, T, nh]
+                mask_h = ggml_add(c, kq_b, ci.mask);
+            }
             ggml_tensor* Kv = ggml_permute(c, ggml_view_3d(c, z.k_cache, hd, nkv, ci.cells, z.k_cache->nb[1], z.k_cache->nb[2],
                                                           (size_t) ci.j0 * z.k_cache->nb[2]), 0, 2, 1, 3);
             ggml_tensor* Vv = ggml_permute(c, ggml_view_3d(c, z.v_cache, hd, nkv, ci.cells, z.v_cache->nb[1], z.v_cache->nb[2],
@@ -955,10 +1710,11 @@ struct G {                     // graph-building context
             o = lse ? ggml_div(c, acc, lse) : acc;                                             // [hd, T, nh]  (normalise once)
             o = ggml_cont_2d(c, ggml_permute(c, o, 0, 2, 1, 3), (int64_t) hd * nh, T);
         }
-        o = ggml_mul(c, o, ggml_sigmoid(c, Gp ? Gp : ggml_mul_mat(c, y.gate, in[0])));
+        if (!gated) o = ggml_mul(c, o, ggml_sigmoid(c, Gp ? Gp : ggml_mul_mat(c, y.gate, in[0])));
         if (st) tap(o, inkling_stats::ST_O);            // --stats: the o_proj input, exactly what wo consumes
         o = ggml_mul_mat(c, y.wo, o);
         o = convolve(o, y.attn_post_conv, nullptr, z.conv, 2 * kgqa);
+        if (y.wo_b) o = ggml_add(c, o, y.wo_b);
 
         if (ip % h.block == 0) { blocks.push_back(inpSA); cur = o; }     // a new residual stream starts here
         else cur = ggml_add(c, inpSA, o);
@@ -968,9 +1724,32 @@ struct G {                     // graph-building context
         if (messages) x = control(x, message(3), y, 3);
         x = rms(x, y.ffn_norm);
         if (st) tap(x, inkling_stats::ST_F);            // --stats: the MoE input (gate/up + the router)
+        want_finish = T <= 16;   // decode + verify; prefill keeps the sum and gets the token-parallel conv
         x = moe(x, y);
-        x = convolve(x, y.ffn_post_conv, nullptr, z.conv, 2 * kgqa + E);
-        cur = ggml_add(c, ffn_inp, x);
+        want_finish = false;
+        if (!x) {   // fused MoE finish: weighted sum over k + ffn post-conv + residual (+ the verify conv history)
+            const int64_t K = h.n_conv, off = 2 * kgqa + E;
+            ggml_tensor* stv = ggml_view_2d(c, z.conv, K - 1, E, z.conv->nb[1], (size_t) off * z.conv->nb[1]);
+            ggml_tensor* hview = (s.hist && z.conv_hist) ? ggml_view_2d(c, z.conv_hist, K - 1 + T, E, z.conv_hist->nb[1], (size_t) off * z.conv_hist->nb[1]) : nullptr;
+            static const bool hist_ref = std::getenv("XOLOTL_INKLING_HIST_REF") != nullptr;
+            ggml_tensor* f = (s.hist && (!hview || hist_ref)) ? nullptr
+                           : inkling_moe_finish(c, moe_d, moe_wk, y.ffn_post_conv, stv, ffn_inp, (int) K, 1.0f / std::sqrt((float) (K + 1)), hview);
+            if (f) {
+                if (hview) ggml_build_forward_expand(gf, f);
+                cur = f;
+            } else {   // the reference weighted sum, then the usual convolve + add
+                x = wsum_ref() ? nullptr : inkling_moe_wsum(c, moe_d, moe_wk);
+                if (!x) {
+                    ggml_tensor* dT = ggml_cont(c, ggml_permute(c, moe_d, 1, 0, 2, 3));
+                    x = ggml_reshape_2d(c, ggml_mul_mat(c, dT, ggml_reshape_3d(c, moe_wk, h.n_used, 1, T)), E, T);
+                }
+                x = convolve(x, y.ffn_post_conv, nullptr, z.conv, off);
+                cur = ggml_add(c, ffn_inp, x);
+            }
+        } else {
+            x = convolve(x, y.ffn_post_conv, nullptr, z.conv, 2 * kgqa + E);
+            cur = ggml_add(c, ffn_inp, x);
+        }
         ggml_format_name(cur, "l_out-%d", il);
         if (!s.taps.empty()) { ggml_set_output(cur); s.taps[il] = cur; }
         if (!s.dtaps.empty() && (il == 4 || il == 28 || il == 46)) { ggml_set_output(cur); s.dtaps[il == 4 ? 0 : il == 28 ? 1 : 2] = cur; }
@@ -992,6 +1771,9 @@ int64_t attn_cell_chunk(const Model& m, int T, int64_t nk, int nh) {
 }
 
 bool fa_ok(const Model& m, int T) { return fa_on() && T <= 16 && !m.st; }
+bool pattn_use(const Model& m, int T) {
+    return prompt_attn_on() && T > 16 && !m.st && m.pattn_ok && m.kv_k == GGML_TYPE_F16 && m.kv_v == GGML_TYPE_F16;
+}
 
 // T tokens at positions p0 .. p0+T-1; logits for the last n_out of them
 Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = false) {
@@ -1003,6 +1785,7 @@ Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = fals
     s.gf = ggml_new_graph_custom(c, kGraphNodes, false);
     if (dump) s.taps.assign(h.n_slot, nullptr);
     if (m.st) s.st_taps.assign((size_t) h.n_slot * inkling_stats::ST_NKIND, nullptr);
+    if (m.route_fp) { s.rt_ids.assign(h.n_slot, nullptr); s.rt_w.assign(h.n_slot, nullptr); }
     if (dspark) { s.dtaps.assign(4, nullptr); s.hist = m.spec && T <= kSpecT; }
 
     s.tokens = ggml_new_tensor_1d(c, GGML_TYPE_I32, T); ggml_set_input(s.tokens);
@@ -1028,8 +1811,11 @@ Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = fals
             }
             return v;
         };
-        s.ck_full = plan(s.n_kv_full);
-        s.ck_swa = plan(s.n_kv_swa);
+        // the prompt attention computes the causal/window test and the distance in-kernel: no host masks
+        if (!pattn_use(m, T)) {
+            s.ck_full = plan(s.n_kv_full);
+            s.ck_swa = plan(s.n_kv_swa);
+        }
     }
     if (n_out < T) { s.out_ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_out); ggml_set_input(s.out_ids); }
     s.idx_full = ggml_new_tensor_1d(c, GGML_TYPE_I64, T); ggml_set_input(s.idx_full);
@@ -1037,6 +1823,7 @@ Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = fals
 
     G g{m, h, c, s.gf, s, T, p0};
     g.st = m.st;
+    g.route = m.route_fp != nullptr;
     // log-scaled positions for the global layers: 1 + alpha*log(max(1, (pos + 1)/floor))
     ggml_tensor* tau = ggml_scale_bias(c, s.posf, 1.0f, 1.0f);
     tau = ggml_log(c, ggml_clamp(c, ggml_scale(c, tau, 1.0f / (float) h.log_floor), 1.0f, INFINITY));
@@ -1130,6 +1917,34 @@ void stats_consume(Model& m, Step& s, int T, int64_t p0) {
 }
 #endif
 
+// --route-log: append this forward's per-slot routing to the record file. The ids tensor is a strided view over the
+// full [n_expert, T] argsort (nb[1] = n_expert * 4); a flat read of ggml_nbytes() therefore starts at token 0's row
+// and runs k + (T-1)*n_expert entries, exactly the layout stats_consume() reads (inkling_main.cpp:1119-1123).
+// Record: int32 slot, phys, pass, T, k, 0; int64 p0; int32 ids[k*T]; float w[k*T].
+void route_consume(Model& m, Step& s, int T, int64_t p0) {
+    const Hp& h = m.hp;
+    const int K = h.n_used;
+    std::vector<int32_t> idraw((size_t) h.n_expert * T);
+    std::vector<int32_t> idb((size_t) K * T);
+    std::vector<float> wb((size_t) K * T);
+    for (int il = 0; il < h.n_slot; ++il) {
+        if (!s.rt_ids[il]) continue;
+        ggml_backend_tensor_get(s.rt_ids[il], idraw.data(), 0, ggml_nbytes(s.rt_ids[il]));
+        ggml_backend_tensor_get(s.rt_w[il], wb.data(), 0, ggml_nbytes(s.rt_w[il]));
+        for (int t = 0; t < T; ++t)
+            for (int kk = 0; kk < K; ++kk) idb[(size_t) kk + (size_t) t * K] = idraw[(size_t) kk + (size_t) t * h.n_expert];
+        const int32_t phys = h.phys_of(il);
+        const int32_t pass = il < h.n_phys ? 0 : 1 + (il - h.n_phys) / std::max(1, h.loop_end - h.loop_start);
+        const int32_t hdr[6] = {il, phys, pass, T, K, 0};
+        std::fwrite(hdr, sizeof(hdr), 1, m.route_fp);
+        std::fwrite(&p0, sizeof(p0), 1, m.route_fp);
+        std::fwrite(idb.data(), sizeof(int32_t), idb.size(), m.route_fp);
+        std::fwrite(wb.data(), sizeof(float), wb.size(), m.route_fp);
+        ++m.route_records;
+    }
+    std::fflush(m.route_fp);
+}
+
 // one forward pass; host logits for the last n_out tokens; taps (dump): l_out per slot, [T][n_embd] each
 void drop_graph(Model& m) {
     if (m.last) { ggml_free(m.last->ctx); delete m.last; m.last = nullptr; }
@@ -1173,6 +1988,19 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
         drop_graph(m);
         m.last = new Step(build(m, T, p0, n_out, taps != nullptr, dtap != nullptr));
         ggml_backend_sched_reset(m.sched);
+        // --vram-budget-mib: the cold arena lives in pinned host memory, which a discrete card does not accept as a
+        // weight buft (ggml-cuda's supports_buft is integrated-only), so the scheduler would copy it to VRAM.  Pin
+        // the cold mmid nodes AND their weight leaves to CUDA, after the reset (which clears ids) and before alloc
+        // (a user assignment is never overwritten, and no copy is inserted when src and node share a backend).
+        // --vram-budget-mib: pin every cold-related tensor to CUDA - the pinned-host weight leaves, the mmid nodes,
+        // and (staged mode) the copy nodes with their graph-allocated VRAM destinations.  With all of them on one
+        // backend the scheduler inserts no copy of its own and the cold path never falls to the CPU backend, which
+        // is what the pinning is for; the regime (zero-copy at T == 1, staged at T >= 2) is chosen in G::moe().
+        if (!m.last->cold_ops.empty()) {
+            for (ggml_tensor* t : m.last->cold_w) ggml_backend_sched_set_tensor_backend(m.sched, t, m.gpu);
+            for (ggml_tensor* t : m.last->cold_stage) ggml_backend_sched_set_tensor_backend(m.sched, t, m.gpu);
+            for (ggml_tensor* t : m.last->cold_ops) ggml_backend_sched_set_tensor_backend(m.sched, t, m.gpu);
+        }
         if (!ggml_backend_sched_alloc_graph(m.sched, m.last->gf)) { drop_graph(m); throw AllocFail(); }
         std::copy(key, key + 7, m.last_key);
     }
@@ -1232,9 +2060,29 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
         ggml_backend_tensor_set(s.out_ids, o.data(), 0, o.size() * sizeof(int32_t));
     }
     if (ggml_backend_sched_graph_compute(m.sched, s.gf) != GGML_STATUS_SUCCESS) { drop_graph(m); die("graph compute failed"); }
+    if (m.route_fp && !s.rt_ids.empty()) route_consume(m, s, T, p0);
 #if XOLOTL_INKLING_STATS
     if (m.st && !s.st_taps.empty()) stats_consume(m, s, T, p0);
 #endif
+    {   // XOLOTL_INKLING_NODES=1: the op histogram of the first one-token graph (where fusion would cut launches)
+        static bool shown = false;
+        static const bool want = std::getenv("XOLOTL_INKLING_NODES") != nullptr;
+        if (want && !shown && T == 1) {
+            shown = true;
+            std::map<std::string, int> hist;
+            for (int i = 0; i < ggml_graph_n_nodes(s.gf); ++i) {
+                ggml_tensor* n = ggml_graph_node(s.gf, i);
+                std::string k = ggml_op_desc(n);
+                if (n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE) k += " (no kernel)";
+                hist[k]++;
+            }
+            std::vector<std::pair<int, std::string>> v;
+            for (auto& kv : hist) v.push_back({kv.second, kv.first});
+            std::sort(v.rbegin(), v.rend());
+            std::fprintf(stderr, "xolotl-inkling: one-token graph %d nodes:\n", ggml_graph_n_nodes(s.gf));
+            for (auto& e : v) std::fprintf(stderr, "  %5d  %s\n", e.first, e.second.c_str());
+        }
+    }
     if (dbg) std::fprintf(stderr, "xolotl-inkling: T=%d nodes=%d splits=%d %s %.1f ms compute %.1f ms\n", T,
                           ggml_graph_n_nodes(s.gf), ggml_backend_sched_get_n_splits(m.sched), reuse ? "reused" : "built+alloc", ms_build + ms_alloc, ms_since(tc));
     logits.resize((size_t) n_out * h.n_vocab);
@@ -1277,7 +2125,13 @@ struct SpecStats { long long steps = 0, drafted = 0, accepted = 0; long long his
 // One verify step.  `fed` = committed tokens (positions 0..P-1, the drafter holds their taps); `next` = the target's
 // greedy token at P, not yet fed.  Commits next + the accepted drafts to `fed`, returns how many (>= 1), and leaves
 // the logits row after the last committed token in `lg` (its argmax is the next step's `next`).
-int spec_step(Model& m, std::vector<int32_t>& fed, int32_t next, std::vector<float>& lg, SpecStats& ss) {
+// `pick` (null = greedy argmax) chooses the target's token from a logits row.  Sampled speculation is exact: the draft
+// is deterministic, so drawing s ~ p from the verify row and accepting iff s == draft accepts with probability p(draft)
+// and, on a reject, s is already a draw from p restricted to != draft (the residual) - it is returned in *resample and
+// MUST be the next token (re-drawing from the same row would be biased).  *resample = -1 when every draft was accepted.
+int spec_step(Model& m, std::vector<int32_t>& fed, int32_t next, std::vector<float>& lg, SpecStats& ss,
+              const std::function<int32_t(const float*)>& pick = nullptr, int32_t* resample = nullptr) {
+    if (resample) *resample = -1;
     const int64_t P = (int64_t) fed.size();
     const int64_t nv = m.hp.n_vocab;
     int32_t d[16] = {};
@@ -1303,7 +2157,8 @@ int spec_step(Model& m, std::vector<int32_t>& fed, int32_t next, std::vector<flo
     int n = 1;
     while (n < V) {
         const float* r = lgs.data() + (size_t) (n - 1) * nv;
-        if ((int32_t) (std::max_element(r, r + nv) - r) != chunk[(size_t) n]) break;
+        const int32_t t = pick ? pick(r) : (int32_t) (std::max_element(r, r + nv) - r);
+        if (t != chunk[(size_t) n]) { if (resample) *resample = t; break; }
         ++n;
     }
     if (n < V) {
@@ -1321,7 +2176,9 @@ int spec_step(Model& m, std::vector<int32_t>& fed, int32_t next, std::vector<flo
 // the longest chunk at p whose attention scores fit the budget (global slots read p + T cells)
 int chunk_len(const Model& m, int64_t p, int64_t left) {
     int T = (int) std::min<int64_t>(m.ubatch, left);
-    while (T > 16 && ((p + T + 255) / 256) * 256 * (int64_t) T > m.attn_budget) T /= 2;
+    while (!pattn_use(m, T) && T > 16 && ((p + T + 255) / 256) * 256 * (int64_t) T > m.attn_budget) T /= 2;   // no score tensor with it
+    // a chunk's sliding keys (n_swa - 1 before it + its T) must all be in the ring at once
+    if (m.ring < m.n_ctx) T = (int) std::min<int64_t>(T, std::max<int64_t>(1, m.ring - m.hp.n_swa + 1));
     return std::max(1, T);
 }
 
@@ -1463,7 +2320,11 @@ void usage() {
     std::fprintf(stderr,
                  "usage: xolotl-inkling --serve --native <inkling-2-mini.gguf> [--context N] [--ubatch N] [--threads N]\n"
                  "       [--cpu-exps L] [--kv-type f16|q8_0|k8v4] [--dspark F | --mtp] [--attn-budget N] [--park-idle SECS] [--peer-vram URL]\n"
-                 "       [--no-park-copy]\n"
+                 "       [--no-park-copy] [--route-log PATH]\n"
+                 "  --route-log appends per-visit routing records (slot, phys, pass, ids, w) for expert-usage analysis;\n"
+                 "  off by default, and off costs nothing (no tap tensor is marked).  XOLOTL_INKLING_ROUTE_LOG=PATH too.\n"
+                 "  --vram-budget-mib N (off by default) keeps each layer's most-routed experts in VRAM and the rest in\n"
+                 "  pinned host RAM, so a 12 GB card runs the 14 GB quant; the loop core (visited 3x) is kept first.\n"
                  "  --kv-type quantises the full-context K/V cache (k8v4 = K q8_0, V q4_0; the sliding-window rings stay f16).\n"
                  "  --attn-budget caps one prefill chunk's n_kv*T scores and sizes the attention cell chunks (default 33554432).\n"
                  "       xolotl-inkling --dump <inkling-2-mini.gguf> --ids a,b,c,... --out-dir DIR [--gen N]\n"
@@ -1486,9 +2347,10 @@ int main(int argc, char** argv) {
     bool serve = false, dump = false, park_copy = true;
     ggml_type kv_k = GGML_TYPE_F16, kv_v = GGML_TYPE_F16;
     int64_t ctx = 0, attn_budget = 1 << 25;
-    int ubatch = 512, threads = 8, gen_n = 0;
+    int ubatch = 0, threads = 8, gen_n = 0;   // ubatch 0 = auto (2048 with the prompt attention on a >= 20 GB card, else 512)
     double park_idle_s = 0;
-    std::string peer_vram;
+    std::string peer_vram, route_log;
+    int64_t vram_budget_mib = 0;
     // --stats
     bool stats = false, per_visit = false, with_down_hess = false, dump_eval = true;
     std::string tokens_path, stats_out, meta_path;
@@ -1498,6 +2360,12 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> std::string { if (i + 1 >= argc) { usage(); std::exit(2); } return argv[++i]; };
+        if (a == "--arena-selftest") {   // the remap probe alone: a few MB of VRAM, no model load
+            const std::string p = val();
+            const int l = i + 1 < argc ? std::atoi(argv[i + 1]) : 0;
+            if (i + 1 < argc && argv[i + 1][0] != '-') ++i;
+            return arena_selftest_main(p, l);
+        }
         if (a == "--serve") serve = true;
         else if (a == "--dump") { dump = true; gguf_path = val(); }
         else if (a == "--stats") {
@@ -1522,10 +2390,12 @@ int main(int argc, char** argv) {
         else if (a == "--ubatch") ubatch = std::atoi(val().c_str());
         else if (a == "--threads") threads = std::atoi(val().c_str());
         else if (a == "--cpu-exps") cpu_exps = val();
+        else if (a == "--vram-budget-mib") vram_budget_mib = std::atoll(val().c_str());
         else if (a == "--attn-budget") attn_budget = std::max<int64_t>(4096, std::atoll(val().c_str()));
         else if (a == "--park-idle") park_idle_s = std::atof(val().c_str());
         else if (a == "--peer-vram") peer_vram = val();
         else if (a == "--no-park-copy") park_copy = false;
+        else if (a == "--route-log") route_log = val();
         else if (a == "--ids") ids_arg = val();
         else if (a == "--out-dir") out_dir = val();
         else if (a == "--gen") gen_n = std::atoi(val().c_str());
@@ -1548,11 +2418,27 @@ int main(int argc, char** argv) {
                              "(exp_dn_sq, the per-expert down diagonal, is); continuing with the diagonal only\n");
     signal(SIGPIPE, SIG_IGN);
 
+    if (route_log.empty()) if (const char* e = std::getenv("XOLOTL_INKLING_ROUTE_LOG")) route_log = e;
+
     Model m;
+    // ubatch 0 = auto: load() picks the biggest prompt chunk (2048 / 1024 / 512 / 256) that the VRAM left after the
+    // weights holds with its KV, compute buffer and the drafter (bigger chunks read each expert once for more rows:
+    // 8K prefill GPU 1.84 s at 512 -> 1.40 s at 2048; compute ~0.75 MiB a row, measured t16)
+    m.ubatch_auto = ubatch <= 0 && !stats;
+    if (ubatch <= 0) ubatch = 512;
     m.ubatch = std::max(16, stats ? std::min(ubatch, s_chunk) : ubatch);
     m.attn_budget = attn_budget;
     m.kv_k = kv_k;
     m.kv_v = kv_v;
+    m.vram_budget_mib = vram_budget_mib;
+    if (!route_log.empty()) {   // --route-log: file header, then route_consume() appends one record per slot visit
+        m.route_fp = std::fopen(route_log.c_str(), "wb");
+        if (!m.route_fp) { std::fprintf(stderr, "xolotl-inkling: cannot write --route-log %s\n", route_log.c_str()); return 2; }
+        static char rb[1 << 20];
+        std::setvbuf(m.route_fp, rb, _IOFBF, sizeof rb);
+        const uint32_t rh[3] = {0x54525851u /* "XQRT" */, 1u, 0u};   // magic, version, reserved
+        std::fwrite(rh, sizeof(rh), 1, m.route_fp);
+    }
     try {
         const int64_t want_ctx = stats ? std::max<int64_t>(s_seq > 0 ? s_seq + 16 : 0, 1024)
                              : dump ? std::max<int64_t>(ctx, 4096) : ctx;
@@ -1562,6 +2448,11 @@ int main(int argc, char** argv) {
             dspark_prefix = "dspark.";
         }
         m.spec = !dspark_path.empty();
+        if (m.spec) {   // the drafter loads after the target: hold its file size (+ its buffers) out of the auto ubatch
+            FILE* df = std::fopen(dspark_path.c_str(), "rb");
+            if (df) { std::fseek(df, 0, SEEK_END); m.extra_vram = (size_t) std::ftell(df) + (512ull << 20); std::fclose(df); }
+            if (dspark_path == gguf_path) m.extra_vram = 1536ull << 20;   // --mtp: built in, ~0.6 GB of drafter tensors
+        }
         load(m, gguf_path, want_ctx, threads, cpu_exps, park_copy && serve);
         if (m.spec) {
             DsparkTarget tgt{m.tok_embd, m.tok_norm, m.output};
@@ -1577,12 +2468,51 @@ int main(int argc, char** argv) {
 
     if (dump) {
         std::vector<int32_t> ids;
+        if (!ids_arg.empty() && ids_arg[0] == '@') {   // --ids @file: the comma list from a file (32K+ ids exceed argv limits)
+            FILE* fi = std::fopen(ids_arg.c_str() + 1, "rb");
+            if (!fi) die("cannot read " + ids_arg.substr(1));
+            std::string b; char tmp[65536]; size_t r;
+            while ((r = std::fread(tmp, 1, sizeof tmp, fi)) > 0) b.append(tmp, r);
+            std::fclose(fi);
+            ids_arg = b;
+        }
         if (!parse_ids(ids_arg.c_str(), ids) || out_dir.empty()) { usage(); return 2; }
         std::vector<float> lg;
         std::vector<std::vector<float>> taps;
         try {
             const auto t0 = Clock::now();
-            const bool chunked = ids.size() > 256;   // long prompts: chunked like serve, logits only (no slot taps)
+            // XOLOTL_INKLING_DUMP_T=N: forwards of at most N tokens (1 = every logit from the one-token decode graph)
+            static const int dump_t = std::getenv("XOLOTL_INKLING_DUMP_T") ? std::max(1, std::atoi(std::getenv("XOLOTL_INKLING_DUMP_T"))) : 1 << 30;
+            // XOLOTL_INKLING_DUMP_TAIL=N: the last chunk is exactly the last N tokens (its taps = those N rows);
+            // XOLOTL_INKLING_DUMP_LAST=1: keep/write only the final logit row (a 13K-token prompt's [T][n_vocab] is 10 GB)
+            static const int64_t dump_tail = std::getenv("XOLOTL_INKLING_DUMP_TAIL") ? std::max(0, std::atoi(std::getenv("XOLOTL_INKLING_DUMP_TAIL"))) : 0;
+            static const bool dump_last = std::getenv("XOLOTL_INKLING_DUMP_LAST") != nullptr;
+            std::vector<int64_t> tap_rows;
+            if (const char* tr = std::getenv("XOLOTL_INKLING_TAP_ROWS")) {
+                std::string a = tr;
+                if (!a.empty() && a[0] == '@') {
+                    FILE* fi = std::fopen(a.c_str() + 1, "rb");
+                    if (!fi) die("cannot read " + a.substr(1));
+                    a.clear(); char tb[65536]; size_t r;
+                    while ((r = std::fread(tb, 1, sizeof tb, fi)) > 0) a.append(tb, r);
+                    std::fclose(fi);
+                }
+                for (const char* q = a.c_str(); *q;) {
+                    char* e = nullptr; const long long v = std::strtoll(q, &e, 10);
+                    if (e == q) { ++q; continue; }
+                    if (v >= 0 && v < (long long) ids.size()) tap_rows.push_back(v);
+                    q = e;
+                }
+                std::sort(tap_rows.begin(), tap_rows.end());
+                tap_rows.erase(std::unique(tap_rows.begin(), tap_rows.end()), tap_rows.end());
+            }
+            auto dchunk = [&](int64_t p, int64_t left) {
+                int64_t T = std::min(chunk_len(m, p, left), dump_t);
+                const int64_t cut = (int64_t) ids.size() - std::min<int64_t>(dump_tail, (int64_t) ids.size());
+                if (dump_tail > 0 && p < cut) T = std::min<int64_t>(T, cut - p);
+                return (int) T;
+            };
+            const bool chunked = ids.size() > 256 || dump_t < (int) ids.size();   // long prompts: chunked like serve, logits only
             std::vector<float> dt;
             // XOLOTL_INKLING_DUMP_NLL=1: no logits file; nll.f32 [T-1] = -log p(ids[t+1] | ids[..t]) computed per chunk,
             // so a long-context perplexity run (32K+ tokens) needs no [T][n_vocab] buffer
@@ -1590,7 +2520,7 @@ int main(int argc, char** argv) {
             if (nll_only) {
                 std::vector<float> part, nll;
                 for (size_t p = 0; p < ids.size();) {
-                    const int T = chunk_len(m, (int64_t) p, (int64_t) (ids.size() - p));
+                    const int T = dchunk((int64_t) p, (int64_t) (ids.size() - p));
                     forward(m, ids.data() + p, T, (int64_t) p, T, part, nullptr, nullptr);
                     for (int t = 0; t < T && p + t + 1 < ids.size(); ++t) {
                         const float* r = part.data() + (size_t) t * n_vocab;
@@ -1613,10 +2543,32 @@ int main(int argc, char** argv) {
                 std::vector<float> part;
                 lg.clear();
                 for (size_t p = 0; p < ids.size();) {
-                    const int T = chunk_len(m, (int64_t) p, (int64_t) (ids.size() - p));
-                    forward(m, ids.data() + p, T, (int64_t) p, T, part, nullptr, m.dspark ? &dt : nullptr);
+                    const int T = dchunk((int64_t) p, (int64_t) (ids.size() - p));
+                    // the last chunk keeps its slot taps (l_out-<slot>.f32 = that chunk's T rows); with
+                    // XOLOTL_INKLING_TAP_ROWS (sorted positions, "a,b,c" or @file) every chunk that holds a listed
+                    // position keeps its taps and l_out-<slot>.f32 = those rows, in list order
+                    const bool last = p + (size_t) T == ids.size();
+                    bool want = last && tap_rows.empty();
+                    if (!tap_rows.empty()) {
+                        auto it = std::lower_bound(tap_rows.begin(), tap_rows.end(), (int64_t) p);
+                        want = it != tap_rows.end() && *it < (int64_t) (p + T);
+                    }
+                    std::vector<std::vector<float>> ctaps;
+                    // DUMP_LAST: one logit row per chunk, like serve's prefill (all T rows = [T][n_vocab] to the host per chunk)
+                    forward(m, ids.data() + p, T, (int64_t) p, dump_last ? 1 : T, part, want ? (tap_rows.empty() ? &taps : &ctaps) : nullptr,
+                            m.dspark ? &dt : nullptr);
+                    if (want && !tap_rows.empty()) {
+                        const int64_t E = m.hp.n_embd;
+                        if (taps.empty()) taps.assign(m.hp.n_slot, {});
+                        for (auto it = std::lower_bound(tap_rows.begin(), tap_rows.end(), (int64_t) p);
+                             it != tap_rows.end() && *it < (int64_t) (p + T); ++it)
+                            for (int sl = 0; sl < m.hp.n_slot; ++sl)
+                                taps[sl].insert(taps[sl].end(), ctaps[sl].begin() + (*it - (int64_t) p) * E,
+                                                ctaps[sl].begin() + (*it - (int64_t) p + 1) * E);
+                    }
                     if (m.dspark) dspark_add_ctx(*m.dspark, dt.data(), T, (int64_t) p);
-                    lg.insert(lg.end(), part.begin(), part.end());
+                    if (!dump_last) lg.insert(lg.end(), part.begin(), part.end());
+                    else if (last) lg.assign(part.end() - n_vocab, part.end());
                     p += T;
                 }
             }
@@ -1628,7 +2580,7 @@ int main(int argc, char** argv) {
                 std::fclose(f);
             };
             wr("logits.f32", lg);
-            if (!chunked) for (int s = 0; s < m.hp.n_slot; ++s) wr("l_out-" + std::to_string(s) + ".f32", taps[s]);
+            if (!taps.empty()) for (int s = 0; s < m.hp.n_slot; ++s) wr("l_out-" + std::to_string(s) + ".f32", taps[s]);
             if (m.dspark && !chunked) dspark_add_ctx(*m.dspark, dt.data(), (int) ids.size(), 0);
             if (gen_n > 0 && m.dspark) {   // greedy continuation, speculative (must print the same ids as without --dspark)
                 std::vector<float> row(lg.end() - n_vocab, lg.end());
@@ -1976,16 +2928,29 @@ int main(int argc, char** argv) {
         long long gen = 0;
         const char* why = "length";
         std::vector<int32_t> hist;
-        const bool spec_req = spec_ok && sp.greedy && !sp.logit_bias &&
+        static const bool spec_sampled = !(std::getenv("XOLOTL_SPEC_SAMPLED") && std::string(std::getenv("XOLOTL_SPEC_SAMPLED")) == "0");
+        const bool spec_req = spec_ok && (sp.greedy || spec_sampled) && !sp.logit_bias &&
                               (sp.penalty_last_n <= 0 || (sp.penalty_repeat == 1.0f && sp.penalty_freq == 0.0f && sp.penalty_present == 0.0f));
         SpecStats ss;
         try {
-            if (spec_req) {   // speculative greedy decode: one verify forward commits 1..kSpecT tokens
+            if (spec_req) {   // speculative decode (greedy, or exact sampled - see spec_step): one verify commits 1..kSpecT
+                uint64_t draws = 0;
+                std::function<int32_t(const float*)> pick = nullptr;
+                if (!sp.greedy) pick = [&](const float* row) {   // the request's sampler on one row (no penalties here)
+                    cudaMemcpy(d_logits, row, (size_t) n_vocab * sizeof(float), cudaMemcpyHostToDevice);
+                    sp.counter = draws++;
+                    int t = 0;
+                    strata::kernels::sample_tokens(d_logits, 1, n_vocab, nullptr, 0, sp, d_next, nullptr);
+                    cudaMemcpy(&t, d_next, sizeof(int), cudaMemcpyDeviceToHost);
+                    return (int32_t) t;
+                };
+                int32_t carry = -1;   // a rejected verify row's draw: it IS the next token
                 for (;;) {
-                    const int32_t nx = (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+                    const int32_t nx = carry >= 0 ? carry
+                                     : pick ? pick(lg.data()) : (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
                     if ((int64_t) fed.size() + 1 >= m.n_ctx) { std::printf("T %d\n", nx); ++gen; std::fflush(stdout); break; }
                     const size_t f0 = fed.size();
-                    spec_step(m, fed, nx, lg, ss);
+                    spec_step(m, fed, nx, lg, ss, pick, &carry);
                     bool end = false;
                     for (size_t k = f0; k < fed.size(); ++k) {
                         std::printf("T %d\n", fed[k]);

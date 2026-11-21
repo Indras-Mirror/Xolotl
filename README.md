@@ -12,7 +12,11 @@
 
 ## Latest
 
-- **21 Nov** - **[Inkling-2-Mini](docs/INKLING.md)** (Thinking Machines, 26B looped MoE, 5.4B active per token) on
+- **22 Nov** - **Inkling-2-Mini prefill 1.2K -> 4.2K tok/s at 32K** (tensor-core prompt attention with the relative
+  bias in-kernel, ported from Basalt; 2048-row prompt chunks), **decode 93 -> 113 tok/s**, 136 tok/s with the DSpark
+  drafter, on one RTX 4090. Quality checked against the NVFP4 parent.
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-prefill-12k---42k-toks-at-32k-decode-93---113-toks-dspark-136-toks-22-nov).
+- **21 Nov** - **[Inkling-2-Mini](docs/INKLING.md)** (Thinking Machines, 26B looped MoE, 3B active, ~5.4B effective per token with its 3x loop) on
   its own engine, `xolotl-inkling`: **93 tok/s decode** on one RTX 4090 after kernel fusion (from 57), 1.1K+ tok/s
   prefill. Our abliterated 13.93 GB XQ quant matches its parents (MMLU-100 76 %, HumanEval, tool use) and refuses
   4/100 harmful prompts: [IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored).

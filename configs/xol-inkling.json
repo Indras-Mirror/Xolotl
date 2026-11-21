@@ -5,7 +5,8 @@
     "GGUF's general.architecture is inkling2_loop (serve/server.py treats inkling2 and inkling2_loop alike).",
     "The chat template has no generation prompt: the model writes <|message_model|> itself, and the thinking",
     "effort is a template variable (a short prompt system message). Sampling: the model's generation_config.json",
-    "(temperature 1.0, do_sample). The 'tokenizer' folder is the pack (vocab.json, merges.txt, token_type.json,",
+    "(temperature 1.0, top_p 1.0, no top-k; 64 is the engine maximum (a request top_k of 0 maps to it).",
+    "A small top-k such as 20 makes the thinking loop, a known model-card limitation), do_sample. The 'tokenizer' folder is the pack (vocab.json, merges.txt, token_type.json,",
     "tokenizer.json with pre=inkling2 and special_ids), exported from the checkpoint by tools/inkling/export_tokenizer.py;",
     "without it the server refuses to start and says so."
   ],
@@ -28,6 +29,8 @@
   "gpu": 0,
 
   "sampling": {
-    "temperature": 1.0
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 64
   }
 }

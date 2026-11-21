@@ -8,8 +8,16 @@
 // inputs (written in place).  x [C, T] contiguous, w [K, C], state = a [K-1, C] view of the slot's conv state,
 // dyn = nullptr or [K * nh, T] (per-head input-dependent taps).  The chain it replaces: concat + cpy + ssm_conv
 // (+ K x (cont transpose + mul + add)) + add + scale.
+// hist (optional, --dspark verify) = a [K-1+T, C] view (row per channel) that receives [state ; inputs] for the exact
+// rollback of a rejected draft tail, the chain's concat + cpy.
 ggml_tensor* inkling_conv_step(ggml_context* c, ggml_tensor* x, ggml_tensor* w, ggml_tensor* state, ggml_tensor* dyn,
-                               int K, int nh, float scale);
+                               int K, int nh, float scale, ggml_tensor* hist = nullptr);
+
+// MoE finish: res + conv_step(sum_i d[:, i, t] * wk[i, t]) in one kernel - the routing-weighted sum of the k expert
+// outputs d [C, k, T] (wk [k, T]), the ffn post-convolution (state/hist as inkling_conv_step, no dynamic taps), and the
+// residual add.  Replaces cont + permute + the weighted-sum mat-vec + conv + add.
+ggml_tensor* inkling_moe_finish(ggml_context* c, ggml_tensor* d, ggml_tensor* wk, ggml_tensor* w, ggml_tensor* state,
+                                ggml_tensor* res, int K, float scale, ggml_tensor* hist = nullptr);
 
 // SiTU on a gate|up tensor gu [2F, k, T]: beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u) -> [F, k, T].
 // The chain it replaces: 2 conts + scale + tanh + scale + sigmoid + mul (+ scale + tanh + scale) + mul.
@@ -17,6 +25,56 @@ ggml_tensor* inkling_situ(ggml_context* c, ggml_tensor* gu, float beta, float lb
 
 // [E, n, T] from n tensors of [E, T] (contiguous F32, n <= GGML_MAX_SRC): row i = srcs[i]; nullptr if not applicable
 ggml_tensor* inkling_stack(ggml_context* c, ggml_tensor* const* srcs, int n);
+
+// thr * l2_norm(x [* scale], eps = thr) [* tau] over rows of x [hd, nh, T] (hd < 1024); scale [hd, nh], tau [T]; the
+// mul + l2_norm + scale (+ mul) chain of clip() as one kernel; nullptr if not applicable
+ggml_tensor* inkling_clip(ggml_context* c, ggml_tensor* x, ggml_tensor* scale, float thr, ggml_tensor* tau);
+
+// mix(): rms-normed streams srcs[i] [E, T] (n <= 9), softmax over <stream, query_j>/sqrt(E), weighted sum -> [E, nq, T]
+// (query [E, nq], nq <= 4) in one kernel; fp32, a different summation order than the 6-kernel chain (rounding level)
+ggml_tensor* inkling_mix(ggml_context* c, ggml_tensor* const* srcs, int n, ggml_tensor* query);
+
+// the relative-position bias mask for attention: M[j, t, h] = (table[rp[j, t], h, t] - sinks[h, t]) + mask[j, t] as
+// [cells, T, nh] F32 (or F16 for flash attention) in one kernel; table [Ext+1, nh, T] (contiguous), sinks [nh, T],
+// rp/mask [cells, T] (row views ok).  Bit-identical to sub + permute + get_rows + permute + add (+ cast).
+ggml_tensor* inkling_relbias(ggml_context* c, ggml_tensor* table, ggml_tensor* sinks, ggml_tensor* rp, ggml_tensor* mask,
+                             ggml_type out_type);
+
+// decode / verify attention (T <= 64) over an f16 K/V window read in place: q [HD, nh, T] (contiguous F32), k/v
+// [HD, nkv, cells] F16 views (nh % nkv == 0, nh / nkv <= 4, HD 64/128/256), mask = the inkling_relbias F32 output
+// [cells, T, nh] (bias + causal/window mask); softmax(q.k * scale + mask) with a zero sink logit, times V -> [HD, nh, T].
+// Two kernels (split-K partials + reduce) replace the V transpose copy + K.Q + softmax + V.P chain; fp32 math.
+// gate (optional) = [HD * nh, T] F32 pre-activations: the output is multiplied by sigmoid(gate) (the attention output gate).
+ggml_tensor* inkling_attn_dec(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* mask, float scale,
+                              ggml_tensor* gate = nullptr);
+
+// the MoE weighted sum x [C, T] = sum_i d[:, i, t] * wk[i, t] (d [C, k, T], wk k*T floats), for prompt chunks
+ggml_tensor* inkling_moe_wsum(ggml_context* c, ggml_tensor* d, ggml_tensor* wk);
+
+// prompt attention (T > 16), flash style on the tensor cores (port of Basalt attn_prompt.cu, MIT): q [128, nh, T] (nh = 3 nkv),
+// k/v = the whole f16 cache [128, nkv, cap] (position p in cell p % cap), R [16, nh, T], sinks [nh, T], relb [16, Ext+1];
+// rows at positions pos0..pos0+T-1, window > 0 = sliding.  kst/vst = the cache stores (ordering only).  nullptr = unsupported.
+ggml_tensor* inkling_attn_prompt(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* R,
+                                 ggml_tensor* sinks, ggml_tensor* relb, ggml_tensor* kst, ggml_tensor* vst, int64_t pos0,
+                                 int window, float scale);
+
+// inkling_attn_dec with the relative bias computed in-kernel instead of a [cells, T, nh] mask: bias(j, h) =
+// (relb[:, rp[j]] . R[:, h, t] - sinks[h, t]) + mask[j, t]; relb = the padded table [n_rel, Ext+1] (n_rel <= 32),
+// R [n_rel, nh, T] (the clipped relative state), sinks [nh, T], rp/mask [cells, T] row views (the host plan).
+// Replaces the table mat-mul + inkling_relbias + the mask read.
+ggml_tensor* inkling_attn_dec_rel(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* relb,
+                                  ggml_tensor* Rt, ggml_tensor* sinks, ggml_tensor* rp, ggml_tensor* mask, float scale,
+                                  ggml_tensor* gate = nullptr);
+
+// attention prepare (key/value side) in one kernel: K and V convolutions (xk/xv [C, T] rows, C = hd*nkv; state = the
+// slot's whole conv state, K at row 0 and V at row off_v; dynk/dynv = the global layers' dynamic taps or nullptr), the
+// key clip and value RMS norm per head row, the f16 writes of both into kcache/vcache [hd, nkv, cells] at cells idx [T]
+// (I64), and the optional verify history (hist = the slot's conv_hist).  Returns a 1-element tensor to expand into the
+// graph BEFORE the attention reads the caches.  Replaces 2 conv + clip + rms_norm + 2 set_rows.
+ggml_tensor* inkling_attn_prep(ggml_context* c, ggml_tensor* xk, ggml_tensor* xv, ggml_tensor* wk, ggml_tensor* wv,
+                               ggml_tensor* state, int off_v, ggml_tensor* dynk, ggml_tensor* dynv, int K, float scale,
+                               ggml_tensor* idx, ggml_tensor* kcache, ggml_tensor* vcache, float thr, float eps,
+                               ggml_tensor* hist);
 
 // true when the ggml build runs these on CUDA (the custom-op hook is present); else the engine keeps the op chains
 bool inkling_fused_available();

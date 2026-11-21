@@ -114,6 +114,8 @@ struct Dspark {
     ggml_tensor *fold_w = nullptr, *fold_b = nullptr;
     ggml_tensor *hoT = nullptr;                     // dspark_hidden_out transposed: [n_embd, 256] f32
     ggml_tensor *jctx = nullptr;
+    ggml_tensor *jst = nullptr, *jpv = nullptr;     // joint_proj[:, 0:256] / [:, 256:512] as [256, 768] f32 (markov, on the GPU)
+    ggml_tensor *ctx_buf = nullptr;                 // [768, block] f32: the block's markov ctx term stays on the GPU
     ggml_tensor *base_buf = nullptr;                // [vocab, block] f32: the block's base logits stay on the GPU                    // joint_proj[:, 512:] as [2*n_embd, 768] f32 (the ctx part, on the GPU)
     float tau = 0.0f;                               // XOLOTL_DSPARK_TAU: stop drafting once the cumulative confidence < tau
     int max_draft = 7;                              // XOLOTL_DSPARK_MAXD
@@ -450,10 +452,13 @@ Dspark* dspark_load(const std::string& path, ggml_backend_t gpu, const DsparkTar
             ggml_backend_buffer_clear(d->sbuf, 0);
             d->state_bytes = ggml_backend_buffer_get_size(d->sbuf);
 
-            ggml_init_params fp{6 * ggml_tensor_overhead(), nullptr, true};
+            ggml_init_params fp{10 * ggml_tensor_overhead(), nullptr, true};
             d->fctx = ggml_init(fp);
             if (!d->fctx) dfail("cannot create the drafter fold context");
-            d->fold_w = ggml_new_tensor_2d(d->fctx, GGML_TYPE_F32, d->markov_rank, d->vocab);
+            // fold_w is read in full by every draft slot (7 x per draft): F16 halves that traffic.  Draft quality only
+            // moves the acceptance rate, never the output (verify is exact).  XOLOTL_DSPARK_FOLD_F32=1 keeps fp32.
+            const ggml_type fold_t = std::getenv("XOLOTL_DSPARK_FOLD_F32") ? GGML_TYPE_F32 : GGML_TYPE_F16;
+            d->fold_w = ggml_new_tensor_2d(d->fctx, fold_t, d->markov_rank, d->vocab);
             d->fold_b = ggml_new_tensor_2d(d->fctx, GGML_TYPE_F32, d->vocab, 1);
             d->hoT = ggml_new_tensor_2d(d->fctx, GGML_TYPE_F32, d->n_embd, d->markov_rank);
             ggml_format_name(d->fold_w, "dspark_fold_w");
@@ -463,6 +468,12 @@ Dspark* dspark_load(const std::string& path, ggml_backend_t gpu, const DsparkTar
             ggml_format_name(d->jctx, "dspark_jctx");
             d->base_buf = ggml_new_tensor_2d(d->fctx, GGML_TYPE_F32, d->vocab, d->block);
             ggml_format_name(d->base_buf, "dspark_base");
+            d->jst = ggml_new_tensor_2d(d->fctx, GGML_TYPE_F32, d->markov_rank, 768);
+            d->jpv = ggml_new_tensor_2d(d->fctx, GGML_TYPE_F32, d->markov_rank, 768);
+            d->ctx_buf = ggml_new_tensor_2d(d->fctx, GGML_TYPE_F32, 768, d->block);
+            ggml_format_name(d->jst, "dspark_jst");
+            ggml_format_name(d->jpv, "dspark_jpv");
+            ggml_format_name(d->ctx_buf, "dspark_ctxm");
             d->fbuf = ggml_backend_alloc_ctx_tensors(d->fctx, d->gpu);
             if (!d->fbuf) dfail("cannot allocate the folded LM head in VRAM");
             ggml_backend_buffer_clear(d->fbuf, 0);
@@ -477,6 +488,15 @@ Dspark* dspark_load(const std::string& path, ggml_backend_t gpu, const DsparkTar
                 for (int64_t o = 0; o < 768; ++o)
                     for (int64_t k = 0; k < I; ++k) jc[(size_t) (o * I + k)] = d->h_joint[(size_t) ((R2 + k) * 768 + o)];
                 ggml_backend_tensor_set(d->jctx, jc.data(), 0, jc.size() * sizeof(float));
+                const int64_t R = d->markov_rank;   // the recurrence's two 256-wide inputs, [out][in] for ggml_mul_mat
+                std::vector<float> js((size_t) R * 768), jp((size_t) R * 768);
+                for (int64_t o = 0; o < 768; ++o)
+                    for (int64_t e = 0; e < R; ++e) {
+                        js[(size_t) (o * R + e)] = d->h_joint[(size_t) (e * 768 + o)];
+                        jp[(size_t) (o * R + e)] = d->h_joint[(size_t) ((R + e) * 768 + o)];
+                    }
+                ggml_backend_tensor_set(d->jst, js.data(), 0, js.size() * sizeof(float));
+                ggml_backend_tensor_set(d->jpv, jp.data(), 0, jp.size() * sizeof(float));
             }
             if (const char* e = std::getenv("XOLOTL_DSPARK_TAU")) d->tau = (float) std::atof(e);
             else d->tau = 0.35f;
@@ -504,8 +524,9 @@ Dspark* dspark_load(const std::string& path, ggml_backend_t gpu, const DsparkTar
                 const int64_t n = std::min<int64_t>(CH, d->vocab - v0);
                 ggml_tensor* us = ggml_view_2d(c, d->unembed, E, n, d->unembed->nb[1], (size_t) v0 * d->unembed->nb[1]);
                 ggml_tensor* r = ggml_mul_mat(c, d->hoT, us);                 // [256, n] = ho^T @ unembed[:, v0:]
-                ggml_tensor* dst = ggml_view_2d(c, d->fold_w, d->markov_rank, n, (size_t) d->markov_rank * sizeof(float),
-                                                (size_t) v0 * d->markov_rank * sizeof(float));
+                const size_t es = ggml_element_size(d->fold_w);
+                ggml_tensor* dst = ggml_view_2d(c, d->fold_w, d->markov_rank, n, (size_t) d->markov_rank * es,
+                                                (size_t) v0 * d->markov_rank * es);
                 ggml_build_forward_expand(gr.gf, ggml_cpy(c, r, dst));
             }
             ggml_tensor* fb = ggml_mul_mat(c, d->unembed, d->ho_b);           // [vpad, 1]
@@ -693,6 +714,7 @@ int dspark_draft(Dspark& d, int32_t anchor, int64_t T, int32_t* out, int* n_all)
     ggml_tensor* ctxg = ggml_add(c, ggml_mul_mat(c, d.jctx, ggml_concat(c, hidden, ggml_repeat(c, frnn_in, hidden), 0)), d.joint_b);
     ggml_set_output(ctxg);
     ggml_build_forward_expand(gr.gf, ctxg);
+    ggml_build_forward_expand(gr.gf, ggml_cpy(c, ctxg, d.ctx_buf));     // read by the device markov graph
     ggml_tensor* base = ggml_mul_mat(c, d.unembed, hidden);                        // [vpad, B]
     ggml_tensor* bview = ggml_view_2d(c, base, d.vocab, B, base->nb[1], 0);
     base = ggml_cont(c, bview);
@@ -720,12 +742,13 @@ int dspark_draft(Dspark& d, int32_t anchor, int64_t T, int32_t* out, int* n_all)
         ggml_backend_tensor_set(frnn_in, d.f_rnn.data(), 0, (size_t) E * sizeof(float));
     }
     if (ggml_backend_sched_graph_compute(d.sched, gr.gf) != GGML_STATUS_SUCCESS) { ggml_free(gr.ctx); dfail("drafter block compute failed"); }
-    std::vector<float> ctxm_gpu((size_t) 768 * B);
-    ggml_backend_tensor_get(ctxg, ctxm_gpu.data(), 0, ctxm_gpu.size() * sizeof(float));
+    static const bool host_mk = std::getenv("XOLOTL_DSPARK_HOST_MARKOV") != nullptr;
+    std::vector<float> ctxm_gpu(host_mk ? (size_t) 768 * B : 0);   // the device markov reads ctx_buf instead
+    if (host_mk) ggml_backend_tensor_get(ctxg, ctxm_gpu.data(), 0, ctxm_gpu.size() * sizeof(float));
     const bool dumping = std::getenv("XOLOTL_DSPARK_DUMP") != nullptr;
     std::vector<float> hbase(dumping ? (size_t) d.vocab * B : 0), hid((size_t) E * B);
     if (dumping) ggml_backend_tensor_get(base, hbase.data(), 0, hbase.size() * sizeof(float));
-    ggml_backend_tensor_get(hidden, hid.data(), 0, hid.size() * sizeof(float));
+    if (dumping) ggml_backend_tensor_get(hidden, hid.data(), 0, hid.size() * sizeof(float));
     if (const char* dd = std::getenv("XOLOTL_DSPARK_DUMP")) {   // debug: block hidden + base logits for the torch diff
         auto dump = [&](const char* n, const std::vector<float>& v) {
             const std::string p = std::string(dd) + "/" + n;
@@ -748,6 +771,67 @@ int dspark_draft(Dspark& d, int32_t anchor, int64_t T, int32_t* out, int* n_all)
     // ---- the markov head, as dspark_dry_validated.py lines 132-153 (ctx part computed in the block graph)
     const int R = d.markov_rank, J = 768, W = 768;   // raw width = 3*256
     const std::vector<float>& ctxm = ctxm_gpu;       // [B][768]
+
+    // DEVICE markov (default): the whole 7-slot recurrence as ONE graph - prev = argmax feeds the next slot's
+    // w1 row through get_rows on the GPU, so there is no host recurrence and no per-slot sync (the host path did a
+    // sched reset + graph launch + two D2H per slot).  XOLOTL_DSPARK_HOST_MARKOV=1 = the validated host path below.
+    static const bool host_markov = std::getenv("XOLOTL_DSPARK_HOST_MARKOV") != nullptr;
+    if (!host_markov) {
+        Graph mg = graph_begin(d);
+        ggml_context* mc = mg.ctx;
+        ggml_tensor* aid = ggml_new_tensor_1d(mc, GGML_TYPE_I32, 1);
+        ggml_set_input(aid);
+        ggml_tensor *prev = aid, *state = nullptr;
+        std::vector<ggml_tensor*> ams, ses;
+        for (int i = 1; i < B; ++i) {
+            ggml_tensor* pe = ggml_get_rows(mc, d.w1, prev);                                   // [R, 1] f32 = w1[prev]
+            ggml_tensor* raw = ggml_mul_mat(mc, d.jpv, pe);                                    // [768, 1]
+            if (state) raw = ggml_add(mc, raw, ggml_mul_mat(mc, d.jst, state));
+            raw = ggml_add(mc, raw, ggml_view_2d(mc, d.ctx_buf, J, 1, d.ctx_buf->nb[1], (size_t) i * d.ctx_buf->nb[1]));
+            raw = ggml_cont(mc, raw);
+            ggml_tensor* gt = ggml_sigmoid(mc, ggml_view_1d(mc, raw, R, 0));
+            ggml_tensor* cd = ggml_tanh(mc, ggml_view_1d(mc, raw, R, (size_t) R * sizeof(float)));
+            ggml_tensor* lt = ggml_tanh(mc, ggml_view_1d(mc, raw, R, (size_t) 2 * R * sizeof(float)));
+            ggml_tensor* gc = ggml_mul(mc, gt, cd);
+            state = state ? ggml_add(mc, ggml_sub(mc, cd, gc), ggml_mul(mc, gt, state)) : ggml_sub(mc, cd, gc);   // g*s + (1-g)*c
+            ggml_tensor* t = ggml_mul_mat(mc, d.fold_w, lt);                                   // [vocab, 1]
+            t = ggml_add(mc, ggml_add(mc, t, d.fold_b),
+                         ggml_view_2d(mc, d.base_buf, d.vocab, 1, d.base_buf->nb[1], (size_t) i * d.base_buf->nb[1]));
+            if (d.softcap > 0.0f) t = ggml_scale(mc, ggml_tanh(mc, ggml_scale(mc, t, 1.0f / d.softcap)), d.softcap);
+            ggml_tensor* am = ggml_argmax(mc, t);                                                // [1] i32
+            ggml_tensor* mx = ggml_get_rows(mc, ggml_reshape_2d(mc, t, 1, d.vocab), am);
+            ggml_tensor* se = ggml_sum(mc, ggml_exp(mc, ggml_sub(mc, t, ggml_repeat(mc, mx, t))));
+            ggml_set_output(am); ggml_set_output(se);
+            ggml_build_forward_expand(mg.gf, am);
+            ggml_build_forward_expand(mg.gf, se);
+            ams.push_back(am); ses.push_back(se);
+            prev = am;
+        }
+        ggml_backend_sched_reset(d.sched);
+        if (!ggml_backend_sched_alloc_graph(d.sched, mg.gf)) { ggml_free(mc); dfail("drafter markov graph allocation failed"); }
+        ggml_backend_tensor_set(aid, &anchor, 0, sizeof(int32_t));
+        if (ggml_backend_sched_graph_compute(d.sched, mg.gf) != GGML_STATUS_SUCCESS) { ggml_free(mc); dfail("drafter markov compute failed"); }
+        int n = 0, nconf = -1;
+        double cum = 1.0;
+        for (int i = 1; i < B; ++i) {
+            int32_t best = 0;
+            float sexp = 1.0f;
+            ggml_backend_tensor_get(ams[(size_t) i - 1], &best, 0, sizeof(int32_t));
+            ggml_backend_tensor_get(ses[(size_t) i - 1], &sexp, 0, sizeof(float));
+            out[n++] = best;
+            if (n >= 2 && (d.tau > 0.0f || n > d.max_draft)) {   // same stopping rule as the host path
+                if (n > d.max_draft) { --n; break; }
+                cum *= 1.0 / std::max(1.0f, sexp);
+                if (cum < d.tau && nconf < 0) {
+                    nconf = n - 1;
+                    if (!n_all) break;
+                }
+            }
+        }
+        ggml_free(mc);
+        if (n_all) *n_all = n;
+        return nconf < 0 ? n : nconf;
+    }
 
     // the 256 -> vocab projection on the device, one slot at a time (the recurrence is serial)
     Graph fgr = graph_begin(d);

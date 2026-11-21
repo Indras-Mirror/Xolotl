@@ -77,7 +77,7 @@
 - **[penink-WH](https://github.com/penink-WH)**: the AC922 rig
 - **[cpacsm75](https://github.com/cpacsm75)**: 192 GB arena tuning on Windows (#77); the RTX 5090 arena and `--kv-q8`
   numbers at 256K/512K (#114)
-- **[jesdga95](https://github.com/jesdga95/basalt)** (Basalt): the priced stream-all prefill chunk, quoted tool calls in
+- **[jesdga95](https://github.com/jesdga95/basalt)** (Basalt, Jesus Gulfo): the Inkling-2-Mini prompt attention kernel (`attn_prompt.cu`, ported as `inkling_attn_prompt`) and the fused-decode and DSpark designs our Inkling kernels follow; the priced stream-all prefill chunk, quoted tool calls in
   string values, union/nullable tool parameters, IQ code bytes by shift, IQ1_M on MMQ, and the ideas behind the
   DeepSeek-V4.1 Engram read-ahead and late shared expert
 

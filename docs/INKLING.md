@@ -1,20 +1,30 @@
 # Inkling-2-Mini on Xolotl
 
 Thinking Machines' [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Apache 2.0) is a 26B
-looped MoE with 5.4B active parameters per token (about 3.1B distinct weights; the 12-layer loop core runs
-3 times per token). `xolotl-inkling` is Xolotl's engine for it, behind the usual
+looped MoE with 3B active parameters per token (the official count; about 5.4B effective per token, because the
+12-layer loop core runs 3 times). `xolotl-inkling` is Xolotl's engine for it, behind the usual
 OpenAI- and Anthropic-compatible server.
 
 | | |
 |---|---|
-| parameters | 26B total, 5.4B active per token (about 3.1B distinct weights per token: 1.6B shared + 8 of 128 experts; layers 6-17 run 3 times) |
+| parameters | 26B total, 3B active (official; about 3.1B distinct weights per token: 1.6B shared + 8 of 128 experts), about 5.4B effective per token because layers 6-17 run 3 times |
 | layers | 24 physical, 48 applications per token: layers 6 to 17 run 3 passes, with low-rank loop controllers |
 | experts | 128 routed, top-8, sigmoid router with a selection bias, SiTU activation, no shared expert |
 | attention | sliding window 1024, a global layer every 6th; no RoPE (learned relative-position bias, log-scaled positions on the global layers) |
 | extras | short causal convolutions on K, V and both layer outputs; block attention residuals that mix earlier depths |
 | context | 1M trained (`--context` sets what you allocate) |
 
-## Numbers (RTX 4090, exact NVFP4 parent, all weights in VRAM, 21 Nov 2026)
+## Numbers (RTX 4090, 22 Nov 2026)
+
+| | 14 GB XQ quant | NVFP4 parent |
+|---|---:|---:|
+| decode, 2.8K prompt | **113 tok/s** | 89 tok/s |
+| decode with `--dspark` | **136 tok/s** (~140 on served thinking requests) | 137 tok/s |
+| prefill, 8K prompt (served) | ~3,500 tok/s | ~3,000 tok/s (16K context, 512-row chunks) |
+| prefill, 32K prompt (served) | **4,190 tok/s** | - (the parent leaves little VRAM for big chunks) |
+| prompt chunk (auto) | 2048 rows | 256-512 rows |
+
+## First numbers (RTX 4090, exact NVFP4 parent, all weights in VRAM, 21 Nov 2026)
 
 | | |
 |---|---|
@@ -23,8 +33,8 @@ OpenAI- and Anthropic-compatible server.
 | parity vs the llama.cpp reference | logits KL 2e-4 and top-1 100 % on a short prompt; KL 3e-3, top-1 97.7 % teacher-forced over 1.6K tokens of text; 64 greedy tokens identical on 2 of 3 prompts, the third splits at a near tie after 215 of 248 characters |
 | VRAM | 20.5 GiB weights + 0.75 GiB state at 16K context (token table in RAM) |
 
-Speed work is ongoing (fused kernels, flash attention with the relative bias, faster speculative decoding); these
-are the first numbers, not the ceiling.
+The 22 Nov numbers above come from the fused decode kernels and the tensor-core prompt attention
+([CHANGELOG](xolotl/CHANGELOG.md)).
 
 ## Speculative decoding with the DSpark (MTP) drafter (experimental, opt-in)
 

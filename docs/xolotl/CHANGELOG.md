@@ -8,6 +8,41 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Inkling-2-Mini prefill 1.2K -> 4.2K tok/s at 32K, decode 93 -> 113 tok/s, DSpark 136 tok/s (22 Nov)
+
+**Prompt attention on the tensor cores** (a port of Basalt's `attn_prompt.cu`, by Jesus Gulfo, MIT): a prompt chunk
+attends flash style over the f16 K/V cache in place, with the relative-position bias and the attention sink computed
+inside the kernel (the bias is one extra small tensor-core product over the band of distances a key tile spans). The
+old path built a `[cells, rows, heads]` score tensor and host masks, so its cost grew with context and it had to keep
+chunks at 512 rows. Without it, prompt chunks grow to **2048 rows**, which reads each expert once for four times as
+many tokens. Measured on the RTX 4090, 14 GB XQ quant, served:
+
+| prompt | before | after |
+| --- | ---: | ---: |
+| 8K tokens | ~1,670 tok/s | ~3,500 tok/s |
+| 32K tokens | ~1,210 tok/s (27 s) | **4,190 tok/s (7.8 s)** |
+
+Also for prompt chunks: the MoE weighted sum over the 8 experts is one bandwidth-bound kernel instead of a batched
+mat-vec over a transposed copy (-24 % of prefill GPU time at 2048-row chunks). The chunk size is picked at load from
+the VRAM left after the weights (2048 / 1024 / 512 / 256 rows: the quant at 36K-131K context gets 2048, the NVFP4
+parent at 32K gets 256); `--ubatch N` still overrides it. `XOLOTL_INKLING_PROMPT_ATTN=0` restores the old path.
+
+**Decode** (all default on, each with an env switch back to the old path): split-K decode attention that reads the f16
+K/V window in place with the relative bias in-kernel (`XOLOTL_INKLING_DECATTN=0`), the attention prepare (K/V
+convolutions, key clip, value norm, cache writes) in two kernels, the MoE finish (weighted sum, post-conv, residual) in
+one, and the verify step's conv history fused. Plain decode **93 -> 113 tok/s**; with the DSpark drafter (`--dspark`)
+**136 tok/s** on a 2.8K-token prompt (2.4 of up to 7 drafts accepted per step) and ~140 tok/s on served thinking
+requests. The NVFP4 parent on the same engine: 89 tok/s plain, 137 tok/s with DSpark.
+
+**Quality:** this model's logits move at the rounding level with any kernel change (near-tied expert picks flip), so
+each change was judged by paired NLL and KL against the NVFP4 parent on 2 x 1024 held-out tokens, prefill and decode
+paths: prefill NLL 1.1967 -> 1.1987, KL to the parent 0.0364 -> 0.0369; decode KL to the parent 0.0377, unchanged.
+Both inside the noise between runs of the old path.
+
+Also: Inkling-2-Mini is **3B active** per token (the official count), about 5.4B effective because its 12-layer loop
+core runs 3 times; the 21 Nov notes said "5.4B active". The example config's sampling now matches the model card
+(temperature 1.0, top_p 1.0, top_k 64 = the engine's maximum).
+
 ### Inkling-2-Mini decode 67 -> 93 tok/s: fused conv, SiTU and stream-stack kernels (21 Nov, evening)
 
 **Inkling-2-Mini decode 67 -> 93 tok/s** on the RTX 4090 (the 14 GB XQ quant, 256-token
