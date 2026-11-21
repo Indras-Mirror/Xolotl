@@ -104,7 +104,7 @@ struct Dspark {
     int n_embd = 0, n_head = 0, n_head_kv = 0, hd = 0, ff = 0, block = 0, n_swa = 0;
     int vpad = 0, vocab = 0, markov_rank = 256;
     float eps = 1e-6f, rope_base = 1e6f, softcap = 30.0f;
-    int64_t n_ctx = 0, n_local = 0, ctx_end = 0;
+    int64_t n_ctx = 0, n_local = 0, ctx_end = 0, n_glob = 0;
     DLayer L[kLayers];
 
     ggml_tensor *fuse = nullptr, *mask_embd = nullptr, *norm = nullptr, *markov_norm = nullptr;
@@ -141,6 +141,14 @@ struct Dspark {
 };
 
 int64_t cells_local(const Dspark& d) { return d.n_swa + 1; }
+// The global layer keeps the last n_glob positions in a ring (XOLOTL_DSPARK_WINDOW, default 32768; 0 = the whole
+// context, the old positional cache).  A full-context f16 cache was 2 GiB at 512K and each draft cast all of it to
+// f32 (O(T) per step: below plain decode at 38K, an allocation failure at 110K).  The drafter only proposes; the target
+// verifies every token, so the window changes acceptance, never the output.  kGlobSlack extra cells keep rewinds of up
+// to that many tokens exact.
+constexpr int64_t kGlobSlack = 512;
+int64_t cells_global(const Dspark& d) { return d.n_glob > 0 ? d.n_glob + kGlobSlack : d.n_ctx; }
+bool glob_ring(const Dspark& d) { return d.n_glob > 0; }
 
 ggml_tensor* need(ggml_context* c, const std::string& n) {
     ggml_tensor* t = ggml_get_tensor(c, n.c_str());
@@ -340,6 +348,11 @@ Dspark* dspark_load(const std::string& path, ggml_backend_t gpu, const DsparkTar
 
         d->n_local = (int64_t) d->n_swa + 1;   // the python's ck[max(0, anchor - SWA):] is up to SWA + 1 cells
         d->n_ctx = std::max<int64_t>(n_ctx, 2048);
+        {
+            const char* w = std::getenv("XOLOTL_DSPARK_WINDOW");
+            const int64_t win = w ? std::atoll(w) : 32768;
+            d->n_glob = (win > 0 && win + kGlobSlack < d->n_ctx) ? win : 0;
+        }
 
         auto need_w = [&](const std::string& n) { return need(d->wctx, n); };
         d->fuse = need_w("dspark_fuse.weight");
@@ -441,7 +454,7 @@ Dspark* dspark_load(const std::string& path, ggml_backend_t gpu, const DsparkTar
             d->sctx = ggml_init(sp);
             if (!d->sctx) dfail("cannot create the drafter state context");
             for (int l = 0; l < kLayers; ++l) {
-                const int64_t cells = d->L[l].local ? cells_local(*d) : d->n_ctx;
+                const int64_t cells = d->L[l].local ? cells_local(*d) : cells_global(*d);
                 d->L[l].k_cache = ggml_new_tensor_3d(d->sctx, GGML_TYPE_F16, d->hd, d->n_head_kv, cells);
                 d->L[l].v_cache = ggml_new_tensor_3d(d->sctx, GGML_TYPE_F16, d->hd, d->n_head_kv, cells);
                 ggml_format_name(d->L[l].k_cache, "dspark_k.%d", l);
@@ -567,7 +580,7 @@ void dspark_snap(const Dspark& d, DsparkSnap& s) {
     s.ctx_end = d.ctx_end;
     s.k.resize(kLayers); s.v.resize(kLayers);
     for (size_t l = 0; l < (size_t) kLayers; ++l) {
-        if (!d.L[l].local) { s.k[l].clear(); s.v[l].clear(); continue; }
+        if (!d.L[l].local && !glob_ring(d)) { s.k[l].clear(); s.v[l].clear(); continue; }
         s.k[l].resize(ggml_nbytes(d.L[l].k_cache)); s.v[l].resize(ggml_nbytes(d.L[l].v_cache));
         ggml_backend_tensor_get(d.L[l].k_cache, s.k[l].data(), 0, s.k[l].size());
         ggml_backend_tensor_get(d.L[l].v_cache, s.v[l].data(), 0, s.v[l].size());
@@ -578,7 +591,7 @@ void dspark_snap(const Dspark& d, DsparkSnap& s) {
 void dspark_restore(Dspark& d, const DsparkSnap& s) {
     if (s.ctx_end < 0 || s.k.size() != (size_t) kLayers) dfail("dspark_restore: empty or foreign snapshot");
     for (size_t l = 0; l < (size_t) kLayers; ++l) {
-        if (!d.L[l].local) continue;
+        if (!d.L[l].local && s.k[l].empty()) continue;
         ggml_backend_tensor_set(d.L[l].k_cache, s.k[l].data(), 0, s.k[l].size());
         ggml_backend_tensor_set(d.L[l].v_cache, s.v[l].data(), 0, s.v[l].size());
     }
@@ -643,7 +656,7 @@ void dspark_add_ctx(Dspark& d, const float* taps, int T, int64_t p0) {
         for (int t = 0; t < T; ++t) {
             p[t] = (int32_t) (p0 + t);
             il[t] = (p0 + t) % cells_local(d);
-            ig[t] = p0 + t;
+            ig[t] = (p0 + t) % cells_global(d);
         }
         ggml_backend_tensor_set(tin, taps, 0, (size_t) T * 4 * E * sizeof(float));
         ggml_backend_tensor_set(pos, p.data(), 0, p.size() * sizeof(int32_t));
@@ -678,6 +691,7 @@ int dspark_draft(Dspark& d, int32_t anchor, int64_t T, int32_t* out, int* n_all)
     if (T > d.n_ctx) dfail("dspark_draft: context beyond the allocated window");
     const int E = d.n_embd, nkv = d.n_head_kv, hd = d.hd;
     const int64_t nloc = std::min<int64_t>(T, d.n_local);
+    const int64_t nglob = glob_ring(d) ? std::min<int64_t>(T, d.n_glob) : T;
 
     Graph gr = graph_begin(d);
     ggml_context* c = gr.ctx;
@@ -687,6 +701,8 @@ int dspark_draft(Dspark& d, int32_t anchor, int64_t T, int32_t* out, int* n_all)
     ggml_set_input(pos);
     ggml_tensor* idx = ggml_new_tensor_1d(c, GGML_TYPE_I32, nloc);
     ggml_set_input(idx);
+    ggml_tensor* idxg = nullptr;
+    if (glob_ring(d)) { idxg = ggml_new_tensor_1d(c, GGML_TYPE_I32, nglob); ggml_set_input(idxg); }
 
     ggml_tensor* x = xin;
     std::vector<std::pair<std::string, ggml_tensor*>> dbg;
@@ -709,6 +725,11 @@ int dspark_draft(Dspark& d, int32_t anchor, int64_t T, int32_t* out, int* n_all)
             Vc = ggml_cast(c, ggml_get_rows(c, v2, idx), GGML_TYPE_F32);
             Kc = ggml_reshape_3d(c, Kc, hd, nkv, nloc);
             Vc = ggml_reshape_3d(c, Vc, hd, nkv, nloc);
+        } else if (idxg) {   // the global ring: the last nglob positions in chronological order
+            ggml_tensor* k2 = ggml_reshape_2d(c, y.k_cache, (int64_t) hd * nkv, cells_global(d));
+            ggml_tensor* v2 = ggml_reshape_2d(c, y.v_cache, (int64_t) hd * nkv, cells_global(d));
+            Kc = ggml_reshape_3d(c, ggml_cast(c, ggml_get_rows(c, k2, idxg), GGML_TYPE_F32), hd, nkv, nglob);
+            Vc = ggml_reshape_3d(c, ggml_cast(c, ggml_get_rows(c, v2, idxg), GGML_TYPE_F32), hd, nkv, nglob);
         } else {
             Kc = ggml_cast(c, ggml_view_3d(c, y.k_cache, hd, nkv, T, y.k_cache->nb[1], y.k_cache->nb[2], 0), GGML_TYPE_F32);
             Vc = ggml_cast(c, ggml_view_3d(c, y.v_cache, hd, nkv, T, y.v_cache->nb[1], y.v_cache->nb[2], 0), GGML_TYPE_F32);
@@ -761,6 +782,11 @@ int dspark_draft(Dspark& d, int32_t anchor, int64_t T, int32_t* out, int* n_all)
         ggml_backend_tensor_set(xin, xb.data(), 0, xb.size() * sizeof(float));
         ggml_backend_tensor_set(pos, p.data(), 0, p.size() * sizeof(int32_t));
         ggml_backend_tensor_set(idx, idxh.data(), 0, idxh.size() * sizeof(int32_t));
+        if (idxg) {
+            std::vector<int32_t> ig((size_t) nglob);
+            for (int64_t j = 0; j < nglob; ++j) ig[(size_t) j] = (int32_t) ((T - nglob + j) % cells_global(d));
+            ggml_backend_tensor_set(idxg, ig.data(), 0, ig.size() * sizeof(int32_t));
+        }
         mix_host(d, d.anchor_taps.data(), 3, d.h_markov_norm.data(), d.f_rnn.data());
         ggml_backend_tensor_set(frnn_in, d.f_rnn.data(), 0, (size_t) E * sizeof(float));
     }
