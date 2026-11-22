@@ -65,9 +65,16 @@ drafter alone against saved target taps.
 The quantised caches run on the same fused kernels as f16: the tensor-core prompt attention stages the raw
 q8_0 / q4_0 rows and dequantises them in the tile, decode attention reads them in place, and the decode prepare
 kernel (conv + clip + norm + store) writes q8_0 / q4_0 rows itself. A 107,800-token prompt at k8v4 prefills in 29 s
-(~3.7K tok/s); decode at 32K context is 90 tok/s at k8v4 vs 89 at f16. **512K context fits one 24 GB card** at
-k8v4 with the DSpark drafter and the image tower loaded (6.8 GiB of K/V state, 23.4 GB of VRAM in use): a
-477,603-token prompt prefills in ~218 s and decodes at ~27 tok/s. Against f16 on the parent: q8_0 KL 3.6e-4
+(~3.7K tok/s). **512K context fits one 24 GB card** at k8v4 with the DSpark drafter and the image tower loaded
+(6.8 GiB of K/V state, 23.4 GB of VRAM in use): a 477,603-token prompt prefills in ~3 min.
+
+Decode attention over the global layers reads the whole cache every token, so it is the part that grows with
+context. Its kernel scores one cell per lane (the K row in registers, no cross-lane reductions) and runs near the
+card's memory bandwidth (~840 GB/s at 117K). Served decode at k8v4, no drafter, RTX 4090:
+
+| context | 7K | 30K | 117K | 477K |
+| --- | ---: | ---: | ---: | ---: |
+| decode tok/s | 118 | 108 | 93 | 55 | Against f16 on the parent: q8_0 KL 3.6e-4
 with identical greedy output, k8v4 (q8_0 keys, q4_0 values) KL 8e-4. f16 is bit-identical to before.
 
 **Hadamard rotation of the 4-bit leg (default on).** A q4_0 leg goes through a randomised Hadamard rotation

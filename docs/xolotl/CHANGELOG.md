@@ -8,6 +8,29 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Inkling-2-Mini long-context decode near the memory bandwidth: 477K tokens 30 -> 55 tok/s (22 Nov, night)
+
+Profiled with Nsight Systems at
+117K: the global layers' decode attention took 571 us a visit (~340 GB/s of K/V), the merge of its splits ~20 us a
+call, 48 calls a token, and the host filled and uploaded a `[cells, T]` mask and distance array every token.
+- A new decode attention kernel scores **one cell per lane**: each lane holds its cell's whole K row in registers
+  and dots it with q from shared memory, the relative-position bias folded in, so a score needs no cross-lane
+  reduction; then p v with lanes over dims, 16 V loads in flight. 571 -> 232 us a visit at 117K (~840 GB/s).
+- The split merge runs parallel over the splits (8 warps, coalesced) instead of every thread walking all of them.
+- The global layers' mask and distance come from the token's position inside the kernel (cell j = position j):
+  no host arrays (3.8 MB a token at 477K). Bit-identical to the arrays.
+
+Served decode, k8v4, no drafter, 400 tokens after the prompt, RTX 4090:
+
+| context | 7.3K | 30K | 117K | 477K |
+| --- | ---: | ---: | ---: | ---: |
+| before | 108 | 93 | 65 | 30 |
+| after | **118** | **108** | **93** | **55** |
+
+Quality: 8K wikitext NLL in 16-token steps (the decode kernel on every position) stays at the f16 run-to-run floor
+for f16 and k8v4, 32K mean NLL change -0.00005 (se 0.0005); the 477K needle and the drafter's verify path checked.
+Each piece has a switch back (`XOLOTL_INKLING_DECATTN_LANE=0`, `_RED2=0`, `_POS=0`, `_STREAM=0`).
+
 ### Inkling-2-Mini: 512K context on one RTX 4090 with k8v4 on the fast kernels, 4-bit V leg Hadamard-rotated (22 Nov, evening)
 
 **Quantised K/V on the fast kernels.** `--kv-type k8v4` (q8_0 keys, q4_0 values on the global layers) and `q8_0` used
@@ -21,7 +44,8 @@ floor 2.0e-3); a 107K-token summary is correct.
 **512K context on one RTX 4090** (`--context 524288 --kv-type k8v4`, with the DSpark drafter and the image tower
 loaded: 12.5 GiB of weights + 6.8 GiB of K/V state, 23.4 GB of VRAM in use). A 477,603-token prompt (wikitext + the
 four Vedas, one planted sentence at 10 % depth) prefills in ~218 s (~2.2K tok/s) and the model quotes the planted
-sentence exactly; decode at that depth runs ~27 tok/s (400 tokens in ~15 s). Two things stood in the way:
+sentence exactly; decode at that depth ran ~27 tok/s with the drafter on (55 tok/s plain after the kernel work
+below). Two things stood in the way:
 - Decode at long context fell off the fast kernel: the decode window was split into chunks sized for the old
   chain's score tensors (`--attn-budget`), and past ~100K cells that meant several chunks, which the split-K kernel
   does not take. Decode then fell back to the chain, which asked for a 17 GB graph buffer at 477K. Decode and verify
