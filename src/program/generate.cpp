@@ -505,12 +505,6 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
     return true;
 }
 
-// STRATA_KV_ROT: the INT8 K/V Hadamard rotation, default on; "0" turns it off (one reader for the state and the
-// conversation-file config, so the two can never disagree)
-static bool kv_int8_rot_on() {
-    const char* v = std::getenv("STRATA_KV_ROT");
-    return !(v != nullptr && v[0] == '0');
-}
 struct Options {
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
@@ -3775,14 +3769,12 @@ int main(int argc, char** argv) {
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
     strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
-    // INT8 K/V through the Hadamard rotation --kv q4_0 already uses: DEFAULT ON since 22 Nov 2026 (Mal: rotation is
-    // the standard for a quantised KV; Inkling's k8v4 measured -27% of the 4-bit excess per-token noise with it).
-    // STRATA_KV_ROT=0 turns it off.  History: as an opt-in, first-token KL to fp16 K/V improved on an NVFP4 pack
-    // (0.0066 -> 0.0051) but not on IQ2_XS (0.0022 -> 0.0054) - one prompt's first token, not a teacher-forced NLL.
-    strata::core::qsa_set_kv_int8_rotate(kv_int8_rot_on());
-    if (o.kv == "int8")
-        std::fprintf(stderr, "strata generate: INT8 K/V %s the Hadamard rotation (STRATA_KV_ROT=%d)\n",
-                     kv_int8_rot_on() ? "through" : "WITHOUT", kv_int8_rot_on() ? 1 : 0);
+    // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to
+    // fp16 K/V improved on an NVFP4 pack (0.0066 -> 0.0051) but not on IQ2_XS (0.0022 -> 0.0054)
+    const char* kv_rot = std::getenv("STRATA_KV_ROT");
+    strata::core::qsa_set_kv_int8_rotate(kv_rot != nullptr && kv_rot[0] == '1');
+    if (kv_rot != nullptr && kv_rot[0] == '1' && o.kv == "int8")
+        std::fprintf(stderr, "strata generate: STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation (opt-in)\n");
     strata::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
     if (o.kv_resident < 0) {
         std::fprintf(stderr, "strata generate: --kv-resident must be >= 0\n");
@@ -10492,7 +10484,8 @@ int main(int argc, char** argv) {
                 c.max_context = o.max_context;
                 c.kv_resident = o.kv_resident;
                 c.mtp_window = o.mtp.empty() ? -1 : o.mtp_window;
-                c.kv_rot = kv_int8_rot_on();
+                const char* rot = std::getenv("STRATA_KV_ROT");
+                c.kv_rot = rot != nullptr && rot[0] == '1';
                 c.rope = {(int64_t) rope_cfg.type, rope_cfg.freq_base, rope_cfg.factor, rope_cfg.freq_scale(),
                           rope_cfg.orig_ctx, rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast,
                           rope_cfg.beta_slow};
