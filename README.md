@@ -2,16 +2,21 @@
 
 <h1 align="center">Xolotl</h1>
 
-<p align="center"><b>DeepSeek-V4.1-Flash, all 552 billion parameters, on one gaming PC at 33 tok/s on real agent tasks (41 in fast mode)</b>, alongside GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.8-27B, LFM3-Omni and Muse Glimmer 30B, all behind one OpenAI- and Anthropic-compatible server. Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily extended. Linux · NVIDIA · MIT.</p>
+<p align="center"><b>DeepSeek-V4.1-Flash, all 552 billion parameters, on one gaming PC at 33 tok/s on real agent tasks (41 in fast mode)</b>, alongside GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.8-27B, LFM3-Omni, Muse Glimmer 30B and <b>Inkling-2-Mini (127 tok/s, 512K context on one 24 GB card)</b>, all behind one OpenAI- and Anthropic-compatible server. Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily extended. Linux · NVIDIA · MIT.</p>
 
 > **Built from [Strata](https://github.com/Niko1221/Strata), and grown a long way past it.** Niko1221's engine,
 > server and core kernels are still at the heart of it (merged at 0.1.44.1), but Xolotl adds more than 70,000 lines
 > on top: its own DeepSeek-V4.1, V4-Flash and GLM-5.3-Flash engines, the Qwen3.8-27B dense engine (grown from Mirko
-> Perrone's port), the LFM3-Omni engine, fast mode, Xolotl Direct, and the quantisation, expert-tiering and serving
+> Perrone's port), the LFM3-Omni engine, the Inkling-2-Mini engine (looped MoE, 512K on 24 GB), fast mode, Xolotl Direct, and the quantisation, expert-tiering and serving
 > work behind every model here.
 
 ## Latest
 
+- **23 Nov** - **Inkling-2-Mini**: `--vram-budget-mib` (12-16 GB cards, experts split between VRAM and RAM) works again: prompt
+  chunks crashed in MMQ (a token named one shared zero row several times) and staged copies piled up in VRAM; 96 fewer
+  decode launches a token (K+V prepare and q+rel clip each in one launch, 4-row loop controller), bit-identical; the
+  server takes a numeric `reasoning_effort` (0 .. 0.99) like llama.cpp. Loop count checked against
+  [drhb's looped-transformer study](https://drhb.github.io/blog/posts/looped-transformers/): 3 passes stays best (ppl 6.71; 2: 12.06, 4: 11.23, 6: 7.07).
 - **22 Nov, late** - **Inkling-2-Mini decode 118 -> 127 tok/s** (30K 108 -> 118, 117K 93 -> 100): the loop
   controllers fused into three kernels on exact BF16 weights, the per-expert scales folded into existing kernels;
   2,111 -> 1,482 kernels a token. [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-decode-118---127-toks-fused-loop-controllers-folded-expert-scales-bf16-router-22-nov-late).

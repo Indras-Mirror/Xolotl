@@ -8,6 +8,27 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Inkling-2-Mini: `--vram-budget-mib` fixed, 96 fewer decode launches, numeric reasoning effort (23 Nov)
+
+- **`--vram-budget-mib` works again** (the mode that splits experts between VRAM and pinned RAM for 12-16 GB cards).
+  Two bugs, both on prompt chunks: (1) every expert absent from an arena mapped to one shared zero row, so a token
+  could name that row several times, and llama.cpp's MMQ id helper assumes a token uses an expert at most once: the
+  unwritten slots sent `quantize_mmq_q8_1` out of bounds (illegal memory access). Each top-k position now has its own
+  zero row. (2) The cold experts were staged into a new graph *leaf*, which ggml-alloc never frees, so every layer's
+  staging stayed resident (13-24 GB of graph buffer at 128K) and MMQ asserted on the padded view; now a DUP node.
+  Greedy tokens match the all-in-VRAM run. Decode with cold experts is PCIe-bound (XQ at a 10 GB budget: 13.5 tok/s).
+- **Decode, -96 launches a token, bit-identical** (teacher-forced NLL through the decode path unchanged to the bit):
+  the K and V attention-prepare kernels run as one launch (`XOLOTL_INKLING_PREP_PAIR=0` = two), the q and rel clips as
+  one op writing one buffer (`XOLOTL_INKLING_CLIP_PAIR=0`), and the loop controller's down projection reads its
+  activations once per 4 rows (7.06 -> 6.13 us; `XOLOTL_INKLING_CTRL_RB`). ~130 -> ~132 tok/s in-process.
+- **Numeric `reasoning_effort`** for Inkling (0 = off .. 0.99), as llama.cpp and SGLang clients send it in
+  `chat_template_kwargs`; the names keep their meaning.
+- **Loop count.** `XOLOTL_INKLING_PASSES=N` (research only) runs the loop core N times. WikiText 8K perplexity: 2 passes
+  12.06, **3 (trained) 6.71**, 4 11.23, 6 7.07 - the three-pass cycle that
+  [drhb's looped-transformer study](https://drhb.github.io/blog/posts/looped-transformers/) found; 3 stays.
+- **The exact NVFP4 parent** on one 4090: 97 tok/s decode with everything in VRAM up to 32K context (k8v4); above
+  that its BF16 layer-20-23 experts spill and decode is PCIe-bound (`--cpu-exps 20-23`: 36 tok/s at 128K).
+
 ### Inkling-2-Mini decode 118 -> 127 tok/s: fused loop controllers, folded expert scales, BF16 router (22 Nov, late)
 
 Peer engines for this model (satellitedown/skyne98's ingine, 140 tok/s on an RTX 3090; ManyGlue0's InklingEngine) run
