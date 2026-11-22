@@ -23,6 +23,10 @@ constexpr int kP = 8;
 
 template <typename T> T param(const ggml_tensor* t, int i) { T v; std::memcpy(&v, &t->op_params[kP + i], sizeof(T)); return v; }
 template <typename T> void set_param(ggml_tensor* t, int i, T v) { std::memcpy(&t->op_params[kP + i], &v, sizeof(T)); }
+// the K/V cache row encodings the attention kernels read in place (see kv_at): 0 f16, 1 q8_0, 2 q4_0
+static int kv_type_id(ggml_type t) {
+    return t == GGML_TYPE_F16 ? 0 : t == GGML_TYPE_Q8_0 ? 1 : t == GGML_TYPE_Q4_0 ? 2 : -1;
+}
 
 // ------------------------------------------------------------------------------------------------ conv step
 template <int K>
@@ -502,6 +506,46 @@ void relbias_cpu(ggml_tensor* dst, int ith, int nth, void*) {
 // joins the splits with the zero sink logit.  fp32 math throughout (the chain rounds q and p to f16 for the GEMMs).
 constexpr int kDecChunk = 64, kDecThreads = 128, kDecWarps = kDecThreads / 32, kDecU = 4;   // kDecU cells per warp step
 
+// the cached K/V row types: 0 f16, 1 q8_0 (float d, int8 qs[32]; 34 B per 32), 2 q4_0 (half d, uint8 qs[16]; 18 B per 32,
+// low nibbles are dims 0-15).  A row of 128 dims is 256, 136 or 72 bytes.
+__host__ __device__ __forceinline__ float kv_at(const char* row, int dim, int type) {
+    if (type == 0) return __half2float(*reinterpret_cast<const __half*>(row + (size_t) dim * 2));
+    const int b = dim >> 5, o = dim & 31;
+    if (type == 1) {
+        const char* bp = row + (size_t) b * 34;   // q8_0: half d; int8 qs[32] (the 34 B stride is only 2-byte aligned)
+        return __half2float(*reinterpret_cast<const __half*>(bp)) * (float) reinterpret_cast<const int8_t*>(bp + 2)[o];
+    }
+    const char* bp = row + (size_t) b * 18;
+    const uint8_t* q = reinterpret_cast<const uint8_t*>(bp + 2);
+    return __half2float(*reinterpret_cast<const __half*>(bp)) * (float) ((int) (o < 16 ? (q[o] & 0xF) : (q[o - 16] >> 4)) - 8);
+}
+// eight consecutive dims (col is a multiple of 8; a q4_0 block's half boundary can sit inside the run)
+__device__ __forceinline__ void kv_at8(const char* row, int col, int type, float* out) {
+    if (type == 0) {
+        const __half2* h = reinterpret_cast<const __half2*>(row + (size_t) col * 2);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { const float2 f = __half22float2(h[i]); out[2 * i] = f.x; out[2 * i + 1] = f.y; }
+        return;
+    }
+    const int b = col >> 5, o = col & 31;
+    if (type == 1) {
+        const char* bp = row + (size_t) b * 34;
+        const float d = __half2float(*reinterpret_cast<const __half*>(bp));
+        const int8_t* q = reinterpret_cast<const int8_t*>(bp + 2) + o;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) out[j] = d * (float) q[j];
+        return;
+    }
+    const char* bp = row + (size_t) b * 18;
+    const float d = __half2float(*reinterpret_cast<const __half*>(bp));
+    const uint8_t* q = reinterpret_cast<const uint8_t*>(bp + 2);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int e = o + j;
+        out[j] = d * (float) ((int) (e < 16 ? (q[e] & 0xF) : (q[e - 16] >> 4)) - 8);
+    }
+}
+
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
@@ -518,7 +562,7 @@ __device__ __forceinline__ float warp_max(float v) {
 template <int HD, int R, int TT>
 __global__ void __launch_bounds__(kDecThreads) k_attn_dec_part(const float* __restrict__ q, const char* __restrict__ K,
         const char* __restrict__ V, const float* __restrict__ mask, float* __restrict__ part, int cells, int T, int nh,
-        long k_nb1, long k_nb2, long v_nb1, long v_nb2, float scale, int f16r,
+        long k_nb1, long k_nb2, long v_nb1, long v_nb2, float scale, int f16r, int ktype, int vtype,
         const float* __restrict__ relb, const float* __restrict__ Rt, const float* __restrict__ sinks,
         const int* __restrict__ rp, long rp_s1, long mask_s1, int nrel) {
     constexpr int RR = R * TT;
@@ -567,7 +611,7 @@ __global__ void __launch_bounds__(kDecThreads) k_attn_dec_part(const float* __re
     }
     // 1. scores: one warp per cell, kDecU cells per step with their K loads issued together
     for (int i0 = w; i0 < n; i0 += kDecWarps * kDecU) {
-        half2 kv[kDecU][PL / 2];
+        float kf[kDecU][PL];
         float mv[kDecU][RR];
         bool live[kDecU];
 #pragma unroll
@@ -588,9 +632,18 @@ __global__ void __launch_bounds__(kDecThreads) k_attn_dec_part(const float* __re
                 }
             }
             if (live[u]) {
-                const half2* kr = (const half2*) (K + (size_t) (j0 + i) * k_nb2 + (size_t) g * k_nb1) + lane * (PL / 2);
+                const char* kr = K + (size_t) (j0 + i) * k_nb2 + (size_t) g * k_nb1;
+                if (ktype == 0) {
+                    const half2* k2 = (const half2*) kr + lane * (PL / 2);
 #pragma unroll
-                for (int i2 = 0; i2 < PL / 2; ++i2) kv[u][i2] = kr[i2];
+                    for (int i2 = 0; i2 < PL / 2; ++i2) {
+                        const float2 f = __half22float2(k2[i2]);
+                        kf[u][2 * i2] = f.x; kf[u][2 * i2 + 1] = f.y;
+                    }
+                } else {
+#pragma unroll
+                    for (int e = 0; e < PL; ++e) kf[u][e] = kv_at(kr, lane * PL + e, ktype);
+                }
             }
         }
 #pragma unroll
@@ -602,10 +655,9 @@ __global__ void __launch_bounds__(kDecThreads) k_attn_dec_part(const float* __re
 #pragma unroll
             for (int rr = 0; rr < RR; ++rr) d[rr] = 0.0f;
 #pragma unroll
-            for (int i2 = 0; i2 < PL / 2; ++i2) {
-                const float2 f = __half22float2(kv[u][i2]);
+            for (int i2 = 0; i2 < PL; ++i2) {
 #pragma unroll
-                for (int rr = 0; rr < RR; ++rr) d[rr] = fmaf(qr[rr][2 * i2 + 1], f.y, fmaf(qr[rr][2 * i2], f.x, d[rr]));
+                for (int rr = 0; rr < RR; ++rr) d[rr] = fmaf(qr[rr][i2], kf[u][i2], d[rr]);
             }
 #pragma unroll
             for (int rr = 0; rr < RR; ++rr) d[rr] = warp_sum(d[rr]);
@@ -663,7 +715,10 @@ __global__ void __launch_bounds__(kDecThreads) k_attn_dec_part(const float* __re
 #pragma unroll
             for (int rr = 0; rr < RR; ++rr) any |= s[rr][i] != 0.0f;
             if (!any) continue;
-            const float2 f = __half22float2(((const half2*) (V + (size_t) (j0 + i) * v_nb2 + (size_t) g * v_nb1))[pr]);
+            const char* vr = V + (size_t) (j0 + i) * v_nb2 + (size_t) g * v_nb1;
+            float2 f;
+            if (vtype == 0) f = __half22float2(((const half2*) vr)[pr]);
+            else { f.x = kv_at(vr, 2 * pr, vtype); f.y = kv_at(vr, 2 * pr + 1, vtype); }
 #pragma unroll
             for (int rr = 0; rr < RR; ++rr) {
                 const float pv = f16r ? __half2float(__float2half(s[rr][i])) : s[rr][i];
@@ -715,12 +770,13 @@ __global__ void k_attn_dec_reduce(const float* __restrict__ part, float* __restr
 template <int HD, int TT>
 void attn_dec_part_launch_tt(int R, dim3 grid, cudaStream_t st, const float* q, const char* K, const char* V, const float* mk,
                           float* part, int cells, int T, int nh, long a, long b, long c, long d, float scale, int f16r,
-                          const float* relb, const float* Rt, const float* sk, const int* rp, long rps, long mks, int nrel) {
+                          int ktype, int vtype, const float* relb, const float* Rt, const float* sk, const int* rp, long rps, long mks,
+                          int nrel) {
     switch (R) {
-        case 1: k_attn_dec_part<HD, 1, TT><<<grid, kDecThreads, 0, st>>>(q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, relb, Rt, sk, rp, rps, mks, nrel); break;
-        case 2: k_attn_dec_part<HD, 2, TT><<<grid, kDecThreads, 0, st>>>(q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, relb, Rt, sk, rp, rps, mks, nrel); break;
-        case 3: k_attn_dec_part<HD, 3, TT><<<grid, kDecThreads, 0, st>>>(q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, relb, Rt, sk, rp, rps, mks, nrel); break;
-        default: k_attn_dec_part<HD, 4, TT><<<grid, kDecThreads, 0, st>>>(q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, relb, Rt, sk, rp, rps, mks, nrel); break;
+        case 1: k_attn_dec_part<HD, 1, TT><<<grid, kDecThreads, 0, st>>>(q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, ktype, vtype, relb, Rt, sk, rp, rps, mks, nrel); break;
+        case 2: k_attn_dec_part<HD, 2, TT><<<grid, kDecThreads, 0, st>>>(q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, ktype, vtype, relb, Rt, sk, rp, rps, mks, nrel); break;
+        case 3: k_attn_dec_part<HD, 3, TT><<<grid, kDecThreads, 0, st>>>(q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, ktype, vtype, relb, Rt, sk, rp, rps, mks, nrel); break;
+        default: k_attn_dec_part<HD, 4, TT><<<grid, kDecThreads, 0, st>>>(q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, ktype, vtype, relb, Rt, sk, rp, rps, mks, nrel); break;
     }
 }
 
@@ -733,12 +789,13 @@ static int dec_tt(int T) {
 template <int HD>
 void attn_dec_part_launch(int R, dim3 grid, cudaStream_t st, const float* q, const char* K, const char* V, const float* mk,
                           float* part, int cells, int T, int nh, long a, long b, long c, long d, float scale, int f16r,
-                          const float* relb, const float* Rt, const float* sk, const int* rp, long rps, long mks, int nrel) {
+                          int ktype, int vtype, const float* relb, const float* Rt, const float* sk, const int* rp, long rps, long mks,
+                          int nrel) {
     const int tt = dec_tt(T);
     grid.y = (T + tt - 1) / tt;
-    if (tt == 4) attn_dec_part_launch_tt<HD, 4>(R, grid, st, q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, relb, Rt, sk, rp, rps, mks, nrel);
-    else if (tt == 2) attn_dec_part_launch_tt<HD, 2>(R, grid, st, q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, relb, Rt, sk, rp, rps, mks, nrel);
-    else attn_dec_part_launch_tt<HD, 1>(R, grid, st, q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, relb, Rt, sk, rp, rps, mks, nrel);
+    if (tt == 4) attn_dec_part_launch_tt<HD, 4>(R, grid, st, q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, ktype, vtype, relb, Rt, sk, rp, rps, mks, nrel);
+    else if (tt == 2) attn_dec_part_launch_tt<HD, 2>(R, grid, st, q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, ktype, vtype, relb, Rt, sk, rp, rps, mks, nrel);
+    else attn_dec_part_launch_tt<HD, 1>(R, grid, st, q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, f16r, ktype, vtype, relb, Rt, sk, rp, rps, mks, nrel);
 }
 
 void attn_dec_part_cuda(ggml_tensor* dst, void* stream, void*) {
@@ -756,9 +813,9 @@ void attn_dec_part_cuda(ggml_tensor* dst, void* stream, void*) {
     const dim3 grid(nkv, T, nsplit);
     cudaStream_t st = (cudaStream_t) stream;
     const auto args = std::make_tuple((const float*) q->data, (const char*) k->data, (const char*) v->data, (const float*) mk->data, (float*) dst->data);
-    if (HD == 64) attn_dec_part_launch<64>(nh / nkv, grid, st, std::get<0>(args), std::get<1>(args), std::get<2>(args), std::get<3>(args), std::get<4>(args), cells, T, nh, (long) k->nb[1], (long) k->nb[2], (long) v->nb[1], (long) v->nb[2], scale, param<int>(dst, 1), relb, Rt, skp, rpp, rps, mks, nrel);
-    else if (HD == 128) attn_dec_part_launch<128>(nh / nkv, grid, st, std::get<0>(args), std::get<1>(args), std::get<2>(args), std::get<3>(args), std::get<4>(args), cells, T, nh, (long) k->nb[1], (long) k->nb[2], (long) v->nb[1], (long) v->nb[2], scale, param<int>(dst, 1), relb, Rt, skp, rpp, rps, mks, nrel);
-    else attn_dec_part_launch<256>(nh / nkv, grid, st, std::get<0>(args), std::get<1>(args), std::get<2>(args), std::get<3>(args), std::get<4>(args), cells, T, nh, (long) k->nb[1], (long) k->nb[2], (long) v->nb[1], (long) v->nb[2], scale, param<int>(dst, 1), relb, Rt, skp, rpp, rps, mks, nrel);
+    if (HD == 64) attn_dec_part_launch<64>(nh / nkv, grid, st, std::get<0>(args), std::get<1>(args), std::get<2>(args), std::get<3>(args), std::get<4>(args), cells, T, nh, (long) k->nb[1], (long) k->nb[2], (long) v->nb[1], (long) v->nb[2], scale, param<int>(dst, 1), param<int>(dst, 3), param<int>(dst, 4), relb, Rt, skp, rpp, rps, mks, nrel);
+    else if (HD == 128) attn_dec_part_launch<128>(nh / nkv, grid, st, std::get<0>(args), std::get<1>(args), std::get<2>(args), std::get<3>(args), std::get<4>(args), cells, T, nh, (long) k->nb[1], (long) k->nb[2], (long) v->nb[1], (long) v->nb[2], scale, param<int>(dst, 1), param<int>(dst, 3), param<int>(dst, 4), relb, Rt, skp, rpp, rps, mks, nrel);
+    else attn_dec_part_launch<256>(nh / nkv, grid, st, std::get<0>(args), std::get<1>(args), std::get<2>(args), std::get<3>(args), std::get<4>(args), cells, T, nh, (long) k->nb[1], (long) k->nb[2], (long) v->nb[1], (long) v->nb[2], scale, param<int>(dst, 1), param<int>(dst, 3), param<int>(dst, 4), relb, Rt, skp, rpp, rps, mks, nrel);
 }
 
 void attn_dec_reduce_cuda(ggml_tensor* dst, void* stream, void*) {
@@ -804,8 +861,8 @@ void attn_dec_part_cpu(ggml_tensor* dst, int ith, int nth, void*) {
             }
             float d = 0.0f;
             if (mv != -INFINITY) {
-                const ggml_fp16_t* kr = (const ggml_fp16_t*) ((const char*) k->data + (size_t) (j0 + i) * k->nb[2] + (size_t) g * k->nb[1]);
-                for (int e = 0; e < HD; ++e) d += qh[e] * ggml_fp16_to_fp32(kr[e]);
+                const char* kr = (const char*) k->data + (size_t) (j0 + i) * k->nb[2] + (size_t) g * k->nb[1];
+                for (int e = 0; e < HD; ++e) d += qh[e] * kv_at(kr, e, param<int>(dst, 3));
             }
             sc[i] = mv == -INFINITY ? -INFINITY : d * scale + mv;
             m = std::max(m, sc[i]);
@@ -817,8 +874,8 @@ void attn_dec_part_cpu(ggml_tensor* dst, int ith, int nth, void*) {
             const float p = m == -INFINITY ? 0.0f : std::exp(sc[i] - m);
             l += p;
             if (p == 0.0f) continue;
-            const ggml_fp16_t* vr = (const ggml_fp16_t*) ((const char*) v->data + (size_t) (j0 + i) * v->nb[2] + (size_t) g * v->nb[1]);
-            for (int e = 0; e < HD; ++e) o[e] += p * ggml_fp16_to_fp32(vr[e]);
+            const char* vr = (const char*) v->data + (size_t) (j0 + i) * v->nb[2] + (size_t) g * v->nb[1];
+            for (int e = 0; e < HD; ++e) o[e] += p * kv_at(vr, e, param<int>(dst, 4));
         }
         o[HD] = m; o[HD + 1] = l;
     }
@@ -992,6 +1049,7 @@ ggml_cuda_custom_op g_attn_prep{GGML_CUDA_CUSTOM_MAGIC, attn_prep_cuda, nullptr}
 namespace pa {
 constexpr int kHD = 128, kRel = 16, kGroup = 3;
 constexpr int kPos = 64, kWarpsPerHead = kPos / 16, kWarps = kGroup * kWarpsPerHead, kThreads = kWarps * 32, kKeys = 32;
+constexpr int kRawK = 136, kRawV = 136;   // a 128-wide cache row in q8_0 (4 x 34 B; q4_0 is 72 B)
 constexpr int kLd = kHD + 8, kBand = 96, kBandLd = kRel + 8, kGCols = 48, kGLd = 55;
 constexpr float kLog2e = 1.4426950408889634f;
 static_assert(kBand >= kPos + kKeys - 1 && kGCols >= 16 + kKeys - 1 && kGCols % 8 == 0 && kGLd >= kGCols, "band sizes");
@@ -1000,13 +1058,15 @@ struct Smem {
     KvTile t0;
     __half band[kBand][kBandLd];
     union { KvTile t1; float gx[kWarps][16][kGLd]; } u;
+    // the quantised caches stage raw blocks here (one tile of K rows then one of V), then dequantise into the tile
+    char raw[2][kKeys * kRawK + kKeys * kRawV];
 };
 static_assert(sizeof(KvTile) <= sizeof(float) * kWarps * 16 * kGLd, "the second tile fits in the exchange");
 struct Args {
     const float *q, *r, *sink, *rel;   // q [T][nh][128], r [T][nh][16], sink [T][nh], rel [Ext+1][16]
-    const __half *k, *v;               // [cap][nkv][128]
-    long long pos0, cap;
-    int nh, ext, window;
+    const char *k, *v;                 // [cap][nkv][128] as f16, q8_0 or q4_0 rows
+    long long pos0, cap, k_nb1, k_nb2, v_nb1, v_nb2;
+    int nh, ext, window, ktype, vtype;   // ktype/vtype: 0 f16, 1 q8_0, 2 q4_0
     float scale;
 };
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
@@ -1026,11 +1086,16 @@ __device__ __forceinline__ void mma16816(float (&c)[4], unsigned a0, unsigned a1
 __device__ __forceinline__ void cp16(void* dst, const void* src, bool ok) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_u32(dst)), "l"(src), "r"(ok ? 16 : 0));
 }
+__device__ __forceinline__ void cp8(void* dst, const void* src, bool ok) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(smem_u32(dst)), "l"(src), "r"(ok ? 8 : 0));
+}
+// bytes of a 128-dim cache row (q8_0 136, q4_0 72; f16 never stages)
+__host__ __device__ __forceinline__ int kv_row_bytes(int type) { return type == 1 ? 136 : type == 2 ? 72 : 256; }
 __device__ __forceinline__ unsigned pack_h2(float lo, float hi) { const __half2 h = __floats2half2_rn(lo, hi); return *reinterpret_cast<const unsigned*>(&h); }
 __device__ __forceinline__ float quad_max(float v) { v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1)); return fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 2)); }
 __device__ __forceinline__ float quad_sum(float v) { v += __shfl_xor_sync(0xffffffffu, v, 1); return v + __shfl_xor_sync(0xffffffffu, v, 2); }
 
-__device__ __forceinline__ void load_tile(const Args& a, KvTile& sm, int kvh, int nkv, long long k0, long long lo, long long hi, int tid) {
+__device__ __forceinline__ void load_tile(const Args& a, KvTile& sm, int kvh, long long k0, long long lo, long long hi, int tid) {
     constexpr int kPieces = kKeys * kHD / 8;
     for (int c = tid; c < 2 * kPieces; c += kThreads) {
         const bool isv = c >= kPieces;
@@ -1038,8 +1103,40 @@ __device__ __forceinline__ void load_tile(const Args& a, KvTile& sm, int kvh, in
         const int j = rem / (kHD / 8), col = (rem % (kHD / 8)) * 8;
         const long long key = k0 + j;
         const bool ok = key >= lo && key <= hi;
-        const __half* src = (isv ? a.v : a.k) + ((size_t) (ok ? key % a.cap : 0) * nkv + kvh) * kHD + col;
+        const char* src = (isv ? a.v : a.k) + (size_t) (ok ? key % a.cap : 0) * (isv ? a.v_nb2 : a.k_nb2) +
+                          (size_t) kvh * (isv ? a.v_nb1 : a.k_nb1) + (size_t) col * 2;
         cp16(isv ? &sm.v[j][col] : &sm.k[j][col], src, ok);
+    }
+}
+// quantised caches: stage the raw blocks of one tile (all kKeys rows of K, then of V) asynchronously
+__device__ __forceinline__ void load_raw(const Args& a, char* raw, int kvh, long long k0, long long lo, long long hi, int tid) {
+    const int krb = kv_row_bytes(a.ktype), vrb = kv_row_bytes(a.vtype);
+    char* rv = raw + (size_t) kKeys * krb;
+    const int nk = kKeys * (krb / 8), nvv = kKeys * (vrb / 8);
+    for (int c = tid; c < nk + nvv; c += kThreads) {
+        const bool isv = c >= nk;
+        const int rem = isv ? c - nk : c, rb = isv ? vrb : krb;
+        const int j = rem / (rb / 8), off = (rem % (rb / 8)) * 8;
+        const long long key = k0 + j;
+        const bool ok = key >= lo && key <= hi;
+        const char* src = (isv ? a.v : a.k) + (size_t) (ok ? key % a.cap : 0) * (isv ? a.v_nb2 : a.k_nb2) +
+                          (size_t) kvh * (isv ? a.v_nb1 : a.k_nb1) + off;
+        cp8(isv ? rv + (size_t) j * vrb + off : raw + (size_t) j * krb + off, src, ok);
+    }
+}
+__device__ __forceinline__ void dequant_tile(const Args& a, const char* raw, KvTile& sm, int tid) {
+    const int krb = kv_row_bytes(a.ktype), vrb = kv_row_bytes(a.vtype);
+    const char* rv = raw + (size_t) kKeys * krb;
+    constexpr int kCols = kHD / 8;
+    for (int c = tid; c < 2 * kKeys * kCols; c += kThreads) {
+        const bool isv = c >= kKeys * kCols;
+        const int rem = isv ? c - kKeys * kCols : c;
+        const int j = rem / kCols, col = (rem % kCols) * 8;
+        float f[8];
+        kv_at8(isv ? rv + (size_t) j * vrb : raw + (size_t) j * krb, col, isv ? a.vtype : a.ktype, f);
+        __half* dst = isv ? &sm.v[j][col] : &sm.k[j][col];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) dst[i] = __float2half_rn(f[i]);
     }
 }
 
@@ -1085,22 +1182,28 @@ __global__ void __launch_bounds__(kThreads, 1) k_attn_prompt(const Args a, const
     const float scale2 = a.scale * kLog2e;
     float (*gx)[kGLd] = sm.u.gx[w];
     const auto far = [&](long long k0) { return q0 - k0 - (kKeys - 1) >= ext; };
+    const bool quant = a.ktype != 0 || a.vtype != 0;
     int cur = 0;
     bool ready = false;
     for (long long k0 = lo / kKeys * kKeys; k0 <= hi; k0 += kKeys) {
         __syncthreads();
         if (!ready) {
             cur = 0;
-            load_tile(a, sm.t0, kvh, nkv, k0, lo, hi, tid);
+            if (quant) load_raw(a, sm.raw[0], kvh, k0, lo, hi, tid);
+            else load_tile(a, sm.t0, kvh, k0, lo, hi, tid);
             asm volatile("cp.async.commit_group;\n" ::: "memory");
         }
         const bool next = far(k0) && k0 + kKeys <= hi && far(k0 + kKeys);
         if (next) {
-            load_tile(a, cur ? sm.t0 : sm.u.t1, kvh, nkv, k0 + kKeys, lo, hi, tid);
+            if (quant) load_raw(a, sm.raw[cur ^ 1], kvh, k0 + kKeys, lo, hi, tid);
+            else load_tile(a, cur ? sm.t0 : sm.u.t1, kvh, k0 + kKeys, lo, hi, tid);
             asm volatile("cp.async.commit_group;\ncp.async.wait_group 1;\n" ::: "memory");
         } else {
             asm volatile("cp.async.wait_group 0;\n" ::: "memory");
         }
+        // cp.async.wait only covers this thread's own copies: the whole block must see the staged raw rows before any
+        // thread dequantises another thread's bytes (the band's __syncthreads then covers the half tile)
+        if (quant) { __syncthreads(); dequant_tile(a, sm.raw[cur], cur ? sm.u.t1 : sm.t0, tid); }
         const KvTile& kt = cur ? sm.u.t1 : sm.t0;
         ready = next;
         if (next) cur ^= 1;
@@ -1225,7 +1328,10 @@ void attn_prompt_cuda(ggml_tensor* dst, void* stream, void*) {
     const ggml_tensor *q = dst->src[0], *k = dst->src[1], *v = dst->src[2], *R = dst->src[3], *sk = dst->src[4], *rb = dst->src[5];
     pa::Args a;
     a.q = (const float*) q->data; a.r = (const float*) R->data; a.sink = (const float*) sk->data; a.rel = (const float*) rb->data;
-    a.k = (const __half*) k->data; a.v = (const __half*) v->data;
+    a.k = (const char*) k->data; a.v = (const char*) v->data;
+    a.k_nb1 = (long long) k->nb[1]; a.k_nb2 = (long long) k->nb[2];
+    a.v_nb1 = (long long) v->nb[1]; a.v_nb2 = (long long) v->nb[2];
+    a.ktype = param<int>(dst, 5); a.vtype = param<int>(dst, 6);
     a.pos0 = param<int>(dst, 0); a.cap = param<int>(dst, 1); a.window = param<int>(dst, 2); a.ext = param<int>(dst, 3);
     a.scale = param<float>(dst, 4); a.nh = (int) q->ne[1];
     const int rows = (int) q->ne[2], nkv = (int) k->ne[1];
@@ -1251,10 +1357,11 @@ void attn_prompt_cpu(ggml_tensor* dst, int ith, int nth, void*) {
         const float sink = ((const float*) sk->data)[(size_t) t * nh + h];
         sc.assign((size_t) (p - lo + 1), 0.0f);
         float mx = sink;
+        const int kty = param<int>(dst, 5), vty = param<int>(dst, 6);
         for (long long key = lo; key <= p; ++key) {
-            const ggml_fp16_t* kr = (const ggml_fp16_t*) k->data + ((size_t) (key % cap) * nkv + g) * 128;
+            const char* kr = (const char*) k->data + (size_t) (key % cap) * k->nb[2] + (size_t) g * k->nb[1];
             float d = 0.0f;
-            for (int i = 0; i < 128; ++i) d += qh[i] * ggml_fp16_to_fp32(kr[i]);
+            for (int i = 0; i < 128; ++i) d += qh[i] * kv_at(kr, i, kty);
             float b = 0.0f;
             const long long dist = p - key;
             if (dist < ext) for (int i = 0; i < 16; ++i) b += rh[i] * ((const float*) rb->data)[(size_t) dist * 16 + i];
@@ -1267,8 +1374,8 @@ void attn_prompt_cpu(ggml_tensor* dst, int ith, int nth, void*) {
         for (long long key = lo; key <= p; ++key) {
             const float e = std::exp(sc[(size_t) (key - lo)] - mx);
             den += e;
-            const ggml_fp16_t* vr = (const ggml_fp16_t*) v->data + ((size_t) (key % cap) * nkv + g) * 128;
-            for (int i = 0; i < 128; ++i) o[i] += e * ggml_fp16_to_fp32(vr[i]);
+            const char* vr = (const char*) v->data + (size_t) (key % cap) * v->nb[2] + (size_t) g * v->nb[1];
+            for (int i = 0; i < 128; ++i) o[i] += e * kv_at(vr, i, vty);
         }
         for (int i = 0; i < 128; ++i) o[i] /= den;
     }
@@ -1458,7 +1565,8 @@ ggml_tensor* inkling_attn_prompt(ggml_context* c, ggml_tensor* q, ggml_tensor* k
                                  ggml_tensor* sinks, ggml_tensor* relb, ggml_tensor* kst, ggml_tensor* vst, int64_t pos0,
                                  int window, float scale) {
     const int64_t nh = q->ne[1], T = q->ne[2], nkv = k->ne[1], cap = k->ne[2];
-    if (q->type != GGML_TYPE_F32 || !ggml_is_contiguous(q) || q->ne[0] != 128 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+    const int kty = kv_type_id(k->type), vty = kv_type_id(v->type);
+    if (q->type != GGML_TYPE_F32 || !ggml_is_contiguous(q) || q->ne[0] != 128 || kty < 0 || vty < 0 ||
         !ggml_is_contiguous(k) || !ggml_is_contiguous(v) || k->ne[0] != 128 || v->ne[0] != 128 || v->ne[1] != nkv || v->ne[2] != cap ||
         nkv < 1 || nh != 3 * nkv || R->type != GGML_TYPE_F32 || !ggml_is_contiguous(R) || R->ne[0] != 16 || ggml_nelements(R) != 16 * nh * T ||
         sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) || ggml_nelements(sinks) != nh * T ||
@@ -1472,6 +1580,8 @@ ggml_tensor* inkling_attn_prompt(ggml_context* c, ggml_tensor* q, ggml_tensor* k
     set_param<int>(y, 2, window);
     set_param<int>(y, 3, (int) relb->ne[1] - 1);   // Ext (the pad row is the zero row)
     set_param<float>(y, 4, scale);
+    set_param<int>(y, 5, kty);
+    set_param<int>(y, 6, vty);
     return y;
 }
 
@@ -1479,9 +1589,11 @@ ggml_tensor* inkling_attn_dec_rel(ggml_context* c, ggml_tensor* q, ggml_tensor* 
                                   ggml_tensor* Rt, ggml_tensor* sinks, ggml_tensor* rp, ggml_tensor* mask, float scale,
                                   ggml_tensor* gate) {
     const int64_t HD = q->ne[0], nh = q->ne[1], T = q->ne[2], nkv = k->ne[1], cells = k->ne[2];
-    if (q->type != GGML_TYPE_F32 || !ggml_is_contiguous(q) || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) return nullptr;
+    const int kty = kv_type_id(k->type), vty = kv_type_id(v->type);
+    if (q->type != GGML_TYPE_F32 || !ggml_is_contiguous(q) || kty < 0 || vty < 0) return nullptr;
     if ((HD != 64 && HD != 128 && HD != 256) || k->ne[0] != HD || v->ne[0] != HD || v->ne[1] != nkv || v->ne[2] != cells ||
-        k->nb[0] != sizeof(ggml_fp16_t) || v->nb[0] != sizeof(ggml_fp16_t) || nkv < 1 || nh % nkv != 0 || nh / nkv > 4 ||
+        (kty == 0 && k->nb[0] != sizeof(ggml_fp16_t)) || (vty == 0 && v->nb[0] != sizeof(ggml_fp16_t)) ||
+        nkv < 1 || nh % nkv != 0 || nh / nkv > 4 ||
         T > 64 || cells < 1 || k->nb[1] % 4 != 0 || k->nb[2] % 4 != 0 || v->nb[1] % 4 != 0 || v->nb[2] % 4 != 0) return nullptr;
     if (relb->type != GGML_TYPE_F32 || !ggml_is_contiguous(relb) || relb->ne[0] > 32 || Rt->type != GGML_TYPE_F32 ||
         !ggml_is_contiguous(Rt) || Rt->ne[0] != relb->ne[0] || ggml_nelements(Rt) != relb->ne[0] * nh * T ||
@@ -1495,6 +1607,8 @@ ggml_tensor* inkling_attn_dec_rel(ggml_context* c, ggml_tensor* q, ggml_tensor* 
     set_param<float>(part, 0, scale);
     set_param<int>(part, 1, 0);
     set_param<int>(part, 2, 1);
+    set_param<int>(part, 3, kty);
+    set_param<int>(part, 4, vty);
     ggml_tensor* a2[2] = {part, gate};
     ggml_tensor* y = ggml_custom_4d(c, GGML_TYPE_F32, HD, nh, T, 1, a2, gate ? 2 : 1, attn_dec_reduce_cpu, GGML_N_TASKS_MAX, &g_attn_dec_reduce);
     set_param<int>(y, 0, gate ? 1 : 0);
@@ -1503,10 +1617,12 @@ ggml_tensor* inkling_attn_dec_rel(ggml_context* c, ggml_tensor* q, ggml_tensor* 
 ggml_tensor* inkling_attn_dec(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* mask, float scale,
                               ggml_tensor* gate) {
     const int64_t HD = q->ne[0], nh = q->ne[1], T = q->ne[2], nkv = k->ne[1], cells = k->ne[2];
-    if (q->type != GGML_TYPE_F32 || !ggml_is_contiguous(q) || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
+    const int kty = kv_type_id(k->type), vty = kv_type_id(v->type);
+    if (q->type != GGML_TYPE_F32 || !ggml_is_contiguous(q) || kty < 0 || vty < 0 ||
         mask->type != GGML_TYPE_F32 || !ggml_is_contiguous(mask)) return nullptr;
     if ((HD != 64 && HD != 128 && HD != 256) || k->ne[0] != HD || v->ne[0] != HD || v->ne[1] != nkv || v->ne[2] != cells ||
-        k->nb[0] != sizeof(ggml_fp16_t) || v->nb[0] != sizeof(ggml_fp16_t) || nkv < 1 || nh % nkv != 0 || nh / nkv > 4 ||
+        (kty == 0 && k->nb[0] != sizeof(ggml_fp16_t)) || (vty == 0 && v->nb[0] != sizeof(ggml_fp16_t)) ||
+        nkv < 1 || nh % nkv != 0 || nh / nkv > 4 ||
         mask->ne[0] != cells || mask->ne[1] != T || mask->ne[2] != nh || T > 64 || cells < 1) return nullptr;
     if (k->nb[1] % 4 != 0 || k->nb[2] % 4 != 0 || v->nb[1] % 4 != 0 || v->nb[2] % 4 != 0) return nullptr;   // half2 loads
     const int64_t nsplit = (cells + kDecChunk - 1) / kDecChunk;
@@ -1516,6 +1632,8 @@ ggml_tensor* inkling_attn_dec(ggml_context* c, ggml_tensor* q, ggml_tensor* k, g
     static const int f16r = std::getenv("XOLOTL_INKLING_DECATTN_F16R") ? 1 : 0;   // A/B: round q and p to f16 like the chain
     set_param<int>(part, 1, f16r);
     set_param<int>(part, 2, 0);
+    set_param<int>(part, 3, kty);
+    set_param<int>(part, 4, vty);
     if (gate && (gate->type != GGML_TYPE_F32 || gate->nb[0] != sizeof(float) || gate->ne[0] != HD * nh || gate->ne[1] != T)) return nullptr;
     ggml_tensor* a2[2] = {part, gate};
     ggml_tensor* y = ggml_custom_4d(c, GGML_TYPE_F32, HD, nh, T, 1, a2, gate ? 2 : 1, attn_dec_reduce_cpu, GGML_N_TASKS_MAX, &g_attn_dec_reduce);

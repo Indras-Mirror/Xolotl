@@ -1,3 +1,5 @@
+#include <sstream>
+#include <fstream>
 // src/program/inkling_main.cpp - `xolotl-inkling --serve --native <inkling-2-mini.gguf> [--context N] [--ubatch N] [--cpu-exps L]`
 //
 // Inkling-2-Mini (Thinking Machines Lab, Apache 2.0) in Xolotl.  The forward pass is the Inkling 2 graph of llama.cpp
@@ -214,12 +216,22 @@ struct Slot {                  // one cache slot
     int64_t cells = 0;
 };
 
+// XOLOTL_INKLING_KV_ROT: the full-context K/V go through a randomised Hadamard rotation before the cache store when
+// the cache is quantised (default 1; 0 = off; 2 = also the f16 cache, the exactness check).  q.k is unchanged
+// (q rotated with k), the attention output is rotated back once per head; the rotation spreads outlier channels so
+// q8_0 / q4_0 blocks lose less (as the main engine's Q4 K/V and STRATA_KV_ROT INT8).
+inline int kv_rot_mode() { static const int v = std::getenv("XOLOTL_INKLING_KV_ROT") ? std::atoi(std::getenv("XOLOTL_INKLING_KV_ROT")) : 1; return v; }
+inline bool kv_rot_types(ggml_type k, ggml_type v) {
+    const int r = kv_rot_mode();
+    return r >= 2 || (r == 1 && (k != GGML_TYPE_F16 || v != GGML_TYPE_F16));
+}
 struct Model {
     Hp hp;
     Gguf gg;
     std::string arch;
     ggml_context* wctx = nullptr;
     ggml_context* sctx = nullptr;
+    ggml_tensor *hrot_f = nullptr, *hrot_i = nullptr;   // [128,128] randomised Hadamard M and M^T (quantised K/V rotation)
     ggml_tensor* zsink = nullptr;    // [n_head] zeros: the attention sink logit (state buffer, cleared once; was a fill per layer visit)
     ggml_backend_t gpu = nullptr, cpu = nullptr;
     ggml_backend_buffer_t wbuf = nullptr, hbuf = nullptr, sbuf = nullptr;   // GPU weights, host weights, state
@@ -244,10 +256,10 @@ struct Model {
     size_t weight_bytes = 0, host_bytes = 0, state_bytes = 0;
     ggml_type kv_k = GGML_TYPE_F16, kv_v = GGML_TYPE_F16;   // the full-context K/V cache types
     struct Step* last = nullptr;     // the last built + allocated graph, reused while its shape holds
-    int64_t last_key[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    int64_t last_key[9] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
     Dspark* dspark = nullptr;        // --dspark: the drafter (its own K/V caches); spec = conv history + taps allocated
     bool spec = false;
-    struct GSlot { ggml_backend_t gpu = nullptr; ggml_backend_sched_t sched = nullptr; struct Step* last = nullptr; int64_t key[8] = {-1, -1, -1, -1, -1, -1, -1, -1}; std::vector<uint8_t> buf; };
+    struct GSlot { ggml_backend_t gpu = nullptr; ggml_backend_sched_t sched = nullptr; struct Step* last = nullptr; int64_t key[9] = {-1, -1, -1, -1, -1, -1, -1, -1, -1}; std::vector<uint8_t> buf; };
     std::vector<GSlot> vg;           // --dspark: one cached graph (+ its own scheduler) per verify length 2..kSpecT
     uint8_t* host_w = nullptr;       // pinned copy of the GPU weights (park / unpark)
     std::vector<size_t> host_w_at;
@@ -1135,6 +1147,11 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
     ggml_init_params sp{(size_t) (4 * h.n_slot + 4) * ggml_tensor_overhead(), nullptr, true};
     m.sctx = ggml_init(sp);
     m.zsink = ggml_new_tensor_1d(m.sctx, GGML_TYPE_F32, h.n_head);
+    if (h.hd == 128 && kv_rot_types(m.kv_k, m.kv_v)) {
+        m.hrot_f = ggml_new_tensor_2d(m.sctx, GGML_TYPE_F32, h.hd, h.hd);
+        m.hrot_i = ggml_new_tensor_2d(m.sctx, GGML_TYPE_F32, h.hd, h.hd);
+        ggml_format_name(m.hrot_f, "kv_hrot"); ggml_format_name(m.hrot_i, "kv_hrot_t");
+    }
     m.S.resize(h.n_slot);
     for (int s = 0; s < h.n_slot; ++s) {
         Slot& z = m.S[s];
@@ -1159,6 +1176,22 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
     m.sbuf = ggml_backend_alloc_ctx_tensors(m.sctx, m.gpu);
     if (!m.sbuf) die("cannot allocate the K/V cache in VRAM (try a smaller --context, or --cpu-exps)");
     ggml_backend_buffer_clear(m.sbuf, 0);
+    if (m.hrot_f) {   // M = H diag(s) / sqrt(128): Sylvester H, fixed pseudo-random signs (the same every run)
+        const int n = (int) h.hd;
+        std::vector<float> sg(n), f((size_t) n * n), t((size_t) n * n);
+        uint64_t st = 0x9E3779B97F4A7C15ull;
+        for (int k = 0; k < n; ++k) { st = st * 6364136223846793005ull + 1442695040888963407ull; sg[k] = (st >> 63) ? -1.f : 1.f; }
+        const float sc = 1.0f / std::sqrt((float) n);
+        for (int i = 0; i < n; ++i)
+            for (int k = 0; k < n; ++k) {
+                const float v = (__builtin_popcount((unsigned) (i & k)) & 1 ? -sc : sc) * sg[k];   // M[i][k]
+                f[(size_t) i * n + k] = v;   // mul_mat(hrot_f, x)_i = sum_k M[i][k] x_k
+                t[(size_t) k * n + i] = v;   // mul_mat(hrot_i, x)_i = sum_k M[k][i] x_k
+            }
+        ggml_backend_tensor_set(m.hrot_f, f.data(), 0, f.size() * sizeof(float));
+        ggml_backend_tensor_set(m.hrot_i, t.data(), 0, t.size() * sizeof(float));
+        std::fprintf(stderr, "xolotl-inkling: K/V Hadamard rotation on the full-context cache (XOLOTL_INKLING_KV_ROT=0 turns it off)\n");
+    }
     m.state_bytes = ggml_backend_buffer_get_size(m.sbuf);
 
     ggml_backend_t bes[2] = {m.gpu, m.cpu};
@@ -1178,6 +1211,7 @@ inline bool wsum_ref() { static const bool on = std::getenv("XOLOTL_INKLING_WSUM
 // 4090, prefill-path NLL vs the parent gated); XOLOTL_INKLING_PROMPT_ATTN=0 = the chain
 inline bool prompt_attn_on() { static const bool on = !(std::getenv("XOLOTL_INKLING_PROMPT_ATTN") && std::atoi(std::getenv("XOLOTL_INKLING_PROMPT_ATTN")) == 0); return on; }
 struct Model;
+bool kv_fused_type(ggml_type t);
 bool pattn_use(const Model& m, int T);   // prompt_attn_on() and this model/chunk can take it (one predicate for build() and the layer)
 inline bool fa_on() { static const bool on = std::getenv("XOLOTL_INKLING_FA") && std::atoi(std::getenv("XOLOTL_INKLING_FA")) != 0; return on; }
 struct Model;
@@ -1560,7 +1594,13 @@ struct G {                     // graph-building context
         static const bool prep_ref = std::getenv("XOLOTL_INKLING_PREP_REF") != nullptr;
         bool prepped = false;
         ggml_tensor *Kc = nullptr, *Vc = nullptr;
-        if (fused_on() && !prep_ref && !st && T <= 16) {   // decode + verify (the per-token loop is serial in T)
+        // rotated layers take the chain (the prep kernel writes the cache itself, unrotated)
+        const bool rot = !swa && m.hrot_f && !st && kv_rot_types(z.k_cache->type, z.v_cache->type);
+        auto hrot = [&](ggml_tensor* x, ggml_tensor* M) {
+            ggml_tensor* x2 = ggml_reshape_2d(c, ggml_is_contiguous(x) ? x : ggml_cont(c, x), hd, ggml_nelements(x) / hd);
+            return ggml_reshape_3d(c, ggml_mul_mat(c, M, x2), hd, x->ne[1], x->ne[2]);
+        };
+        if (fused_on() && !prep_ref && !st && T <= 16 && !rot) {   // decode + verify (the per-token loop is serial in T)
             ggml_tensor* dk = swa ? nullptr : ggml_mul_mat(c, y.k_conv_proj, in[1]);
             ggml_tensor* dv = swa ? nullptr : ggml_mul_mat(c, y.v_conv_proj, in[2]);
             ggml_tensor* hview = nullptr;
@@ -1594,9 +1634,11 @@ struct G {                     // graph-building context
             if (!swa && !Qf) Q = ggml_mul(c, Q, tau);
             if (!swa && !Rf) R = ggml_mul(c, R, tau);
         }
+        if (rot) { Q = hrot(Q, m.hrot_f); Kc = hrot(Kc, m.hrot_f); }
         ggml_tensor *kst = nullptr, *vst = nullptr;   // the cache stores (the prompt attention orders itself after them)
         if (!prepped) {
             Vc = ggml_rms_norm(c, ggml_reshape_3d(c, Vc, hd, nkv, T), h.eps);
+            if (rot) Vc = hrot(Vc, m.hrot_f);
             kst = store_kv(Kc, z.k_cache, swa);
             vst = store_kv(Vc, z.v_cache, swa);
         }
@@ -1630,14 +1672,14 @@ struct G {                     // graph-building context
         static const bool decattn = !(std::getenv("XOLOTL_INKLING_DECATTN") && std::atoi(std::getenv("XOLOTL_INKLING_DECATTN")) == 0);
         // prompt chunks (T > 16): flash attention on the tensor cores over the whole f16 cache, bias and sink in-kernel
         // (port of Basalt attn_prompt.cu) - no [cells, T, nh] scores, masks or V transposes. XOLOTL_INKLING_PROMPT_ATTN=1
-        if (pattn_use(m, (int) T) && kst && vst && y.rel_bias_pad && z.k_cache->type == GGML_TYPE_F16 && z.v_cache->type == GGML_TYPE_F16) {
+        if (pattn_use(m, (int) T) && kst && vst && y.rel_bias_pad && kv_fused_type(z.k_cache->type) && kv_fused_type(z.v_cache->type)) {
             ggml_tensor* pa = inkling_attn_prompt(c, Q, z.k_cache, z.v_cache, R, sinks, y.rel_bias_pad, kst, vst, p0,
                                                   swa ? h.n_swa : 0, 1.0f / std::sqrt((float) hd));
             if (pa) o = ggml_reshape_2d(c, pa, (int64_t) hd * nh, T);
         }
         if (!o && plan.empty()) GGML_ABORT("xolotl-inkling: prompt attention refused a layer that pattn_use() admitted (a bug; XOLOTL_INKLING_PROMPT_ATTN=0 works around it)");
         if (decattn && !fa_ok(m, (int) T) && T <= 16 && plan.size() == 1 && !m.st &&
-            z.k_cache->type == GGML_TYPE_F16 && z.v_cache->type == GGML_TYPE_F16) {
+            kv_fused_type(z.k_cache->type) && kv_fused_type(z.v_cache->type)) {
             const ChunkIn& ci = plan[0];
             // the relative bias computed inside the attention kernel (no table mat-mul, no [cells, T, nh] mask);
             // XOLOTL_INKLING_DECATTN_REL=0 keeps the relbias mask
@@ -1646,7 +1688,7 @@ struct G {                     // graph-building context
             if (rel_in && y.rel_bias_pad) {
                 ggml_tensor* Kd = ggml_view_3d(c, z.k_cache, hd, nkv, ci.cells, z.k_cache->nb[1], z.k_cache->nb[2], (size_t) ci.j0 * z.k_cache->nb[2]);
                 ggml_tensor* Vd = ggml_view_3d(c, z.v_cache, hd, nkv, ci.cells, z.v_cache->nb[1], z.v_cache->nb[2], (size_t) ci.j0 * z.v_cache->nb[2]);
-                ggml_tensor* Gt = gate_ref0 ? nullptr : (Gp ? Gp : ggml_mul_mat(c, y.gate, in[0]));
+                ggml_tensor* Gt = gate_ref0 || rot ? nullptr : (Gp ? Gp : ggml_mul_mat(c, y.gate, in[0]));
                 ggml_tensor* ad = inkling_attn_dec_rel(c, Q, Kd, Vd, y.rel_bias_pad, R, sinks, ci.rp, ci.mask, 1.0f / std::sqrt((float) hd), Gt);
                 if (ad) { o = ggml_reshape_2d(c, ad, (int64_t) hd * nh, T); gated = Gt != nullptr; }
             }
@@ -1655,7 +1697,7 @@ struct G {                     // graph-building context
                 ggml_tensor* Kd = ggml_view_3d(c, z.k_cache, hd, nkv, ci.cells, z.k_cache->nb[1], z.k_cache->nb[2], (size_t) ci.j0 * z.k_cache->nb[2]);
                 ggml_tensor* Vd = ggml_view_3d(c, z.v_cache, hd, nkv, ci.cells, z.v_cache->nb[1], z.v_cache->nb[2], (size_t) ci.j0 * z.v_cache->nb[2]);
                 static const bool gate_ref = std::getenv("XOLOTL_INKLING_DECATTN_GATE_REF") != nullptr;   // A/B: gate as ggml ops
-                ggml_tensor* Gt = gate_ref ? nullptr : (Gp ? Gp : ggml_mul_mat(c, y.gate, in[0]));
+                ggml_tensor* Gt = gate_ref || rot ? nullptr : (Gp ? Gp : ggml_mul_mat(c, y.gate, in[0]));
                 ggml_tensor* ad = inkling_attn_dec(c, Q, Kd, Vd, mask_h, 1.0f / std::sqrt((float) hd), Gt);
                 if (ad) { o = ggml_reshape_2d(c, ad, (int64_t) hd * nh, T); gated = Gt != nullptr; }
             }
@@ -1723,6 +1765,10 @@ struct G {                     // graph-building context
             o = lse ? ggml_div(c, acc, lse) : acc;                                             // [hd, T, nh]  (normalise once)
             o = ggml_cont_2d(c, ggml_permute(c, o, 0, 2, 1, 3), (int64_t) hd * nh, T);
         }
+        if (rot) {   // the values were stored rotated: o = M^T o' per head, before the (elementwise) gate
+            GGML_ASSERT(!gated);
+            o = ggml_reshape_2d(c, ggml_mul_mat(c, m.hrot_i, ggml_reshape_2d(c, ggml_is_contiguous(o) ? o : ggml_cont(c, o), hd, nh * T)), (int64_t) hd * nh, T);
+        }
         if (!gated) o = ggml_mul(c, o, ggml_sigmoid(c, Gp ? Gp : ggml_mul_mat(c, y.gate, in[0])));
         if (st) tap(o, inkling_stats::ST_O);            // --stats: the o_proj input, exactly what wo consumes
         o = ggml_mul_mat(c, y.wo, o);
@@ -1784,8 +1830,9 @@ int64_t attn_cell_chunk(const Model& m, int T, int64_t nk, int nh) {
 }
 
 bool fa_ok(const Model& m, int T) { return fa_on() && T <= 16 && !m.st; }
+bool kv_fused_type(ggml_type t) { return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0; }
 bool pattn_use(const Model& m, int T) {
-    return prompt_attn_on() && T > 16 && !m.st && m.pattn_ok && m.kv_k == GGML_TYPE_F16 && m.kv_v == GGML_TYPE_F16;
+    return prompt_attn_on() && T > 16 && !m.st && m.pattn_ok && kv_fused_type(m.kv_k) && kv_fused_type(m.kv_v);
 }
 
 // T tokens at positions p0 .. p0+T-1; logits for the last n_out of them
@@ -1994,7 +2041,7 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
     }
     struct SlotSwap {
         Model& m; Model::GSlot* g;
-        void sw() { std::swap(m.sched, g->sched); std::swap(m.last, g->last); std::swap_ranges(m.last_key, m.last_key + 8, g->key); m.graph_buf.swap(g->buf); }
+        void sw() { std::swap(m.sched, g->sched); std::swap(m.last, g->last); std::swap_ranges(m.last_key, m.last_key + 9, g->key); m.graph_buf.swap(g->buf); }
         SlotSwap(Model& mm, Model::GSlot* gg) : m(mm), g(gg) { if (g) sw(); }
         ~SlotSwap() { if (g) sw(); }
     } slot_swap{m, gs};
@@ -2008,9 +2055,12 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
         n_kv_swa = std::min<int64_t>(m.ring, ((hi + 1 + 255) / 256) * 256);
     }
     const bool vision = media_rows != nullptr;
-    const int64_t key[8] = {T, n_out, n_kv_full, n_kv_swa, taps != nullptr, m.st != nullptr, dtap != nullptr, vision};
+    // the prompt attention kernel bakes pos0 into its op params, so its graph is only reusable at the same p0 (a chunk
+    // with the same T in the same 256-cell bucket reran with the old position: wrong attention, 22 Nov S13)
+    const int64_t key[9] = {T, n_out, n_kv_full, n_kv_swa, taps != nullptr, m.st != nullptr, dtap != nullptr, vision,
+                            pattn_use(m, T) ? p0 : -1};
     const auto tb = Clock::now();
-    const bool reuse = m.last && std::equal(key, key + 8, m.last_key);
+    const bool reuse = m.last && std::equal(key, key + 9, m.last_key);
     if (!reuse) {
         drop_graph(m);
         m.last = new Step(build(m, T, p0, n_out, taps != nullptr, dtap != nullptr, vision));
@@ -2029,7 +2079,7 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
             for (ggml_tensor* t : m.last->cold_ops) ggml_backend_sched_set_tensor_backend(m.sched, t, m.gpu);
         }
         if (!ggml_backend_sched_alloc_graph(m.sched, m.last->gf)) { drop_graph(m); throw AllocFail(); }
-        std::copy(key, key + 8, m.last_key);
+        std::copy(key, key + 9, m.last_key);
     }
     Step& s = *m.last;
     const double ms_build = ms_since(tb);
@@ -2548,7 +2598,10 @@ int main(int argc, char** argv) {
             if (vision_device != "cpu" && vision_device != "gpu" && vision_device != "auto") { std::fprintf(stderr, "xolotl-inkling: --vision-device takes cpu or gpu\n"); return 2; }
         }
         else if (a == "--encode") { encode_imgs.push_back(val()); encode_outs.push_back(val()); }
-        else if (a == "--ids") ids_arg = val();
+        else if (a == "--ids") {   // a,b,c,... or @file holding that list (long contexts overflow argv)
+            ids_arg = val();
+            if (!ids_arg.empty() && ids_arg[0] == '@') { std::ifstream f(ids_arg.substr(1)); std::stringstream ss; ss << f.rdbuf(); ids_arg = ss.str(); while (!ids_arg.empty() && std::isspace((unsigned char) ids_arg.back())) ids_arg.pop_back(); }
+        }
         else if (a == "--out-dir") out_dir = val();
         else if (a == "--gen") gen_n = std::atoi(val().c_str());
         else if (a == "--dspark") dspark_path = val();
