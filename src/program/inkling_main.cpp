@@ -205,6 +205,9 @@ struct Layer {                 // one physical layer
     ggml_tensor *msg_query = nullptr, *ctrl_down[4] = {}, *ctrl_gain[4] = {}, *ctrl_forget[4] = {};
     // stacked loop controllers (built at load, exact): q/k/v down [2E, r, 3], q/k/v gain|forget [r, 2E, 3], q/k/v input norms [E, 1, 3]
     ggml_tensor *c3_down = nullptr, *c3_gf = nullptr, *n3 = nullptr;
+    // the same controllers in BF16 (the checkpoint's type, so exact) for the fused decode op: q/k/v stacked, and the
+    // FFN one; up = [gain rows ; forget rows]
+    ggml_tensor *c3_down_h = nullptr, *c3_up_h = nullptr, *c1_down_h = nullptr, *c1_up_h = nullptr;
 };
 
 struct Slot {                  // one cache slot
@@ -338,7 +341,7 @@ void build_stacked_controllers(Model& m) {
         if (ok) ls.push_back(l);
     }
     if (ls.empty()) return;
-    ggml_init_params ip{(ls.size() * 3 + 4) * ggml_tensor_overhead(), nullptr, true};
+    ggml_init_params ip{(ls.size() * 8 + 4) * ggml_tensor_overhead(), nullptr, true};
     m.xctx = ggml_init(ip);
     for (int l : ls) {
         Layer& y = m.L[l];
@@ -346,9 +349,20 @@ void build_stacked_controllers(Model& m) {
         y.c3_down = ggml_new_tensor_3d(m.xctx, GGML_TYPE_F32, E2, r, 3);
         y.c3_gf = ggml_new_tensor_3d(m.xctx, GGML_TYPE_F32, r, 2 * E, 3);
         if (!h.swa[l]) y.n3 = ggml_new_tensor_3d(m.xctx, GGML_TYPE_F32, E, 1, 3);
+        y.c3_down_h = ggml_new_tensor_3d(m.xctx, GGML_TYPE_BF16, E2, r, 3);
+        y.c3_up_h = ggml_new_tensor_3d(m.xctx, GGML_TYPE_BF16, r, 2 * E, 3);
+        if (y.ctrl_down[3] && y.ctrl_down[3]->type == GGML_TYPE_F32 && ggml_are_same_shape(y.ctrl_down[3], y.ctrl_down[0]) &&
+            y.ctrl_gain[3] && y.ctrl_forget[3] && ggml_are_same_shape(y.ctrl_gain[3], y.ctrl_gain[0]) &&
+            ggml_are_same_shape(y.ctrl_forget[3], y.ctrl_gain[0])) {
+            y.c1_down_h = ggml_new_tensor_3d(m.xctx, GGML_TYPE_BF16, E2, r, 1);
+            y.c1_up_h = ggml_new_tensor_3d(m.xctx, GGML_TYPE_BF16, r, 2 * E, 1);
+        }
     }
     m.xbuf = ggml_backend_alloc_ctx_tensors(m.xctx, m.gpu);
-    if (!m.xbuf) { for (int l : ls) m.L[l].c3_down = m.L[l].c3_gf = m.L[l].n3 = nullptr; return; }
+    if (!m.xbuf) {
+        for (int l : ls) m.L[l].c3_down = m.L[l].c3_gf = m.L[l].n3 = m.L[l].c3_down_h = m.L[l].c3_up_h = m.L[l].c1_down_h = m.L[l].c1_up_h = nullptr;
+        return;
+    }
     std::vector<uint8_t> b;
     auto copy = [&](ggml_tensor* src, ggml_tensor* dst, size_t off) {
         b.resize(ggml_nbytes(src));
@@ -361,6 +375,27 @@ void build_stacked_controllers(Model& m) {
             copy(y.ctrl_down[k], y.c3_down, (size_t) k * y.c3_down->nb[2]);
             copy(y.ctrl_gain[k], y.c3_gf, (size_t) k * y.c3_gf->nb[2]);
             copy(y.ctrl_forget[k], y.c3_gf, (size_t) k * y.c3_gf->nb[2] + ggml_nbytes(y.ctrl_gain[k]));
+        }
+        // BF16 copies: the F32 values are BF16 values (the converter widened them), so the rounding is exact
+        std::vector<float> f;
+        std::vector<ggml_bf16_t> hb;
+        auto copy_h = [&](ggml_tensor* src, ggml_tensor* dst, size_t off_elems) {
+            f.resize(ggml_nelements(src));
+            ggml_backend_tensor_get(src, f.data(), 0, f.size() * sizeof(float));
+            hb.resize(f.size());
+            for (size_t i = 0; i < f.size(); ++i) hb[i] = ggml_fp32_to_bf16(f[i]);
+            ggml_backend_tensor_set(dst, hb.data(), off_elems * sizeof(ggml_bf16_t), hb.size() * sizeof(ggml_bf16_t));
+        };
+        const size_t dsz = (size_t) ggml_nelements(y.ctrl_down[0]), gsz = (size_t) ggml_nelements(y.ctrl_gain[0]);
+        for (int k = 0; k < 3; ++k) {
+            copy_h(y.ctrl_down[k], y.c3_down_h, k * dsz);
+            copy_h(y.ctrl_gain[k], y.c3_up_h, k * 2 * gsz);
+            copy_h(y.ctrl_forget[k], y.c3_up_h, k * 2 * gsz + gsz);
+        }
+        if (y.c1_down_h) {
+            copy_h(y.ctrl_down[3], y.c1_down_h, 0);
+            copy_h(y.ctrl_gain[3], y.c1_up_h, 0);
+            copy_h(y.ctrl_forget[3], y.c1_up_h, gsz);
         }
         if (y.n3) {
             copy(y.q_inp_norm, y.n3, 0);
@@ -1547,7 +1582,18 @@ struct G {                     // graph-building context
         ggml_tensor* inpSA = cur;
         ggml_tensor* in[3] = {cur, cur, cur};
         ggml_tensor* mxq = y.attn_res_query ? mix(blocks, cur, y.attn_res_query) : nullptr;
-        if (messages && y.c3_down && (swa || y.n3)) {   // the three controllers as one batched chain: [E, T, 3]
+        // the three controllers as one fused op (decode / verify): strided views in, no copies
+        static const bool ctrl_fused = !(std::getenv("XOLOTL_INKLING_CTRL_FUSED") && std::atoi(std::getenv("XOLOTL_INKLING_CTRL_FUSED")) == 0);
+        ggml_tensor* out3f = nullptr;
+        if (messages && y.c3_down && (swa || y.n3) && fused_on() && ctrl_fused && !st && T <= 16) {
+            ggml_tensor* cur3 = mxq && !swa ? ggml_view_3d(c, mxq, E, T, 3, mxq->nb[2], mxq->nb[1], 0)
+                                            : (mxq ? ggml_view_2d(c, mxq, E, T, mxq->nb[2], 0) : cur);
+            ggml_tensor* msg3 = ggml_view_3d(c, messages, E, T, 3, messages->nb[2], messages->nb[1], 0);
+            out3f = y.c3_down_h ? inkling_ctrl(c, cur3, msg3, y.c3_down_h, y.c3_up_h, swa ? y.attn_norm : y.n3, h.eps) : nullptr;
+            if (out3f) for (int j = 0; j < 3; ++j) in[j] = ggml_view_2d(c, out3f, E, T, out3f->nb[1], (size_t) j * out3f->nb[2]);
+        }
+        if (out3f) {
+        } else if (messages && y.c3_down && (swa || y.n3)) {   // the three controllers as one batched chain: [E, T, 3]
             ggml_tensor* cur3;
             if (mxq && !swa) cur3 = ggml_cont(c, ggml_permute(c, mxq, 0, 2, 1, 3));                       // [E,3,T] -> [E,T,3]
             else {
@@ -1792,8 +1838,18 @@ struct G {                     // graph-building context
         ggml_tensor* ffn_inp = cur;
 
         ggml_tensor* x = ggml_reshape_2d(c, mix(blocks, cur, y.ffn_res_query), E, T);
-        if (messages) x = control(x, message(3), y, 3);
-        x = rms(x, y.ffn_norm);
+        ggml_tensor* xf = nullptr;   // the FFN controller + ffn_norm as one fused op (decode / verify)
+        if (messages && y.c1_down_h && fused_on() && !st && T <= 16 &&
+            !(std::getenv("XOLOTL_INKLING_CTRL_FUSED") && std::atoi(std::getenv("XOLOTL_INKLING_CTRL_FUSED")) == 0)) {
+            ggml_tensor* msg1 = ggml_view_3d(c, messages, E, T, 1, messages->nb[2], messages->nb[1], (size_t) 3 * messages->nb[1]);
+            xf = inkling_ctrl(c, x, msg1, y.c1_down_h, y.c1_up_h, y.ffn_norm, h.eps);
+            if (xf) xf = ggml_reshape_2d(c, xf, E, T);
+        }
+        if (xf) x = xf;
+        else {
+            if (messages) x = control(x, message(3), y, 3);
+            x = rms(x, y.ffn_norm);
+        }
         if (st) tap(x, inkling_stats::ST_F);            // --stats: the MoE input (gate/up + the router)
         want_finish = T <= 16;   // decode + verify; prefill keeps the sum and gets the token-parallel conv
         x = moe(x, y);
@@ -2196,6 +2252,14 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
             std::sort(v.rbegin(), v.rend());
             std::fprintf(stderr, "xolotl-inkling: one-token graph %d nodes:\n", ggml_graph_n_nodes(s.gf));
             for (auto& e : v) std::fprintf(stderr, "  %5d  %s\n", e.first, e.second.c_str());
+            if (std::atoi(std::getenv("XOLOTL_INKLING_NODES")) >= 2)   // =2: every kernel node in order (op, name, shape, srcs)
+                for (int i = 0; i < ggml_graph_n_nodes(s.gf); ++i) {
+                    ggml_tensor* n = ggml_graph_node(s.gf, i);
+                    if (n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE) continue;
+                    std::fprintf(stderr, "  #%04d %-10s %-28s [%lld,%lld,%lld]", i, ggml_op_desc(n), n->name, (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2]);
+                    for (int k = 0; k < 4 && n->src[k]; ++k) std::fprintf(stderr, " <%s:%s>", n->src[k]->name, ggml_type_name(n->src[k]->type));
+                    std::fprintf(stderr, "\n");
+                }
         }
     }
     if (dbg) std::fprintf(stderr, "xolotl-inkling: T=%d nodes=%d splits=%d %s %.1f ms inputs %.2f ms compute %.1f ms\n", T,

@@ -85,5 +85,11 @@ ggml_tensor* inkling_attn_prep(ggml_context* c, ggml_tensor* xk, ggml_tensor* xv
                                ggml_tensor* idx, ggml_tensor* kcache, ggml_tensor* vcache, float thr, float eps,
                                ggml_tensor* hist, ggml_tensor* rotk = nullptr, ggml_tensor* rotv = nullptr);
 
+// the loop controller for K controllers and T <= 16 tokens: rms_norm(cur - f * cur + g * msg) * w with
+// [g; f] = tanh(U (D [rms(cur); rms(msg)])).  cur [E, T, K] or [E, T] (shared by every k), msg [E, T, K] (strided
+// views are fine), D [2E, r, K] BF16, U [r, 2E, K] BF16 (gain rows then forget rows), w [E] or [E, 1, K].
+ggml_tensor* inkling_ctrl(ggml_context* c, ggml_tensor* cur, ggml_tensor* msg, ggml_tensor* down, ggml_tensor* up,
+                          ggml_tensor* w, float eps);
+
 // true when the ggml build runs these on CUDA (the custom-op hook is present); else the engine keeps the op chains
 bool inkling_fused_available();

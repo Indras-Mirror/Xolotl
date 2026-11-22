@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -1581,6 +1582,169 @@ void attn_prep_cpu(ggml_tensor* dst, int ith, int nth, void*) {
     }
 }
 
+// ------------------------------------------------------------------------------------------------ loop controller
+// The loop layers' controller, (1 - forget) * cur + gain * msg with [gain; forget] = tanh(U (D [rms(cur); rms(msg)])),
+// then rms_norm * w, for K controllers (the attention side's q/k/v stacked, or the FFN side's one) and T tokens:
+// three kernels instead of ~13 ops (two rms_norms, concat, two mat-muls, tanh, mul, sub, mul, add, rms_norm, mul and
+// the input copies).  D and U are BF16 (the checkpoint's own type: the GGUF's F32 copies hold exactly those values).
+// cur / msg are strided views: element (e, t, k) at data + e + t * st + k * sk (sk 0 = shared by every k).
+struct CtrlIn { const float* p; long st, sk; };
+static CtrlIn ctrl_in(const ggml_tensor* x, int K) {
+    return {(const float*) x->data, (long) (x->nb[1] / 4), x->ne[2] > 1 || K == 1 ? (long) (x->nb[2] / 4) : 0};
+}
+constexpr int kCtrlE = 32;   // up-kernel outputs per block
+// z[k, t, row] = D_k[row] . [cur * rms_c ; msg * rms_m]   grid (r, T, K), 128 threads (a block per row)
+__global__ void k_ctrl_down(CtrlIn cu, CtrlIn ms, const __nv_bfloat16* __restrict__ D, float* __restrict__ z, int E, int r, int T) {
+    const int row = blockIdx.x, t = blockIdx.y, k = blockIdx.z, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const float* c = cu.p + (size_t) t * cu.st + (size_t) k * cu.sk;
+    const float* m = ms.p + (size_t) t * ms.st + (size_t) k * ms.sk;
+    __shared__ float red[3][4];
+    float a = 0.0f, b = 0.0f;
+    for (int e = threadIdx.x; e < E; e += 128) { const float x = c[e], y = m[e]; a = fmaf(x, x, a); b = fmaf(y, y, b); }
+    a = warp_sum(a); b = warp_sum(b);
+    if (lane == 0) { red[0][w] = a; red[1][w] = b; }
+    __syncthreads();
+    const float sc = rsqrtf((red[0][0] + red[0][1] + red[0][2] + red[0][3]) / E + 1e-6f);
+    const float sm = rsqrtf((red[1][0] + red[1][1] + red[1][2] + red[1][3]) / E + 1e-6f);
+    const __nv_bfloat162* d = reinterpret_cast<const __nv_bfloat162*>(D + ((size_t) k * r + row) * 2 * E);
+    float acc = 0.0f;
+    for (int pi = threadIdx.x; pi < E; pi += 128) {   // pair pi = elements 2pi, 2pi+1 of [cur ; msg] (E even)
+        const float2 wv = __bfloat1622float2(d[pi]);
+        const int e = 2 * pi;
+        const float x0 = e < E ? c[e] * sc : m[e - E] * sm, x1 = e < E ? c[e + 1] * sc : m[e + 1 - E] * sm;
+        acc = fmaf(wv.x, x0, fmaf(wv.y, x1, acc));
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) red[2][w] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) z[((size_t) k * T + t) * r + row] = red[2][0] + red[2][1] + red[2][2] + red[2][3];
+}
+// pre[k, t, e] = (cur - f * cur) + g * msg, [g; f] = tanh(U z) (U rows: gain 0..E-1, forget E..2E-1); each block's sum
+// of squares after the E values.  grid (ceil(E / kCtrlE), T, K), 256 threads: a warp per output, lanes over r
+__global__ void k_ctrl_up(CtrlIn cu, CtrlIn ms, const __nv_bfloat16* __restrict__ U, long uk, const float* __restrict__ z,
+                          float* __restrict__ pre, int E, int r, int T, int pw) {
+    const int t = blockIdx.y, k = blockIdx.z, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    __shared__ float zs[256], red[8];
+    for (int i = threadIdx.x; i < r; i += 256) zs[i] = z[((size_t) k * T + t) * r + i];
+    __syncthreads();
+    const float* c = cu.p + (size_t) t * cu.st + (size_t) k * cu.sk;
+    const float* m = ms.p + (size_t) t * ms.st + (size_t) k * ms.sk;
+    float* o = pre + ((size_t) k * T + t) * pw;
+    float sq = 0.0f;
+    for (int j = w; j < kCtrlE; j += 8) {
+        const int e = blockIdx.x * kCtrlE + j;
+        if (e >= E) break;
+        const __nv_bfloat162* gr = reinterpret_cast<const __nv_bfloat162*>(U + (size_t) k * uk + (size_t) e * r);
+        const __nv_bfloat162* fr = reinterpret_cast<const __nv_bfloat162*>(U + (size_t) k * uk + (size_t) (E + e) * r);
+        float gs = 0.0f, fs = 0.0f;
+        for (int i = lane; 2 * i < r; i += 32) {
+            const float2 g2 = __bfloat1622float2(gr[i]), f2 = __bfloat1622float2(fr[i]);
+            gs = fmaf(g2.x, zs[2 * i], fmaf(g2.y, zs[2 * i + 1], gs));
+            fs = fmaf(f2.x, zs[2 * i], fmaf(f2.y, zs[2 * i + 1], fs));
+        }
+        gs = warp_sum(gs); fs = warp_sum(fs);
+        if (lane == 0) {
+            const float g = tanhf(gs), f = tanhf(fs), cv = c[e], mv = m[e];
+            const float v = __fadd_rn(__fsub_rn(cv, __fmul_rn(f, cv)), __fmul_rn(g, mv));
+            o[e] = v;
+            sq = fmaf(v, v, sq);
+        }
+    }
+    if (lane == 0) red[w] = sq;
+    __syncthreads();
+    if (threadIdx.x == 0) { float a = 0.0f; for (int i = 0; i < 8; ++i) a += red[i]; o[E + blockIdx.x] = a; }
+}
+// out[k, t, e] = pre * rsqrt(mean(pre^2) + eps) * w   grid (T, K), 256 threads
+__global__ void k_ctrl_norm(const float* __restrict__ pre, const float* __restrict__ w, long wk, float* __restrict__ out,
+                            int E, int T, int nb, int pw, float eps) {
+    const int t = blockIdx.x, k = blockIdx.y;
+    const float* p = pre + ((size_t) k * T + t) * pw;
+    __shared__ float rs_s;
+    if (threadIdx.x < 32) {
+        float s = 0.0f;
+        for (int i = threadIdx.x; i < nb; i += 32) s += p[E + i];
+        s = warp_sum(s);
+        if (threadIdx.x == 0) rs_s = rsqrtf(s / E + eps);
+    }
+    __syncthreads();
+    const float rs = rs_s;
+    float* o = out + ((size_t) k * T + t) * E;
+    for (int e = threadIdx.x; e < E; e += 256) o[e] = __fmul_rn(__fmul_rn(p[e], rs), w[(size_t) k * wk + e]);
+}
+static long ctrl_wk(const ggml_tensor* w, int E) { return ggml_nelements(w) > E ? E : 0; }
+static int ctrl_nb(int E) { return (E + kCtrlE - 1) / kCtrlE; }
+void ctrl_down_cuda(ggml_tensor* dst, void* stream, void*) {   // srcs: cur, msg, down [2E, r, K] bf16
+    const ggml_tensor *cu = dst->src[0], *ms = dst->src[1], *D = dst->src[2];
+    const int r = (int) dst->ne[0], T = (int) dst->ne[1], K = (int) dst->ne[2], E = (int) ms->ne[0];
+    k_ctrl_down<<<dim3(r, T, K), 128, 0, (cudaStream_t) stream>>>(ctrl_in(cu, K), ctrl_in(ms, K), (const __nv_bfloat16*) D->data,
+                                                                  (float*) dst->data, E, r, T);
+}
+void ctrl_up_cuda(ggml_tensor* dst, void* stream, void*) {     // srcs: cur, msg, U [r, 2E, K] bf16, z
+    const ggml_tensor *cu = dst->src[0], *ms = dst->src[1], *U = dst->src[2], *z = dst->src[3];
+    const int pw = (int) dst->ne[0], T = (int) dst->ne[1], K = (int) dst->ne[2], E = (int) ms->ne[0], r = (int) z->ne[0];
+    k_ctrl_up<<<dim3(ctrl_nb(E), T, K), 256, 0, (cudaStream_t) stream>>>(ctrl_in(cu, K), ctrl_in(ms, K), (const __nv_bfloat16*) U->data,
+        (long) (U->nb[2] / 2), (const float*) z->data, (float*) dst->data, E, r, T, pw);
+}
+void ctrl_norm_cuda(ggml_tensor* dst, void* stream, void*) {   // srcs: pre, w
+    const ggml_tensor *pre = dst->src[0], *w = dst->src[1];
+    const int E = (int) dst->ne[0], T = (int) dst->ne[1], K = (int) dst->ne[2], pw = (int) pre->ne[0];
+    k_ctrl_norm<<<dim3(T, K), 256, 0, (cudaStream_t) stream>>>((const float*) pre->data, (const float*) w->data, ctrl_wk(w, E),
+                                                               (float*) dst->data, E, T, ctrl_nb(E), pw, param<float>(dst, 0));
+}
+// CPU twins (the same sums, plain loops)
+static float ctrl_at(const ggml_tensor* x, int K, int e, int t, int k) { const CtrlIn c = ctrl_in(x, K); return c.p[(size_t) t * c.st + (size_t) k * c.sk + e]; }
+static float bf(const ggml_tensor* x, size_t i) { return ggml_bf16_to_fp32(((const ggml_bf16_t*) x->data)[i]); }
+void ctrl_down_cpu(ggml_tensor* dst, int ith, int nth, void*) {
+    const ggml_tensor *cu = dst->src[0], *ms = dst->src[1], *D = dst->src[2];
+    const int r = (int) dst->ne[0], T = (int) dst->ne[1], K = (int) dst->ne[2], E = (int) ms->ne[0];
+    for (int u = ith; u < T * K; u += nth) {
+        const int t = u % T, k = u / T;
+        double a = 0, b = 0;
+        for (int e = 0; e < E; ++e) { const float x = ctrl_at(cu, K, e, t, k), y = ctrl_at(ms, K, e, t, k); a += x * x; b += y * y; }
+        const float sc = 1.0f / std::sqrt((float) (a / E) + 1e-6f), sm = 1.0f / std::sqrt((float) (b / E) + 1e-6f);
+        for (int row = 0; row < r; ++row) {
+            const size_t d = ((size_t) k * r + row) * 2 * E;
+            float acc = 0.0f;
+            for (int e = 0; e < E; ++e) acc += bf(D, d + e) * ctrl_at(cu, K, e, t, k) * sc + bf(D, d + E + e) * ctrl_at(ms, K, e, t, k) * sm;
+            ((float*) dst->data)[((size_t) k * T + t) * r + row] = acc;
+        }
+    }
+}
+void ctrl_up_cpu(ggml_tensor* dst, int ith, int nth, void*) {
+    const ggml_tensor *cu = dst->src[0], *ms = dst->src[1], *U = dst->src[2], *z = dst->src[3];
+    const int pw = (int) dst->ne[0], T = (int) dst->ne[1], K = (int) dst->ne[2], E = (int) ms->ne[0], r = (int) z->ne[0];
+    const size_t uk = U->nb[2] / 2;
+    for (int u = ith; u < T * K; u += nth) {
+        const int t = u % T, k = u / T;
+        const float* zz = (const float*) z->data + ((size_t) k * T + t) * r;
+        float* o = (float*) dst->data + ((size_t) k * T + t) * pw;
+        for (int b = 0; b < ctrl_nb(E); ++b) o[E + b] = 0.0f;
+        for (int e = 0; e < E; ++e) {
+            float gs = 0.0f, fs = 0.0f;
+            for (int i = 0; i < r; ++i) { gs += bf(U, k * uk + (size_t) e * r + i) * zz[i]; fs += bf(U, k * uk + (size_t) (E + e) * r + i) * zz[i]; }
+            const float g = std::tanh(gs), f = std::tanh(fs), c = ctrl_at(cu, K, e, t, k), m = ctrl_at(ms, K, e, t, k);
+            o[e] = (c - f * c) + g * m;
+            o[E + e / kCtrlE] += o[e] * o[e];
+        }
+    }
+}
+void ctrl_norm_cpu(ggml_tensor* dst, int ith, int nth, void*) {
+    const ggml_tensor *pre = dst->src[0], *w = dst->src[1];
+    const int E = (int) dst->ne[0], T = (int) dst->ne[1], K = (int) dst->ne[2], pw = (int) pre->ne[0];
+    const float eps = param<float>(dst, 0);
+    const long wk = ctrl_wk(w, E);
+    for (int u = ith; u < T * K; u += nth) {
+        const int t = u % T, k = u / T;
+        const float* p = (const float*) pre->data + ((size_t) k * T + t) * pw;
+        float s = 0.0f;
+        for (int b = 0; b < ctrl_nb(E); ++b) s += p[E + b];
+        const float rs = 1.0f / std::sqrt(s / E + eps);
+        for (int e = 0; e < E; ++e) ((float*) dst->data)[((size_t) k * T + t) * E + e] = p[e] * rs * ((const float*) w->data)[(size_t) k * wk + e];
+    }
+}
+ggml_cuda_custom_op g_ctrl_down{GGML_CUDA_CUSTOM_MAGIC, ctrl_down_cuda, nullptr};
+ggml_cuda_custom_op g_ctrl_up{GGML_CUDA_CUSTOM_MAGIC, ctrl_up_cuda, nullptr};
+ggml_cuda_custom_op g_ctrl_norm{GGML_CUDA_CUSTOM_MAGIC, ctrl_norm_cuda, nullptr};
 ggml_cuda_custom_op g_conv{GGML_CUDA_CUSTOM_MAGIC, conv_cuda, nullptr};
 ggml_cuda_custom_op g_situ{GGML_CUDA_CUSTOM_MAGIC, situ_cuda, nullptr};
 ggml_cuda_custom_op g_stack{GGML_CUDA_CUSTOM_MAGIC, stack_cuda, nullptr};
@@ -2027,6 +2191,24 @@ ggml_tensor* inkling_stack(ggml_context* c, ggml_tensor* const* srcs, int n) {
     return ggml_custom_4d(c, GGML_TYPE_F32, E, n, T, 1, args, n, stack_cpu, GGML_N_TASKS_MAX, &g_stack);
 }
 
+ggml_tensor* inkling_ctrl(ggml_context* c, ggml_tensor* cur, ggml_tensor* msg, ggml_tensor* down, ggml_tensor* up,
+                          ggml_tensor* w, float eps) {
+    const int64_t E = msg->ne[0], T = msg->ne[1], K = msg->ne[2], r = down->ne[1];
+    auto f32 = [](const ggml_tensor* x) { return x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float); };
+    if (!f32(cur) || !f32(msg) || !f32(w) || down->type != GGML_TYPE_BF16 || up->type != GGML_TYPE_BF16 ||
+        !ggml_is_contiguous(down) || !ggml_is_contiguous(up) || !ggml_is_contiguous(w) || E % 2 != 0 || r % 2 != 0 ||
+        cur->ne[0] != E || cur->ne[1] != T || (cur->ne[2] != K && cur->ne[2] != 1) || down->ne[0] != 2 * E ||
+        down->ne[2] != K || r < 2 || r > 256 || up->ne[0] != r || up->ne[1] != 2 * E || up->ne[2] != K ||
+        (ggml_nelements(w) != E && ggml_nelements(w) != E * K) || T > 16) return nullptr;
+    ggml_tensor* a1[3] = {cur, msg, down};
+    ggml_tensor* z = ggml_custom_4d(c, GGML_TYPE_F32, r, T, K, 1, a1, 3, ctrl_down_cpu, GGML_N_TASKS_MAX, &g_ctrl_down);
+    ggml_tensor* a2[4] = {cur, msg, up, z};
+    ggml_tensor* pre = ggml_custom_4d(c, GGML_TYPE_F32, E + ctrl_nb((int) E), T, K, 1, a2, 4, ctrl_up_cpu, GGML_N_TASKS_MAX, &g_ctrl_up);
+    ggml_tensor* a3[2] = {pre, w};
+    ggml_tensor* y = ggml_custom_4d(c, GGML_TYPE_F32, E, T, K, 1, a3, 2, ctrl_norm_cpu, GGML_N_TASKS_MAX, &g_ctrl_norm);
+    set_param<float>(y, 0, eps);
+    return y;
+}
 ggml_tensor* inkling_clip(ggml_context* c, ggml_tensor* x, ggml_tensor* scale, float thr, ggml_tensor* tau) {
     if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] >= 1024 || thr <= 0.0f) return nullptr;
     if (scale && (scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || scale->ne[0] != x->ne[0] ||
@@ -2236,6 +2418,7 @@ ggml_tensor* inkling_moe_finish(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_
 ggml_tensor* inkling_situ(ggml_context*, ggml_tensor*, float, float) { return nullptr; }
 ggml_tensor* inkling_stack(ggml_context*, ggml_tensor* const*, int) { return nullptr; }
 ggml_tensor* inkling_clip(ggml_context*, ggml_tensor*, ggml_tensor*, float, ggml_tensor*) { return nullptr; }
+ggml_tensor* inkling_ctrl(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, float) { return nullptr; }
 ggml_tensor* inkling_mix(ggml_context*, ggml_tensor* const*, int, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_relbias(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_type) { return nullptr; }
 ggml_tensor* inkling_attn_dec(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, float, ggml_tensor*) { return nullptr; }
