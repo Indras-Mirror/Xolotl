@@ -907,14 +907,14 @@ void attn_dec_reduce_cpu(ggml_tensor* dst, int ith, int nth, void*) {
 
 // ------------------------------------------------------------------------------------------------ attention prepare
 // One kernel per visit for the key/value side: K and V convolutions (state, optional dynamic taps, optional verify
-// history), the key clip thr*x/max(|x|,thr) per head row, the value RMS norm per head row, and both f16 cache writes at
-// the step's cells.  Block = (kv head, K|V), thread = channel.  The row reductions are done by warp 0 in exactly the
+// history), the key clip thr*x/max(|x|,thr) per head row, the value RMS norm per head row, the optional cache rotation
+// (shared-memory FWHT), and both cache writes (f16 / q8_0 / q4_0) at the step's cells.  Block = (kv head, K|V), thread = channel.  The row reductions are done by warp 0 in exactly the
 // order of k_clip / ggml's 32-thread rms_norm, so the values match the chain they replace.
 template <int K>
 __global__ void k_attn_prep(const float* __restrict__ x, long xs, const float* __restrict__ w, float* __restrict__ state,
                             int off, const float* __restrict__ dyn, int nhd, float scale, const int64_t* __restrict__ idx,
                             char* __restrict__ cache, long c1, long c2, float* __restrict__ hist, long hs, int T, float thr,
-                            float eps, int isv) {
+                            float eps, int isv, int qty, const float* __restrict__ rs) {
     const int g = blockIdx.x, tid = threadIdx.x, hd = blockDim.x;
     const int C = gridDim.x * hd, ch = g * hd + tid, srow = off + ch;
     __shared__ float yb[256];
@@ -955,8 +955,49 @@ __global__ void k_attn_prep(const float* __restrict__ x, long xs, const float* _
             if (tid == 0) nrm = isv ? rsqrtf(tmp / hd + eps) : rsqrtf(fmaxf(tmp, thr * thr));
         }
         __syncthreads();
-        const float o = isv ? __fmul_rn(nrm, y) : __fmul_rn(thr, __fmul_rn(nrm, y));
-        ((__half*) (cache + (size_t) idx[t] * c2 + (size_t) g * c1))[tid] = __float2half(o);
+        float o = isv ? __fmul_rn(nrm, y) : __fmul_rn(thr, __fmul_rn(nrm, y));
+        if (rs) {   // the cache rotation M = H diag(s)/sqrt(hd): rs = row 0 of M = s/sqrt(hd), then the Sylvester FWHT
+            yb[tid] = o * rs[tid];
+            __syncthreads();
+            for (int len = 1; len < hd; len <<= 1) {
+                const float a = yb[tid], b = yb[tid ^ len];
+                __syncthreads();
+                yb[tid] = (tid & len) ? b - a : a + b;
+                __syncthreads();
+            }
+            o = yb[tid];
+        }
+        char* row = cache + (size_t) idx[t] * c2 + (size_t) g * c1;
+        if (qty == 0) {
+            ((__half*) row)[tid] = __float2half(o);
+        } else {   // one warp = one 32-value block (hd % 32 == 0), quantised as ggml-cuda's set_rows does
+            const int lane = tid & 31, blk = tid >> 5;
+            if (qty == 1) {   // q8_0: fp16 d + 32 x int8, d = amax / 127
+                float am = fabsf(o);
+#pragma unroll
+                for (int m = 16; m > 0; m >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffff, am, m, 32));
+                const float d = am / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+                char* b = row + (size_t) blk * 34;
+                if (lane == 0) *(__half*) b = __float2half(d);
+                b[2 + lane] = (char) (int8_t) roundf(o * id);
+            } else {          // q4_0: fp16 d + 16 bytes, d = (signed max-|x|, first one) / -8, nibble j | j+16
+                float am = fabsf(o);
+                int il = lane;
+#pragma unroll
+                for (int m = 16; m > 0; m >>= 1) {
+                    const float a2 = __shfl_xor_sync(0xffffffff, am, m, 32);
+                    const int i2 = __shfl_xor_sync(0xffffffff, il, m, 32);
+                    if (a2 > am || (a2 == am && i2 < il)) { am = a2; il = i2; }
+                }
+                const float vmax = __shfl_sync(0xffffffff, o, il, 32);
+                const float d = vmax / -8.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+                const int xi = min(15, (int) (int8_t) (o * id + 8.5f));
+                const int hi = __shfl_down_sync(0xffffffff, xi, 16, 32);
+                char* b = row + (size_t) blk * 18;
+                if (lane == 0) *(__half*) b = __float2half(d);
+                if (lane < 16) b[2 + lane] = (char) (uint8_t) (xi | (hi << 4));
+            }
+        }
         __syncthreads();
     }
 #pragma unroll
@@ -967,15 +1008,17 @@ void attn_prep_cuda(ggml_tensor* dst, void* stream, void*) {
     // srcs: x, w, state, idx, cache, [dyn], [hist]
     const int K = param<int>(dst, 0), nhd = param<int>(dst, 1), has_h = param<int>(dst, 2), off = param<int>(dst, 3);
     const float scale = param<float>(dst, 4), thr = param<float>(dst, 5), eps = param<float>(dst, 6);
-    const int isv = param<int>(dst, 7);
+    const int isv = param<int>(dst, 7) & 1, has_r = param<int>(dst, 7) >> 1;   // op_params hold 8 ints after kP: pack
     const ggml_tensor *x = dst->src[0], *w = dst->src[1], *st = dst->src[2], *ix = dst->src[3], *cc = dst->src[4];
     const ggml_tensor* dy = nhd > 0 ? dst->src[5] : nullptr;
     const ggml_tensor* hi = has_h ? dst->src[nhd > 0 ? 6 : 5] : nullptr;
-    const int hd = (int) cc->ne[0], nkv = (int) cc->ne[1], T = (int) ix->ne[0];
+    const ggml_tensor* ro = has_r ? dst->src[5 + (nhd > 0) + has_h] : nullptr;
+    const int hd = (int) cc->ne[0], nkv = (int) cc->ne[1], T = (int) ix->ne[0], qty = kv_type_id(cc->type);
+    const float* rs = ro ? (const float*) ro->data : nullptr;
     cudaStream_t s = (cudaStream_t) stream;
 #define PREP_CASE(k) case k: k_attn_prep<k><<<nkv, hd, 0, s>>>((const float*) x->data, (long) (x->nb[1] / 4), (const float*) w->data, \
         (float*) st->data, off, dy ? (const float*) dy->data : nullptr, nhd, scale, (const int64_t*) ix->data, (char*) cc->data, \
-        (long) cc->nb[1], (long) cc->nb[2], hi ? (float*) hi->data : nullptr, hi ? (long) (hi->nb[1] / 4) : 0, T, thr, eps, isv); break;
+        (long) cc->nb[1], (long) cc->nb[2], hi ? (float*) hi->data : nullptr, hi ? (long) (hi->nb[1] / 4) : 0, T, thr, eps, isv, qty, rs); break;
     switch (K) { PREP_CASE(2) PREP_CASE(3) PREP_CASE(4) PREP_CASE(5) PREP_CASE(6) PREP_CASE(7) PREP_CASE(8) default: break; }
 #undef PREP_CASE
 }
@@ -983,10 +1026,11 @@ void attn_prep_cuda(ggml_tensor* dst, void* stream, void*) {
 void attn_prep_cpu(ggml_tensor* dst, int ith, int nth, void*) {
     const int K = param<int>(dst, 0), nhd = param<int>(dst, 1), has_h = param<int>(dst, 2), off = param<int>(dst, 3);
     const float scale = param<float>(dst, 4), thr = param<float>(dst, 5), eps = param<float>(dst, 6);
-    const int isv = param<int>(dst, 7);
+    const int isv = param<int>(dst, 7) & 1, has_r = param<int>(dst, 7) >> 1;   // op_params hold 8 ints after kP: pack
     const ggml_tensor *x = dst->src[0], *w = dst->src[1], *st = dst->src[2], *ix = dst->src[3], *cc = dst->src[4];
     const ggml_tensor* dy = nhd > 0 ? dst->src[5] : nullptr;
     const ggml_tensor* hi = has_h ? dst->src[nhd > 0 ? 6 : 5] : nullptr;
+    const ggml_tensor* ro = has_r ? dst->src[5 + (nhd > 0) + has_h] : nullptr;
     const int hd = (int) cc->ne[0], nkv = (int) cc->ne[1], T = (int) ix->ne[0], C = hd * nkv;
     for (int g = ith; g < nkv; g += nth) {
         std::vector<float> rr((size_t) hd * K), y(hd);
@@ -1016,10 +1060,17 @@ void attn_prep_cpu(ggml_tensor* dst, int ith, int nth, void*) {
             for (int tid = 0; tid < hd; ++tid) tmp += y[tid] * y[tid];
             const float nr = isv ? 1.0f / std::sqrt(tmp / hd + eps) : 1.0f / std::sqrt(std::max(tmp, thr * thr));
             const int64_t cell = ((const int64_t*) ix->data)[t];
-            for (int tid = 0; tid < hd; ++tid) {
-                const float o = isv ? nr * y[tid] : thr * (nr * y[tid]);
-                ((ggml_fp16_t*) ((char*) cc->data + (size_t) cell * cc->nb[2] + (size_t) g * cc->nb[1]))[tid] = ggml_fp32_to_fp16(o);
+            std::vector<float> o(hd);
+            for (int tid = 0; tid < hd; ++tid) o[tid] = isv ? nr * y[tid] : thr * (nr * y[tid]);
+            if (ro) {   // M = H diag(s)/sqrt(hd): row 0 of M, then the Sylvester FWHT (as the CUDA kernel)
+                for (int tid = 0; tid < hd; ++tid) o[tid] *= ((const float*) ro->data)[tid];
+                for (int len = 1; len < hd; len <<= 1)
+                    for (int i = 0; i < hd; ++i)
+                        if (!(i & len)) { const float a = o[i], b = o[i + len]; o[i] = a + b; o[i + len] = a - b; }
             }
+            char* row = (char*) cc->data + (size_t) cell * cc->nb[2] + (size_t) g * cc->nb[1];
+            if (cc->type == GGML_TYPE_F16) for (int tid = 0; tid < hd; ++tid) ((ggml_fp16_t*) row)[tid] = ggml_fp32_to_fp16(o[tid]);
+            else ggml_quantize_chunk(cc->type, o.data(), row, 0, 1, hd, nullptr);
         }
         for (int tid = 0; tid < hd; ++tid) {
             const int srow = off + g * hd + tid;
@@ -1516,22 +1567,25 @@ ggml_tensor* inkling_relbias(ggml_context* c, ggml_tensor* table, ggml_tensor* s
 
 static ggml_tensor* attn_prep_one(ggml_context* c, ggml_tensor* x, ggml_tensor* w, ggml_tensor* state, int off, ggml_tensor* dyn,
                                   int K, float scale, ggml_tensor* idx, ggml_tensor* cache, float thr, float eps, ggml_tensor* hist, int isv,
-                                  ggml_tensor* dep = nullptr) {
+                                  ggml_tensor* rot, ggml_tensor* dep = nullptr) {
     const int64_t hd = cache->ne[0], nkv = cache->ne[1], C = hd * nkv, T = idx->ne[0];
-    if (cache->type != GGML_TYPE_F16 || hd > 256 || hd % 32 != 0 || K < 2 || K > 8 || idx->type != GGML_TYPE_I64 ||
+    if (kv_type_id(cache->type) < 0 || !ggml_is_contiguous(cache) || hd > 256 || hd % 32 != 0 || K < 2 || K > 8 || idx->type != GGML_TYPE_I64 ||
         !ggml_is_contiguous(idx) || x->type != GGML_TYPE_F32 || x->nb[0] != 4 || x->ne[0] != C || x->ne[1] != T ||
         x->nb[1] % 4 != 0 || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || ggml_nelements(w) != C * K ||
         state->type != GGML_TYPE_F32 || !ggml_is_contiguous(state)) return nullptr;
+    // rot = the [hd, hd] rotation M (only its row 0 = s/sqrt(hd) is read; the kernel does the FWHT): hd a power of 2
+    if (rot && (rot->type != GGML_TYPE_F32 || !ggml_is_contiguous(rot) || rot->ne[0] != hd || (hd & (hd - 1)) != 0)) return nullptr;
     int nhd = 0;
     if (dyn) {
         if (!ggml_is_contiguous(dyn) || dyn->type != GGML_TYPE_F32 || dyn->ne[0] % K != 0) return nullptr;
         nhd = (int) (dyn->ne[0] / K);
         if (C % nhd != 0) return nullptr;
     }
-    ggml_tensor* args[8] = {x, w, state, idx, cache, nullptr, nullptr, nullptr};
+    ggml_tensor* args[9] = {x, w, state, idx, cache, nullptr, nullptr, nullptr, nullptr};
     int n = 5;
     if (dyn) args[n++] = dyn;
     if (hist) args[n++] = hist;
+    if (rot) args[n++] = rot;
     if (dep) args[n++] = dep;   // ordering only (the K op before the V op): the kernel never reads it
     ggml_tensor* y = ggml_custom_4d(c, GGML_TYPE_F32, 1, 1, 1, 1, args, n, attn_prep_cpu, GGML_N_TASKS_MAX, &g_attn_prep);
     set_param<int>(y, 0, K);
@@ -1541,17 +1595,18 @@ static ggml_tensor* attn_prep_one(ggml_context* c, ggml_tensor* x, ggml_tensor* 
     set_param<float>(y, 4, scale);
     set_param<float>(y, 5, thr);
     set_param<float>(y, 6, eps);
-    set_param<int>(y, 7, isv);
+    set_param<int>(y, 7, isv | (rot ? 2 : 0));   // param 8 would be op_params[16], past GGML_MAX_OP_PARAMS
     return y;
 }
 ggml_tensor* inkling_attn_prep(ggml_context* c, ggml_tensor* xk, ggml_tensor* xv, ggml_tensor* wk, ggml_tensor* wv,
                                ggml_tensor* state, int off_v, ggml_tensor* dynk, ggml_tensor* dynv, int K, float scale,
-                               ggml_tensor* idx, ggml_tensor* kcache, ggml_tensor* vcache, float thr, float eps, ggml_tensor* hist) {
+                               ggml_tensor* idx, ggml_tensor* kcache, ggml_tensor* vcache, float thr, float eps, ggml_tensor* hist,
+                               ggml_tensor* rotk, ggml_tensor* rotv) {
     if ((dynk == nullptr) != (dynv == nullptr)) return nullptr;
-    ggml_tensor* a = attn_prep_one(c, xk, wk, state, 0, dynk, K, scale, idx, kcache, thr, eps, hist, 0);
+    ggml_tensor* a = attn_prep_one(c, xk, wk, state, 0, dynk, K, scale, idx, kcache, thr, eps, hist, 0, rotk);
     if (!a) return nullptr;
     // the V op lists the K op as a source, so expanding the V op (the caller does, before the attention) runs both
-    return attn_prep_one(c, xv, wv, state, off_v, dynv, K, scale, idx, vcache, thr, eps, hist, 1, a);
+    return attn_prep_one(c, xv, wv, state, off_v, dynv, K, scale, idx, vcache, thr, eps, hist, 1, rotv, a);
 }
 ggml_tensor* inkling_moe_wsum(ggml_context* c, ggml_tensor* d, ggml_tensor* wk) {
     const int64_t C = d->ne[0], k = d->ne[1], T = d->ne[2];
@@ -1653,7 +1708,7 @@ ggml_tensor* inkling_mix(ggml_context*, ggml_tensor* const*, int, ggml_tensor*) 
 ggml_tensor* inkling_relbias(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_type) { return nullptr; }
 ggml_tensor* inkling_attn_dec(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, float, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_attn_dec_rel(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, float, ggml_tensor*) { return nullptr; }
-ggml_tensor* inkling_attn_prep(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int, ggml_tensor*, ggml_tensor*, int, float, ggml_tensor*, ggml_tensor*, ggml_tensor*, float, float, ggml_tensor*) { return nullptr; }
+ggml_tensor* inkling_attn_prep(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int, ggml_tensor*, ggml_tensor*, int, float, ggml_tensor*, ggml_tensor*, ggml_tensor*, float, float, ggml_tensor*, ggml_tensor*, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_attn_prompt(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int64_t, int, float) { return nullptr; }
 ggml_tensor* inkling_moe_wsum(ggml_context*, ggml_tensor*, ggml_tensor*) { return nullptr; }
 bool inkling_fused_available() { return false; }

@@ -68,13 +68,15 @@ ggml_tensor* inkling_attn_dec_rel(ggml_context* c, ggml_tensor* q, ggml_tensor* 
 
 // attention prepare (key/value side) in one kernel: K and V convolutions (xk/xv [C, T] rows, C = hd*nkv; state = the
 // slot's whole conv state, K at row 0 and V at row off_v; dynk/dynv = the global layers' dynamic taps or nullptr), the
-// key clip and value RMS norm per head row, the f16 writes of both into kcache/vcache [hd, nkv, cells] at cells idx [T]
-// (I64), and the optional verify history (hist = the slot's conv_hist).  Returns a 1-element tensor to expand into the
-// graph BEFORE the attention reads the caches.  Replaces 2 conv + clip + rms_norm + 2 set_rows.
+// key clip and value RMS norm per head row, the writes of both into kcache/vcache [hd, nkv, cells] at cells idx [T]
+// (I64; f16, q8_0 or q4_0 rows, quantised as ggml's set_rows does), and the optional verify history (hist = the slot's
+// conv_hist).  rotk / rotv = the [hd, hd] cache rotation M = H diag(s)/sqrt(hd) or nullptr, per leg: that leg's rows
+// are rotated before the write (the kernel reads row 0 = s/sqrt(hd) and runs the FWHT).  Returns a 1-element tensor to expand into the graph
+// BEFORE the attention reads the caches.  Replaces 2 conv + clip + rms_norm (+ 2 rotations) + 2 set_rows.
 ggml_tensor* inkling_attn_prep(ggml_context* c, ggml_tensor* xk, ggml_tensor* xv, ggml_tensor* wk, ggml_tensor* wv,
                                ggml_tensor* state, int off_v, ggml_tensor* dynk, ggml_tensor* dynv, int K, float scale,
                                ggml_tensor* idx, ggml_tensor* kcache, ggml_tensor* vcache, float thr, float eps,
-                               ggml_tensor* hist);
+                               ggml_tensor* hist, ggml_tensor* rotk = nullptr, ggml_tensor* rotv = nullptr);
 
 // true when the ggml build runs these on CUDA (the custom-op hook is present); else the engine keeps the op chains
 bool inkling_fused_available();

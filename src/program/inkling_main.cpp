@@ -216,14 +216,15 @@ struct Slot {                  // one cache slot
     int64_t cells = 0;
 };
 
-// XOLOTL_INKLING_KV_ROT: the full-context K/V go through a randomised Hadamard rotation before the cache store when
-// the cache is quantised (default 1; 0 = off; 2 = also the f16 cache, the exactness check).  q.k is unchanged
-// (q rotated with k), the attention output is rotated back once per head; the rotation spreads outlier channels so
-// q8_0 / q4_0 blocks lose less (as the main engine's Q4 K/V and STRATA_KV_ROT INT8).
+// XOLOTL_INKLING_KV_ROT: a full-context K or V leg stored as q4_0 goes through a randomised Hadamard rotation
+// before the cache store (default 1; 0 = off; 2 = every leg, f16 and q8_0 too: the exactness check).  A rotated K
+// leg rotates q with it (q.k unchanged); a rotated V leg rotates the attention output back once per head.  The
+// rotation spreads outlier channels so 4-bit blocks lose less; q8_0 legs stay unrotated (near-lossless without it,
+// Mal 22 Nov: "skip q8 rot"), as in the main engine (Q4 K/V rotated, STRATA_KV_ROT INT8 opt-in).
 inline int kv_rot_mode() { static const int v = std::getenv("XOLOTL_INKLING_KV_ROT") ? std::atoi(std::getenv("XOLOTL_INKLING_KV_ROT")) : 1; return v; }
-inline bool kv_rot_types(ggml_type k, ggml_type v) {
+inline bool kv_rot_leg(ggml_type t) {
     const int r = kv_rot_mode();
-    return r >= 2 || (r == 1 && (k != GGML_TYPE_F16 || v != GGML_TYPE_F16));
+    return r >= 2 || (r == 1 && t == GGML_TYPE_Q4_0);
 }
 struct Model {
     Hp hp;
@@ -1147,7 +1148,7 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
     ggml_init_params sp{(size_t) (4 * h.n_slot + 4) * ggml_tensor_overhead(), nullptr, true};
     m.sctx = ggml_init(sp);
     m.zsink = ggml_new_tensor_1d(m.sctx, GGML_TYPE_F32, h.n_head);
-    if (h.hd == 128 && kv_rot_types(m.kv_k, m.kv_v)) {
+    if (h.hd == 128 && (kv_rot_leg(m.kv_k) || kv_rot_leg(m.kv_v))) {
         m.hrot_f = ggml_new_tensor_2d(m.sctx, GGML_TYPE_F32, h.hd, h.hd);
         m.hrot_i = ggml_new_tensor_2d(m.sctx, GGML_TYPE_F32, h.hd, h.hd);
         ggml_format_name(m.hrot_f, "kv_hrot"); ggml_format_name(m.hrot_i, "kv_hrot_t");
@@ -1190,7 +1191,8 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
             }
         ggml_backend_tensor_set(m.hrot_f, f.data(), 0, f.size() * sizeof(float));
         ggml_backend_tensor_set(m.hrot_i, t.data(), 0, t.size() * sizeof(float));
-        std::fprintf(stderr, "xolotl-inkling: K/V Hadamard rotation on the full-context cache (XOLOTL_INKLING_KV_ROT=0 turns it off)\n");
+        std::fprintf(stderr, "xolotl-inkling: Hadamard rotation on the full-context %s%s%s legs (XOLOTL_INKLING_KV_ROT=0 turns it off)\n",
+                     kv_rot_leg(m.kv_k) ? "K" : "", kv_rot_leg(m.kv_k) && kv_rot_leg(m.kv_v) ? " + " : "", kv_rot_leg(m.kv_v) ? "V" : "");
     }
     m.state_bytes = ggml_backend_buffer_get_size(m.sbuf);
 
@@ -1594,13 +1596,16 @@ struct G {                     // graph-building context
         static const bool prep_ref = std::getenv("XOLOTL_INKLING_PREP_REF") != nullptr;
         bool prepped = false;
         ggml_tensor *Kc = nullptr, *Vc = nullptr;
-        // rotated layers take the chain (the prep kernel writes the cache itself, unrotated)
-        const bool rot = !swa && m.hrot_f && !st && kv_rot_types(z.k_cache->type, z.v_cache->type);
+        // rotated legs: the prep kernel rotates K / V itself (XOLOTL_INKLING_PREP_ROT_REF=1: those layers take the chain)
+        const bool rot_k = !swa && m.hrot_f && !st && kv_rot_leg(z.k_cache->type);
+        const bool rot_v = !swa && m.hrot_f && !st && kv_rot_leg(z.v_cache->type);
+        const bool rot = rot_k || rot_v;
+        static const bool prep_rot_ref = std::getenv("XOLOTL_INKLING_PREP_ROT_REF") != nullptr;
         auto hrot = [&](ggml_tensor* x, ggml_tensor* M) {
             ggml_tensor* x2 = ggml_reshape_2d(c, ggml_is_contiguous(x) ? x : ggml_cont(c, x), hd, ggml_nelements(x) / hd);
             return ggml_reshape_3d(c, ggml_mul_mat(c, M, x2), hd, x->ne[1], x->ne[2]);
         };
-        if (fused_on() && !prep_ref && !st && T <= 16 && !rot) {   // decode + verify (the per-token loop is serial in T)
+        if (fused_on() && !prep_ref && !st && T <= 16 && !(rot && prep_rot_ref)) {   // decode + verify (the per-token loop is serial in T)
             ggml_tensor* dk = swa ? nullptr : ggml_mul_mat(c, y.k_conv_proj, in[1]);
             ggml_tensor* dv = swa ? nullptr : ggml_mul_mat(c, y.v_conv_proj, in[2]);
             ggml_tensor* hview = nullptr;
@@ -1609,7 +1614,8 @@ struct G {                     // graph-building context
             const int64_t K = h.n_conv;
             ggml_tensor* pr = hist_ok ? inkling_attn_prep(c, Kp, Vp, y.k_conv, y.v_conv, z.conv, (int) kgqa, dk, dv, (int) K,
                                                           1.0f / std::sqrt((float) ((dk ? 2 : 1) * K + 1)), swa ? s.idx_swa : s.idx_full,
-                                                          z.k_cache, z.v_cache, h.qk_clip, h.eps, hview) : nullptr;
+                                                          z.k_cache, z.v_cache, h.qk_clip, h.eps, hview, rot_k ? m.hrot_f : nullptr,
+                                                          rot_v ? m.hrot_f : nullptr) : nullptr;
             if (pr) { ggml_build_forward_expand(gf, pr); prepped = true; }
             else {
                 Kc = convolve(Kp, y.k_conv, dk, z.conv, 0);
@@ -1634,11 +1640,11 @@ struct G {                     // graph-building context
             if (!swa && !Qf) Q = ggml_mul(c, Q, tau);
             if (!swa && !Rf) R = ggml_mul(c, R, tau);
         }
-        if (rot) { Q = hrot(Q, m.hrot_f); Kc = hrot(Kc, m.hrot_f); }
+        if (rot_k) { Q = hrot(Q, m.hrot_f); if (!prepped) Kc = hrot(Kc, m.hrot_f); }
         ggml_tensor *kst = nullptr, *vst = nullptr;   // the cache stores (the prompt attention orders itself after them)
         if (!prepped) {
             Vc = ggml_rms_norm(c, ggml_reshape_3d(c, Vc, hd, nkv, T), h.eps);
-            if (rot) Vc = hrot(Vc, m.hrot_f);
+            if (rot_v) Vc = hrot(Vc, m.hrot_f);
             kst = store_kv(Kc, z.k_cache, swa);
             vst = store_kv(Vc, z.v_cache, swa);
         }
@@ -1688,7 +1694,7 @@ struct G {                     // graph-building context
             if (rel_in && y.rel_bias_pad) {
                 ggml_tensor* Kd = ggml_view_3d(c, z.k_cache, hd, nkv, ci.cells, z.k_cache->nb[1], z.k_cache->nb[2], (size_t) ci.j0 * z.k_cache->nb[2]);
                 ggml_tensor* Vd = ggml_view_3d(c, z.v_cache, hd, nkv, ci.cells, z.v_cache->nb[1], z.v_cache->nb[2], (size_t) ci.j0 * z.v_cache->nb[2]);
-                ggml_tensor* Gt = gate_ref0 || rot ? nullptr : (Gp ? Gp : ggml_mul_mat(c, y.gate, in[0]));
+                ggml_tensor* Gt = gate_ref0 || rot_v ? nullptr : (Gp ? Gp : ggml_mul_mat(c, y.gate, in[0]));
                 ggml_tensor* ad = inkling_attn_dec_rel(c, Q, Kd, Vd, y.rel_bias_pad, R, sinks, ci.rp, ci.mask, 1.0f / std::sqrt((float) hd), Gt);
                 if (ad) { o = ggml_reshape_2d(c, ad, (int64_t) hd * nh, T); gated = Gt != nullptr; }
             }
@@ -1697,7 +1703,7 @@ struct G {                     // graph-building context
                 ggml_tensor* Kd = ggml_view_3d(c, z.k_cache, hd, nkv, ci.cells, z.k_cache->nb[1], z.k_cache->nb[2], (size_t) ci.j0 * z.k_cache->nb[2]);
                 ggml_tensor* Vd = ggml_view_3d(c, z.v_cache, hd, nkv, ci.cells, z.v_cache->nb[1], z.v_cache->nb[2], (size_t) ci.j0 * z.v_cache->nb[2]);
                 static const bool gate_ref = std::getenv("XOLOTL_INKLING_DECATTN_GATE_REF") != nullptr;   // A/B: gate as ggml ops
-                ggml_tensor* Gt = gate_ref || rot ? nullptr : (Gp ? Gp : ggml_mul_mat(c, y.gate, in[0]));
+                ggml_tensor* Gt = gate_ref || rot_v ? nullptr : (Gp ? Gp : ggml_mul_mat(c, y.gate, in[0]));
                 ggml_tensor* ad = inkling_attn_dec(c, Q, Kd, Vd, mask_h, 1.0f / std::sqrt((float) hd), Gt);
                 if (ad) { o = ggml_reshape_2d(c, ad, (int64_t) hd * nh, T); gated = Gt != nullptr; }
             }
@@ -1765,7 +1771,7 @@ struct G {                     // graph-building context
             o = lse ? ggml_div(c, acc, lse) : acc;                                             // [hd, T, nh]  (normalise once)
             o = ggml_cont_2d(c, ggml_permute(c, o, 0, 2, 1, 3), (int64_t) hd * nh, T);
         }
-        if (rot) {   // the values were stored rotated: o = M^T o' per head, before the (elementwise) gate
+        if (rot_v) {   // the values were stored rotated: o = M^T o' per head, before the (elementwise) gate
             GGML_ASSERT(!gated);
             o = ggml_reshape_2d(c, ggml_mul_mat(c, m.hrot_i, ggml_reshape_2d(c, ggml_is_contiguous(o) ? o : ggml_cont(c, o), hd, nh * T)), (int64_t) hd * nh, T);
         }
