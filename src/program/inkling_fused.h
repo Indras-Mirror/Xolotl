@@ -65,6 +65,13 @@ ggml_tensor* inkling_attn_prompt(ggml_context* c, ggml_tensor* q, ggml_tensor* k
 ggml_tensor* inkling_attn_dec_rel(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* relb,
                                   ggml_tensor* Rt, ggml_tensor* sinks, ggml_tensor* rp, ggml_tensor* mask, float scale,
                                   ggml_tensor* gate = nullptr);
+// the same for a positional slot (cell j = position j, the global layers): the mask (j <= pos[t]) and the distance
+// (min(pos[t] - j, ext)) come from pos [T] (I64, the step's positions) inside the kernel - no host [cells, T] arrays.
+// Only where inkling_dec_pos_ok() holds (the kernel that takes it); else nullptr.
+bool inkling_dec_pos_ok(int hd, int nh, int nkv, ggml_type kt, ggml_type vt, int nrel, size_t knb1, size_t knb2);
+ggml_tensor* inkling_attn_dec_rel_pos(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* relb,
+                                      ggml_tensor* Rt, ggml_tensor* sinks, ggml_tensor* pos, int ext, float scale,
+                                      ggml_tensor* gate = nullptr);
 
 // attention prepare (key/value side) in one kernel: K and V convolutions (xk/xv [C, T] rows, C = hd*nkv; state = the
 // slot's whole conv state, K at row 0 and V at row off_v; dynk/dynv = the global layers' dynamic taps or nullptr), the

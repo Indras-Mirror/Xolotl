@@ -1233,6 +1233,7 @@ struct Step {
     ggml_tensor *tokens = nullptr, *posf = nullptr;
     ggml_tensor *media = nullptr, *media_sel = nullptr;   // GENI: encoder rows [n_embd, T] and where they go [1, T]
     std::vector<ChunkIn> ck_full, ck_swa;   // the visible window in cell chunks (one entry when it fits the budget)
+    bool pos_full = false;   // the global slots' decode attention takes the positions (idx_full): ck_full has no mask/rp
     ggml_tensor *out_ids = nullptr, *logits = nullptr;
     ggml_tensor *idx_full = nullptr, *idx_swa = nullptr;   // the cells this step writes (set_rows: fixed pointers -> CUDA graphs)
     std::vector<ggml_tensor*> taps;   // --dump: l_out of every slot
@@ -1697,7 +1698,10 @@ struct G {                     // graph-building context
                 ggml_tensor* Kd = ggml_view_3d(c, z.k_cache, hd, nkv, ci.cells, z.k_cache->nb[1], z.k_cache->nb[2], (size_t) ci.j0 * z.k_cache->nb[2]);
                 ggml_tensor* Vd = ggml_view_3d(c, z.v_cache, hd, nkv, ci.cells, z.v_cache->nb[1], z.v_cache->nb[2], (size_t) ci.j0 * z.v_cache->nb[2]);
                 ggml_tensor* Gt = gate_ref0 || rot_v ? nullptr : (Gp ? Gp : ggml_mul_mat(c, y.gate, in[0]));
-                ggml_tensor* ad = inkling_attn_dec_rel(c, Q, Kd, Vd, y.rel_bias_pad, R, sinks, ci.rp, ci.mask, 1.0f / std::sqrt((float) hd), Gt);
+                ggml_tensor* ad = !swa && s.pos_full
+                    ? inkling_attn_dec_rel_pos(c, Q, Kd, Vd, y.rel_bias_pad, R, sinks, s.idx_full, h.rel_extent, 1.0f / std::sqrt((float) hd), Gt)
+                    : inkling_attn_dec_rel(c, Q, Kd, Vd, y.rel_bias_pad, R, sinks, ci.rp, ci.mask, 1.0f / std::sqrt((float) hd), Gt);
+                if (!ad && !swa && s.pos_full) GGML_ABORT("xolotl-inkling: positional decode attention refused (inkling_dec_pos_ok out of sync)");
                 if (ad) { o = ggml_reshape_2d(c, ad, (int64_t) hd * nh, T); gated = Gt != nullptr; }
             }
             ggml_tensor* mask_h = o ? nullptr : fused_mask(ci, GGML_TYPE_F32);
@@ -1881,7 +1885,13 @@ Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = fals
         s.n_kv_swa = std::min<int64_t>(m.ring, ((hi + 1 + 255) / 256) * 256);
     }
     {   // the visible window in cell chunks; one chunk at short context == the old single mask/rel-pos pair
-        auto plan = [&](int64_t nk) {
+        // positional global slots: the decode kernel derives mask and distance from idx_full, so the plan carries no
+        // [cells, T] host arrays for them (3.8 MB of fill + upload a token at 477K)
+        static const bool rel_in_env = !(std::getenv("XOLOTL_INKLING_DECATTN_REL") && std::atoi(std::getenv("XOLOTL_INKLING_DECATTN_REL")) == 0);
+        s.pos_full = dec_kernel_use(m, T) && rel_in_env && !m.L.empty() && m.L[0].rel_bias_pad &&
+                     inkling_dec_pos_ok(h.hd, h.n_head, h.n_head_kv, m.kv_k, m.kv_v, h.n_rel, ggml_row_size(m.kv_k, h.hd),
+                                        ggml_row_size(m.kv_k, h.hd) * h.n_head_kv);
+        auto plan = [&](int64_t nk, bool positional) {
             std::vector<ChunkIn> v;
             // --stats keeps the single-shot attention it was gated with (its score tensor is a few tens of MB here)
             const int64_t C = (m.st && nk * T * h.n_head * 4 <= (256 << 20)) || fa_ok(m, T) || dec_kernel_use(m, T) ? nk
@@ -1889,16 +1899,18 @@ Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = fals
             for (int64_t j0 = 0; j0 < nk; j0 += C) {
                 ChunkIn ci;
                 ci.j0 = j0; ci.cells = std::min(C, nk - j0);
-                ci.mask = ggml_new_tensor_2d(c, GGML_TYPE_F32, ci.cells, T); ggml_set_input(ci.mask);
-                ci.rp = ggml_new_tensor_2d(c, GGML_TYPE_I32, ci.cells, T); ggml_set_input(ci.rp);
+                if (!positional) {
+                    ci.mask = ggml_new_tensor_2d(c, GGML_TYPE_F32, ci.cells, T); ggml_set_input(ci.mask);
+                    ci.rp = ggml_new_tensor_2d(c, GGML_TYPE_I32, ci.cells, T); ggml_set_input(ci.rp);
+                }
                 v.push_back(ci);
             }
             return v;
         };
         // the prompt attention computes the causal/window test and the distance in-kernel: no host masks
         if (!pattn_use(m, T)) {
-            s.ck_full = plan(s.n_kv_full);
-            s.ck_swa = plan(s.n_kv_swa);
+            s.ck_full = plan(s.n_kv_full, s.pos_full);
+            s.ck_swa = plan(s.n_kv_swa, false);
         }
     }
     if (n_out < T) { s.out_ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_out); ggml_set_input(s.out_ids); }
@@ -2124,6 +2136,7 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
     }
     const Hp& h = m.hp;
     for (const ChunkIn& ci : s.ck_full) {   // global slots: cell j = position j, masked when j > p0 + t
+        if (!ci.mask) continue;   // positional (the kernel derives both from idx_full)
         std::vector<float> mk((size_t) ci.cells * T);
         std::vector<int32_t> rp((size_t) ci.cells * T);
         const int32_t ext = h.rel_extent;
@@ -2160,6 +2173,7 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
         for (int i = 0; i < n_out; ++i) o[i] = T - n_out + i;
         ggml_backend_tensor_set(s.out_ids, o.data(), 0, o.size() * sizeof(int32_t));
     }
+    const double ms_inputs = ms_since(tc);   // host-side input fill + upload (masks, positions, ids)
     if (ggml_backend_sched_graph_compute(m.sched, s.gf) != GGML_STATUS_SUCCESS) { drop_graph(m); die("graph compute failed"); }
     if (m.route_fp && !s.rt_ids.empty()) route_consume(m, s, T, p0);
 #if XOLOTL_INKLING_STATS
@@ -2184,8 +2198,9 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
             for (auto& e : v) std::fprintf(stderr, "  %5d  %s\n", e.first, e.second.c_str());
         }
     }
-    if (dbg) std::fprintf(stderr, "xolotl-inkling: T=%d nodes=%d splits=%d %s %.1f ms compute %.1f ms\n", T,
-                          ggml_graph_n_nodes(s.gf), ggml_backend_sched_get_n_splits(m.sched), reuse ? "reused" : "built+alloc", ms_build + ms_alloc, ms_since(tc));
+    if (dbg) std::fprintf(stderr, "xolotl-inkling: T=%d nodes=%d splits=%d %s %.1f ms inputs %.2f ms compute %.1f ms\n", T,
+                          ggml_graph_n_nodes(s.gf), ggml_backend_sched_get_n_splits(m.sched), reuse ? "reused" : "built+alloc", ms_build + ms_alloc,
+                          ms_inputs, ms_since(tc) - ms_inputs);
     logits.resize((size_t) n_out * h.n_vocab);
     ggml_backend_tensor_get(s.logits, logits.data(), 0, logits.size() * sizeof(float));
     if (taps) {

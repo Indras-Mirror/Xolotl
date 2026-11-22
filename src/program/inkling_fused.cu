@@ -527,6 +527,30 @@ __host__ __device__ __forceinline__ float kv_at(const char* row, int dim, int ty
     const uint8_t* q = reinterpret_cast<const uint8_t*>(bp + 2);
     return __half2float(*reinterpret_cast<const __half*>(bp)) * (float) ((int) (o < 16 ? (q[o] & 0xF) : (q[o - 16] >> 4)) - 8);
 }
+// N consecutive dims inside one 32-value block and one q4_0 half (col a multiple of N, N even and <= 16): the block
+// scale is read once and the quants as aligned byte pairs.  Same arithmetic as kv_at (d * q), so the same values.
+template <int N>
+__device__ __forceinline__ void kv_run(const char* row, int col, int type, float* out) {
+    const int b = col >> 5, o = col & 31;
+    if (type == 1) {
+        const char* bp = row + (size_t) b * 34;
+        const float d = __half2float(*reinterpret_cast<const __half*>(bp));
+        const char2* q = reinterpret_cast<const char2*>(bp + 2 + o);   // 34 b + 2 + o: even, so 2-byte aligned
+#pragma unroll
+        for (int j = 0; j < N / 2; ++j) { const char2 c = q[j]; out[2 * j] = d * (float) (int8_t) c.x; out[2 * j + 1] = d * (float) (int8_t) c.y; }
+        return;
+    }
+    const char* bp = row + (size_t) b * 18;
+    const float d = __half2float(*reinterpret_cast<const __half*>(bp));
+    const bool hi = o >= 16;
+    const uchar2* q = reinterpret_cast<const uchar2*>(bp + 2 + (hi ? o - 16 : o));
+#pragma unroll
+    for (int j = 0; j < N / 2; ++j) {
+        const uchar2 c = q[j];
+        out[2 * j] = d * (float) ((int) (hi ? c.x >> 4 : c.x & 0xF) - 8);
+        out[2 * j + 1] = d * (float) ((int) (hi ? c.y >> 4 : c.y & 0xF) - 8);
+    }
+}
 // eight consecutive dims (col is a multiple of 8; a q4_0 block's half boundary can sit inside the run)
 __device__ __forceinline__ void kv_at8(const char* row, int col, int type, float* out) {
     if (type == 0) {
@@ -662,8 +686,7 @@ __global__ void __launch_bounds__(kDecThreads) k_attn_dec_part(const float* __re
                         kf[u][2 * i2] = f.x; kf[u][2 * i2 + 1] = f.y;
                     }
                 } else {
-#pragma unroll
-                    for (int e = 0; e < PL; ++e) kf[u][e] = kv_at(kr, lane * PL + e, ktype);
+                    kv_run<PL>(kr, lane * PL, ktype, kf[u]);
                 }
             }
         }
@@ -737,7 +760,7 @@ __global__ void __launch_bounds__(kDecThreads) k_attn_dec_part(const float* __re
             const char* vr = V + (size_t) (j0 + i) * v_nb2 + (size_t) g * v_nb1;
             float2 f;
             if (vtype == 0) f = __half22float2(((const half2*) vr)[pr]);
-            else { f.x = kv_at(vr, 2 * pr, vtype); f.y = kv_at(vr, 2 * pr + 1, vtype); }
+            else { float t2[2]; kv_run<2>(vr, 2 * pr, vtype, t2); f.x = t2[0]; f.y = t2[1]; }
 #pragma unroll
             for (int rr = 0; rr < RR; ++rr) {
                 const float pv = f16r ? __half2float(__float2half(s[rr][i])) : s[rr][i];
@@ -784,19 +807,419 @@ __global__ void k_attn_dec_reduce(const float* __restrict__ part, float* __restr
                                   const float* __restrict__ gate, long gs) {
     const int h = blockIdx.x, t = blockIdx.y;
     auto P = [&](int sp) { return part + (((size_t) sp * T + t) * nh + h) * (HD + 2); };
+    // the max over the splits block-wide, each split's weight exp(m - M) once into shared memory (it used to be
+    // recomputed per dim, every thread walking every split three times: ~19 us a call); the same sums in the same order
+    __shared__ float wsp[kDecMaxSplit], red[32], den_s;
     float M = 0.0f;                                   // the zero sink logit joins the max
-    for (int sp = 0; sp < nsplit; ++sp) M = fmaxf(M, P(sp)[HD]);
-    float den = __expf(-M);                           // the sink's exp(0 - M)
-    for (int sp = 0; sp < nsplit; ++sp) { const float m = P(sp)[HD]; if (m != -INFINITY) den += P(sp)[HD + 1] * __expf(m - M); }
+    for (int sp = threadIdx.x; sp < nsplit; sp += blockDim.x) M = fmaxf(M, P(sp)[HD]);
+    M = warp_max(M);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = M;
+    __syncthreads();
+    M = red[0];
+    for (int k = 1; k < (int) (blockDim.x + 31) / 32; ++k) M = fmaxf(M, red[k]);
+    for (int sp = threadIdx.x; sp < nsplit; sp += blockDim.x) { const float m = P(sp)[HD]; wsp[sp] = m == -INFINITY ? -1.0f : __expf(m - M); }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float den = __expf(-M);                       // the sink's exp(0 - M)
+        for (int sp = 0; sp < nsplit; ++sp) if (wsp[sp] >= 0.0f) den += P(sp)[HD + 1] * wsp[sp];
+        den_s = den;
+    }
     for (int d = threadIdx.x; d < HD; d += blockDim.x) {
         float a = 0.0f;
-        for (int sp = 0; sp < nsplit; ++sp) { const float m = P(sp)[HD]; if (m != -INFINITY) a = fmaf(P(sp)[d], __expf(m - M), a); }
+        for (int sp = 0; sp < nsplit; ++sp) if (wsp[sp] >= 0.0f) a = fmaf(P(sp)[d], wsp[sp], a);
+        __syncthreads();   // den_s (uniform trip count: HD is a multiple of blockDim)
+        float o = a / den_s;
+        if (gate) {   // the attention output gate, o * sigmoid(g) (ggml's sigmoid, then mul)
+            const float gv = gate[(size_t) t * gs + (size_t) h * HD + d];
+            o = __fmul_rn(o, 1.0f / (1.0f + expf(-gv)));
+        }
+        out[((size_t) t * nh + h) * HD + d] = o;
+    }
+}
+
+// The split merge, parallel over the splits: grid (nh, T, HD / 32), 256 threads = 8 warps x 32 dims; each warp sums an
+// eighth of the splits for its block's 32 dims (coalesced), max and denominator are block reductions.  The serial form
+// (every thread walking every split, one dependent global load each) cost ~20-25 us a call, 48 calls a token: ~1.2 ms
+// of every decode step at any context.  XOLOTL_INKLING_DECATTN_RED2=0: the serial merge.
+template <int HD>
+__global__ void __launch_bounds__(256) k_attn_dec_reduce2(const float* __restrict__ part, float* __restrict__ out, int T, int nh,
+                                                          int nsplit, const float* __restrict__ gate, long gs) {
+    const int h = blockIdx.x, t = blockIdx.y, d = blockIdx.z * 32 + (threadIdx.x & 31), wg = threadIdx.x >> 5;
+    auto P = [&](int sp) { return part + (((size_t) sp * T + t) * nh + h) * (HD + 2); };
+    __shared__ float wsp[kDecMaxSplit], red[8], acc[8][32];
+    float M = 0.0f;                                   // the zero sink logit joins the max
+    for (int sp = threadIdx.x; sp < nsplit; sp += 256) M = fmaxf(M, P(sp)[HD]);
+    M = warp_max(M);
+    if ((threadIdx.x & 31) == 0) red[wg] = M;
+    __syncthreads();
+    M = red[0];
+#pragma unroll
+    for (int k = 1; k < 8; ++k) M = fmaxf(M, red[k]);
+    __syncthreads();   // red is reused below
+    float dl = 0.0f;
+    for (int sp = threadIdx.x; sp < nsplit; sp += 256) {
+        const float m = P(sp)[HD], wv = m == -INFINITY ? 0.0f : __expf(m - M);
+        wsp[sp] = wv;
+        if (wv != 0.0f) dl = fmaf(P(sp)[HD + 1], wv, dl);
+    }
+    dl = warp_sum(dl);
+    if ((threadIdx.x & 31) == 0) red[wg] = dl;
+    __syncthreads();
+    float den = __expf(-M);                           // the sink's exp(0 - M)
+#pragma unroll
+    for (int k = 0; k < 8; ++k) den += red[k];
+    float a0 = 0.0f, a1 = 0.0f;                       // two chains for load overlap
+    int sp = wg;
+    for (; sp + 8 < nsplit; sp += 16) {
+        a0 = fmaf(P(sp)[d], wsp[sp], a0);
+        a1 = fmaf(P(sp + 8)[d], wsp[sp + 8], a1);
+    }
+    if (sp < nsplit) a0 = fmaf(P(sp)[d], wsp[sp], a0);
+    acc[wg][threadIdx.x & 31] = a0 + a1;
+    __syncthreads();
+    if (wg == 0) {
+        float a = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) a += acc[k][threadIdx.x];
         float o = a / den;
         if (gate) {   // the attention output gate, o * sigmoid(g) (ggml's sigmoid, then mul)
             const float gv = gate[(size_t) t * gs + (size_t) h * HD + d];
             o = __fmul_rn(o, 1.0f / (1.0f + expf(-gv)));
         }
         out[((size_t) t * nh + h) * HD + d] = o;
+    }
+}
+static bool dec_red2_on() {
+    static const bool v = !(std::getenv("XOLOTL_INKLING_DECATTN_RED2") && std::atoi(std::getenv("XOLOTL_INKLING_DECATTN_RED2")) == 0);
+    return v;
+}
+
+// Streaming decode partials (relb mode, the default path): each warp walks its own cells with a private online softmax in
+// registers - score = q.k * scale + the relative bias (folded into the same warp reduction) - sink + mask, then p v into
+// the lane's HD / 32 dims - and the block's 4 warps merge once at the end.  No block barrier per 64 cells (the chunked
+// kernel above takes ~8), so long-context decode runs near the K/V read bandwidth.  Same partial format as
+// k_attn_dec_part ([HD + 2, nh, T, nsplit]: sum p v, max, sum p), same reduce.  XOLOTL_INKLING_DECATTN_STREAM=0: chunked.
+template <int HD, int R>
+__global__ void __launch_bounds__(kDecThreads) k_attn_dec_stream(const float* __restrict__ q, const char* __restrict__ K,
+        const char* __restrict__ V, const float* __restrict__ mask, float* __restrict__ part, int cells, int T, int nh,
+        long k_nb1, long k_nb2, long v_nb1, long v_nb2, float scale, int ktype, int vtype,
+        const float* __restrict__ relb, const float* __restrict__ Rt, const float* __restrict__ sinks,
+        const int* __restrict__ rp, long rp_s1, long mask_s1, int nrel) {
+    constexpr int PL = HD / 32, U = 4;
+    const int g = blockIdx.x, t = blockIdx.y, sp = blockIdx.z;
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int nch = (cells + kDecChunk - 1) / kDecChunk, per = (nch + (int) gridDim.z - 1) / (int) gridDim.z;
+    const int jb = sp * per * kDecChunk, je = min(cells, jb + per * kDecChunk);
+    float qr[R][PL], rs[R], sk[R], m[R], l[R], acc[R][PL];
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) {
+        const int h = g * R + rr;
+        const float* qh = q + ((size_t) t * nh + h) * HD + lane * PL;
+#pragma unroll
+        for (int i = 0; i < PL; ++i) { qr[rr][i] = qh[i]; acc[rr][i] = 0.0f; }
+        rs[rr] = lane < nrel ? Rt[((size_t) t * nh + h) * nrel + lane] : 0.0f;
+        sk[rr] = sinks[(size_t) t * nh + h];
+        m[rr] = -INFINITY; l[rr] = 0.0f;
+    }
+    const float* mrow = mask + (size_t) t * mask_s1;
+    const int* rrow = rp + (size_t) t * rp_s1;
+    for (int j0 = jb + w * U; j0 < je; j0 += kDecWarps * U) {
+        float mv[U], bt[U], kf[U][PL], vf[U][PL];
+        bool live[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int j = j0 + u;
+            live[u] = false;
+            mv[u] = -INFINITY;
+            if (j < je) { mv[u] = mrow[j]; live[u] = mv[u] != -INFINITY; }
+            bt[u] = live[u] && lane < nrel ? relb[(size_t) rrow[j] * nrel + lane] : 0.0f;
+            if (live[u]) {
+                const char* kr = K + (size_t) j * k_nb2 + (size_t) g * k_nb1;
+                const char* vr = V + (size_t) j * v_nb2 + (size_t) g * v_nb1;
+                if (ktype == 0) {
+                    const half2* k2 = (const half2*) kr + lane * (PL / 2);
+#pragma unroll
+                    for (int i2 = 0; i2 < PL / 2; ++i2) { const float2 f = __half22float2(k2[i2]); kf[u][2 * i2] = f.x; kf[u][2 * i2 + 1] = f.y; }
+                } else kv_run<PL>(kr, lane * PL, ktype, kf[u]);
+                if (vtype == 0) {
+                    const half2* v2 = (const half2*) vr + lane * (PL / 2);
+#pragma unroll
+                    for (int i2 = 0; i2 < PL / 2; ++i2) { const float2 f = __half22float2(v2[i2]); vf[u][2 * i2] = f.x; vf[u][2 * i2 + 1] = f.y; }
+                } else kv_run<PL>(vr, lane * PL, vtype, vf[u]);
+            }
+        }
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) {
+            float sc[U], mx = -INFINITY;
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                sc[u] = -INFINITY;
+                if (!live[u]) continue;   // warp-uniform
+                float d = 0.0f;
+#pragma unroll
+                for (int i = 0; i < PL; ++i) d = fmaf(qr[rr][i], kf[u][i], d);
+                const float tot = warp_sum(fmaf(d, scale, bt[u] * rs[rr]));   // scale * q.k + the bias dot (lanes < nrel)
+                sc[u] = __fadd_rn(__fsub_rn(tot, sk[rr]), mv[u]);
+                mx = fmaxf(mx, sc[u]);
+            }
+            if (mx == -INFINITY) continue;
+            const float mn = fmaxf(m[rr], mx), corr = m[rr] == -INFINITY ? 0.0f : __expf(m[rr] - mn);
+            l[rr] *= corr;
+#pragma unroll
+            for (int i = 0; i < PL; ++i) acc[rr][i] *= corr;
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                if (sc[u] == -INFINITY) continue;
+                const float pv = __expf(sc[u] - mn);
+                l[rr] += pv;
+#pragma unroll
+                for (int i = 0; i < PL; ++i) acc[rr][i] = fmaf(pv, vf[u][i], acc[rr][i]);
+            }
+            m[rr] = mn;
+        }
+    }
+    __shared__ float wm[kDecWarps][R], wl[kDecWarps][R], wa[kDecWarps][R][HD];
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) {
+        if (lane == 0) { wm[w][rr] = m[rr]; wl[w][rr] = l[rr]; }
+#pragma unroll
+        for (int i = 0; i < PL; ++i) wa[w][rr][lane * PL + i] = acc[rr][i];
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < R * (HD + 2); idx += kDecThreads) {
+        const int rr = idx / (HD + 2), e = idx % (HD + 2);
+        float M = -INFINITY;
+#pragma unroll
+        for (int k = 0; k < kDecWarps; ++k) M = fmaxf(M, wm[k][rr]);
+        float a = 0.0f;
+        if (M != -INFINITY) {
+#pragma unroll
+            for (int k = 0; k < kDecWarps; ++k)
+                if (wm[k][rr] != -INFINITY) a = fmaf(e < HD ? wa[k][rr][e] : wl[k][rr], __expf(wm[k][rr] - M), a);
+        }
+        float* o = part + (((size_t) sp * T + t) * nh + g * R + rr) * (HD + 2);
+        if (e < HD) o[e] = a;
+        else if (e == HD) o[HD] = M;
+        else o[HD + 1] = a;
+    }
+}
+// Lane-per-cell decode partials (HD 128, relb mode; the default for f16 / q8_0 / q4_0 caches): each lane takes one cell
+// of the warp's 32 - the whole K row into registers as aligned 8-byte words, q * scale from shared memory, the relative
+// bias dot - so a score needs no cross-lane reduction (the warp-per-cell kernel above paid R * 4 warp sums per 4 cells).
+// One warp max per 32 cells and row; then p v with lanes over dims as before.  Same partials.  XOLOTL_INKLING_DECATTN_LANE=0:
+// the warp-per-cell streaming kernel.
+__device__ __forceinline__ uint32_t kb8(const uint32_t* w, int o) { return (w[o >> 2] >> ((o & 3) * 8)) & 0xFFu; }
+__device__ __forceinline__ float kh16(const uint32_t* w, int o) {   // o even
+    return __half2float(__ushort_as_half((unsigned short) ((w[o >> 2] >> ((o & 3) * 8)) & 0xFFFFu)));
+}
+template <int R, int KT, int VT>
+__global__ void __launch_bounds__(kDecThreads) k_attn_dec_lane(const float* __restrict__ q, const char* __restrict__ K,
+        const char* __restrict__ V, const float* __restrict__ mask, float* __restrict__ part, int cells, int T, int nh,
+        long k_nb1, long k_nb2, long v_nb1, long v_nb2, float scale,
+        const float* __restrict__ relb, const float* __restrict__ Rt, const float* __restrict__ sinks,
+        const int* __restrict__ rp, long rp_s1, long mask_s1, int nrel, const int64_t* __restrict__ pos, int ext) {
+    constexpr int HD = 128, PL = 4;
+    constexpr int KW = KT == 0 ? 64 : KT == 1 ? 34 : 18;   // the K row in 32-bit words (256 / 136 / 72 bytes)
+    const int g = blockIdx.x, t = blockIdx.y, sp = blockIdx.z;
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int nch = (cells + kDecChunk - 1) / kDecChunk, per = (nch + (int) gridDim.z - 1) / (int) gridDim.z;
+    const int jb = sp * per * kDecChunk, je = min(cells, jb + per * kDecChunk);
+    __shared__ float qs[R][HD], rss[R][32], ps[kDecWarps][R][32];
+    for (int i = threadIdx.x; i < R * HD; i += kDecThreads) {
+        const int rr = i / HD, e = i % HD;
+        qs[rr][e] = q[((size_t) t * nh + g * R + rr) * HD + e] * scale;
+    }
+    for (int i = threadIdx.x; i < R * 32; i += kDecThreads) {
+        const int rr = i / 32, k = i % 32;
+        rss[rr][k] = k < nrel ? Rt[((size_t) t * nh + g * R + rr) * nrel + k] : 0.0f;
+    }
+    float sk[R], m[R], lp[R], acc[R][PL];
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) {
+        sk[rr] = sinks[(size_t) t * nh + g * R + rr];
+        m[rr] = -INFINITY; lp[rr] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < PL; ++i) acc[rr][i] = 0.0f;
+    }
+    __syncthreads();
+    // pos (positional mode, the global slots: cell j = position j): the mask and distance come from the token's
+    // position, no host arrays; else from mask [cells, T] / rp [cells, T]
+    const float* mrow = pos ? nullptr : mask + (size_t) t * mask_s1;
+    const int* rrow = pos ? nullptr : rp + (size_t) t * rp_s1;
+    const int64_t pt = pos ? pos[t] : 0;
+    for (int c0 = jb + w * 32; c0 < je; c0 += kDecWarps * 32) {
+        const int j = c0 + lane;
+        float mv = -INFINITY;
+        int rpj = ext;
+        if (j < je) {
+            if (pos) { const int64_t dd = pt - j; mv = dd >= 0 ? 0.0f : -INFINITY; rpj = dd < ext ? (int) dd : ext; }
+            else { mv = mrow[j]; rpj = rrow[j]; }
+        }
+        const bool live = mv != -INFINITY;
+        float sc[R];
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) sc[rr] = -INFINITY;
+        uint32_t kw[KW];
+        if (j < je) {   // issued with the mask load (not after it): a masked cell's row is read but unused
+            const uint2* k2 = reinterpret_cast<const uint2*>(K + (size_t) j * k_nb2 + (size_t) g * k_nb1);
+#pragma unroll
+            for (int i = 0; i < KW / 2; ++i) { const uint2 x = k2[i]; kw[2 * i] = x.x; kw[2 * i + 1] = x.y; }
+        }
+        if (live) {
+            float dot[R];
+#pragma unroll
+            for (int rr = 0; rr < R; ++rr) dot[rr] = 0.0f;
+            if (KT == 0) {
+#pragma unroll
+                for (int e = 0; e < HD; e += 2) {
+                    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&kw[e / 2]));
+#pragma unroll
+                    for (int rr = 0; rr < R; ++rr) dot[rr] = fmaf(qs[rr][e], f.x, fmaf(qs[rr][e + 1], f.y, dot[rr]));
+                }
+            } else {
+#pragma unroll
+                for (int b = 0; b < HD / 32; ++b) {
+                    const int bo = b * (KT == 1 ? 34 : 18);
+                    const float d = kh16(kw, bo);
+                    float pb[R];
+#pragma unroll
+                    for (int rr = 0; rr < R; ++rr) pb[rr] = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 32; ++i) {
+                        float qv;
+                        if (KT == 1) qv = (float) (int8_t) kb8(kw, bo + 2 + i);
+                        else qv = (float) ((int) (i < 16 ? (kb8(kw, bo + 2 + i) & 0xF) : (kb8(kw, bo + 2 + i - 16) >> 4)) - 8);
+#pragma unroll
+                        for (int rr = 0; rr < R; ++rr) pb[rr] = fmaf(qs[rr][b * 32 + i], qv, pb[rr]);
+                    }
+#pragma unroll
+                    for (int rr = 0; rr < R; ++rr) dot[rr] = fmaf(d, pb[rr], dot[rr]);
+                }
+            }
+            const float4* tb = reinterpret_cast<const float4*>(relb + (size_t) rpj * nrel);
+            float bs[R];
+#pragma unroll
+            for (int rr = 0; rr < R; ++rr) bs[rr] = 0.0f;
+            for (int k4 = 0; k4 < nrel / 4; ++k4) {
+                const float4 f = tb[k4];
+#pragma unroll
+                for (int rr = 0; rr < R; ++rr)
+                    bs[rr] = fmaf(f.x, rss[rr][4 * k4], fmaf(f.y, rss[rr][4 * k4 + 1], fmaf(f.z, rss[rr][4 * k4 + 2], fmaf(f.w, rss[rr][4 * k4 + 3], bs[rr]))));
+            }
+#pragma unroll
+            for (int rr = 0; rr < R; ++rr) sc[rr] = __fadd_rn(__fsub_rn(dot[rr] + bs[rr], sk[rr]), mv);
+        }
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) {
+            const float mx = warp_max(sc[rr]);
+            if (mx == -INFINITY) { ps[w][rr][lane] = 0.0f; continue; }   // warp-uniform
+            const float mn = fmaxf(m[rr], mx), corr = m[rr] == -INFINITY ? 0.0f : __expf(m[rr] - mn);
+            const float pv = sc[rr] == -INFINITY ? 0.0f : __expf(sc[rr] - mn);
+            lp[rr] = fmaf(lp[rr], corr, pv);
+#pragma unroll
+            for (int i = 0; i < PL; ++i) acc[rr][i] *= corr;
+            m[rr] = mn;
+            ps[w][rr][lane] = pv;
+        }
+        __syncwarp();
+        // p v: no per-cell branch (a masked cell has p = 0), so the unrolled V loads issue together
+        auto pv_cell = [&](int c) {
+            const char* vr = V + (size_t) (c0 + c) * v_nb2 + (size_t) g * v_nb1;
+            float vf[PL];
+            if (VT == 0) {
+                const half2* v2 = reinterpret_cast<const half2*>(vr) + lane * 2;
+                const float2 a = __half22float2(v2[0]), b = __half22float2(v2[1]);
+                vf[0] = a.x; vf[1] = a.y; vf[2] = b.x; vf[3] = b.y;
+            } else kv_run<PL>(vr, lane * PL, VT, vf);
+#pragma unroll
+            for (int rr = 0; rr < R; ++rr) {
+                const float pr = ps[w][rr][c];
+#pragma unroll
+                for (int i = 0; i < PL; ++i) acc[rr][i] = fmaf(pr, vf[i], acc[rr][i]);
+            }
+        };
+        const int nc = min(32, je - c0);
+        if (nc == 32) {
+#pragma unroll 16
+            for (int c = 0; c < 32; ++c) pv_cell(c);
+        } else {
+            for (int c = 0; c < nc; ++c) pv_cell(c);
+        }
+        __syncwarp();   // ps is rewritten by the next group
+    }
+    __shared__ float wm[kDecWarps][R], wl[kDecWarps][R], wa[kDecWarps][R][HD];
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) {
+        const float l = warp_sum(lp[rr]);
+        if (lane == 0) { wm[w][rr] = m[rr]; wl[w][rr] = l; }
+#pragma unroll
+        for (int i = 0; i < PL; ++i) wa[w][rr][lane * PL + i] = acc[rr][i];
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < R * (HD + 2); idx += kDecThreads) {
+        const int rr = idx / (HD + 2), e = idx % (HD + 2);
+        float M = -INFINITY;
+#pragma unroll
+        for (int k = 0; k < kDecWarps; ++k) M = fmaxf(M, wm[k][rr]);
+        float a = 0.0f;
+        if (M != -INFINITY) {
+#pragma unroll
+            for (int k = 0; k < kDecWarps; ++k)
+                if (wm[k][rr] != -INFINITY) a = fmaf(e < HD ? wa[k][rr][e] : wl[k][rr], __expf(wm[k][rr] - M), a);
+        }
+        float* o = part + (((size_t) sp * T + t) * nh + g * R + rr) * (HD + 2);
+        if (e < HD) o[e] = a;
+        else if (e == HD) o[HD] = M;
+        else o[HD + 1] = a;
+    }
+}
+static bool dec_lane_on() {
+    static const bool v = !(std::getenv("XOLOTL_INKLING_DECATTN_LANE") && std::atoi(std::getenv("XOLOTL_INKLING_DECATTN_LANE")) == 0);
+    return v;
+}
+// true when it launched (HD 128, nrel % 4 == 0, a supported K/V type pair)
+static bool attn_dec_lane_launch(int R, dim3 grid, cudaStream_t st, const float* q, const char* K, const char* V, const float* mk,
+                                 float* part, int cells, int T, int nh, long a, long b, long c, long d, float scale, int kt, int vt,
+                                 const float* relb, const float* Rt, const float* sk, const int* rp, long rps, long mks, int nrel,
+                                 const int64_t* pos = nullptr, int ext = 0) {
+    if (nrel % 4 != 0 || nrel > 32 || R < 1 || R > 4 || !dec_lane_on()) return false;
+    const int combo = kt * 3 + vt;   // f16/f16, q8/q8, q8/q4, q4/q4
+    if (combo != 0 && combo != 4 && combo != 5 && combo != 8) return false;
+    if ((a % 8) || (b % 8)) return false;   // the K rows load as 8-byte words
+    grid.y = T;
+#define LANE_K(RR, KK, VV) k_attn_dec_lane<RR, KK, VV><<<grid, kDecThreads, 0, st>>>(q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, relb, Rt, sk, rp, rps, mks, nrel, pos, ext)
+#define LANE_R(RR) switch (combo) { case 0: LANE_K(RR, 0, 0); break; case 4: LANE_K(RR, 1, 1); break; case 5: LANE_K(RR, 1, 2); break; default: LANE_K(RR, 2, 2); break; }
+    switch (R) { case 1: LANE_R(1) break; case 2: LANE_R(2) break; case 3: LANE_R(3) break; default: LANE_R(4) break; }
+#undef LANE_R
+#undef LANE_K
+    return true;
+}
+static bool dec_pos_on() {
+    static const bool v = !(std::getenv("XOLOTL_INKLING_DECATTN_POS") && std::atoi(std::getenv("XOLOTL_INKLING_DECATTN_POS")) == 0);
+    return v;
+}
+static bool dec_stream_on();
+// the positional mode runs only on the lane kernel: the conditions under which attn_dec_lane_launch takes the op
+static bool dec_lane_takes(int HD, int R, int kt, int vt, int nrel, size_t knb1, size_t knb2) {
+    const int combo = kt * 3 + vt;
+    return HD == 128 && dec_lane_on() && dec_stream_on() && nrel % 4 == 0 && nrel <= 32 && R >= 1 && R <= 4 &&
+           (combo == 0 || combo == 4 || combo == 5 || combo == 8) && knb1 % 8 == 0 && knb2 % 8 == 0 &&
+           !std::getenv("XOLOTL_INKLING_DECATTN_F16R");
+}
+static bool dec_stream_on() {
+    static const bool v = !(std::getenv("XOLOTL_INKLING_DECATTN_STREAM") && std::atoi(std::getenv("XOLOTL_INKLING_DECATTN_STREAM")) == 0);
+    return v;
+}
+template <int HD>
+void attn_dec_stream_launch(int R, dim3 grid, cudaStream_t st, const float* q, const char* K, const char* V, const float* mk,
+                            float* part, int cells, int T, int nh, long a, long b, long c, long d, float scale, int ktype,
+                            int vtype, const float* relb, const float* Rt, const float* sk, const int* rp, long rps, long mks, int nrel) {
+    grid.y = T;
+    switch (R) {
+        case 1: k_attn_dec_stream<HD, 1><<<grid, kDecThreads, 0, st>>>(q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, ktype, vtype, relb, Rt, sk, rp, rps, mks, nrel); break;
+        case 2: k_attn_dec_stream<HD, 2><<<grid, kDecThreads, 0, st>>>(q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, ktype, vtype, relb, Rt, sk, rp, rps, mks, nrel); break;
+        case 3: k_attn_dec_stream<HD, 3><<<grid, kDecThreads, 0, st>>>(q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, ktype, vtype, relb, Rt, sk, rp, rps, mks, nrel); break;
+        default: k_attn_dec_stream<HD, 4><<<grid, kDecThreads, 0, st>>>(q, K, V, mk, part, cells, T, nh, a, b, c, d, scale, ktype, vtype, relb, Rt, sk, rp, rps, mks, nrel); break;
     }
 }
 
@@ -836,16 +1259,39 @@ void attn_dec_part_cuda(ggml_tensor* dst, void* stream, void*) {
     const int HD = (int) q->ne[0], nh = (int) q->ne[1], T = (int) q->ne[2], nkv = (int) k->ne[1], cells = (int) k->ne[2];
     const int nsplit = (int) dst->ne[3];
     const float scale = param<float>(dst, 0);
-    const int rmode = param<int>(dst, 2);   // relb mode: srcs q, k, v, mask[cells,T], relb, R, sinks, rp
+    // relb mode 1: srcs q, k, v, mask[cells,T], relb, R, sinks, rp.  Mode 2 (positional): q, k, v, pos[T] (I64), relb, R,
+    // sinks; the mask and distance follow from the position (param 5 = the distance extent); the lane kernel only
+    const int rmode = param<int>(dst, 2);
     const float* relb = rmode ? (const float*) dst->src[4]->data : nullptr;
     const float* Rt = rmode ? (const float*) dst->src[5]->data : nullptr;
     const float* skp = rmode ? (const float*) dst->src[6]->data : nullptr;
-    const int* rpp = rmode ? (const int*) dst->src[7]->data : nullptr;
-    const long rps = rmode ? (long) (dst->src[7]->nb[1] / sizeof(int)) : 0, mks = rmode ? (long) (mk->nb[1] / sizeof(float)) : 0;
+    const int* rpp = rmode == 1 ? (const int*) dst->src[7]->data : nullptr;
+    const long rps = rmode == 1 ? (long) (dst->src[7]->nb[1] / sizeof(int)) : 0, mks = rmode == 1 ? (long) (mk->nb[1] / sizeof(float)) : 0;
     const int nrel = rmode ? (int) dst->src[4]->ne[0] : 0;
     const dim3 grid(nkv, T, nsplit);
     cudaStream_t st = (cudaStream_t) stream;
+    if (rmode == 2) {
+        if (!attn_dec_lane_launch(nh / nkv, grid, st, (const float*) q->data, (const char*) k->data, (const char*) v->data, nullptr,
+                                  (float*) dst->data, cells, T, nh, (long) k->nb[1], (long) k->nb[2], (long) v->nb[1], (long) v->nb[2],
+                                  scale, param<int>(dst, 3), param<int>(dst, 4), relb, Rt, skp, nullptr, 0, 0, nrel,
+                                  (const int64_t*) mk->data, param<int>(dst, 5)))
+            GGML_ABORT("xolotl-inkling: positional decode attention refused by the lane kernel (dec_lane_takes out of sync)");
+        return;
+    }
     const auto args = std::make_tuple((const float*) q->data, (const char*) k->data, (const char*) v->data, (const float*) mk->data, (float*) dst->data);
+    if (rmode && !param<int>(dst, 1) && dec_stream_on()) {   // relb mode without the f16r A/B: the streaming kernel
+        const char *Kp = std::get<1>(args), *Vp = std::get<2>(args);
+#define STREAM_ARGS nh / nkv, grid, st, std::get<0>(args), Kp, Vp, std::get<3>(args), std::get<4>(args), cells, T, nh, (long) k->nb[1], \
+            (long) k->nb[2], (long) v->nb[1], (long) v->nb[2], scale, param<int>(dst, 3), param<int>(dst, 4), relb, Rt, skp, rpp, rps, mks, nrel
+        if (HD == 128 && attn_dec_lane_launch(nh / nkv, grid, st, std::get<0>(args), Kp, Vp, std::get<3>(args), std::get<4>(args), cells, T,
+                                              nh, (long) k->nb[1], (long) k->nb[2], (long) v->nb[1], (long) v->nb[2], scale,
+                                              param<int>(dst, 3), param<int>(dst, 4), relb, Rt, skp, rpp, rps, mks, nrel)) return;
+        if (HD == 64) attn_dec_stream_launch<64>(STREAM_ARGS);
+        else if (HD == 128) attn_dec_stream_launch<128>(STREAM_ARGS);
+        else attn_dec_stream_launch<256>(STREAM_ARGS);
+#undef STREAM_ARGS
+        return;
+    }
     if (HD == 64) attn_dec_part_launch<64>(nh / nkv, grid, st, std::get<0>(args), std::get<1>(args), std::get<2>(args), std::get<3>(args), std::get<4>(args), cells, T, nh, (long) k->nb[1], (long) k->nb[2], (long) v->nb[1], (long) v->nb[2], scale, param<int>(dst, 1), param<int>(dst, 3), param<int>(dst, 4), relb, Rt, skp, rpp, rps, mks, nrel);
     else if (HD == 128) attn_dec_part_launch<128>(nh / nkv, grid, st, std::get<0>(args), std::get<1>(args), std::get<2>(args), std::get<3>(args), std::get<4>(args), cells, T, nh, (long) k->nb[1], (long) k->nb[2], (long) v->nb[1], (long) v->nb[2], scale, param<int>(dst, 1), param<int>(dst, 3), param<int>(dst, 4), relb, Rt, skp, rpp, rps, mks, nrel);
     else attn_dec_part_launch<256>(nh / nkv, grid, st, std::get<0>(args), std::get<1>(args), std::get<2>(args), std::get<3>(args), std::get<4>(args), cells, T, nh, (long) k->nb[1], (long) k->nb[2], (long) v->nb[1], (long) v->nb[2], scale, param<int>(dst, 1), param<int>(dst, 3), param<int>(dst, 4), relb, Rt, skp, rpp, rps, mks, nrel);
@@ -859,6 +1305,13 @@ void attn_dec_reduce_cuda(ggml_tensor* dst, void* stream, void*) {
     const int HD = (int) dst->ne[0], nh = (int) dst->ne[1], T = (int) dst->ne[2], nsplit = (int) pt->ne[3];
     const dim3 grid(nh, T);
     cudaStream_t st = (cudaStream_t) stream;
+    if (dec_red2_on() && nsplit <= kDecMaxSplit) {
+        const dim3 g2(nh, T, HD / 32);
+        if (HD == 64) k_attn_dec_reduce2<64><<<g2, 256, 0, st>>>((const float*) pt->data, (float*) dst->data, T, nh, nsplit, gp, gs);
+        else if (HD == 128) k_attn_dec_reduce2<128><<<g2, 256, 0, st>>>((const float*) pt->data, (float*) dst->data, T, nh, nsplit, gp, gs);
+        else k_attn_dec_reduce2<256><<<g2, 256, 0, st>>>((const float*) pt->data, (float*) dst->data, T, nh, nsplit, gp, gs);
+        return;
+    }
     if (HD == 64) k_attn_dec_reduce<64><<<grid, 64, 0, st>>>((const float*) pt->data, (float*) dst->data, T, nh, nsplit, gp, gs);
     else if (HD == 128) k_attn_dec_reduce<128><<<grid, 128, 0, st>>>((const float*) pt->data, (float*) dst->data, T, nh, nsplit, gp, gs);
     else k_attn_dec_reduce<256><<<grid, 128, 0, st>>>((const float*) pt->data, (float*) dst->data, T, nh, nsplit, gp, gs);
@@ -886,13 +1339,15 @@ void attn_dec_part_cpu(ggml_tensor* dst, int ith, int nth, void*) {
         float m = -INFINITY;
         for (int i = 0; i < n; ++i) {
             float mv;
-            if (param<int>(dst, 2)) {   // relb mode
+            if (param<int>(dst, 2)) {   // relb mode (2: positional, mk = pos [T])
                 const ggml_tensor *rb = dst->src[4], *Rt = dst->src[5], *sk = dst->src[6], *rpt = dst->src[7];
-                const int nrel = (int) rb->ne[0];
-                const float m0 = *(const float*) ((const char*) mk->data + (size_t) t * mk->nb[1] + (size_t) (j0 + i) * 4);
+                const int nrel = (int) rb->ne[0], pm = param<int>(dst, 2) == 2;
+                const int64_t dd = pm ? ((const int64_t*) mk->data)[t] - (j0 + i) : 0;
+                const float m0 = pm ? (dd >= 0 ? 0.0f : -INFINITY) : *(const float*) ((const char*) mk->data + (size_t) t * mk->nb[1] + (size_t) (j0 + i) * 4);
                 if (m0 == -INFINITY) mv = -INFINITY;
                 else {
-                    const int e = *(const int*) ((const char*) rpt->data + (size_t) t * rpt->nb[1] + (size_t) (j0 + i) * 4);
+                    const int e = pm ? (int) std::min<int64_t>(dd, param<int>(dst, 5))
+                                     : *(const int*) ((const char*) rpt->data + (size_t) t * rpt->nb[1] + (size_t) (j0 + i) * 4);
                     float b = 0.0f;
                     for (int kk = 0; kk < nrel; ++kk) b += ((const float*) rb->data)[(size_t) e * nrel + kk] * ((const float*) Rt->data)[((size_t) t * nh + h) * nrel + kk];
                     mv = (b - ((const float*) sk->data)[(size_t) t * nh + h]) + m0;
@@ -1687,6 +2142,36 @@ ggml_tensor* inkling_attn_prompt(ggml_context* c, ggml_tensor* q, ggml_tensor* k
     return y;
 }
 
+bool inkling_dec_pos_ok(int hd, int nh, int nkv, ggml_type kt, ggml_type vt, int nrel, size_t knb1, size_t knb2) {
+    return dec_pos_on() && nkv > 0 && nh % nkv == 0 &&
+           dec_lane_takes(hd, nh / nkv, kv_type_id(kt), kv_type_id(vt), nrel, knb1, knb2) && kv_type_id(kt) >= 0 && kv_type_id(vt) >= 0;
+}
+ggml_tensor* inkling_attn_dec_rel_pos(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* relb,
+                                      ggml_tensor* Rt, ggml_tensor* sinks, ggml_tensor* pos, int ext, float scale, ggml_tensor* gate) {
+    const int64_t HD = q->ne[0], nh = q->ne[1], T = q->ne[2], nkv = k->ne[1], cells = k->ne[2];
+    if (q->type != GGML_TYPE_F32 || !ggml_is_contiguous(q) || pos->type != GGML_TYPE_I64 || !ggml_is_contiguous(pos) || pos->ne[0] != T ||
+        v->ne[1] != nkv || v->ne[2] != cells || k->ne[0] != HD || v->ne[0] != HD || T > 64 || cells < 1 ||
+        !inkling_dec_pos_ok((int) HD, (int) nh, (int) nkv, k->type, v->type, (int) relb->ne[0], k->nb[1], k->nb[2]) ||
+        v->nb[1] % 4 != 0 || v->nb[2] % 4 != 0 ||
+        relb->type != GGML_TYPE_F32 || !ggml_is_contiguous(relb) || Rt->type != GGML_TYPE_F32 || !ggml_is_contiguous(Rt) ||
+        Rt->ne[0] != relb->ne[0] || ggml_nelements(Rt) != relb->ne[0] * nh * T ||
+        sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) || ggml_nelements(sinks) != nh * T ||
+        relb->ne[1] < ext + 1) return nullptr;
+    if (gate && (gate->type != GGML_TYPE_F32 || gate->nb[0] != sizeof(float) || gate->ne[0] != HD * nh || gate->ne[1] != T)) return nullptr;
+    const int64_t nsplit = dec_nsplit(cells);
+    ggml_tensor* a1[7] = {q, k, v, pos, relb, Rt, sinks};
+    ggml_tensor* part = ggml_custom_4d(c, GGML_TYPE_F32, HD + 2, nh, T, nsplit, a1, 7, attn_dec_part_cpu, GGML_N_TASKS_MAX, &g_attn_dec_part);
+    set_param<float>(part, 0, scale);
+    set_param<int>(part, 1, 0);
+    set_param<int>(part, 2, 2);
+    set_param<int>(part, 3, kv_type_id(k->type));
+    set_param<int>(part, 4, kv_type_id(v->type));
+    set_param<int>(part, 5, ext);
+    ggml_tensor* a2[2] = {part, gate};
+    ggml_tensor* y = ggml_custom_4d(c, GGML_TYPE_F32, HD, nh, T, 1, a2, gate ? 2 : 1, attn_dec_reduce_cpu, GGML_N_TASKS_MAX, &g_attn_dec_reduce);
+    set_param<int>(y, 0, gate ? 1 : 0);
+    return y;
+}
 ggml_tensor* inkling_attn_dec_rel(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* relb,
                                   ggml_tensor* Rt, ggml_tensor* sinks, ggml_tensor* rp, ggml_tensor* mask, float scale,
                                   ggml_tensor* gate) {
@@ -1755,6 +2240,8 @@ ggml_tensor* inkling_mix(ggml_context*, ggml_tensor* const*, int, ggml_tensor*) 
 ggml_tensor* inkling_relbias(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_type) { return nullptr; }
 ggml_tensor* inkling_attn_dec(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, float, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_attn_dec_rel(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, float, ggml_tensor*) { return nullptr; }
+bool inkling_dec_pos_ok(int, int, int, ggml_type, ggml_type, int, size_t, size_t) { return false; }
+ggml_tensor* inkling_attn_dec_rel_pos(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int, float, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_attn_prep(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int, ggml_tensor*, ggml_tensor*, int, float, ggml_tensor*, ggml_tensor*, ggml_tensor*, float, float, ggml_tensor*, ggml_tensor*, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_attn_prompt(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int64_t, int, float) { return nullptr; }
 ggml_tensor* inkling_moe_wsum(ggml_context*, ggml_tensor*, ggml_tensor*) { return nullptr; }
