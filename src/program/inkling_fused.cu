@@ -505,6 +505,14 @@ void relbias_cpu(ggml_tensor* dst, int ith, int nth, void*) {
 // (the sliding window, future cells).  Partials [HD + 2, nh, T, nsplit] = (sum_j p_j v_j, max, sum_j p_j); the reduce
 // joins the splits with the zero sink logit.  fp32 math throughout (the chain rounds q and p to f16 for the GEMMs).
 constexpr int kDecChunk = 64, kDecThreads = 128, kDecWarps = kDecThreads / 32, kDecU = 4;   // kDecU cells per warp step
+// at most this many splits per (kv head, token block): past 512 x 64 cells a split walks several 64-cell chunks with an
+// online softmax, so the partials (and each verify length's graph buffer) stay ~O(1) in context, not O(cells / 64)
+constexpr int64_t kDecMaxSplit = 512;
+inline int64_t dec_nsplit(int64_t cells) {   // XOLOTL_INKLING_DECATTN_MAXSPLIT: a lower cap (gates the multi-chunk path)
+    static const int64_t cap = std::getenv("XOLOTL_INKLING_DECATTN_MAXSPLIT") ? std::max(1, std::atoi(std::getenv("XOLOTL_INKLING_DECATTN_MAXSPLIT"))) : kDecMaxSplit;
+    const int64_t nch = (cells + kDecChunk - 1) / kDecChunk, per = (nch + cap - 1) / cap;
+    return (nch + per - 1) / per;
+}
 
 // the cached K/V row types: 0 f16, 1 q8_0 (float d, int8 qs[32]; 34 B per 32), 2 q4_0 (half d, uint8 qs[16]; 18 B per 32,
 // low nibbles are dims 0-15).  A row of 128 dims is 256, 136 or 72 bytes.
@@ -567,7 +575,7 @@ __global__ void __launch_bounds__(kDecThreads) k_attn_dec_part(const float* __re
         const int* __restrict__ rp, long rp_s1, long mask_s1, int nrel) {
     constexpr int RR = R * TT;
     const int g = blockIdx.x, t0 = blockIdx.y * TT, sp = blockIdx.z;
-    const int j0 = sp * kDecChunk, n = min(cells - j0, kDecChunk);
+    const int nch = (cells + kDecChunk - 1) / kDecChunk, per = (nch + (int) gridDim.z - 1) / (int) gridDim.z;   // chunks per split
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     constexpr int PL = HD / 32;                      // dims per lane in the score pass (even)
     __shared__ float s[RR][kDecChunk];
@@ -583,6 +591,27 @@ __global__ void __launch_bounds__(kDecThreads) k_attn_dec_part(const float* __re
         }
         if (threadIdx.x < RR) sks[threadIdx.x] = row_t(threadIdx.x) < T ? sinks[(size_t) row_t(threadIdx.x) * nh + row_h(threadIdx.x)] : 0.0f;
         __syncthreads();
+    }
+    float qr[RR][PL];
+#pragma unroll
+    for (int rr = 0; rr < RR; ++rr) {
+        const int t = min(row_t(rr), T - 1);
+        const float* qh = q + ((size_t) t * nh + row_h(rr)) * HD + lane * PL;
+#pragma unroll
+        for (int i = 0; i < PL; ++i) qr[rr][i] = f16r ? __half2float(__float2half(qh[i])) : qh[i];   // f16r: the chain's f16 q
+    }
+    // the split's running (max, sum, sum p v) over its chunks, held by the cg == 0 threads (per == 1: one chunk, and the
+    // merge below is a * 1.0f, bit-identical to writing the chunk's partial directly)
+    constexpr int NP = HD / 2, NG = kDecThreads / NP > 0 ? kDecThreads / NP : 1;
+    const int pr = threadIdx.x % NP, cg = threadIdx.x / NP;
+    float Mr[RR], Lr[RR], A0[RR], A1[RR];
+#pragma unroll
+    for (int rr = 0; rr < RR; ++rr) { Mr[rr] = -INFINITY; Lr[rr] = 0.0f; A0[rr] = 0.0f; A1[rr] = 0.0f; }
+    for (int sub = 0; sub < per; ++sub) {
+    const int j0 = (sp * per + sub) * kDecChunk;
+    if (j0 >= cells) break;   // uniform across the block
+    const int n = min(cells - j0, kDecChunk);
+    if (relb) {
         // every (cell, row) bias of this split in parallel, into s[][] (phase 1 reads it as the mask, then
         // overwrites it with the score)
         for (int idx = threadIdx.x; idx < n * RR; idx += kDecThreads) {
@@ -600,14 +629,6 @@ __global__ void __launch_bounds__(kDecThreads) k_attn_dec_part(const float* __re
             s[rr][i] = mvv;
         }
         __syncthreads();
-    }
-    float qr[RR][PL];
-#pragma unroll
-    for (int rr = 0; rr < RR; ++rr) {
-        const int t = min(row_t(rr), T - 1);
-        const float* qh = q + ((size_t) t * nh + row_h(rr)) * HD + lane * PL;
-#pragma unroll
-        for (int i = 0; i < PL; ++i) qr[rr][i] = f16r ? __half2float(__float2half(qh[i])) : qh[i];   // f16r: the chain's f16 q
     }
     // 1. scores: one warp per cell, kDecU cells per step with their K loads issued together
     for (int i0 = w; i0 < n; i0 += kDecWarps * kDecU) {
@@ -702,9 +723,7 @@ __global__ void __launch_bounds__(kDecThreads) k_attn_dec_part(const float* __re
         stat[1][threadIdx.x] = l;
     }
     // 3. sum_j p_j v_j: thread = (dim pair, cell group); groups split the cells, then join through shared memory
-    constexpr int NP = HD / 2, NG = kDecThreads / NP > 0 ? kDecThreads / NP : 1;
     __shared__ float accs[NG > 1 ? NG - 1 : 1][RR][HD];
-    const int pr = threadIdx.x % NP, cg = threadIdx.x / NP;
     float a0[RR], a1[RR];
 #pragma unroll
     for (int rr = 0; rr < RR; ++rr) { a0[rr] = 0.0f; a1[rr] = 0.0f; }
@@ -735,13 +754,27 @@ __global__ void __launch_bounds__(kDecThreads) k_attn_dec_part(const float* __re
     if (cg == 0) {
 #pragma unroll
         for (int rr = 0; rr < RR; ++rr) {
+            for (int k = 0; k + 1 < NG; ++k) { a0[rr] += accs[k][rr][2 * pr]; a1[rr] += accs[k][rr][2 * pr + 1]; }
+            const float mc = stat[0][rr];
+            if (mc == -INFINITY) continue;   // nothing visible in this chunk
+            const float mn = fmaxf(Mr[rr], mc);
+            const float fo = Mr[rr] == -INFINITY ? 0.0f : __expf(Mr[rr] - mn), fc = __expf(mc - mn);
+            A0[rr] = fmaf(A0[rr], fo, a0[rr] * fc); A1[rr] = fmaf(A1[rr], fo, a1[rr] * fc);
+            Lr[rr] = fmaf(Lr[rr], fo, stat[1][rr] * fc);
+            Mr[rr] = mn;
+        }
+    }
+    __syncthreads();   // s, red, stat and accs are reused by the next chunk
+    }
+    if (cg == 0) {
+#pragma unroll
+        for (int rr = 0; rr < RR; ++rr) {
             const int t = row_t(rr);
             if (t >= T) continue;
-            for (int k = 0; k + 1 < NG; ++k) { a0[rr] += accs[k][rr][2 * pr]; a1[rr] += accs[k][rr][2 * pr + 1]; }
             float* o = part + (((size_t) sp * T + t) * nh + row_h(rr)) * (HD + 2);
-            o[2 * pr] = a0[rr];
-            o[2 * pr + 1] = a1[rr];
-            if (pr == 0) { o[HD] = stat[0][rr]; o[HD + 1] = stat[1][rr]; }
+            o[2 * pr] = A0[rr];
+            o[2 * pr + 1] = A1[rr];
+            if (pr == 0) { o[HD] = Mr[rr]; o[HD + 1] = Lr[rr]; }
         }
     }
 }
@@ -838,9 +871,17 @@ void attn_dec_part_cpu(ggml_tensor* dst, int ith, int nth, void*) {
     const int nsplit = (int) dst->ne[3], R = nh / nkv;
     const float scale = param<float>(dst, 0);
     std::vector<float> sc(kDecChunk);
+    const int nch = (cells + kDecChunk - 1) / kDecChunk, per = (nch + nsplit - 1) / nsplit;   // chunks per split
+    std::vector<float> acc(HD);
     for (int u = ith; u < nh * T * nsplit; u += nth) {
         const int h = u % nh, t = (u / nh) % T, sp = u / (nh * T), g = h / R;
-        const int j0 = sp * kDecChunk, n = std::min(cells - j0, kDecChunk);
+        float* o = (float*) dst->data + (((size_t) sp * T + t) * nh + h) * (HD + 2);
+        float Mr = -INFINITY, Lr = 0.0f;
+        for (int e = 0; e < HD; ++e) o[e] = 0.0f;
+        for (int sub = 0; sub < per; ++sub) {   // the split's chunks, joined with an online softmax (as the CUDA kernel)
+        const int j0 = (sp * per + sub) * kDecChunk;
+        if (j0 >= cells) break;
+        const int n = std::min(cells - j0, kDecChunk);
         const float* qh = (const float*) q->data + ((size_t) t * nh + h) * HD;
         float m = -INFINITY;
         for (int i = 0; i < n; ++i) {
@@ -867,17 +908,23 @@ void attn_dec_part_cpu(ggml_tensor* dst, int ith, int nth, void*) {
             sc[i] = mv == -INFINITY ? -INFINITY : d * scale + mv;
             m = std::max(m, sc[i]);
         }
-        float* o = (float*) dst->data + (((size_t) sp * T + t) * nh + h) * (HD + 2);
         float l = 0.0f;
-        for (int e = 0; e < HD; ++e) o[e] = 0.0f;
+        for (int e = 0; e < HD; ++e) acc[e] = 0.0f;
         for (int i = 0; i < n; ++i) {
             const float p = m == -INFINITY ? 0.0f : std::exp(sc[i] - m);
             l += p;
             if (p == 0.0f) continue;
             const char* vr = (const char*) v->data + (size_t) (j0 + i) * v->nb[2] + (size_t) g * v->nb[1];
-            for (int e = 0; e < HD; ++e) o[e] += p * kv_at(vr, e, param<int>(dst, 4));
+            for (int e = 0; e < HD; ++e) acc[e] += p * kv_at(vr, e, param<int>(dst, 4));
         }
-        o[HD] = m; o[HD + 1] = l;
+        if (m != -INFINITY) {
+            const float mn = std::max(Mr, m), fo = Mr == -INFINITY ? 0.0f : std::exp(Mr - mn), fc = std::exp(m - mn);
+            for (int e = 0; e < HD; ++e) o[e] = o[e] * fo + acc[e] * fc;
+            Lr = Lr * fo + l * fc;
+            Mr = mn;
+        }
+        }
+        o[HD] = Mr; o[HD + 1] = Lr;
     }
 }
 void attn_dec_reduce_cpu(ggml_tensor* dst, int ith, int nth, void*) {
@@ -1656,7 +1703,7 @@ ggml_tensor* inkling_attn_dec_rel(ggml_context* c, ggml_tensor* q, ggml_tensor* 
         rp->type != GGML_TYPE_I32 || rp->nb[0] != sizeof(int32_t) || rp->ne[0] != cells || rp->ne[1] != T ||
         mask->type != GGML_TYPE_F32 || mask->nb[0] != sizeof(float) || mask->ne[0] != cells || mask->ne[1] != T) return nullptr;
     if (gate && (gate->type != GGML_TYPE_F32 || gate->nb[0] != sizeof(float) || gate->ne[0] != HD * nh || gate->ne[1] != T)) return nullptr;
-    const int64_t nsplit = (cells + kDecChunk - 1) / kDecChunk;
+    const int64_t nsplit = dec_nsplit(cells);
     ggml_tensor* a1[8] = {q, k, v, mask, relb, Rt, sinks, rp};
     ggml_tensor* part = ggml_custom_4d(c, GGML_TYPE_F32, HD + 2, nh, T, nsplit, a1, 8, attn_dec_part_cpu, GGML_N_TASKS_MAX, &g_attn_dec_part);
     set_param<float>(part, 0, scale);
@@ -1680,7 +1727,7 @@ ggml_tensor* inkling_attn_dec(ggml_context* c, ggml_tensor* q, ggml_tensor* k, g
         nkv < 1 || nh % nkv != 0 || nh / nkv > 4 ||
         mask->ne[0] != cells || mask->ne[1] != T || mask->ne[2] != nh || T > 64 || cells < 1) return nullptr;
     if (k->nb[1] % 4 != 0 || k->nb[2] % 4 != 0 || v->nb[1] % 4 != 0 || v->nb[2] % 4 != 0) return nullptr;   // half2 loads
-    const int64_t nsplit = (cells + kDecChunk - 1) / kDecChunk;
+    const int64_t nsplit = dec_nsplit(cells);
     ggml_tensor* a1[4] = {q, k, v, mask};
     ggml_tensor* part = ggml_custom_4d(c, GGML_TYPE_F32, HD + 2, nh, T, nsplit, a1, 4, attn_dec_part_cpu, GGML_N_TASKS_MAX, &g_attn_dec_part);
     set_param<float>(part, 0, scale);

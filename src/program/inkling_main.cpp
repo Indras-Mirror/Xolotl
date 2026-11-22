@@ -1218,6 +1218,8 @@ bool pattn_use(const Model& m, int T);   // prompt_attn_on() and this model/chun
 inline bool fa_on() { static const bool on = std::getenv("XOLOTL_INKLING_FA") && std::atoi(std::getenv("XOLOTL_INKLING_FA")) != 0; return on; }
 struct Model;
 bool fa_ok(const Model& m, int T);
+bool decattn_on();
+bool dec_kernel_use(const Model& m, int T);
 
 struct ChunkIn {
     ggml_tensor* mask = nullptr;   // [cells, T] F32 (0 / -inf, the causal or window test)
@@ -1675,7 +1677,7 @@ struct G {                     // graph-building context
         // decode / verify (T <= 16): the split-K attention kernel reads the f16 K/V window in place (no V transpose
         // copy per step).  Default on: quality-neutral vs the chain against the NVFP4 parent (paired NLL / KL-to-parent, 22 Nov S8); XOLOTL_INKLING_DECATTN=0 = the chain
         bool gated = false;   // the output gate already applied inside the attention kernel
-        static const bool decattn = !(std::getenv("XOLOTL_INKLING_DECATTN") && std::atoi(std::getenv("XOLOTL_INKLING_DECATTN")) == 0);
+        const bool decattn = decattn_on();
         // prompt chunks (T > 16): flash attention on the tensor cores over the whole f16 cache, bias and sink in-kernel
         // (port of Basalt attn_prompt.cu) - no [cells, T, nh] scores, masks or V transposes. XOLOTL_INKLING_PROMPT_ATTN=1
         if (pattn_use(m, (int) T) && kst && vst && y.rel_bias_pad && kv_fused_type(z.k_cache->type) && kv_fused_type(z.v_cache->type)) {
@@ -1837,6 +1839,17 @@ int64_t attn_cell_chunk(const Model& m, int T, int64_t nk, int nh) {
 
 bool fa_ok(const Model& m, int T) { return fa_on() && T <= 16 && !m.st; }
 bool kv_fused_type(ggml_type t) { return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0; }
+// the split-K decode attention kernel (decode + verify): XOLOTL_INKLING_DECATTN=0 = the chain
+bool decattn_on() {
+    static const bool v = !(std::getenv("XOLOTL_INKLING_DECATTN") && std::atoi(std::getenv("XOLOTL_INKLING_DECATTN")) == 0);
+    return v;
+}
+// decode / verify steps the split-K kernel takes: it reads the K/V window in place with no score tensor, so its plan is
+// ONE chunk at any context (split by --attn-budget, a 477K-cell window became several chunks, which the kernel refuses,
+// and the chain fallback asked for a 17 GB graph buffer)
+bool dec_kernel_use(const Model& m, int T) {
+    return decattn_on() && fa_ok(m, T) == false && T <= 16 && !m.st && kv_fused_type(m.kv_k) && kv_fused_type(m.kv_v);
+}
 bool pattn_use(const Model& m, int T) {
     return prompt_attn_on() && T > 16 && !m.st && m.pattn_ok && kv_fused_type(m.kv_k) && kv_fused_type(m.kv_v);
 }
@@ -1871,7 +1884,8 @@ Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = fals
         auto plan = [&](int64_t nk) {
             std::vector<ChunkIn> v;
             // --stats keeps the single-shot attention it was gated with (its score tensor is a few tens of MB here)
-            const int64_t C = (m.st && nk * T * h.n_head * 4 <= (256 << 20)) || fa_ok(m, T) ? nk : attn_cell_chunk(m, T, nk, h.n_head);
+            const int64_t C = (m.st && nk * T * h.n_head * 4 <= (256 << 20)) || fa_ok(m, T) || dec_kernel_use(m, T) ? nk
+                                                                                                                  : attn_cell_chunk(m, T, nk, h.n_head);
             for (int64_t j0 = 0; j0 < nk; j0 += C) {
                 ChunkIn ci;
                 ci.j0 = j0; ci.cells = std::min(C, nk - j0);
