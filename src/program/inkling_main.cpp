@@ -200,6 +200,9 @@ struct Layer {                 // one physical layer
     // no .scale, 20-23 in this quant, never gets one invented for it).
     ggml_tensor *gu_hot = nullptr, *gu_cold = nullptr, *dn_hot = nullptr, *dn_cold = nullptr;
     ggml_tensor *hot_tab = nullptr, *cold_tab = nullptr;                  // I32 [n_expert] -> slot (+1) or 0
+    // I32 [k, n_expert]: [e][i] = slot if expert e is in this arena, else a zero row of its own for top-k position i
+    // (0 for i = 0, n + i above).  MMQ's id helper (prompt chunks) assumes a token never names one row twice.
+    ggml_tensor *hot_tab2 = nullptr, *cold_tab2 = nullptr;
     int n_hot = 0, n_cold = 0;
     // loop controllers (loop layers only): Q, K, V, FFN
     ggml_tensor *msg_query = nullptr, *ctrl_down[4] = {}, *ctrl_gain[4] = {}, *ctrl_forget[4] = {};
@@ -583,7 +586,7 @@ bool setup_expert_cache(Model& m, const std::string& path) {
         size_t max_cold = 0;
         for (int l = 0; l < h.n_phys; ++l) {
             const int64_t nc = NE - q[l];
-            if (nc > 0) max_cold = std::max(max_cold, (size_t) (nc + 1) * (bgu[l] + bdn[l]));
+            if (nc > 0) max_cold = std::max(max_cold, (size_t) (nc + h.n_used) * (bgu[l] + bdn[l]));
         }
         if (max_cold > 0 && hot_budget > max_cold + (128ull << 20)) {
             const size_t used2 = fill_quotas(hot_budget - max_cold - (32ull << 20));
@@ -652,7 +655,8 @@ bool setup_expert_cache(Model& m, const std::string& path) {
     std::fclose(f);
 
     // contexts: hot arenas + tables on the device, cold arenas in pinned host memory (CUDA host buft)
-    ggml_init_params dcp{(size_t) (h.n_phys * 4 + 8) * ggml_tensor_overhead(), nullptr, true};
+    ggml_init_params dcp{(size_t) (h.n_phys * 6 + 8) * ggml_tensor_overhead(), nullptr, true};
+    const int64_t KD = h.n_used;   // zero rows per arena: one per top-k position (see hot_tab2)
     ggml_init_params hcp{(size_t) (h.n_phys * 2 + 8) * ggml_tensor_overhead(), nullptr, true};
     m.ectx = ggml_init(dcp);
     ggml_context* hctx = ggml_init(hcp);
@@ -660,14 +664,16 @@ bool setup_expert_cache(Model& m, const std::string& path) {
         Layer& y = m.L[l];
         if (!y.gate_up_exps || (y.n_hot == 0 && y.n_cold == 0)) continue;
         if (y.n_hot > 0) {
-            y.gu_hot = ggml_new_tensor_3d(m.ectx, y.gate_up_exps->type, y.gate_up_exps->ne[0], y.gate_up_exps->ne[1], y.n_hot + 1);
-            y.dn_hot = ggml_new_tensor_3d(m.ectx, y.down_exps->type, y.down_exps->ne[0], y.down_exps->ne[1], y.n_hot + 1);
+            y.gu_hot = ggml_new_tensor_3d(m.ectx, y.gate_up_exps->type, y.gate_up_exps->ne[0], y.gate_up_exps->ne[1], y.n_hot + KD);
+            y.dn_hot = ggml_new_tensor_3d(m.ectx, y.down_exps->type, y.down_exps->ne[0], y.down_exps->ne[1], y.n_hot + KD);
         }
         y.hot_tab = ggml_new_tensor_1d(m.ectx, GGML_TYPE_I32, NE);
+        y.hot_tab2 = ggml_new_tensor_2d(m.ectx, GGML_TYPE_I32, KD, NE);
         if (y.n_cold > 0) {
-            y.gu_cold = ggml_new_tensor_3d(hctx, y.gate_up_exps->type, y.gate_up_exps->ne[0], y.gate_up_exps->ne[1], y.n_cold + 1);
-            y.dn_cold = ggml_new_tensor_3d(hctx, y.down_exps->type, y.down_exps->ne[0], y.down_exps->ne[1], y.n_cold + 1);
+            y.gu_cold = ggml_new_tensor_3d(hctx, y.gate_up_exps->type, y.gate_up_exps->ne[0], y.gate_up_exps->ne[1], y.n_cold + KD);
+            y.dn_cold = ggml_new_tensor_3d(hctx, y.down_exps->type, y.down_exps->ne[0], y.down_exps->ne[1], y.n_cold + KD);
             y.cold_tab = ggml_new_tensor_1d(m.ectx, GGML_TYPE_I32, NE);
+            y.cold_tab2 = ggml_new_tensor_2d(m.ectx, GGML_TYPE_I32, KD, NE);
         }
     }
     m.ehot_buf = ggml_backend_alloc_ctx_tensors(m.ectx, m.gpu);
@@ -1148,8 +1154,13 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
                             die(std::string("--vram-budget-mib: short read on ") + src->name);
                     }
                 }
-                if (hot) ggml_backend_tensor_set(hot, zeros.data(), 0, blob);
-                if (cold) ggml_backend_tensor_set(cold, zeros.data(), 0, blob);
+                // the zero rows: slot 0 and the top-k positions' own rows above the last slot (n + 1 .. n + k - 1)
+                for (ggml_tensor* a : {hot, cold}) {
+                    if (!a) continue;
+                    const int64_t n = a->ne[2] - h.n_used;
+                    ggml_backend_tensor_set(a, zeros.data(), 0, blob);
+                    for (int64_t i = 1; i < h.n_used; ++i) ggml_backend_tensor_set(a, zeros.data(), (size_t) (n + i) * blob, blob);
+                }
                 // readback: the first n_verify experts of the layer, hot or cold, compared byte for byte to the file
                 std::vector<uint8_t> got;
                 for (int e = 0; e < std::min<int>(n_verify, h.n_expert); ++e) {
@@ -1179,6 +1190,18 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
             }
             ggml_backend_tensor_set(y.hot_tab, htab.data(), 0, (size_t) h.n_expert * sizeof(int32_t));
             if (y.cold_tab) ggml_backend_tensor_set(y.cold_tab, ctab.data(), 0, (size_t) h.n_expert * sizeof(int32_t));
+            for (int which = 0; which < 2; ++which) {   // hot_tab2 / cold_tab2: a zero row per top-k position
+                ggml_tensor* t2 = which == 0 ? y.hot_tab2 : y.cold_tab2;
+                ggml_tensor* a = which == 0 ? y.gu_hot : y.gu_cold;
+                if (!t2 || !a) continue;
+                const std::vector<int32_t>& tab = which == 0 ? htab : ctab;
+                const int64_t K = h.n_used, n = a->ne[2] - K;
+                std::vector<int32_t> t2v((size_t) K * h.n_expert);
+                for (int e = 0; e < h.n_expert; ++e)
+                    for (int64_t i = 0; i < K; ++i)
+                        t2v[(size_t) e * K + i] = tab[e] > 0 ? tab[e] : (i == 0 ? 0 : (int32_t) (n + i));
+                ggml_backend_tensor_set(t2, t2v.data(), 0, t2v.size() * sizeof(int32_t));
+            }
             if (std::getenv("XOLOTL_INKLING_SELFTEST") && (l == 0 || l == h.loop_start)) arena_selftest(m, f, base, l);
         }
         std::fclose(f);
@@ -1489,11 +1512,15 @@ struct G {                     // graph-building context
         // --vram-budget-mib: expert id -> arena slot (+1; 0 = the zero expert).  get_rows wants ne0 = the row width,
         // so the table is read through a [1, NE] view and the ids flattened ([k*T, 1]); ids is a strided view over
         // the full argsort when T > 1, hence the cont.
+        // expert id -> arena slot, with a distinct zero row per top-k position for experts not in this arena:
+        // rows of tab2 [k, NE] gathered per (token, position) -> [k, k*T], then the diagonal (position i, column i)
         auto slot_ids = [&](ggml_tensor* tab) {
+            ggml_tensor* tab2 = tab == y.hot_tab ? y.hot_tab2 : y.cold_tab2;
             ggml_tensor* ic = ggml_cont(c, ids);
-            ggml_tensor* iflat = ggml_reshape_2d(c, ic, k * T, 1);
-            ggml_tensor* map = ggml_reshape_2d(c, tab, 1, NE);
-            return ggml_reshape_2d(c, ggml_get_rows(c, map, iflat), k, T);
+            ggml_tensor* iflat = ggml_reshape_1d(c, ic, k * T);
+            ggml_tensor* g = ggml_get_rows(c, tab2, iflat);   // [k, k*T]
+            ggml_tensor* d = ggml_view_3d(c, g, 1, k, T, (size_t) (k + 1) * sizeof(int32_t), (size_t) k * k * sizeof(int32_t), 0);
+            return ggml_reshape_2d(c, ggml_cont(c, d), k, T);
         };
         // --vram-budget-mib, the cold arena and the two kernel regimes.  mul_mat_id uses MMVQ (reads each expert's
         // weights in place) only up to a per-type batch cap (ggml-cuda/mmvq.cu:177); above it, grouped MMQ runs,
@@ -1511,12 +1538,11 @@ struct G {                     // graph-building context
         auto cold_weights = [&](ggml_tensor* cold) -> ggml_tensor* {
             s.cold_w.push_back(cold);
             if (zero_copy) return cold;
-            ggml_tensor* st = ggml_new_tensor_3d(c, cold->type, cold->ne[0], cold->ne[1], cold->ne[2]);
-            ggml_tensor* cp = ggml_cpy(c, cold, st);   // returns a view of st: using it makes the order explicit
-            ggml_build_forward_expand(gf, cp);
-            s.cold_ops.push_back(cp);
-            s.cold_stage.push_back(st);
-            return cp;
+            // a DUP node, not a copy into a new leaf: ggml-alloc never frees leaves (every layer's staging stayed
+            // resident: graph buffers of 13-24 GB at 128K), and MMQ refuses a padded src0 that is a view
+            ggml_tensor* st = ggml_dup(c, cold);
+            s.cold_ops.push_back(st);
+            return st;
         };
         // the mmid over a cold weight: recorded so forward() can pin it to CUDA
         static const bool dbg_cold = std::getenv("XOLOTL_INKLING_DBG_COLD") != nullptr;
