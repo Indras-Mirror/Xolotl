@@ -21,7 +21,7 @@ Our quant, **Inkling-2-Mini XQ Unbound** (13.93 GB, uncensored), is on Hugging F
 
 | | 14 GB XQ quant | NVFP4 parent |
 |---|---:|---:|
-| decode, 2.8K prompt | **113 tok/s** | 89 tok/s |
+| decode, 2.8K prompt | **113 tok/s** (127 at 7K served, 22 Nov late) | 89 tok/s |
 | decode with `--dspark` | **136 tok/s** (~140 on served thinking requests) | 137 tok/s |
 | prefill, 8K prompt (served) | ~3,500 tok/s | ~3,000 tok/s (16K context, 512-row chunks) |
 | prefill, 32K prompt (served) | **4,190 tok/s** | - (the parent leaves little VRAM for big chunks) |
@@ -83,7 +83,7 @@ card's memory bandwidth (~840 GB/s at 117K). Served decode at k8v4, no drafter, 
 
 | context | 7K | 30K | 117K | 477K |
 | --- | ---: | ---: | ---: | ---: |
-| decode tok/s | 118 | 108 | 93 | 55 |
+| decode tok/s | 127 | 118 | 100 | 56 |
 
 Against f16 on the parent: q8_0 KL 3.6e-4 with identical greedy output, k8v4 (q8_0 keys, q4_0 values) KL 8e-4.
 

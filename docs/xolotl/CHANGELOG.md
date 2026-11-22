@@ -8,6 +8,29 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Inkling-2-Mini decode 118 -> 127 tok/s: fused loop controllers, folded expert scales, BF16 router (22 Nov, late)
+
+Peer engines for this model (satellitedown/skyne98's ingine, 140 tok/s on an RTX 3090; ManyGlue0's InklingEngine) run
+about 450 kernels a token; we ran 2,111. A decode token reads ~3.8 GB of weights (1.8 GB dense with the 3x loop,
+1.6 GB of experts, 0.5 GB head) and our weight mat-vecs already ran at ~950 GB/s, so the gap was the small kernels.
+- **Loop controllers** (24 visits a token, ~25 kernels each for the q/k/v and FFN controllers): one fused op, three
+  kernels, reading BF16 copies of the controller weights. The checkpoint stores them as BF16 and the GGUF's F32
+  tensors hold exactly those values, so the copies are exact and half the bytes.
+- **Per-expert NVFP4 scales**: the gate/up scale is applied inside the SiTU kernel and the down scale inside the
+  fused MoE finish (the same fp32 multiply, bit-identical), removing a gather and a multiply each a visit.
+- **Router** read as its exact BF16 copy for decode.
+
+2,111 -> 1,482 kernels a token, GPU time 7.48 -> 6.80 ms. Served decode, k8v4, no drafter:
+
+| context | 7.3K | 30K | 117K | 477K |
+| --- | ---: | ---: | ---: | ---: |
+| before | 118 | 108 | 93 | 55 |
+| after | **127** | **118** | **100** | **56** |
+
+With the DSpark drafter, code requests run ~150 tok/s. Quality: 8K NLL in 16-token steps at the f16 run-to-run floor
+(controllers vs the chain 0.0205 per-token, mean -0.0004; scale folds bit-identical). Switches back:
+`XOLOTL_INKLING_CTRL_FUSED=0`, `XOLOTL_INKLING_SCALE_FOLD=0`, `XOLOTL_INKLING_ROUTER_F32=1`.
+
 ### Inkling-2-Mini long-context decode near the memory bandwidth: 477K tokens 30 -> 55 tok/s (22 Nov, night)
 
 Profiled with Nsight Systems at

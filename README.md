@@ -12,6 +12,9 @@
 
 ## Latest
 
+- **22 Nov, late** - **Inkling-2-Mini decode 118 -> 127 tok/s** (30K 108 -> 118, 117K 93 -> 100): the loop
+  controllers fused into three kernels on exact BF16 weights, the per-expert scales folded into existing kernels;
+  2,111 -> 1,482 kernels a token. [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-decode-118---127-toks-fused-loop-controllers-folded-expert-scales-bf16-router-22-nov-late).
 - **22 Nov, evening** - **Inkling-2-Mini at 512K context on one RTX 4090**: the quantised K/V cache (`--kv-type
   k8v4`) now runs on the fast kernels (107K-token prefill in 29 s, was ~130 tok/s), its 4-bit value leg is
   Hadamard-rotated by default (-33 % of the 4-bit noise, no speed cost), and long-context decode near the card's
