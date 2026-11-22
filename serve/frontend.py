@@ -198,14 +198,16 @@ EFFORT_DEEPSEEK = {"none": None, "off": None, "minimal": None, "disabled": None,
                    "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 _EFFORT_QWEN = dict(EFFORT)
 _NUMERIC_EFFORT = False
+_FRACTION_EFFORT = False   # Inkling 2: its template's own number, 0.0 (off) .. 0.99 (as llama.cpp / SGLang take it)
 
 
 def use_family(family: str | None) -> None:
     """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER)."""
-    global _NUMERIC_EFFORT
+    global _NUMERIC_EFFORT, _FRACTION_EFFORT
     EFFORT.clear()
     EFFORT.update(EFFORT_DEEPSEEK if family == "deepseek41" else _EFFORT_QWEN)
     _NUMERIC_EFFORT = family == "deepseek41"
+    _FRACTION_EFFORT = family in ("inkling2", "inkling2_loop")
 
 
 def effort_kwargs(value) -> dict:
@@ -218,6 +220,10 @@ def effort_kwargs(value) -> dict:
         if not 1 <= value <= 100:
             raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, max or 1..100")
         return {"reasoning_effort": value}
+    if _FRACTION_EFFORT and isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not 0.0 <= float(value) <= 0.99:
+            raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high or 0.0..0.99")
+        return {"enable_thinking": False} if float(value) == 0.0 else {"reasoning_effort": float(value)}
     key = str(value).strip().lower()
     if key not in EFFORT:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high"
