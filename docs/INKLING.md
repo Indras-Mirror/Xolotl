@@ -26,7 +26,8 @@ Our quant, **Inkling-2-Mini XQ Unbound** (13.93 GB, uncensored), is on Hugging F
 | prefill, 8K prompt (served) | ~3,500 tok/s | ~3,000 tok/s (16K context, 512-row chunks) |
 | prefill, 32K prompt (served) | **4,190 tok/s** | - (the parent leaves little VRAM for big chunks) |
 | prompt chunk (auto) | 2048 rows | 256-512 rows |
-| decode during agent work (Gauntlet v3, 289K tokens, served sampling) | 104.5 tok/s | - |
+| decode during agent work (Gauntlet v3-small, 193K tokens, served sampling) | 116.5 tok/s | - |
+| Gauntlet v3-small, 6 tasks (one run) / v3, 7 tasks | 4.42 of 6 (3 solved) / 4 of 7 solved | - |
 | long context, `--kv-type k8v4` | 512K fits; decode 108 / 93 / 55 tok/s at 30K / 117K / 477K | - |
 | images (`--mmproj`, F16 tower) | a 4K screenshot encodes in 1-2 s | same |
 

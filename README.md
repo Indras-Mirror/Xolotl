@@ -86,10 +86,10 @@ served. Decode is the generation speed during those tasks.
 | **[Qwen3.8-27B Swift-1.5 XQ 14 GB](https://huggingface.co/IndrasMirror/Qwen3.8-27B-Swift-1.5-XQ-Uncensored)** (ours, uncensored) | 27B dense |     6.00     |      120       |   1,840-2,120   |   200K  |     -     |
 | **Qwen3.8-27B XQ** (ours, uncensored, 16.2 GB)                                                                    | 27B dense |     4.97     |      99.6      |   1,760-1,980   |   200K  |     -     |
 | **[Muse Glimmer 30B](docs/GLIMMER.md)** (heretic IQ4_NL)                                                          | 30B dense |     4.89     |      148       |   3,330-3,410   |   512K  |     -     |
-| **[Inkling-2-Mini XQ Unbound 13.9 GB](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored)** (ours, uncensored, [engine](docs/INKLING.md)) | 26B looped MoE, 3B active | to come | 104.5 | 3,500-4,190 | 512K | - |
+| **[Inkling-2-Mini XQ Unbound 13.9 GB](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored)** (ours, uncensored, [engine](docs/INKLING.md)) | 26B looped MoE, 3B active | 4.42 | 116.5 | 3,500-4,190 | 512K | - |
 
-<sub>Inkling-2-Mini: not yet run on v3-small; on the full 7-task Gauntlet v3 (thinking on, served sampling) it solved
-4/7, and its decode is the average over that run's 289K generated tokens. It is not on OpenRouter.
+<sub>Inkling-2-Mini: one run on 22 Nov (solved 3/6, 09-dst-scheduler at 0.92), k8v4 K/V, plain decode, decode averaged over
+193K generated tokens; on the full 7-task Gauntlet v3 it solved 4/7. It is not on OpenRouter.
 Score (of 6) = each task's progress summed (1 per solve, partial credit from the hidden tests), averaged over the runs.
 API score = each model's own full-precision API through OpenRouter (DeepSeek-V4.1-Flash-1017, GLM-5.3-Flash, Qwen3.8-Flash,
 Qwen3.8-27B), the same tasks and turns, reasoning on (8 Nov).

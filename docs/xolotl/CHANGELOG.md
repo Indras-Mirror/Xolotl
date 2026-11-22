@@ -101,6 +101,7 @@ strength 4 (they ship 3): on a sweep, 3 / 4 / 5 gave greedy MATH-24 87.5 / 87.5 
 | KL to the official model, 8,192 held-out tokens (top-1) | - (its bf16 parent: 0.0336, 92.1 %) | **0.0282 (92.8 %)** |
 | harmful / harmless refused of 100 (BERT gate, thinking off) | 4 / 1 | 24 / 0 |
 | Gauntlet v3, 7 tasks, thinking on | not run | 4/7 solved |
+| Gauntlet v3-small, 6 tasks (the README table's score) | not run | 4.42 of 6 (3 solved) |
 
 MMLU-100 moves ~4.5 points on a 100-question sample. Most of the 24 counted refusals are partial or vague answers; if
 you need zero, nokeep's own release at strength 3 measures 0/277 on their sealed set with a judge (a different gate).
