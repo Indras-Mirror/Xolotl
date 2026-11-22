@@ -223,7 +223,9 @@ def effort_kwargs(value) -> dict:
     if _FRACTION_EFFORT and isinstance(value, (int, float)) and not isinstance(value, bool):
         if not 0.0 <= float(value) <= 0.99:
             raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high or 0.0..0.99")
-        return {"enable_thinking": False} if float(value) == 0.0 else {"reasoning_effort": float(value)}
+        # 0 is the template's own effort 0 (as llama.cpp / SGLang send it): the model opens its reply itself, the
+        # server does not force the answer channel the way enable_thinking=false does
+        return {"reasoning_effort": float(value)}
     key = str(value).strip().lower()
     if key not in EFFORT:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high"
