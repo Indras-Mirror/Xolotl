@@ -17,11 +17,13 @@ ggml_tensor* inkling_conv_step(ggml_context* c, ggml_tensor* x, ggml_tensor* w, 
 // outputs d [C, k, T] (wk [k, T]), the ffn post-convolution (state/hist as inkling_conv_step, no dynamic taps), and the
 // residual add.  Replaces cont + permute + the weighted-sum mat-vec + conv + add.
 ggml_tensor* inkling_moe_finish(ggml_context* c, ggml_tensor* d, ggml_tensor* wk, ggml_tensor* w, ggml_tensor* state,
-                                ggml_tensor* res, int K, float scale, ggml_tensor* hist = nullptr);
+                                ggml_tensor* res, int K, float scale, ggml_tensor* hist = nullptr, ggml_tensor* ds = nullptr,
+                                ggml_tensor* ids = nullptr);   // ds [NE] + ids [k, T]: the per-expert down scale, w * ds[id]
 
 // SiTU on a gate|up tensor gu [2F, k, T]: beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u) -> [F, k, T].
 // The chain it replaces: 2 conts + scale + tanh + scale + sigmoid + mul (+ scale + tanh + scale) + mul.
-ggml_tensor* inkling_situ(ggml_context* c, ggml_tensor* gu, float beta, float lb);
+// sc [NE] + ids [k, T] (optional): the per-expert gate/up scale applied first (gu * sc[id], as the mul it replaces).
+ggml_tensor* inkling_situ(ggml_context* c, ggml_tensor* gu, float beta, float lb, ggml_tensor* sc = nullptr, ggml_tensor* ids = nullptr);
 
 // [E, n, T] from n tensors of [E, T] (contiguous F32, n <= GGML_MAX_SRC): row i = srcs[i]; nullptr if not applicable
 ggml_tensor* inkling_stack(ggml_context* c, ggml_tensor* const* srcs, int n);

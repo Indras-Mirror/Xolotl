@@ -34,7 +34,8 @@ template <int K>
 __global__ void k_conv_step(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ st,
                             const float* __restrict__ dyn, float* __restrict__ y, int C, int T, int nh, float scale,
                             float* __restrict__ hist, long hs, const float* __restrict__ md, const float* __restrict__ mw,
-                            int mk, const float* __restrict__ res) {
+                            int mk, const float* __restrict__ res, const float* __restrict__ ds = nullptr,
+                            const int* __restrict__ ids = nullptr, long is1 = 0) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float r[K], wr[K];
@@ -52,7 +53,10 @@ __global__ void k_conv_step(const float* __restrict__ x, const float* __restrict
         float xv;
         if (md) {   // MoE finish: the input is the routing-weighted sum of the k expert outputs d [C, mk, T]
             xv = 0.0f;
-            for (int i = 0; i < mk; ++i) xv = fmaf(md[((size_t) t * mk + i) * C + c], mw[(size_t) t * mk + i], xv);
+            for (int i = 0; i < mk; ++i) {   // ds: the per-expert down scale folded in (w * s, as the mul it replaces)
+                const float wv = ds ? __fmul_rn(mw[(size_t) t * mk + i], ds[ids[(size_t) t * is1 + i]]) : mw[(size_t) t * mk + i];
+                xv = fmaf(md[((size_t) t * mk + i) * C + c], wv, xv);
+            }
         } else {
             xv = x[(size_t) t * C + c];
         }
@@ -135,6 +139,10 @@ void conv_cuda(ggml_tensor* dst, void* stream, void*) {
     const float* mdp = mk > 0 ? (const float*) x->data : nullptr;
     const float* mwp = mwt ? (const float*) mwt->data : nullptr;
     const float* rsp = rst ? (const float*) rst->data : nullptr;
+    const int has_ds = mk > 0 ? param<int>(dst, 6) : 0;   // finish: + down scale [NE], ids [k, T]
+    const float* dsp = has_ds ? (const float*) dst->src[si]->data : nullptr;
+    const int* idp = has_ds ? (const int*) dst->src[si + 1]->data : nullptr;
+    const long is1 = has_ds ? (long) (dst->src[si + 1]->nb[1] / sizeof(int)) : 0;
     float* hp = hi ? (float*) hi->data : nullptr;
     const long hs = hi ? (long) (hi->nb[1] / sizeof(float)) : 0;
     const float scale = param<float>(dst, 2);
@@ -151,7 +159,7 @@ void conv_cuda(ggml_tensor* dst, void* stream, void*) {
 #undef CONV_PAR
         return;
     }
-#define CONV_CASE(k) case k: k_conv_step<k><<<g, b, 0, s>>>((const float*) x->data, (const float*) w->data, (float*) st->data, d, (float*) dst->data, C, T, nh, scale, hp, hs, mdp, mwp, mk, rsp); break;
+#define CONV_CASE(k) case k: k_conv_step<k><<<g, b, 0, s>>>((const float*) x->data, (const float*) w->data, (float*) st->data, d, (float*) dst->data, C, T, nh, scale, hp, hs, mdp, mwp, mk, rsp, dsp, idp, is1); break;
     switch (K) { CONV_CASE(2) CONV_CASE(3) CONV_CASE(4) CONV_CASE(5) CONV_CASE(6) CONV_CASE(7) CONV_CASE(8) default: break; }
 #undef CONV_CASE
 }
@@ -164,6 +172,9 @@ void conv_cpu(ggml_tensor* dst, int ith, int nth, void*) {
     int si = 3 + (nh > 0) + (has_h ? 1 : 0);
     const float* mwp = mk > 0 ? (const float*) dst->src[si++]->data : nullptr;
     const float* rsp = has_r ? (const float*) dst->src[si++]->data : nullptr;
+    const int has_ds = mk > 0 ? param<int>(dst, 6) : 0;
+    const float* dsp = has_ds ? (const float*) dst->src[si]->data : nullptr;
+    const ggml_tensor* idt = has_ds ? dst->src[si + 1] : nullptr;
     const float scale = param<float>(dst, 2);
     const int C = (int) dst->ne[0], T = (int) dst->ne[1];
     const float *xp = (const float*) x->data, *wp = (const float*) w->data, *dp = dyn ? (const float*) dyn->data : nullptr;
@@ -176,7 +187,12 @@ void conv_cpu(ggml_tensor* dst, int ith, int nth, void*) {
         const int hh = nh > 0 ? c / (C / nh) : 0;
         for (int t = 0; t < T; ++t) {
             float xv = 0.0f;
-            if (mk > 0) for (int i = 0; i < mk; ++i) xv += xp[((size_t) t * mk + i) * C + c] * mwp[(size_t) t * mk + i];
+            if (mk > 0)
+                for (int i = 0; i < mk; ++i) {
+                    float wv = mwp[(size_t) t * mk + i];
+                    if (dsp) wv *= dsp[*(const int*) ((const char*) idt->data + (size_t) t * idt->nb[1] + (size_t) i * 4)];
+                    xv += xp[((size_t) t * mk + i) * C + c] * wv;
+                }
             else xv = xp[(size_t) t * C + c];
             r[K - 1] = xv;
             if (hr) hr[K - 1 + t] = xv;
@@ -193,12 +209,18 @@ void conv_cpu(ggml_tensor* dst, int ith, int nth, void*) {
 
 // ------------------------------------------------------------------------------------------------ SiTU
 __global__ void k_situ(const float* __restrict__ gu, float* __restrict__ y, int F, int64_t n, float beta, float ibeta,
-                       float lb, float ilb) {
+                       float lb, float ilb, const float* __restrict__ sc = nullptr, const int* __restrict__ ids = nullptr,
+                       int k = 1, long is1 = 0) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int64_t row = i / F, f = i - row * F;
-    const float g = gu[row * 2 * F + f];
+    float g = gu[row * 2 * F + f];
     float u = gu[row * 2 * F + F + f];
+    if (sc) {   // the per-expert gate/up scale of NVFP4-kept experts (row = token * k + slot), as the mul it replaces
+        const float s = sc[ids[(row / k) * is1 + row % k]];
+        g = __fmul_rn(g, s);
+        u = __fmul_rn(u, s);
+    }
     float a = fmaf(beta, tanhf(fmaf(ibeta, g, 0.0f)), 0.0f);            // scale(tanh(scale(g)))  (scale = s*x + 0)
     a = __fmul_rn(a, 1.0f / (1.0f + expf(-g)));                          // * sigmoid(g)
     if (lb > 0.0f) u = fmaf(lb, tanhf(fmaf(ilb, u, 0.0f)), 0.0f);
@@ -210,8 +232,10 @@ void situ_cuda(ggml_tensor* dst, void* stream, void*) {
     const float beta = param<float>(dst, 0), lb = param<float>(dst, 1);
     const int F = (int) dst->ne[0];
     const int64_t n = ggml_nelements(dst);
+    const ggml_tensor *sc = param<int>(dst, 2) ? dst->src[1] : nullptr, *ids = sc ? dst->src[2] : nullptr;
     k_situ<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>((const float*) gu->data, (float*) dst->data, F, n,
-                                                                          beta, 1.0f / beta, lb, lb > 0.0f ? 1.0f / lb : 0.0f);
+        beta, 1.0f / beta, lb, lb > 0.0f ? 1.0f / lb : 0.0f, sc ? (const float*) sc->data : nullptr,
+        ids ? (const int*) ids->data : nullptr, (int) dst->ne[1], ids ? (long) (ids->nb[1] / sizeof(int)) : 0);
 }
 
 void situ_cpu(ggml_tensor* dst, int ith, int nth, void*) {
@@ -220,10 +244,17 @@ void situ_cpu(ggml_tensor* dst, int ith, int nth, void*) {
     const int64_t F = dst->ne[0], rows = ggml_nelements(dst) / F;
     const float* gp = (const float*) gu->data;
     float* yp = (float*) dst->data;
+    const ggml_tensor *sct = param<int>(dst, 2) ? dst->src[1] : nullptr, *idt = sct ? dst->src[2] : nullptr;
+    const int64_t kk = dst->ne[1];
     for (int64_t r = ith; r < rows; r += nth)
         for (int64_t f = 0; f < F; ++f) {
-            const float g = gp[r * 2 * F + f];
+            float g = gp[r * 2 * F + f];
             float u = gp[r * 2 * F + F + f];
+            if (sct) {
+                const int id = *(const int*) ((const char*) idt->data + (size_t) (r / kk) * idt->nb[1] + (size_t) (r % kk) * 4);
+                const float sv = ((const float*) sct->data)[id];
+                g *= sv; u *= sv;
+            }
             float a = beta * std::tanh(g * (1.0f / beta)) * (1.0f / (1.0f + std::exp(-g)));
             if (lb > 0.0f) u = lb * std::tanh(u * (1.0f / lb));
             yp[r * F + f] = a * u;
@@ -2151,16 +2182,20 @@ ggml_tensor* inkling_conv_step(ggml_context* c, ggml_tensor* x, ggml_tensor* w, 
 }
 
 ggml_tensor* inkling_moe_finish(ggml_context* c, ggml_tensor* d, ggml_tensor* wk, ggml_tensor* w, ggml_tensor* state,
-                                ggml_tensor* res, int K, float scale, ggml_tensor* hist) {
+                                ggml_tensor* res, int K, float scale, ggml_tensor* hist, ggml_tensor* ds, ggml_tensor* ids) {
     const int64_t C = d->ne[0], k = d->ne[1], T = d->ne[2];
     if (d->type != GGML_TYPE_F32 || !ggml_is_contiguous(d) || wk->type != GGML_TYPE_F32 || !ggml_is_contiguous(wk) ||
         ggml_nelements(wk) != k * T || res->type != GGML_TYPE_F32 || !ggml_is_contiguous(res) || ggml_nelements(res) != C * T ||
         w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || K > 8) return nullptr;
-    ggml_tensor* args[6] = {d, w, state, nullptr, nullptr, nullptr};
+    if ((ds == nullptr) != (ids == nullptr)) return nullptr;
+    if (ds && (ds->type != GGML_TYPE_F32 || !ggml_is_contiguous(ds) || ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int) ||
+               ids->ne[0] != k || ids->ne[1] != T)) return nullptr;
+    ggml_tensor* args[8] = {d, w, state, nullptr, nullptr, nullptr, nullptr, nullptr};
     int n = 3;
     if (hist) args[n++] = hist;
     args[n++] = wk;
     args[n++] = res;
+    if (ds) { args[n++] = ds; args[n++] = ids; }
     ggml_tensor* y = ggml_custom_4d(c, GGML_TYPE_F32, C, T, 1, 1, args, n, conv_cpu, GGML_N_TASKS_MAX, &g_conv);
     set_param<int>(y, 0, K);
     set_param<int>(y, 1, 0);
@@ -2168,15 +2203,20 @@ ggml_tensor* inkling_moe_finish(ggml_context* c, ggml_tensor* d, ggml_tensor* wk
     set_param<int>(y, 3, hist ? 1 : 0);
     set_param<int>(y, 4, (int) k);
     set_param<int>(y, 5, 1);
+    set_param<int>(y, 6, ds ? 1 : 0);
     return y;
 }
 
-ggml_tensor* inkling_situ(ggml_context* c, ggml_tensor* gu, float beta, float lb) {
-    ggml_tensor* args[1] = {gu};
-    ggml_tensor* y = ggml_custom_4d(c, GGML_TYPE_F32, gu->ne[0] / 2, gu->ne[1], gu->ne[2], gu->ne[3], args, 1, situ_cpu,
+ggml_tensor* inkling_situ(ggml_context* c, ggml_tensor* gu, float beta, float lb, ggml_tensor* sc, ggml_tensor* ids) {
+    if ((sc == nullptr) != (ids == nullptr)) return nullptr;
+    if (sc && (sc->type != GGML_TYPE_F32 || !ggml_is_contiguous(sc) || ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int) ||
+               ids->ne[0] != gu->ne[1] || ids->ne[1] != gu->ne[2] || gu->ne[3] != 1)) return nullptr;
+    ggml_tensor* args[3] = {gu, sc, ids};
+    ggml_tensor* y = ggml_custom_4d(c, GGML_TYPE_F32, gu->ne[0] / 2, gu->ne[1], gu->ne[2], gu->ne[3], args, sc ? 3 : 1, situ_cpu,
                                     GGML_N_TASKS_MAX, &g_situ);
     set_param<float>(y, 0, beta);
     set_param<float>(y, 1, lb);
+    set_param<int>(y, 2, sc ? 1 : 0);
     return y;
 }
 
@@ -2414,8 +2454,8 @@ bool inkling_fused_available() { return true; }
 #else   // a ggml without the hook: the custom ops would run on the CPU, so the engine keeps its op chains
 
 ggml_tensor* inkling_conv_step(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int, int, float, ggml_tensor*) { return nullptr; }
-ggml_tensor* inkling_moe_finish(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int, float, ggml_tensor*) { return nullptr; }
-ggml_tensor* inkling_situ(ggml_context*, ggml_tensor*, float, float) { return nullptr; }
+ggml_tensor* inkling_moe_finish(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int, float, ggml_tensor*, ggml_tensor*, ggml_tensor*) { return nullptr; }
+ggml_tensor* inkling_situ(ggml_context*, ggml_tensor*, float, float, ggml_tensor*, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_stack(ggml_context*, ggml_tensor* const*, int) { return nullptr; }
 ggml_tensor* inkling_clip(ggml_context*, ggml_tensor*, ggml_tensor*, float, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_ctrl(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, float) { return nullptr; }

@@ -208,6 +208,7 @@ struct Layer {                 // one physical layer
     // the same controllers in BF16 (the checkpoint's type, so exact) for the fused decode op: q/k/v stacked, and the
     // FFN one; up = [gain rows ; forget rows]
     ggml_tensor *c3_down_h = nullptr, *c3_up_h = nullptr, *c1_down_h = nullptr, *c1_up_h = nullptr;
+    ggml_tensor* router_h = nullptr;   // gate_inp in BF16 (the checkpoint's type, exact) for decode / verify
 };
 
 struct Slot {                  // one cache slot
@@ -240,6 +241,7 @@ struct Model {
     ggml_backend_t gpu = nullptr, cpu = nullptr;
     ggml_backend_buffer_t wbuf = nullptr, hbuf = nullptr, sbuf = nullptr;   // GPU weights, host weights, state
     ggml_context* xctx = nullptr; ggml_backend_buffer_t xbuf = nullptr;   // derived weights (stacked controllers)
+    ggml_context* rctx = nullptr; ggml_backend_buffer_t rbuf = nullptr;   // derived weights (BF16 routers)
     ggml_context* bctx = nullptr; ggml_backend_buffer_t bbuf = nullptr;   // side-file biases (blk.N.attn_output.bias)
     ggml_context* pctx = nullptr; ggml_backend_buffer_t pbuf = nullptr;   // derived weights (padded rel bias tables)
     bool ubatch_auto = false;   // --ubatch not given: load() sizes it from the free VRAM
@@ -324,6 +326,37 @@ std::vector<int> parse_layers(const std::string& s, int n) {
 // The three attention-input controllers of a loop layer (q, k, v) run as ONE batched chain: their weights stacked
 // along dim 2 (gain and forget rows side by side), so a pass-2/3 visit issues ~14 kernels instead of ~48. Rows are
 // computed exactly as before (same kernels per row). XOLOTL_INKLING_CTRL_REF=1 keeps the per-controller chains.
+// gate_inp (the router) in BF16: the checkpoint stores it as BF16 and the GGUF's F32 copy holds exactly those values,
+// so decode / verify read half the bytes for the same logits (ggml's mat-vec keeps the activations F32)
+void build_router_bf16(Model& m) {
+    if (std::getenv("XOLOTL_INKLING_ROUTER_F32")) return;
+    int n = 0;
+    for (int l = 0; l < m.hp.n_phys; ++l) if (m.L[l].gate_inp && m.L[l].gate_inp->type == GGML_TYPE_F32) ++n;
+    if (!n) return;
+    ggml_init_params ip{(size_t) (n + 2) * ggml_tensor_overhead(), nullptr, true};
+    m.rctx = ggml_init(ip);
+    for (int l = 0; l < m.hp.n_phys; ++l) {
+        Layer& y = m.L[l];
+        if (y.gate_inp && y.gate_inp->type == GGML_TYPE_F32)
+            y.router_h = ggml_new_tensor_2d(m.rctx, GGML_TYPE_BF16, y.gate_inp->ne[0], y.gate_inp->ne[1]);
+    }
+    m.rbuf = ggml_backend_alloc_ctx_tensors(m.rctx, m.gpu);
+    if (!m.rbuf) { for (int l = 0; l < m.hp.n_phys; ++l) m.L[l].router_h = nullptr; return; }
+    std::vector<float> f;
+    std::vector<ggml_bf16_t> hb;
+    for (int l = 0; l < m.hp.n_phys; ++l) {
+        Layer& y = m.L[l];
+        if (!y.router_h) continue;
+        f.resize(ggml_nelements(y.gate_inp));
+        ggml_backend_tensor_get(y.gate_inp, f.data(), 0, f.size() * sizeof(float));
+        hb.resize(f.size());
+        bool exact = true;
+        for (size_t i = 0; i < f.size(); ++i) { hb[i] = ggml_fp32_to_bf16(f[i]); exact = exact && ggml_bf16_to_fp32(hb[i]) == f[i]; }
+        if (!exact) { y.router_h = nullptr; continue; }   // not BF16 values after all: keep the F32 router
+        ggml_backend_tensor_set(y.router_h, hb.data(), 0, hb.size() * sizeof(ggml_bf16_t));
+    }
+}
+
 void build_stacked_controllers(Model& m) {
     if (std::getenv("XOLOTL_INKLING_CTRL_REF")) return;
     const Hp& h = m.hp;
@@ -1154,6 +1187,7 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
         std::fprintf(stderr, "xolotl-inkling: arena verify: %lld expert blobs read back, all match the file\n", (long long) n_checked);
     }
     build_stacked_controllers(m);
+    build_router_bf16(m);
     build_padded_rel_bias(m);
     m.pattn_ok = h.hd == 128 && h.n_rel == 16 && h.n_head == 3 * h.n_head_kv;
     for (int l = 0; l < h.n_phys; ++l) m.pattn_ok = m.pattn_ok && m.L[l].rel_bias_pad != nullptr;
@@ -1420,11 +1454,13 @@ struct G {                     // graph-building context
     }
 
     ggml_tensor *moe_d = nullptr, *moe_wk = nullptr;   // moe() -> layer(): the fused finish's inputs
+    ggml_tensor *moe_ds = nullptr, *moe_ids = nullptr;  // + the per-expert down scale and the ids it is gathered by
     bool want_finish = false;
     ggml_tensor* moe(ggml_tensor* x, const Layer& y) {
         const int64_t E = h.n_embd, NE = h.n_expert, k = h.n_used;
-        moe_d = moe_wk = nullptr;
-        ggml_tensor* logits = ggml_mul_mat(c, y.gate_inp, x);                    // [NE, T] (router F32)
+        moe_d = moe_wk = moe_ds = moe_ids = nullptr;
+        // [NE, T]; decode / verify read the BF16 copy (same values, half the bytes)
+        ggml_tensor* logits = ggml_mul_mat(c, T <= 16 && y.router_h && !st ? y.router_h : y.gate_inp, x);
         ggml_tensor* probs = ggml_sigmoid(c, logits);
         ggml_tensor* sel = y.probs_b ? ggml_add(c, probs, y.probs_b) : probs;
         ggml_tensor* ids = ggml_argsort_top_k(c, sel, (int) k);                  // [k, T]
@@ -1495,6 +1531,7 @@ struct G {                     // graph-building context
         };
         ggml_tensor* x3 = ggml_reshape_3d(c, x, E, 1, T);
         ggml_tensor* gu = nullptr;
+        ggml_tensor* gu_act = nullptr;   // SiTU with the gate/up scale folded in
         ggml_tensor* hid = nullptr, *cid = nullptr;
         if (y.gu_hot || y.gu_cold) {
             // The split moves expert BYTES; it changes nothing else.  Routing ids, w and the per-expert .scale are
@@ -1511,11 +1548,19 @@ struct G {                     // graph-building context
             }
             gu = exp_scale(gu, y.gate_up_s);
         } else {
-            gu = exp_scale(ggml_mul_mat_id(c, y.gate_up_exps, x3, ids), y.gate_up_s);
+            gu = ggml_mul_mat_id(c, y.gate_up_exps, x3, ids);
+            // the per-expert gate/up scale goes into the SiTU kernel (gather + mul folded in) when it is fused
+            static const bool fold_ref = std::getenv("XOLOTL_INKLING_SCALE_FOLD") && std::atoi(std::getenv("XOLOTL_INKLING_SCALE_FOLD")) == 0;
+            ggml_tensor* folded = y.gate_up_s && fused_on() && !fold_ref && !st && ggml_is_contiguous(gu) && gu->type == GGML_TYPE_F32
+                                      ? inkling_situ(c, gu, h.situ_beta, h.situ_lb, y.gate_up_s, ids) : nullptr;
+            if (folded) gu_act = folded;
+            else gu = exp_scale(gu, y.gate_up_s);
         }
         const int64_t F = gu->ne[0] / 2;
         ggml_tensor* act;
-        if (fused_on() && ggml_is_contiguous(gu) && gu->type == GGML_TYPE_F32) {
+        if (gu_act) {
+            act = gu_act;
+        } else if (fused_on() && ggml_is_contiguous(gu) && gu->type == GGML_TYPE_F32) {
             act = inkling_situ(c, gu, h.situ_beta, h.situ_lb);   // the chain below as one kernel
         } else {
             ggml_tensor* g = ggml_cont(c, ggml_view_3d(c, gu, F, k, T, gu->nb[1], gu->nb[2], 0));
@@ -1556,10 +1601,17 @@ struct G {                     // graph-building context
             }
             return k == 1 ? ggml_cont(c, out) : out;
         }
+        // fused finish (layer() does the weighted sum + ffn post-conv + residual in one kernel): hand d, w and (folded
+        // into the kernel) the per-expert down scale over
+        static const bool finish_ref = std::getenv("XOLOTL_INKLING_MOE_FINISH_REF") != nullptr;
+        static const bool fold_ref2 = std::getenv("XOLOTL_INKLING_SCALE_FOLD") && std::atoi(std::getenv("XOLOTL_INKLING_SCALE_FOLD")) == 0;
+        if (want_finish && fused_on() && !finish_ref && !fold_ref2 && !st && y.down_s && d->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(d) && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w)) {
+            moe_d = d; moe_wk = w; moe_ds = y.down_s; moe_ids = ids;
+            return nullptr;
+        }
         // the weighted sum over the k experts as one batched mat-vec; the per-expert down scale folds into the weights
         ggml_tensor* wk = y.down_s ? exp_scale(w, y.down_s) : w;                           // [1, k, T]
-        // fused finish (layer() does the weighted sum + ffn post-conv + residual in one kernel): hand d and wk over
-        static const bool finish_ref = std::getenv("XOLOTL_INKLING_MOE_FINISH_REF") != nullptr;
         if (want_finish && fused_on() && !finish_ref && d->type == GGML_TYPE_F32 && ggml_is_contiguous(d) &&
             wk->type == GGML_TYPE_F32 && ggml_is_contiguous(wk)) {
             moe_d = d; moe_wk = wk;
@@ -1860,11 +1912,19 @@ struct G {                     // graph-building context
             ggml_tensor* hview = (s.hist && z.conv_hist) ? ggml_view_2d(c, z.conv_hist, K - 1 + T, E, z.conv_hist->nb[1], (size_t) off * z.conv_hist->nb[1]) : nullptr;
             static const bool hist_ref = std::getenv("XOLOTL_INKLING_HIST_REF") != nullptr;
             ggml_tensor* f = (s.hist && (!hview || hist_ref)) ? nullptr
-                           : inkling_moe_finish(c, moe_d, moe_wk, y.ffn_post_conv, stv, ffn_inp, (int) K, 1.0f / std::sqrt((float) (K + 1)), hview);
+                           : inkling_moe_finish(c, moe_d, moe_wk, y.ffn_post_conv, stv, ffn_inp, (int) K, 1.0f / std::sqrt((float) (K + 1)), hview,
+                                                    moe_ds, moe_ids);
             if (f) {
                 if (hview) ggml_build_forward_expand(gf, f);
                 cur = f;
             } else {   // the reference weighted sum, then the usual convolve + add
+                if (moe_ds) {   // the down scale was left for the fused finish: apply it here (as moe()'s exp_scale)
+                    const int64_t NE = h.n_expert;
+                    ggml_tensor* s3 = T == 1 ? ggml_reshape_3d(c, moe_ds, 1, NE, 1)
+                                             : ggml_repeat_4d(c, ggml_reshape_3d(c, moe_ds, 1, NE, 1), 1, NE, T, 1);
+                    moe_wk = ggml_mul(c, moe_wk, ggml_get_rows(c, s3, moe_ids));
+                    moe_ds = moe_ids = nullptr;
+                }
                 x = wsum_ref() ? nullptr : inkling_moe_wsum(c, moe_d, moe_wk);
                 if (!x) {
                     ggml_tensor* dT = ggml_cont(c, ggml_permute(c, moe_d, 1, 0, 2, 3));
