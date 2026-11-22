@@ -955,6 +955,10 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
         h.loop_start = (int) m.gg.i(a + "loop.start");
         h.loop_end = (int) m.gg.i(a + "loop.end");
         h.n_pass = (int) m.gg.i(a + "loop.count");
+        if (const char* np = std::getenv("XOLOTL_INKLING_PASSES")) {   // research: run the loop core N times (trained: 3)
+            h.n_pass = std::atoi(np);
+            std::fprintf(stderr, "xolotl-inkling: XOLOTL_INKLING_PASSES=%d (trained %lld)\n", h.n_pass, (long long) m.gg.i(a + "loop.count"));
+        }
         if (m.gg.i_or(a + "loop.varying", 0)) die("a varying loop (loop.varying = true) is not supported");
         if (h.n_pass < 2 || h.loop_start <= 0 || h.loop_start >= h.loop_end || h.loop_end > h.n_phys ||
             h.loop_start % h.block || h.loop_end % h.block) die("invalid loop core");
@@ -1756,7 +1760,15 @@ struct G {                     // graph-building context
             static const bool clip_ref = std::getenv("XOLOTL_INKLING_CLIP_REF") != nullptr;
             ggml_tensor* tq = swa ? nullptr : tau;
             ggml_tensor *Qf = nullptr, *Kf = nullptr, *Rf = nullptr;
-            if (fused_on() && !clip_ref) {
+            static const bool clip_pair = !(std::getenv("XOLOTL_INKLING_CLIP_PAIR") && std::atoi(std::getenv("XOLOTL_INKLING_CLIP_PAIR")) == 0);
+            ggml_tensor* qr = fused_on() && !clip_ref && clip_pair
+                ? inkling_clip2(c, ggml_reshape_3d(c, Q, hd, nh, T), y.q_clip, h.qk_clip,
+                                ggml_reshape_3d(c, R, h.n_rel, nh, T), y.rel_clip, h.rel_clip, tq) : nullptr;
+            if (qr) {   // q and rel clips in one launch: views of the one output
+                Qf = ggml_view_3d(c, qr, hd, nh, T, hd * 4, hd * nh * 4, 0);
+                Rf = ggml_view_3d(c, qr, h.n_rel, nh, T, h.n_rel * 4, h.n_rel * nh * 4, (size_t) hd * nh * T * 4);
+                if (!prepped) Kf = inkling_clip(c, ggml_reshape_3d(c, Kc, hd, nkv, T), nullptr, h.qk_clip, nullptr);
+            } else if (fused_on() && !clip_ref) {
                 Qf = inkling_clip(c, ggml_reshape_3d(c, Q, hd, nh, T), y.q_clip, h.qk_clip, tq);
                 if (!prepped) Kf = inkling_clip(c, ggml_reshape_3d(c, Kc, hd, nkv, T), nullptr, h.qk_clip, nullptr);
                 Rf = inkling_clip(c, ggml_reshape_3d(c, R, h.n_rel, nh, T), y.rel_clip, h.rel_clip, tq);

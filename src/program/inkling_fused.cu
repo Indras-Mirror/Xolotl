@@ -295,9 +295,9 @@ void stack_cpu(ggml_tensor* dst, int ith, int nth, void*) {
 // y = thr * l2_norm(x [* s], eps = thr) [* tau]: rows of hd = x->ne[0], one warp per row like ggml's l2_norm_f32 for
 // rows < 1024 (same strided FMA partial sums, same xor-shuffle reduction, rsqrtf(fmaxf(sum, eps^2))), so the result
 // equals the mul + l2_norm + scale (+ mul) chain.  x [hd, nh, T] contiguous, s [hd, nh] or null, tau [T] or null.
-__global__ void k_clip(const float* __restrict__ x, const float* __restrict__ sc, const float* __restrict__ tau,
-                       float* __restrict__ y, int hd, int nh, float thr) {
-    const int row = blockIdx.x, lane = threadIdx.x;
+__device__ __forceinline__ void clip_row(const float* __restrict__ x, const float* __restrict__ sc, const float* __restrict__ tau,
+                                         float* __restrict__ y, int hd, int nh, float thr, const int row) {
+    const int lane = threadIdx.x;
     const int h = row % nh, t = row / nh;
     const float* xr = x + (size_t) row * hd;
     float tmp = 0.0f;
@@ -315,6 +315,52 @@ __global__ void k_clip(const float* __restrict__ x, const float* __restrict__ sc
         float o = __fmul_rn(thr, __fmul_rn(scale, v));
         if (tau) o = __fmul_rn(o, tau[t]);
         y[(size_t) row * hd + col] = o;
+    }
+}
+
+__global__ void k_clip(const float* __restrict__ x, const float* __restrict__ sc, const float* __restrict__ tau,
+                       float* __restrict__ y, int hd, int nh, float thr) {
+    clip_row(x, sc, tau, y, hd, nh, thr, blockIdx.x);
+}
+// two clips (q and rel) in one launch: rows [0, ra) = a, the rest = b; one output buffer, b after a
+struct ClipArgs { const float* x; const float* sc; float* y; int hd, nh; float thr; };
+__global__ void k_clip2(ClipArgs a, ClipArgs b, const float* __restrict__ tau, int ra) {
+    const int r = blockIdx.x;
+    if (r < ra) clip_row(a.x, a.sc, tau, a.y, a.hd, a.nh, a.thr, r);
+    else clip_row(b.x, b.sc, tau, b.y, b.hd, b.nh, b.thr, r - ra);
+}
+// srcs: xa, sa|xa, xb, sb|xb, tau|xa; params: thra, thrb, flags (1 sa, 2 sb, 4 tau)
+static void clip2_args(const ggml_tensor* dst, ClipArgs& a, ClipArgs& b, const float*& tau, int& ra, int& rb) {
+    const ggml_tensor *xa = dst->src[0], *xb = dst->src[2];
+    const int fl = param<int>(dst, 2);
+    a = {(const float*) xa->data, fl & 1 ? (const float*) dst->src[1]->data : nullptr, (float*) dst->data,
+         (int) xa->ne[0], (int) xa->ne[1], param<float>(dst, 0)};
+    b = {(const float*) xb->data, fl & 2 ? (const float*) dst->src[3]->data : nullptr, (float*) dst->data + ggml_nelements(xa),
+         (int) xb->ne[0], (int) xb->ne[1], param<float>(dst, 1)};
+    tau = fl & 4 ? (const float*) dst->src[4]->data : nullptr;
+    ra = (int) (ggml_nelements(xa) / xa->ne[0]); rb = (int) (ggml_nelements(xb) / xb->ne[0]);
+}
+void clip2_cuda(ggml_tensor* dst, void* stream, void*) {
+    ClipArgs a, b; const float* tau; int ra, rb;
+    clip2_args(dst, a, b, tau, ra, rb);
+    k_clip2<<<ra + rb, 32, 0, (cudaStream_t) stream>>>(a, b, tau, ra);
+}
+void clip2_cpu(ggml_tensor* dst, int ith, int nth, void*) {
+    ClipArgs a, b; const float* tau; int ra, rb;
+    clip2_args(dst, a, b, tau, ra, rb);
+    for (int r = ith; r < ra + rb; r += nth) {
+        const ClipArgs& p = r < ra ? a : b;
+        const int row = r < ra ? r : r - ra, h = row % p.nh, t = row / p.nh;
+        const float* xr = p.x + (size_t) row * p.hd;
+        double sum = 0.0;
+        for (int i = 0; i < p.hd; ++i) { const float v = xr[i] * (p.sc ? p.sc[(size_t) h * p.hd + i] : 1.0f); sum += (double) v * v; }
+        const float scale = 1.0f / std::sqrt(std::max((float) sum, p.thr * p.thr));
+        for (int i = 0; i < p.hd; ++i) {
+            const float v = xr[i] * (p.sc ? p.sc[(size_t) h * p.hd + i] : 1.0f);
+            float o = p.thr * (scale * v);
+            if (tau) o *= tau[t];
+            p.y[(size_t) row * p.hd + i] = o;
+        }
     }
 }
 
@@ -1444,15 +1490,18 @@ void attn_dec_reduce_cpu(ggml_tensor* dst, int ith, int nth, void*) {
 // history), the key clip thr*x/max(|x|,thr) per head row, the value RMS norm per head row, the optional cache rotation
 // (shared-memory FWHT), and both cache writes (f16 / q8_0 / q4_0) at the step's cells.  Block = (kv head, K|V), thread = channel.  The row reductions are done by warp 0 in exactly the
 // order of k_clip / ggml's 32-thread rms_norm, so the values match the chain they replace.
+struct PrepArgs {   // one side (K or V) of the prepare
+    const float* x; long xs; const float* w; float* state; int off; const float* dyn; int nhd; const int64_t* idx;
+    char* cache; long c1, c2; float* hist; long hs; int isv, qty; const float* rs; int nkv;
+};
 template <int K>
-__global__ void k_attn_prep(const float* __restrict__ x, long xs, const float* __restrict__ w, float* __restrict__ state,
+__device__ __forceinline__ void attn_prep_body(const float* __restrict__ x, long xs, const float* __restrict__ w, float* __restrict__ state,
                             int off, const float* __restrict__ dyn, int nhd, float scale, const int64_t* __restrict__ idx,
                             char* __restrict__ cache, long c1, long c2, float* __restrict__ hist, long hs, int T, float thr,
-                            float eps, int isv, int qty, const float* __restrict__ rs) {
-    const int g = blockIdx.x, tid = threadIdx.x, hd = blockDim.x;
-    const int C = gridDim.x * hd, ch = g * hd + tid, srow = off + ch;
-    __shared__ float yb[256];
-    __shared__ float nrm;
+                            float eps, int isv, int qty, const float* __restrict__ rs, const int g, const int nkv,
+                            float* yb, float& nrm) {
+    const int tid = threadIdx.x, hd = blockDim.x;
+    const int C = nkv * hd, ch = g * hd + tid, srow = off + ch;
     float r[K], wr[K];
 #pragma unroll
     for (int j = 0; j < K; ++j) wr[j] = w[(size_t) ch * K + j];
@@ -1537,22 +1586,56 @@ __global__ void k_attn_prep(const float* __restrict__ x, long xs, const float* _
 #pragma unroll
     for (int j = 0; j < K - 1; ++j) state[(size_t) srow * (K - 1) + j] = r[j];
 }
+template <int K>
+__global__ void k_attn_prep(PrepArgs a, int T, float scale, float thr, float eps) {
+    __shared__ float yb[256];
+    __shared__ float nrm;
+    attn_prep_body<K>(a.x, a.xs, a.w, a.state, a.off, a.dyn, a.nhd, scale, a.idx, a.cache, a.c1, a.c2, a.hist, a.hs, T, thr, eps,
+                      a.isv, a.qty, a.rs, blockIdx.x, a.nkv, yb, nrm);
+}
+// K and V sides in one launch: blocks [0, a.nkv) = a, the rest = b (each block's work is unchanged)
+template <int K>
+__global__ void k_attn_prep2(PrepArgs a, PrepArgs b, int T, float scale, float thr, float eps) {
+    __shared__ float yb[256];
+    __shared__ float nrm;
+    const bool first = (int) blockIdx.x < a.nkv;
+    const PrepArgs& p = first ? a : b;
+    attn_prep_body<K>(p.x, p.xs, p.w, p.state, p.off, p.dyn, p.nhd, scale, p.idx, p.cache, p.c1, p.c2, p.hist, p.hs, T, thr, eps,
+                      p.isv, p.qty, p.rs, first ? (int) blockIdx.x : (int) blockIdx.x - a.nkv, p.nkv, yb, nrm);
+}
 
-void attn_prep_cuda(ggml_tensor* dst, void* stream, void*) {
-    // srcs: x, w, state, idx, cache, [dyn], [hist]
-    const int K = param<int>(dst, 0), nhd = param<int>(dst, 1), has_h = param<int>(dst, 2), off = param<int>(dst, 3);
-    const float scale = param<float>(dst, 4), thr = param<float>(dst, 5), eps = param<float>(dst, 6);
-    const int isv = param<int>(dst, 7) & 1, has_r = param<int>(dst, 7) >> 1;   // op_params hold 8 ints after kP: pack
+static PrepArgs prep_args(const ggml_tensor* dst) {
+    const int nhd = param<int>(dst, 1), has_h = param<int>(dst, 2), off = param<int>(dst, 3);
+    const int isv = param<int>(dst, 7) & 1, has_r = (param<int>(dst, 7) >> 1) & 1;
     const ggml_tensor *x = dst->src[0], *w = dst->src[1], *st = dst->src[2], *ix = dst->src[3], *cc = dst->src[4];
     const ggml_tensor* dy = nhd > 0 ? dst->src[5] : nullptr;
     const ggml_tensor* hi = has_h ? dst->src[nhd > 0 ? 6 : 5] : nullptr;
     const ggml_tensor* ro = has_r ? dst->src[5 + (nhd > 0) + has_h] : nullptr;
-    const int hd = (int) cc->ne[0], nkv = (int) cc->ne[1], T = (int) ix->ne[0], qty = kv_type_id(cc->type);
-    const float* rs = ro ? (const float*) ro->data : nullptr;
+    return {(const float*) x->data, (long) (x->nb[1] / 4), (const float*) w->data, (float*) st->data, off,
+            dy ? (const float*) dy->data : nullptr, nhd, (const int64_t*) ix->data, (char*) cc->data, (long) cc->nb[1],
+            (long) cc->nb[2], hi ? (float*) hi->data : nullptr, hi ? (long) (hi->nb[1] / 4) : 0, isv, kv_type_id(cc->type),
+            ro ? (const float*) ro->data : nullptr, (int) cc->ne[1]};
+}
+
+void attn_prep_cuda(ggml_tensor* dst, void* stream, void*) {
+    // srcs: x, w, state, idx, cache, [dyn], [hist], [rot], [dep = the K op].  param 7: bit 0 isv, bit 1 rot,
+    // bit 2 = this K op is run by the V op's launch (skip), bit 3 = this V op also runs the K op (src = dep, last)
+    const int K = param<int>(dst, 0), mode = param<int>(dst, 7);
+    if (mode & 4) return;
+    const float scale = param<float>(dst, 4), thr = param<float>(dst, 5), eps = param<float>(dst, 6);
+    const PrepArgs b = prep_args(dst);
+    const int hd = (int) dst->src[4]->ne[0], T = (int) dst->src[3]->ne[0];
     cudaStream_t s = (cudaStream_t) stream;
-#define PREP_CASE(k) case k: k_attn_prep<k><<<nkv, hd, 0, s>>>((const float*) x->data, (long) (x->nb[1] / 4), (const float*) w->data, \
-        (float*) st->data, off, dy ? (const float*) dy->data : nullptr, nhd, scale, (const int64_t*) ix->data, (char*) cc->data, \
-        (long) cc->nb[1], (long) cc->nb[2], hi ? (float*) hi->data : nullptr, hi ? (long) (hi->nb[1] / 4) : 0, T, thr, eps, isv, qty, rs); break;
+    if (mode & 8) {
+        const ggml_tensor* kop = nullptr;
+        for (int i = GGML_MAX_SRC - 1; i >= 0 && !kop; --i) if (dst->src[i]) kop = dst->src[i];
+        const PrepArgs a = prep_args(kop);
+#define PREP_CASE(k) case k: k_attn_prep2<k><<<a.nkv + b.nkv, hd, 0, s>>>(a, b, T, scale, thr, eps); break;
+        switch (K) { PREP_CASE(2) PREP_CASE(3) PREP_CASE(4) PREP_CASE(5) PREP_CASE(6) PREP_CASE(7) PREP_CASE(8) default: break; }
+#undef PREP_CASE
+        return;
+    }
+#define PREP_CASE(k) case k: k_attn_prep<k><<<b.nkv, hd, 0, s>>>(b, T, scale, thr, eps); break;
     switch (K) { PREP_CASE(2) PREP_CASE(3) PREP_CASE(4) PREP_CASE(5) PREP_CASE(6) PREP_CASE(7) PREP_CASE(8) default: break; }
 #undef PREP_CASE
 }
@@ -1560,7 +1643,7 @@ void attn_prep_cuda(ggml_tensor* dst, void* stream, void*) {
 void attn_prep_cpu(ggml_tensor* dst, int ith, int nth, void*) {
     const int K = param<int>(dst, 0), nhd = param<int>(dst, 1), has_h = param<int>(dst, 2), off = param<int>(dst, 3);
     const float scale = param<float>(dst, 4), thr = param<float>(dst, 5), eps = param<float>(dst, 6);
-    const int isv = param<int>(dst, 7) & 1, has_r = param<int>(dst, 7) >> 1;   // op_params hold 8 ints after kP: pack
+    const int isv = param<int>(dst, 7) & 1, has_r = (param<int>(dst, 7) >> 1) & 1;   // bits 2/3 = CUDA launch pairing only
     const ggml_tensor *x = dst->src[0], *w = dst->src[1], *st = dst->src[2], *ix = dst->src[3], *cc = dst->src[4];
     const ggml_tensor* dy = nhd > 0 ? dst->src[5] : nullptr;
     const ggml_tensor* hi = has_h ? dst->src[nhd > 0 ? 6 : 5] : nullptr;
@@ -1625,11 +1708,13 @@ static CtrlIn ctrl_in(const ggml_tensor* x, int K) {
 }
 constexpr int kCtrlE = 32;   // up-kernel outputs per block
 // z[k, t, row] = D_k[row] . [cur * rms_c ; msg * rms_m]   grid (r, T, K), 128 threads (a block per row)
+// RB rows per block (the activations and their rms read once per block); each row's sum keeps the per-thread order
+template <int RB>
 __global__ void k_ctrl_down(CtrlIn cu, CtrlIn ms, const __nv_bfloat16* __restrict__ D, float* __restrict__ z, int E, int r, int T) {
-    const int row = blockIdx.x, t = blockIdx.y, k = blockIdx.z, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row0 = blockIdx.x * RB, t = blockIdx.y, k = blockIdx.z, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const float* c = cu.p + (size_t) t * cu.st + (size_t) k * cu.sk;
     const float* m = ms.p + (size_t) t * ms.st + (size_t) k * ms.sk;
-    __shared__ float red[3][4];
+    __shared__ float red[2 + RB][4];
     float a = 0.0f, b = 0.0f;
     for (int e = threadIdx.x; e < E; e += 128) { const float x = c[e], y = m[e]; a = fmaf(x, x, a); b = fmaf(y, y, b); }
     a = warp_sum(a); b = warp_sum(b);
@@ -1637,18 +1722,25 @@ __global__ void k_ctrl_down(CtrlIn cu, CtrlIn ms, const __nv_bfloat16* __restric
     __syncthreads();
     const float sc = rsqrtf((red[0][0] + red[0][1] + red[0][2] + red[0][3]) / E + 1e-6f);
     const float sm = rsqrtf((red[1][0] + red[1][1] + red[1][2] + red[1][3]) / E + 1e-6f);
-    const __nv_bfloat162* d = reinterpret_cast<const __nv_bfloat162*>(D + ((size_t) k * r + row) * 2 * E);
-    float acc = 0.0f;
+    const __nv_bfloat162* d[RB];
+#pragma unroll
+    for (int q = 0; q < RB; ++q) d[q] = reinterpret_cast<const __nv_bfloat162*>(D + ((size_t) k * r + min(row0 + q, r - 1)) * 2 * E);
+    float acc[RB];
+#pragma unroll
+    for (int q = 0; q < RB; ++q) acc[q] = 0.0f;
     for (int pi = threadIdx.x; pi < E; pi += 128) {   // pair pi = elements 2pi, 2pi+1 of [cur ; msg] (E even)
-        const float2 wv = __bfloat1622float2(d[pi]);
         const int e = 2 * pi;
         const float x0 = e < E ? c[e] * sc : m[e - E] * sm, x1 = e < E ? c[e + 1] * sc : m[e + 1 - E] * sm;
-        acc = fmaf(wv.x, x0, fmaf(wv.y, x1, acc));
+#pragma unroll
+        for (int q = 0; q < RB; ++q) { const float2 wv = __bfloat1622float2(d[q][pi]); acc[q] = fmaf(wv.x, x0, fmaf(wv.y, x1, acc[q])); }
     }
-    acc = warp_sum(acc);
-    if (lane == 0) red[2][w] = acc;
+#pragma unroll
+    for (int q = 0; q < RB; ++q) { const float v = warp_sum(acc[q]); if (lane == 0) red[2 + q][w] = v; }
     __syncthreads();
-    if (threadIdx.x == 0) z[((size_t) k * T + t) * r + row] = red[2][0] + red[2][1] + red[2][2] + red[2][3];
+    if (threadIdx.x < RB && row0 + (int) threadIdx.x < r) {
+        const int q = threadIdx.x;
+        z[((size_t) k * T + t) * r + row0 + q] = red[2 + q][0] + red[2 + q][1] + red[2 + q][2] + red[2 + q][3];
+    }
 }
 // pre[k, t, e] = (cur - f * cur) + g * msg, [g; f] = tanh(U z) (U rows: gain 0..E-1, forget E..2E-1); each block's sum
 // of squares after the E values.  grid (ceil(E / kCtrlE), T, K), 256 threads: a warp per output, lanes over r
@@ -1707,8 +1799,11 @@ static int ctrl_nb(int E) { return (E + kCtrlE - 1) / kCtrlE; }
 void ctrl_down_cuda(ggml_tensor* dst, void* stream, void*) {   // srcs: cur, msg, down [2E, r, K] bf16
     const ggml_tensor *cu = dst->src[0], *ms = dst->src[1], *D = dst->src[2];
     const int r = (int) dst->ne[0], T = (int) dst->ne[1], K = (int) dst->ne[2], E = (int) ms->ne[0];
-    k_ctrl_down<<<dim3(r, T, K), 128, 0, (cudaStream_t) stream>>>(ctrl_in(cu, K), ctrl_in(ms, K), (const __nv_bfloat16*) D->data,
-                                                                  (float*) dst->data, E, r, T);
+    static const int rb = std::getenv("XOLOTL_INKLING_CTRL_RB") ? std::atoi(std::getenv("XOLOTL_INKLING_CTRL_RB")) : 4;
+    cudaStream_t s = (cudaStream_t) stream;
+#define CD(RB) k_ctrl_down<RB><<<dim3((r + RB - 1) / RB, T, K), 128, 0, s>>>(ctrl_in(cu, K), ctrl_in(ms, K), (const __nv_bfloat16*) D->data, (float*) dst->data, E, r, T)
+    if (rb >= 8) CD(8); else if (rb >= 4) CD(4); else if (rb >= 2) CD(2); else CD(1);
+#undef CD
 }
 void ctrl_up_cuda(ggml_tensor* dst, void* stream, void*) {     // srcs: cur, msg, U [r, 2E, K] bf16, z
     const ggml_tensor *cu = dst->src[0], *ms = dst->src[1], *U = dst->src[2], *z = dst->src[3];
@@ -1780,6 +1875,7 @@ ggml_cuda_custom_op g_conv{GGML_CUDA_CUSTOM_MAGIC, conv_cuda, nullptr};
 ggml_cuda_custom_op g_situ{GGML_CUDA_CUSTOM_MAGIC, situ_cuda, nullptr};
 ggml_cuda_custom_op g_stack{GGML_CUDA_CUSTOM_MAGIC, stack_cuda, nullptr};
 ggml_cuda_custom_op g_clip{GGML_CUDA_CUSTOM_MAGIC, clip_cuda, nullptr};
+ggml_cuda_custom_op g_clip2{GGML_CUDA_CUSTOM_MAGIC, clip2_cuda, nullptr};
 ggml_cuda_custom_op g_mix{GGML_CUDA_CUSTOM_MAGIC, mix_cuda, nullptr};
 ggml_cuda_custom_op g_relbias{GGML_CUDA_CUSTOM_MAGIC, relbias_cuda, nullptr};
 ggml_cuda_custom_op g_attn_prep{GGML_CUDA_CUSTOM_MAGIC, attn_prep_cuda, nullptr};
@@ -2263,6 +2359,24 @@ ggml_tensor* inkling_clip(ggml_context* c, ggml_tensor* x, ggml_tensor* scale, f
     return y;
 }
 
+ggml_tensor* inkling_clip2(ggml_context* c, ggml_tensor* xa, ggml_tensor* sa, float thra, ggml_tensor* xb, ggml_tensor* sb,
+                           float thrb, ggml_tensor* tau) {
+    for (auto [x, s, thr] : {std::tuple{xa, sa, thra}, std::tuple{xb, sb, thrb}}) {
+        if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] >= 1024 || thr <= 0.0f || x->ne[3] != 1) return nullptr;
+        if (s && (s->type != GGML_TYPE_F32 || !ggml_is_contiguous(s) || s->ne[0] != x->ne[0] ||
+                  ggml_nelements(s) != x->ne[0] * x->ne[1])) return nullptr;
+    }
+    if (xa->ne[2] != xb->ne[2]) return nullptr;
+    if (tau && (tau->type != GGML_TYPE_F32 || !ggml_is_contiguous(tau) || ggml_nelements(tau) != xa->ne[2])) return nullptr;
+    ggml_tensor* args[5] = {xa, sa ? sa : xa, xb, sb ? sb : xb, tau ? tau : xa};
+    ggml_tensor* y = ggml_custom_4d(c, GGML_TYPE_F32, ggml_nelements(xa) + ggml_nelements(xb), 1, 1, 1, args, 5, clip2_cpu,
+                                    GGML_N_TASKS_MAX, &g_clip2);
+    set_param<float>(y, 0, thra);
+    set_param<float>(y, 1, thrb);
+    set_param<int>(y, 2, (sa ? 1 : 0) | (sb ? 2 : 0) | (tau ? 4 : 0));
+    return y;
+}
+
 ggml_tensor* inkling_mix(ggml_context* c, ggml_tensor* const* srcs, int n, ggml_tensor* query) {
     if (n < 1 || n > 6 || query->type != GGML_TYPE_F32 || !ggml_is_contiguous(query)) return nullptr;
     const int64_t E = srcs[0]->ne[0], T = ggml_nelements(srcs[0]) / E, nq = ggml_nelements(query) / E;
@@ -2330,7 +2444,14 @@ ggml_tensor* inkling_attn_prep(ggml_context* c, ggml_tensor* xk, ggml_tensor* xv
     ggml_tensor* a = attn_prep_one(c, xk, wk, state, 0, dynk, K, scale, idx, kcache, thr, eps, hist, 0, rotk);
     if (!a) return nullptr;
     // the V op lists the K op as a source, so expanding the V op (the caller does, before the attention) runs both
-    return attn_prep_one(c, xv, wv, state, off_v, dynv, K, scale, idx, vcache, thr, eps, hist, 1, rotv, a);
+    ggml_tensor* v = attn_prep_one(c, xv, wv, state, off_v, dynv, K, scale, idx, vcache, thr, eps, hist, 1, rotv, a);
+    // one launch for both sides (XOLOTL_INKLING_PREP_PAIR=0: two): the K op is skipped on CUDA and the V op runs it
+    static const bool pair = !(std::getenv("XOLOTL_INKLING_PREP_PAIR") && std::atoi(std::getenv("XOLOTL_INKLING_PREP_PAIR")) == 0);
+    if (v && pair && kcache->ne[0] == vcache->ne[0]) {
+        set_param<int>(a, 7, param<int>(a, 7) | 4);
+        set_param<int>(v, 7, param<int>(v, 7) | 8);
+    }
+    return v;
 }
 ggml_tensor* inkling_moe_wsum(ggml_context* c, ggml_tensor* d, ggml_tensor* wk) {
     const int64_t C = d->ne[0], k = d->ne[1], T = d->ne[2];
@@ -2458,6 +2579,7 @@ ggml_tensor* inkling_moe_finish(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_
 ggml_tensor* inkling_situ(ggml_context*, ggml_tensor*, float, float, ggml_tensor*, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_stack(ggml_context*, ggml_tensor* const*, int) { return nullptr; }
 ggml_tensor* inkling_clip(ggml_context*, ggml_tensor*, ggml_tensor*, float, ggml_tensor*) { return nullptr; }
+ggml_tensor* inkling_clip2(ggml_context*, ggml_tensor*, ggml_tensor*, float, ggml_tensor*, ggml_tensor*, float, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_ctrl(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, float) { return nullptr; }
 ggml_tensor* inkling_mix(ggml_context*, ggml_tensor* const*, int, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_relbias(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_type) { return nullptr; }

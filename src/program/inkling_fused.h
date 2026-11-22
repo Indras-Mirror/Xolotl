@@ -31,6 +31,9 @@ ggml_tensor* inkling_stack(ggml_context* c, ggml_tensor* const* srcs, int n);
 // thr * l2_norm(x [* scale], eps = thr) [* tau] over rows of x [hd, nh, T] (hd < 1024); scale [hd, nh], tau [T]; the
 // mul + l2_norm + scale (+ mul) chain of clip() as one kernel; nullptr if not applicable
 ggml_tensor* inkling_clip(ggml_context* c, ggml_tensor* x, ggml_tensor* scale, float thr, ggml_tensor* tau);
+// two clips in one launch (q and rel): one buffer [a | b], each part as inkling_clip; same T, shared tau
+ggml_tensor* inkling_clip2(ggml_context* c, ggml_tensor* xa, ggml_tensor* sa, float thra, ggml_tensor* xb, ggml_tensor* sb,
+                           float thrb, ggml_tensor* tau);
 
 // mix(): rms-normed streams srcs[i] [E, T] (n <= 9), softmax over <stream, query_j>/sqrt(E), weighted sum -> [E, nq, T]
 // (query [E, nq], nq <= 4) in one kernel; fp32, a different summation order than the 6-kernel chain (rounding level)
