@@ -18,14 +18,18 @@
   memory bandwidth: **477K tokens 30 -> 55 tok/s**, 117K 65 -> 93 (new decode attention kernel), plus fixes for
   multi-turn graph reuse and long quantised prompts.
   [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-512k-context-on-one-rtx-4090-with-k8v4-on-the-fast-kernels-4-bit-v-leg-hadamard-rotated-22-nov-evening).
+- **22 Nov** - **Inkling-2-Mini XQ re-released as "Unbound"** ([HF](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored), same file name and size): nokeep's
+  convolution-aware refusal edit at strength 4 replaces the first release's ARA edit. Closer to the official model
+  (held-out KL 0.028, top-1 92.8 %), MATH-24 88.9 % (was 83.3 %), HumanEval 21/21, tools 9/10, Gauntlet v3 4/7.
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-xq-re-released-as-unbound-22-nov).
 - **22 Nov** - **Inkling-2-Mini prefill 1.2K -> 4.2K tok/s at 32K** (tensor-core prompt attention with the relative
   bias in-kernel, ported from Basalt; 2048-row prompt chunks), **decode 93 -> 113 tok/s**, 136 tok/s with the DSpark
   drafter, on one RTX 4090. Quality checked against the NVFP4 parent.
   [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-prefill-12k---42k-toks-at-32k-decode-93---113-toks-dspark-136-toks-22-nov).
 - **21 Nov** - **[Inkling-2-Mini](docs/INKLING.md)** (Thinking Machines, 26B looped MoE, 3B active, ~5.4B effective per token with its 3x loop) on
   its own engine, `xolotl-inkling`: **93 tok/s decode** on one RTX 4090 after kernel fusion (from 57), 1.1K+ tok/s
-  prefill. Our abliterated 13.93 GB XQ quant matches its parents (MMLU-100 76 %, HumanEval, tool use) and refuses
-  4/100 harmful prompts: [IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored).
+  prefill. Our abliterated 13.93 GB XQ quant (first release, ARA edit; replaced by Unbound on 22 Nov) matched its
+  parents (MMLU-100 76 %, HumanEval, tool use) and refused 4/100 harmful prompts: [IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored).
   [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-decode-67---93-toks-fused-conv-situ-and-stream-stack-kernels-21-nov-evening).
 - **21 Nov** - LoRA training on the served MoE models, **proven end to end** on QFN (-6.5 % held-out loss in ~6 min
   on a 4090): [docs/LORA_TRAINING.md](docs/LORA_TRAINING.md).
@@ -82,8 +86,11 @@ served. Decode is the generation speed during those tasks.
 | **[Qwen3.8-27B Swift-1.5 XQ 14 GB](https://huggingface.co/IndrasMirror/Qwen3.8-27B-Swift-1.5-XQ-Uncensored)** (ours, uncensored) | 27B dense |     6.00     |      120       |   1,840-2,120   |   200K  |     -     |
 | **Qwen3.8-27B XQ** (ours, uncensored, 16.2 GB)                                                                    | 27B dense |     4.97     |      99.6      |   1,760-1,980   |   200K  |     -     |
 | **[Muse Glimmer 30B](docs/GLIMMER.md)** (heretic IQ4_NL)                                                          | 30B dense |     4.89     |      148       |   3,330-3,410   |   512K  |     -     |
+| **[Inkling-2-Mini XQ Unbound 13.9 GB](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored)** (ours, uncensored, [engine](docs/INKLING.md)) | 26B looped MoE, 3B active | to come | 104.5 | 3,500-4,190 | 512K | - |
 
-<sub>Score (of 6) = each task's progress summed (1 per solve, partial credit from the hidden tests), averaged over the runs.
+<sub>Inkling-2-Mini: not yet run on v3-small; on the full 7-task Gauntlet v3 (thinking on, served sampling) it solved
+4/7, and its decode is the average over that run's 289K generated tokens. It is not on OpenRouter.
+Score (of 6) = each task's progress summed (1 per solve, partial credit from the hidden tests), averaged over the runs.
 API score = each model's own full-precision API through OpenRouter (DeepSeek-V4.1-Flash-1017, GLM-5.3-Flash, Qwen3.8-Flash,
 Qwen3.8-27B), the same tasks and turns, reasoning on (8 Nov).
 Qwen3.8-27B: one run on 8 Nov after that day's decode fixes (MTP with thinking off, one-pass verify attention,
@@ -170,6 +177,7 @@ pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up
 | [Prune masking](docs/EXPERT_KEEP.md)               | `STRATA_EXPERT_KEEP` task profiles: keep lists, how to build and gate one, results |
 | [LFM3-Omni engine](docs/LFM3.md)                   | pictures, audio, video and speech on a 2B model, park/unpark beside a big one     |
 | [Muse Glimmer engine](docs/GLIMMER.md)             | Meta's dense 30B at 512K on 24 GB, its channel / ATEM tool-call format, pictures  |
+| [Inkling-2-Mini engine](docs/INKLING.md)           | Thinking Machines' looped MoE: 512K on 24 GB, DSpark drafter, pictures, our quant |
 | [Qwen3.8-27B dense howto](docs/dense/HOWTO.md)     | dense vs MoE paths, binaries, configs, MTP (by Mirko Perrone, also in Italian)    |
 | [Setting up with an agent](AGENTS.md)              | the build-and-serve steps for an AI agent (or a person) setting Xolotl up         |
 | [Qwen3.8 / upstream Strata](README.strata.md)      | the Strata engine this grew from                                                  |
@@ -182,7 +190,8 @@ pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up
 
 Built on **[Strata](https://github.com/Niko1221/Strata)** by Niko1221 and [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp),
 with the Qwen3.8-27B dense port by [perronemirko](https://github.com/perronemirko/Strata). Model weights by DeepSeek,
-Zhipu AI, Qwen, Liquid AI and Meta, with quants and fine-tunes by peasantsmith, ukisai, d0xin and gcsa-abliterix. Thanks to
+Zhipu AI, Qwen, Liquid AI, Meta and Thinking Machines, with quants, fine-tunes and refusal edits by peasantsmith, ukisai,
+d0xin, gcsa-abliterix, nokeep and unsloth. Thanks to
 every contributor: NektoDron, Xiaomi2008, AlexeyMatskevich, paul123637-lab, kelheor, exye137, penink-WH, cpacsm75,
 jesdga95 (Basalt) and Ryan Flavell (PROMETHEVS). Who did what: **[CREDITS.md](CREDITS.md)**.
 

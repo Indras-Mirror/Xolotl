@@ -3,7 +3,10 @@
 Thinking Machines' [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Apache 2.0) is a 26B
 looped MoE with 3B active parameters per token (the official count; about 5.4B effective per token, because the
 12-layer loop core runs 3 times). `xolotl-inkling` is Xolotl's engine for it, behind the usual
-OpenAI- and Anthropic-compatible server.
+OpenAI- and Anthropic-compatible server, with text, images (`--mmproj`) and up to 512K context on one 24 GB card.
+Our quant, **Inkling-2-Mini XQ Unbound** (13.93 GB, uncensored), is on Hugging Face:
+[IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored) (release notes:
+[CHANGELOG](xolotl/CHANGELOG.md#inkling-2-mini-xq-re-released-as-unbound-22-nov)).
 
 | | |
 |---|---|
@@ -23,6 +26,9 @@ OpenAI- and Anthropic-compatible server.
 | prefill, 8K prompt (served) | ~3,500 tok/s | ~3,000 tok/s (16K context, 512-row chunks) |
 | prefill, 32K prompt (served) | **4,190 tok/s** | - (the parent leaves little VRAM for big chunks) |
 | prompt chunk (auto) | 2048 rows | 256-512 rows |
+| decode during agent work (Gauntlet v3, 289K tokens, served sampling) | 104.5 tok/s | - |
+| long context, `--kv-type k8v4` | 512K fits; decode 108 / 93 / 55 tok/s at 30K / 117K / 477K | - |
+| images (`--mmproj`, F16 tower) | a 4K screenshot encodes in 1-2 s | same |
 
 ## First numbers (RTX 4090, exact NVFP4 parent, all weights in VRAM, 21 Nov 2026)
 
@@ -36,7 +42,7 @@ OpenAI- and Anthropic-compatible server.
 The 22 Nov numbers above come from the fused decode kernels and the tensor-core prompt attention
 ([CHANGELOG](xolotl/CHANGELOG.md)).
 
-## Speculative decoding with the DSpark (MTP) drafter (experimental, opt-in)
+## Speculative decoding with the DSpark (MTP) drafter (opt-in)
 
 Inkling ships a block drafter in `mtp.safetensors`: 3 dense layers that read the target's hidden states at layer
 visits 5, 23, 41 and the final norm, and propose up to 7 tokens per step through a rank-256 Markov head.
@@ -55,9 +61,11 @@ drafter alone against saved target taps.
 - Correctness: verify lengths 1, 5, 6 and 7 are bit-identical to plain decoding. Lengths 2 to 4 use a different
   reduction order in ggml's quantised mat-vec, so a greedy near-tie can flip after a few hundred tokens (rounding,
   not a logic error). `XOLOTL_SPEC_EXACT=1` pads those lengths for gates.
-- Speed is still being tuned: on a test quant, a fixed 3-token verify gives 76.5 tok/s vs 65.4 plain. Each token
-  picks 8 of 128 experts, so a verify chunk reads the union of its tokens' experts; a grouped MoE kernel for
-  verify is the next lever.
+- Speed: 113 -> 136 tok/s on a 2.8K-token prompt (2.4 of up to 7 drafts accepted a step), ~140 on served thinking
+  requests. It helps most on structured text (code, maths); on prose acceptance is lower. `XOLOTL_DSPARK_ADAPT=1`
+  (the wrapper's default) switches to plain decoding while drafting is not paying.
+- The drafter's global layer keeps a ring of the last `XOLOTL_DSPARK_WINDOW` positions (default 32768; 0 = a
+  full-context cache), so it costs no extra memory at long context.
 
 ## K/V cache types
 
@@ -74,8 +82,9 @@ card's memory bandwidth (~840 GB/s at 117K). Served decode at k8v4, no drafter, 
 
 | context | 7K | 30K | 117K | 477K |
 | --- | ---: | ---: | ---: | ---: |
-| decode tok/s | 118 | 108 | 93 | 55 | Against f16 on the parent: q8_0 KL 3.6e-4
-with identical greedy output, k8v4 (q8_0 keys, q4_0 values) KL 8e-4. f16 is bit-identical to before.
+| decode tok/s | 118 | 108 | 93 | 55 |
+
+Against f16 on the parent: q8_0 KL 3.6e-4 with identical greedy output, k8v4 (q8_0 keys, q4_0 values) KL 8e-4.
 
 **Hadamard rotation of the 4-bit leg (default on).** A q4_0 leg goes through a randomised Hadamard rotation
 before it is stored: on k8v4 the values are rotated and the attention output is rotated back once per head (keys
@@ -98,6 +107,10 @@ exactness check).
   and MXFP8 (20-23). llama.cpp's converter from [PR #32694](https://github.com/ggml-org/llama.cpp/pull/32694)
   dequantises them; `tools/inkling/convert-keep-nvfp4.patch` makes it keep the NVFP4 bits (+ a per-expert `.scale`)
   and writes MXFP8 as BF16 (exact). 22.9 GB. `tools/inkling/check_nvfp4_exact.py` checks the experts bit for bit.
+- **Ours:** [IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored): `Inkling-2-Mini-XQ-Uncensored.gguf` (13.93 GB,
+  the model), `mmproj-Inkling-2-Mini-XQ-Uncensored-F16.gguf` (0.64 GB, images) and
+  `Inkling-2-Mini-XQ-Uncensored-DSpark-BF16.gguf` (0.64 GB, the drafter). Load them with `--native`, `--mmproj` and
+  `--dspark`.
 - **Upstream GGUFs and llama.cpp quants** of Inkling-2-Mini load too (same tensor names; the `.scale` tensors are
   optional). Not yet tested here; a dequantised BF16 file is ~52 GB, so on a 24 GB card use a quant or
   `--cpu-exps`.
@@ -111,7 +124,8 @@ python tools/inkling/export_tokenizer.py <Inkling-2-Mini HF dir> <pack dir>   # 
 .venv/bin/python -m serve.server --engine strata --config configs/xol-inkling.json --port 8134
 ```
 
-`--cpu-exps 20-23` keeps those layers' experts in host RAM (the CPU computes them) for more context on a 24 GB card.
+Add `--mmproj <file>` for images, `--dspark <file>` for the drafter, and `--kv-type k8v4 --context 524288` for
+512K. `--cpu-exps 20-23` keeps those layers' experts in host RAM (the CPU computes them) for more context on a 24 GB card.
 Thinking effort follows `reasoning_effort` (the chat template's effort line); sampling defaults to the model's
 `generation_config.json` (temperature 1.0).
 

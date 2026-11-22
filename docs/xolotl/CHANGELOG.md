@@ -81,6 +81,30 @@ Mean perplexity is unchanged in every arm (within one standard error).
   load, and an O(context) cast per draft step). It is now a ring of the last `XOLOTL_DSPARK_WINDOW` positions
   (default 32768; 0 = the old cache).
 
+### Inkling-2-Mini XQ re-released as "Unbound" (22 Nov)
+
+[IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored) now holds the **Unbound** build, under the same file name and
+size (13.93 GB), so existing links and configs keep working; the first (ARA) file stays in the repo's history.
+[nokeep](https://huggingface.co/nokeepai/Inkling-2-Mini-Unbound) found that a plain refusal-direction projection does
+not survive on this model: the short causal convolution after each attention output mixes neighbouring positions, so
+19-88 % of what a projection removes leaks back. Their edit projects through a convolution-aware subspace and keeps
+row norms, on the 20 attention-output projections of layers 4-23; no expert is touched. This build applies it at
+strength 4 (they ship 3): on a sweep, 3 / 4 / 5 gave greedy MATH-24 87.5 / 87.5 / 83.3 % and 34 / 24 / 21 refused of
+100 harmful prompts. The XQ experts are unchanged from the first release.
+
+| RTX 4090, Xolotl's engine | first release (ARA) | **Unbound** |
+| --- | ---: | ---: |
+| MATH-24 sampled, 3 seeds (thinking tokens) | 83.3 % (1,024) | **88.9 % (911)** |
+| MMLU-100 greedy / MMLU-30 thinking | 76 % / 87 % | 71 % / 86.7 % |
+| HumanEval (21) / tool choice (10) / agent loops (3) | 19 / 8 / 3 | **21 / 9 / 3** |
+| WikiText-2 perplexity (same engine) | 4.554 | **4.496** |
+| KL to the official model, 8,192 held-out tokens (top-1) | - (its bf16 parent: 0.0336, 92.1 %) | **0.0282 (92.8 %)** |
+| harmful / harmless refused of 100 (BERT gate, thinking off) | 4 / 1 | 24 / 0 |
+| Gauntlet v3, 7 tasks, thinking on | not run | 4/7 solved |
+
+MMLU-100 moves ~4.5 points on a 100-question sample. Most of the 24 counted refusals are partial or vague answers; if
+you need zero, nokeep's own release at strength 3 measures 0/277 on their sealed set with a judge (a different gate).
+
 ### Inkling-2-Mini prefill 1.2K -> 4.2K tok/s at 32K, decode 93 -> 113 tok/s, DSpark 136 tok/s (22 Nov)
 
 **Prompt attention on the tensor cores** (a port of Basalt's `attn_prompt.cu`, by Jesus Gulfo, MIT): a prompt chunk
@@ -839,6 +863,15 @@ cache has to hand ~4.5 GB back (`POST /v1/vram`) or LFM3's encoder cannot load. 
 and LFM3 transcribes and speaks while QFN keeps its speed: 0.75 s for a 96-token answer while 3.5 s of speech streamed.
 
 ## Model releases
+
+### Inkling-2-Mini XQ Unbound 13.9 GB (22 Nov; first release 21 Nov)
+
+On [Hugging Face](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored): Thinking Machines' 26B looped MoE (3B active), our XQ quant with nokeep's
+convolution-aware refusal edit ("Unbound"), plus the model's own DSpark drafter and vision projector as optional
+files. On the 4090 it does **113 tok/s decode (136-140 with the drafter), 4,190 tok/s prefill at 32K, and 512K
+context** (55 tok/s decode at 477K tokens). Held-out KL to the official model 0.028 (top-1 92.8 %), HumanEval 21/21,
+Gauntlet v3 4/7. Runs on its own engine, `xolotl-inkling`: [docs/INKLING.md](../INKLING.md).
+[Release notes](#inkling-2-mini-xq-re-released-as-unbound-22-nov).
 
 ### Qwen3.8-Flash-Next XQ 45 GB (31 Oct)
 
