@@ -62,9 +62,28 @@ drafter alone against saved target taps.
 ## K/V cache types
 
 `--kv-type f16|q8_0|k8v4` sets the cache of the global (full-context) layers; the sliding-window rings stay f16.
-Attention over a quantised cache dequantises per chunk with an online softmax, so memory stays bounded at long
-context. Against f16 on the parent: q8_0 KL 3.6e-4 with identical greedy output, k8v4 (q8_0 keys, q4_0 values)
-KL 8e-4. f16 is bit-identical to before.
+The quantised caches run on the same fused kernels as f16: the tensor-core prompt attention stages the raw
+q8_0 / q4_0 rows and dequantises them in the tile, decode attention reads them in place, and the decode prepare
+kernel (conv + clip + norm + store) writes q8_0 / q4_0 rows itself. A 107,800-token prompt at k8v4 prefills in 29 s
+(~3.7K tok/s); decode at 32K context is 90 tok/s at k8v4 vs 89 at f16. **512K context fits one 24 GB card** at
+k8v4 with the DSpark drafter and the image tower loaded (6.8 GiB of K/V state, 23.4 GB of VRAM in use): a
+477,603-token prompt prefills in ~218 s and decodes at ~27 tok/s. Against f16 on the parent: q8_0 KL 3.6e-4
+with identical greedy output, k8v4 (q8_0 keys, q4_0 values) KL 8e-4. f16 is bit-identical to before.
+
+**Hadamard rotation of the 4-bit leg (default on).** A q4_0 leg goes through a randomised Hadamard rotation
+before it is stored: on k8v4 the values are rotated and the attention output is rotated back once per head (keys
+stay plain q8_0, which is near-lossless without it). The rotation spreads outlier channels across each 32-value
+block. Per-token |dNLL| against f16 on 32K tokens of wikitext (f16 run-to-run floor 0.0395):
+
+| k8v4 | per-token \|dNLL\| | excess over the floor |
+| --- | ---: | ---: |
+| no rotation | 0.0483 | 0.0088 |
+| K and V rotated | 0.0459 | 0.0064 |
+| **V rotated (default)** | **0.0454** | **0.0059** |
+
+Mean perplexity is unchanged in every arm (within one standard error). `XOLOTL_INKLING_KV_ROT=0` turns it off,
+`=2` rotates every leg (f16 and q8_0 too; with f16 it matches the unrotated cache within the floor, the
+exactness check).
 
 ## Get a GGUF
 
@@ -96,5 +115,7 @@ Thinking effort follows `reasoning_effort` (the chat template's effort line); sa
   dequantised GGUFs never hit it); `tools/inkling/ref-loop-expert-scale-fix.patch` is the fix for the reference.
 - The conv state is recurrent, so a request resumes by appending to what the engine read, or from the checkpoint
   one token before the end of the previous prompt (sliding rings + conv states), else from token 0.
-- Not yet: vision (the model has a 23-layer vision tower; in progress), flash attention (the pinned ggml has no
-  flash-attention kernel for per-head masks, which the relative bias needs).
+- Vision: `--mmproj <mmproj.gguf>` runs the 23-block image tower inside the engine (rebuilt from llama.cpp PR
+  #32694's inkling2v). Its weights go to the GPU per picture and are freed after it, so a text-only session keeps
+  no VRAM for it; big pictures (a 4K screenshot is 16K positions) use flash attention and encode in 1-2 s. The
+  mmproj is a separate file (convert_hf_to_gguf.py --mmproj).

@@ -8,6 +8,55 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Inkling-2-Mini: 512K context on one RTX 4090 with k8v4 on the fast kernels, 4-bit V leg Hadamard-rotated (22 Nov, evening)
+
+**Quantised K/V on the fast kernels.** `--kv-type k8v4` (q8_0 keys, q4_0 values on the global layers) and `q8_0` used
+to fall back to the reference op chain, about 130 tok/s of prefill at 100K. The tensor-core prompt attention now stages
+the raw q8_0 / q4_0 rows with cp.async and dequantises them into its f16 tile, decode attention reads them in place,
+and the decode prepare kernel (K/V conv, key clip, value norm, cache store) writes q8_0 / q4_0 rows itself. A
+107,800-token prompt at k8v4 prefills in **29 s (~3.7K tok/s)**; decode at 32K context is **90 tok/s at k8v4**
+(89 at f16, 86.6 before the prepare kernel took quantised rows). Gate: fast vs chain KL 3.1e-3 at k8v4 (f16 run-to-run
+floor 2.0e-3); a 107K-token summary is correct.
+
+**512K context on one RTX 4090** (`--context 524288 --kv-type k8v4`, with the DSpark drafter and the image tower
+loaded: 12.5 GiB of weights + 6.8 GiB of K/V state, 23.4 GB of VRAM in use). A 477,603-token prompt (wikitext + the
+four Vedas, one planted sentence at 10 % depth) prefills in ~218 s (~2.2K tok/s) and the model quotes the planted
+sentence exactly; decode at that depth runs ~27 tok/s (400 tokens in ~15 s). Two things stood in the way:
+- Decode at long context fell off the fast kernel: the decode window was split into chunks sized for the old
+  chain's score tensors (`--attn-budget`), and past ~100K cells that meant several chunks, which the split-K kernel
+  does not take. Decode then fell back to the chain, which asked for a 17 GB graph buffer at 477K. Decode and verify
+  steps now plan one chunk at any length (the kernel reads K/V in place and builds no score tensor).
+- The kernel kept one partial result per 64 cells: ~93 MB per token at 477K, and ~3 GB across the drafter's verify
+  lengths, which each keep their own graph buffer. Splits are now capped at 512; past 32K cells a split walks
+  several 64-cell chunks and joins them with an online softmax. Up to 32K context nothing changes (bit-identical
+  output); with the cap forced low the result stays at the f16 noise floor.
+
+**Hadamard rotation of the 4-bit leg, default on** (`XOLOTL_INKLING_KV_ROT`, 0 = off, 2 = every leg). A q4_0 leg is
+rotated by a randomised Hadamard transform before it is stored, which spreads outlier channels across each 32-value
+block; on k8v4 that is the values, with the attention output rotated back once per head. The q8_0 keys stay plain:
+they are near-lossless without it (q8_0 noise = the f16 floor on Inkling; int8 KL 3.4e-4, top-1 99.5 % on the dense
+27B). The decode prepare kernel applies the rotation itself (a shared-memory FWHT), so it costs no speed. Per-token
+|dNLL| against f16, wikitext:
+
+| k8v4 | 32K prompt path | 8K in 16-token steps (decode kernels) |
+| --- | ---: | ---: |
+| f16 run-to-run floor | 0.0395 | 0.0359 |
+| no rotation | 0.0483 | 0.0438 |
+| K and V rotated | 0.0459 | 0.0403 |
+| **V rotated (default)** | **0.0454** | **0.0403** |
+
+Mean perplexity is unchanged in every arm (within one standard error).
+
+**Fixes, all in the released engine too:**
+- Graph reuse: the prompt attention kernel bakes the chunk's start position into its op params, but the graph key had
+  no start position, so a prompt chunk with the same length in the same 256-cell bucket reran at the previous chunk's
+  position (wrong attention on multi-turn follow-ups that hit it). Dump gate: KL to the chain 0.258 -> 0.002.
+- The prompt kernel's dequantise step read cp.async-staged rows without a block barrier (cp.async.wait covers only a
+  thread's own copies): garbage logits on long quantised prompts.
+- The DSpark drafter kept a full-context f16 cache on its global layer (2 GiB at 512K, the allocation that refused to
+  load, and an O(context) cast per draft step). It is now a ring of the last `XOLOTL_DSPARK_WINDOW` positions
+  (default 32768; 0 = the old cache).
+
 ### Inkling-2-Mini prefill 1.2K -> 4.2K tok/s at 32K, decode 93 -> 113 tok/s, DSpark 136 tok/s (22 Nov)
 
 **Prompt attention on the tensor cores** (a port of Basalt's `attn_prompt.cu`, by Jesus Gulfo, MIT): a prompt chunk

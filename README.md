@@ -12,6 +12,11 @@
 
 ## Latest
 
+- **22 Nov, evening** - **Inkling-2-Mini at 512K context on one RTX 4090**: the quantised K/V cache (`--kv-type
+  k8v4`) now runs on the fast kernels (107K-token prefill in 29 s, was ~130 tok/s), its 4-bit value leg is
+  Hadamard-rotated by default (-33 % of the 4-bit noise, no speed cost), decode stays on the fast kernel at any
+  length (~27 tok/s at 477K tokens), plus fixes for multi-turn graph reuse and long quantised prompts.
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-512k-context-on-one-rtx-4090-with-k8v4-on-the-fast-kernels-4-bit-v-leg-hadamard-rotated-22-nov-evening).
 - **22 Nov** - **Inkling-2-Mini prefill 1.2K -> 4.2K tok/s at 32K** (tensor-core prompt attention with the relative
   bias in-kernel, ported from Basalt; 2048-row prompt chunks), **decode 93 -> 113 tok/s**, 136 tok/s with the DSpark
   drafter, on one RTX 4090. Quality checked against the NVFP4 parent.
