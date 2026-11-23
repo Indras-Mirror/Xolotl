@@ -1062,7 +1062,7 @@ index 86df5fda2..0ec6cb590 100644
  #ifdef GGML_CUDA_USE_CUB
  void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
 diff --git a/ggml/src/ggml-cuda/binbcast.cu b/ggml/src/ggml-cuda/binbcast.cu
-index f7c3a7322..7d5f1481a 100644
+index f7c3a7322..46aa2b53e 100644
 --- a/ggml/src/ggml-cuda/binbcast.cu
 +++ b/ggml/src/ggml-cuda/binbcast.cu
 @@ -360,11 +360,11 @@ template <typename T>
@@ -1070,42 +1070,46 @@ index f7c3a7322..7d5f1481a 100644
      const T * __restrict__ src, T * __restrict__ dst, const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
      const size_t s00, const size_t s01, const size_t s02, const size_t s03,
 -    const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3) {
-+    const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, const int64_t z0) {
++    const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, const int64_t z0, const int64_t y0) {
  
      const int64_t tid0  = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
-     const int64_t tid1  = int64_t(blockIdx.y)*blockDim.y + threadIdx.y;
+-    const int64_t tid1  = int64_t(blockIdx.y)*blockDim.y + threadIdx.y;
 -    const int64_t tid23 = int64_t(blockIdx.z)*blockDim.z + threadIdx.z;
++    const int64_t tid1  = int64_t(blockIdx.y)*blockDim.y + threadIdx.y + y0;
 +    const int64_t tid23 = int64_t(blockIdx.z)*blockDim.z + threadIdx.z + z0;
      const int64_t tid2  = tid23 % ne2;
      const int64_t tid3  = tid23 / ne2;
  
-@@ -403,10 +403,14 @@ static void repeat_back_cuda(
+@@ -403,10 +403,17 @@ static void repeat_back_cuda(
      const size_t s00, const size_t s01, const size_t s02, const size_t s03,
      const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
  
-+    // Xolotl (LoRA training): ne2*ne3 can exceed the grid-z limit (layer 47's GQA expand over ~16K+ cells) -> slabs
++    // Xolotl (LoRA training): ne2*ne3 can exceed the grid-z limit (layer 47's GQA expand over ~16K+ cells) and ne1
++    // the grid-y limit (a train attention over > 65535 cells) -> slabs in both
      const dim3 block_dims(WARP_SIZE, 1, 1);
 -    const dim3 block_nums((ne0 + WARP_SIZE - 1) / WARP_SIZE, ne1, ne2*ne3);
 -    k_repeat_back<T><<<block_nums, block_dims, 0, stream>>>
 -        (src, dst, ne00, ne01, ne02, ne03, s00, s01, s02, s03, ne0, ne1, ne2, ne3);
-+    const int64_t n23 = ne2*ne3, zmax = 1 << 15;
++    const int64_t n23 = ne2*ne3, zmax = 1 << 15, ymax = 65535;
 +    for (int64_t z0 = 0; z0 < n23; z0 += zmax) {
-+        const dim3 block_nums((ne0 + WARP_SIZE - 1) / WARP_SIZE, ne1, (unsigned) std::min(zmax, n23 - z0));
-+        k_repeat_back<T><<<block_nums, block_dims, 0, stream>>>
-+            (src, dst, ne00, ne01, ne02, ne03, s00, s01, s02, s03, ne0, ne1, ne2, ne3, z0);
++        for (int64_t y0 = 0; y0 < ne1; y0 += ymax) {
++            const dim3 block_nums((ne0 + WARP_SIZE - 1) / WARP_SIZE, (unsigned) std::min(ymax, ne1 - y0), (unsigned) std::min(zmax, n23 - z0));
++            k_repeat_back<T><<<block_nums, block_dims, 0, stream>>>
++                (src, dst, ne00, ne01, ne02, ne03, s00, s01, s02, s03, ne0, ne1, ne2, ne3, z0, y0);
++        }
 +    }
  }
  
  template<class op>
-@@ -566,7 +570,7 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -566,8 +573,6 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
  
      GGML_TENSOR_UNARY_OP_LOCALS;
  
 -    GGML_ASSERT(ne2*ne3 <= (1 << 15));
-+    GGML_ASSERT(ne1 <= 65535);
- 
+-
      const size_t ts = ggml_type_size(src0->type);
      const size_t s00 = nb00 / ts;
+     const size_t s01 = nb01 / ts;
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 index 6b36ca90b..ff03498df 100644
 --- a/ggml/src/ggml-cuda/common.cuh

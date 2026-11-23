@@ -163,6 +163,30 @@ helps). Step time 3.0 / 5.7 / 14 s at T = 512 / 1024 / 2048 without a prefix (VR
 inside the noise of 20 problems), and the adapter costs ~20 % decode speed through the per-weight LoRA path. The pipeline
 (data, prompt carry, training, serving) is proven; which data actually makes the model a better agent is the open part.
 
+### What we learned about the data (24 Nov)
+
+Two adapters, two honest negatives on behaviour, both with clear loss gains:
+
+| adapter | data | held-out loss | behaviour |
+| --- | --- | --- | --- |
+| harness r2 | 22.9K sub-windows of our own agent transcripts, coding-weighted, behind the 23K prompt | -15.6 % | LiveCodeBench-20: 13/20 vs base 15/20 (inside the noise) |
+| task adapter | 6 successful runs of a stronger local model (a 45 GB MoE teacher) on two tasks of a private multi-step agent benchmark, 1,461 windows behind each run's real conversation (up to 65K tokens) | **-28.4 %** on the held-out runs | worse on both tasks it was trained on (2/12 and 0/12 vs base 4/12 and 4/12); one run went 4x longer before stopping |
+
+What that says, and what we would do next:
+
+- **The trainer is not the bottleneck; the data is.** Teacher-forced imitation lowers loss on the teacher's text fast,
+  but a few trajectories teach the surface of those runs, and small deviations at inference compound into loops.
+  Six runs is far too few: plan on tens to hundreds of successful trajectories per task family.
+- **Train on whole trajectories.** The task adapter only saw the first <=65K tokens of each run and collapsed exactly
+  where runs go past that. Long-context training (above) matters for agent data.
+- **Select for success and for the behaviour you want.** Our transcripts mix planning, mistakes and recoveries;
+  `harness_build_inkling.py --mask-errors` drops turns whose tool call failed (3 % of tool results in our corpus);
+  coding gains probably need curated, verified coding trajectories rather than everything we have.
+- **Adapter strength.** Rank 16, alpha 32 is a strong default; try `--lora-scale 0.5` at serve time and earlier
+  checkpoints (`P-stepNNNNNN.gguf`) before concluding a dataset is bad.
+- **Evaluate behaviour with several samples.** Single runs at temperature 1 swing by several points on a 12-check
+  task; use 3+ samples per arm, or greedy where the task allows.
+
 ## What is in
 
 | piece | where | gate |
@@ -178,7 +202,7 @@ inside the noise of 20 problems), and the adapter costs ~20 % decode speed throu
 | Capture from the served engine (no engine change) | `tools/train/harness_capture.py` | prefix rows bit-identical across runs |
 | QFN top-4 stack forward + prefix carry + YaRN + layer-47 selection replay | `tools/train/qfn_topk.hpp`, `qfn_topk_gate.cpp`, `qfn_topk_long.cpp` | 25-token smoke: top-1 25/25; real 21,686-position window: loss 1.7798 vs engine 1.7795 |
 | **GPU trainer** (per-layer backward graphs, shared allocator, host AdamW, metrics, adapter) | `tools/train/qfn_harness_train.cpp`, `metrics.hpp`, `lossplot.py` | step-0 loss = base (1.7780); held-out loss falls (table above) |
-| CUDA fixes for training shapes: OUT_PROD with a cuBLAS-invalid view stride, REPEAT_BACK past the grid-z limit | `tools/xolotl/ggml/xolotl-ggml.patch` | backward-only ops; the trainer runs where it crashed before |
+| CUDA fixes for training shapes: OUT_PROD with a cuBLAS-invalid view stride, REPEAT_BACK past the grid-z and grid-y limits | `tools/xolotl/ggml/xolotl-ggml.patch` | backward-only ops; the trainer runs where it crashed before |
 | Inkling backward rules: `GGML_OP_MUL_MAT_ID_BACK` (activation gradient through frozen quantized experts), TANH, L2_NORM, FILL, batched GET_ROWS_BACK, the softmax **mask** gradient (Inkling's learned relative bias is the mask), broadcast SUB | same patch | FD on CPU (negative controls), CUDA vs CPU for every XQ expert type; softmax mask vs a double-precision reference |
 | **Inkling-2-Mini trainer** (whole model, per-slot VJP, stream DAG, chunked CE head, AdamW, adapter GGUF, `--check` / `--fd` / `--overfit` gates) and **`--lora` at serve time** | `src/program/inkling_train.cpp`, `inkling_main.cpp` | train graph == engine forward bit for bit; held-out loss falls (table above) |
 | **Prompt carry** for Inkling (engine prefill of the context, carried K/V + conv state, prompt snapshot, per-window `prefix` / `context`, engine-layout cell padding) and `harness_subwindows.py` | `src/program/inkling_train.cpp`, `inkling_main.cpp`, `tools/train/harness_subwindows.py` | `--check-prefix`: bit for bit up to a 23,061-token prefix; snapshot A-B-A identical; held-out loss falls behind the prompt (r2) |
@@ -194,10 +218,11 @@ unchanged; Hy4 builds use 16).
 - **A long run and a behavioural check.** The pipeline is proven on held-out loss; next: the full window set, then the
   adapter on real agent tasks. QFN: serving it in Xolotl needs a merged clone pack (the engine has no LoRA path for
   these tensors yet); llama.cpp can load it today. Inkling-2-Mini: served by Xolotl (`--lora`).
-- **Inkling-2-Mini contexts past 65K cells**: one training attention tensor may span at most 65,535 cells (a CUDA grid
-  limit in the backward), so prefix + window must stay under ~65K for now; past that, the attention needs cell chunks
-  (and memory: a 72-token window behind a 55K prefix already peaks at 22.9 GB). Then speed: a step is still slow
-  behind a long prefix, and serving with `--lora` costs ~20 % decode speed.
+- **Inkling-2-Mini contexts past 65K cells**: the backward's REPEAT_BACK used to stop at 65,535 cells (CUDA grid-y);
+  the patch now runs it in slabs (identical below 65K, where every run above used it), but no run past 65K has been
+  made yet, and memory is the next wall (a 72-token window behind a 55K prefix peaks at 22.9 GB; the attention needs
+  cell chunks or a smaller cache type there). Speed: a step is still slow behind a long prefix, and serving with
+  `--lora` costs ~20 % decode speed.
 - **Fast capture parity** (above): find why the serve path's window rows differ from the one-shot path.
 - DeepSeek-V4.1 wiring (it shares the hyper-connection / MLA / indexer ops, so it follows QFN).
 - LoRA on the routed experts themselves, full fine-tuning, more than one GPU: out of scope for v1.

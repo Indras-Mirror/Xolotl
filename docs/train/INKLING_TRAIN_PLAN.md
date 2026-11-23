@@ -43,7 +43,7 @@ coding/harness adapter.
 | W7 | adapter loading in `xolotl-inkling` | **DONE 23 Nov** - `--lora` / `--lora-scale`; gate below |
 | W8 | throughput / memory tuning | |
 | M1 | **milestone: reproduce nokeep v2 on our XQ** (data prep slice `ink-train-data`), compare useful % with their card | |
-| W9 | prefix carry (windows starting at p0 > 0) | v2 |
+| W9 | prefix carry (windows starting at p0 > 0) | **done 24 Nov**: bit for bit to a 23,061-token prefix, snapshot, r2 trained behind it |
 
 ## W1 - MUL_MAT_ID_BACK
 
@@ -114,6 +114,21 @@ Experts are frozen (the backward asserts no gradient is asked for `as`); ids out
   gap), adapter effect 1.12 (top-1 changes 38 / 64).
 - Checkpoints (Mal): `--save P --save-every N` -> `P-stepNNNNNN.gguf` kept + `P` latest + `P.state` (AdamW moments,
   step); `--resume P`; SIGTERM/SIGINT checkpoint then exit 0.
+
+### W9 prefix carry + r2 (24 Nov night)
+- Gate `--check 64 --check-prefix P` (KV16): first version drifted 2.9e-2 (P=1500) / 6.1e-2 (P=23061). Bisection: exact for
+  P <= 16, then exact only when prefix + T was a multiple of 4 (< 256 cells) / 64 (more) and P < 1024. Cause: the engine
+  attends over a 256-multiple of cells and its V x probs mul_mat has no F32 precision flag (f16 accumulation in cuBLAS), so
+  results depend on the cell count and on where masked cells sit (one masked head cell: 2.9e-3 at slot 0). Not state.
+- Fix: G::tpad pads the train attention to the 256-multiple; the gate's sliding slots read every prefix cell in the
+  engine's order (swa_full; ring sized for prefix + window, 1024-token prefill chunks, one-softmax budget). Training keeps
+  the 1023 tail (tail vs full differs at the same level as a pure precision change, 2.7e-2 vs 2.9e-2, under the engine's
+  own fused/unfused 4.3e-2). Exact at P = 0, 16, 17, 20, 300, 1023, 1024, 1500, 23061. Snapshot A-B-A: identical loss,
+  0 tokens re-prefilled.
+- Limits: REPEAT_BACK grid-y (65,535 cells) - now slabbed, untested past 65K; memory (55K prefix x 72 tokens = 22.9 GB).
+  --fd / --overfit with a 55K prefix at T = 145 run out of memory; at T = 72 an overfit converges (0.386 -> 0.0000, 2.1 s/step).
+- r2: 300 steps, held-out 1.3821 -> 1.1802 -> 1.1688 -> 1.1659 (-15.6 %), 87 min. LCB-20: base 15/20, r2 13/20 (4 vs 2 flips).
+- Task adapter (private benchmark, 1,461 windows, 1460 steps): held-out 0.3987 -> 0.2853, benchmark worse (see LORA_TRAINING.md).
 
 ## Rules
 

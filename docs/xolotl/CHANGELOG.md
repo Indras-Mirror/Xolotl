@@ -22,7 +22,11 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
   in 300 steps (87 min). LiveCodeBench-20 with the adapter: 13/20 vs base 15/20, inside the noise: lower transcript loss
   is not yet better coding. How-to and numbers: [docs/LORA_TRAINING.md](../LORA_TRAINING.md#inkling-2-mini-the-whole-model-on-one-4090).
 - `harness_build_inkling.py --mask-errors`: leave out of the loss an assistant turn whose tool call came back as an error.
-- Known limit: one training attention tensor spans at most 65,535 cells, so prefix + window stays under ~65K for now.
+- A task adapter trained on 6 teacher runs of a private agent benchmark: held-out loss -28.4 %, but worse on the
+  benchmark itself. Both results point at the data (size, whole trajectories, success selection), written up in
+  [What we learned about the data](../LORA_TRAINING.md#what-we-learned-about-the-data-24-nov).
+- REPEAT_BACK (CUDA) runs in grid-y slabs too, so the backward no longer stops at 65,535 attention cells (untested past
+  65K; memory is the next limit there).
 
 ### LoRA training for Inkling-2-Mini, the whole model on one RTX 4090, and `--lora` at serve time (23 Nov)
 
