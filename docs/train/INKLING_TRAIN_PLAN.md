@@ -40,7 +40,7 @@ coding/harness adapter.
 | W4 | `train` variant of `G`/`layer()` | **DONE (WIP commit)** - `--check 64` bit-exact vs inference with f16 K/V |
 | W5 | per-slot VJP trainer (`src/program/inkling_train.cpp`, `xolotl-inkling --train`) | **DONE 23 Nov** - `--fd` (frozen routing) + `--overfit` pass (below) |
 | W6 | gates: train graph == inference graph (T=64, rel err < 1e-3); per-component FD + NeMo oracle; directional FD over all adapters (eps 0.1); 20-step overfit loss drop; every adapter gets a non-zero grad | |
-| W7 | adapter loading in `xolotl-inkling` | |
+| W7 | adapter loading in `xolotl-inkling` | **DONE 23 Nov** - `--lora` / `--lora-scale`; gate below |
 | W8 | throughput / memory tuning | |
 | M1 | **milestone: reproduce nokeep v2 on our XQ** (data prep slice `ink-train-data`), compare useful % with their card | |
 | W9 | prefix carry (windows starting at p0 > 0) | v2 |
@@ -101,6 +101,19 @@ Experts are frozen (the backward asserts no gradient is asked for `as`); ids out
 - `--overfit 20 --lr 1e-3` on a real harness window (`gate/h512.jsonl`): loss 1.227 -> 0.0002 (w512 is repeated text,
   base loss 0.009 - useless for this gate). Step time / VRAM peak (frozen weights 13.9 GB): T=512 3.0 s / 15.8 GB,
   T=1024 5.7 s / 15.9 GB, T=2048 14.0 s / 17.4 GB (~150-180 tok/s).
+
+### First real run + W7 (23 Nov night)
+
+- r1 (`--data train-t2048.jsonl`, 15,227 windows, no prefix; eval = 32 windows from the 14 held-out conversations,
+  `harness_build_inkling.py --heldout-only`): held-out 1.492 -> 1.243 (step 100) -> 1.223 -> 1.215 -> 1.212 (step 400,
+  -18.8 %); stopped at 400 (proof in; Mal: shorter proofs).
+- W7 `--lora`: the loader attaches each `.lora_a/.lora_b` pair to its model tensor through G::mm (the trainer's hook);
+  the T=1 stacked q/rel/gate(/k/v) mat-vec steps aside with an adapter, the fused-attention gate projections go through
+  mm(). Gate (`w7_gate.sh`, step-400 adapter): `--check 64 --init-from` (adapter in both trainer and engine, f16 K/V)
+  0.000 / 64 of 64; `--dump --lora` (fused serve paths) vs trainer logits 4.1e-2 mean (base: 4.3e-2 = the fused-path
+  gap), adapter effect 1.12 (top-1 changes 38 / 64).
+- Checkpoints (Mal): `--save P --save-every N` -> `P-stepNNNNNN.gguf` kept + `P` latest + `P.state` (AdamW moments,
+  step); `--resume P`; SIGTERM/SIGINT checkpoint then exit 0.
 
 ## Rules
 

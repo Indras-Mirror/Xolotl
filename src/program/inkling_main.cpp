@@ -234,6 +234,8 @@ inline bool kv_rot_leg(ggml_type t) {
     const int r = kv_rot_mode();
     return r >= 2 || (r == 1 && t == GGML_TYPE_Q4_0);
 }
+struct InkLora { ggml_tensor *a = nullptr, *b = nullptr; };   // a [n_in, r], b [r, n_out]: y += scale * b (a x)
+
 struct Model {
     Hp hp;
     Gguf gg;
@@ -277,6 +279,11 @@ struct Model {
     bool parked = false;
     inkling_stats::Stats* st = nullptr;   // --stats: accumulate from the graph's taps
     FILE* route_fp = nullptr;        // --route-log: per-visit routing record sink (off: null, no tap, no cost)
+    // --lora: one LoRA adapter (xolotl-inkling --train output) applied on top of the base weights in G::mm()
+    std::unordered_map<const ggml_tensor*, InkLora> lora;
+    float lora_scale = 1.0f;
+    ggml_context* lora_ctx = nullptr;
+    ggml_backend_buffer_t lora_buf = nullptr;
     int64_t route_records = 0;
     // --vram-budget-mib
     int64_t vram_budget_mib = 0;     // 0: off
@@ -1369,7 +1376,7 @@ struct G {                     // graph-building context
 
     // --train (inkling_train.cpp): the same op sequence over one chunk, with no cache or state writes.  The slot's conv
     // history and the K/V before the chunk come in as inputs (zeros / none when the chunk starts at position 0).
-    struct Lora { ggml_tensor *a = nullptr, *b = nullptr; };   // a [n_in, r], b [r, n_out]: y += scale * b (a x)
+    using Lora = InkLora;
     bool train = false;
     ggml_tensor* tconv = nullptr;                        // [n_conv-1, n_chan], the slot's conv history
     ggml_tensor *tk_pre = nullptr, *tv_pre = nullptr;    // [hd, nkv, n_pre] carried K (clipped) / V (normed), or null
@@ -1735,7 +1742,7 @@ struct G {                     // graph-building context
         // one token: q/rel/gate (and k/v on sliding layers fed one input) as one stacked mat-vec, sliced by row views
         ggml_tensor *Q, *R, *Kp = nullptr, *Vp = nullptr, *Gp = nullptr;
         const bool one_in = in[1] == in[0] && in[2] == in[0];
-        if (T == 1 && y.pqrg) {
+        if (T == 1 && y.pqrg && !lora) {   // --lora: per-weight projections, so each adapter applies
             const bool all = y.pall && one_in;
             ggml_tensor* P = ggml_mul_mat(c, all ? y.pall : y.pqrg, in[0]);
             const int64_t nq = y.wq->ne[1], nr = y.rel->ne[1], ng = y.gate->ne[1];
@@ -1884,7 +1891,7 @@ struct G {                     // graph-building context
             if (rel_in && y.rel_bias_pad) {
                 ggml_tensor* Kd = ggml_view_3d(c, z.k_cache, hd, nkv, ci.cells, z.k_cache->nb[1], z.k_cache->nb[2], (size_t) ci.j0 * z.k_cache->nb[2]);
                 ggml_tensor* Vd = ggml_view_3d(c, z.v_cache, hd, nkv, ci.cells, z.v_cache->nb[1], z.v_cache->nb[2], (size_t) ci.j0 * z.v_cache->nb[2]);
-                ggml_tensor* Gt = gate_ref0 || rot_v ? nullptr : (Gp ? Gp : ggml_mul_mat(c, y.gate, in[0]));
+                ggml_tensor* Gt = gate_ref0 || rot_v ? nullptr : (Gp ? Gp : mm(y.gate, in[0]));
                 ggml_tensor* ad = !swa && s.pos_full
                     ? inkling_attn_dec_rel_pos(c, Q, Kd, Vd, y.rel_bias_pad, R, sinks, s.idx_full, h.rel_extent, 1.0f / std::sqrt((float) hd), Gt)
                     : inkling_attn_dec_rel(c, Q, Kd, Vd, y.rel_bias_pad, R, sinks, ci.rp, ci.mask, 1.0f / std::sqrt((float) hd), Gt);
@@ -1896,7 +1903,7 @@ struct G {                     // graph-building context
                 ggml_tensor* Kd = ggml_view_3d(c, z.k_cache, hd, nkv, ci.cells, z.k_cache->nb[1], z.k_cache->nb[2], (size_t) ci.j0 * z.k_cache->nb[2]);
                 ggml_tensor* Vd = ggml_view_3d(c, z.v_cache, hd, nkv, ci.cells, z.v_cache->nb[1], z.v_cache->nb[2], (size_t) ci.j0 * z.v_cache->nb[2]);
                 static const bool gate_ref = std::getenv("XOLOTL_INKLING_DECATTN_GATE_REF") != nullptr;   // A/B: gate as ggml ops
-                ggml_tensor* Gt = gate_ref || rot_v ? nullptr : (Gp ? Gp : ggml_mul_mat(c, y.gate, in[0]));
+                ggml_tensor* Gt = gate_ref || rot_v ? nullptr : (Gp ? Gp : mm(y.gate, in[0]));
                 ggml_tensor* ad = inkling_attn_dec(c, Q, Kd, Vd, mask_h, 1.0f / std::sqrt((float) hd), Gt);
                 if (ad) { o = ggml_reshape_2d(c, ad, (int64_t) hd * nh, T); gated = Gt != nullptr; }
             }
@@ -2124,6 +2131,7 @@ Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = fals
 
     G g{m, h, c, s.gf, s, T, p0};
     g.st = m.st;
+    if (!m.lora.empty()) { g.lora = &m.lora; g.lora_scale = m.lora_scale; }
     g.route = m.route_fp != nullptr;
     // log-scaled positions for the global layers: 1 + alpha*log(max(1, (pos + 1)/floor))
     ggml_tensor* tau = ggml_scale_bias(c, s.posf, 1.0f, 1.0f);
@@ -2752,11 +2760,74 @@ std::vector<int32_t> token_ids_named(const Model& m, std::initializer_list<const
     return out;
 }
 
+// --lora <adapter.gguf> [--lora-scale S]: a llama.cpp-format LoRA adapter (what --train writes, tools/train/lora_gguf.hpp)
+// on the attention projections. Each "<w>.lora_a" [n_in, r] / "<w>.lora_b" [r, n_out] pair attaches to the model
+// tensor <w>; the delta is (alpha / r) * S * B (A x), exactly the trainer's.
+void load_lora(Model& m, const std::string& path, float user_scale) {
+    ggml_context* meta = nullptr;
+    gguf_init_params gp = {true, &meta};
+    gguf_context* g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) die("--lora: cannot read " + path);
+    auto str = [&](const char* k) -> std::string { const int64_t i = gguf_find_key(g, k); return i >= 0 ? gguf_get_val_str(g, i) : ""; };
+    if (str("adapter.type") != "lora") die("--lora: " + path + " is not a LoRA adapter (adapter.type)");
+    if (!str("general.architecture").empty() && str("general.architecture") != m.arch)
+        die("--lora: adapter is for " + str("general.architecture") + ", the model is " + m.arch);
+    const int64_t ka = gguf_find_key(g, "adapter.lora.alpha");
+    std::vector<std::pair<std::string, std::pair<ggml_tensor*, ggml_tensor*>>> pairs;
+    for (ggml_tensor* t = ggml_get_first_tensor(meta); t; t = ggml_get_next_tensor(meta, t)) {
+        const std::string n = ggml_get_name(t);
+        if (n.size() < 7 || n.compare(n.size() - 7, 7, ".lora_a") != 0) continue;
+        const std::string base = n.substr(0, n.size() - 7);
+        ggml_tensor* b = ggml_get_tensor(meta, (base + ".lora_b").c_str());
+        if (!b) die("--lora: " + n + " has no .lora_b");
+        pairs.push_back({base, {t, b}});
+    }
+    if (pairs.empty()) die("--lora: no .lora_a/.lora_b pairs in " + path);
+    const int64_t rank = pairs[0].second.first->ne[1];
+    const float alpha = ka >= 0 ? gguf_get_val_f32(g, ka) : (float) rank;
+    ggml_init_params ip = {ggml_tensor_overhead() * (pairs.size() * 2 + 4), nullptr, true};
+    m.lora_ctx = ggml_init(ip);
+    std::vector<std::pair<ggml_tensor*, ggml_tensor*>> dev;   // (device tensor, file tensor)
+    for (auto& [base, ab] : pairs) {
+        ggml_tensor *a = ab.first, *b = ab.second;
+        ggml_tensor* W = get(m, base, false);
+        if (!W) die("--lora: the model has no tensor " + base);
+        if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) die("--lora: " + base + ": adapters must be F32");
+        if (a->ne[1] != rank || b->ne[0] != rank) die("--lora: mixed ranks are not supported (" + base + ")");
+        if (W->ne[0] != a->ne[0] || W->ne[1] != b->ne[1]) die("--lora: shape mismatch for " + base);
+        ggml_tensor* da = ggml_dup_tensor(m.lora_ctx, a);
+        ggml_tensor* db = ggml_dup_tensor(m.lora_ctx, b);
+        ggml_set_name(da, ggml_get_name(a)); ggml_set_name(db, ggml_get_name(b));
+        m.lora[W] = {da, db};
+        dev.push_back({da, a}); dev.push_back({db, b});
+    }
+    m.lora_buf = ggml_backend_alloc_ctx_tensors(m.lora_ctx, m.gpu ? m.gpu : m.cpu);
+    if (!m.lora_buf) die("--lora: cannot allocate the adapter tensors");
+    ggml_backend_buffer_set_usage(m.lora_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) die("--lora: cannot open " + path);
+    std::vector<uint8_t> buf;
+    for (auto& [d, t] : dev) {
+        const int64_t ti = gguf_find_tensor(g, ggml_get_name(t));
+        buf.resize(ggml_nbytes(t));
+        if (fseeko(f, (off_t) (gguf_get_data_offset(g) + gguf_get_tensor_offset(g, ti)), SEEK_SET) != 0 ||
+            std::fread(buf.data(), 1, buf.size(), f) != buf.size()) die("--lora: short read in " + path);
+        ggml_backend_tensor_set(d, buf.data(), 0, buf.size());
+    }
+    std::fclose(f);
+    m.lora_scale = alpha / (float) rank * user_scale;
+    std::fprintf(stderr, "xolotl-inkling: LoRA %s: %zu adapted weights, rank %lld, alpha %.3g, scale %.4g (%.1f MiB)\n",
+                 path.c_str(), pairs.size(), (long long) rank, alpha, m.lora_scale, ggml_backend_buffer_get_size(m.lora_buf) / 1048576.0);
+    gguf_free(g);
+    ggml_free(meta);
+}
+
 void usage() {
     std::fprintf(stderr,
                  "usage: xolotl-inkling --serve --native <inkling-2-mini.gguf> [--context N] [--ubatch N] [--threads N]\n"
                  "       [--cpu-exps L] [--kv-type f16|q8_0|k8v4] [--dspark F | --mtp] [--attn-budget N] [--park-idle SECS] [--peer-vram URL]\n"
-                 "       [--no-park-copy] [--route-log PATH]\n"
+                 "       [--no-park-copy] [--route-log PATH] [--lora ADAPTER.gguf [--lora-scale S]]\n"
+                 "  --lora applies a LoRA adapter (as written by --train) to the attention projections at serve time.\n"
                  "  --route-log appends per-visit routing records (slot, phys, pass, ids, w) for expert-usage analysis;\n"
                  "  off by default, and off costs nothing (no tap tensor is marked).  XOLOTL_INKLING_ROUTE_LOG=PATH too.\n"
                  "  --vram-budget-mib N (off by default) keeps each layer's most-routed experts in VRAM and the rest in\n"
@@ -2796,7 +2867,8 @@ int main(int argc, char** argv) {
     int64_t ctx = 0, attn_budget = 1 << 25;
     int ubatch = 0, threads = 8, gen_n = 0;   // ubatch 0 = auto (2048 with the prompt attention on a >= 20 GB card, else 512)
     double park_idle_s = 0;
-    std::string peer_vram, route_log;
+    std::string peer_vram, route_log, lora_path;
+    float lora_user_scale = 1.0f;
     int64_t vram_budget_mib = 0;
     // --stats
     bool stats = false, per_visit = false, with_down_hess = false, dump_eval = true;
@@ -2843,6 +2915,8 @@ int main(int argc, char** argv) {
         else if (a == "--peer-vram") peer_vram = val();
         else if (a == "--no-park-copy") park_copy = false;
         else if (a == "--route-log") route_log = val();
+        else if (a == "--lora") lora_path = val();
+        else if (a == "--lora-scale") lora_user_scale = (float) std::atof(val().c_str());
         else if (a == "--mmproj") mmproj_path = val();
         else if (a == "--vision-device") {
             vision_device = val();
@@ -2931,7 +3005,9 @@ int main(int argc, char** argv) {
             if (df) { std::fseek(df, 0, SEEK_END); m.extra_vram = (size_t) std::ftell(df) + (512ull << 20); std::fclose(df); }
             if (dspark_path == gguf_path) m.extra_vram = 1536ull << 20;   // --mtp: built in, ~0.6 GB of drafter tensors
         }
+        if (!lora_path.empty()) m.extra_vram += 128ull << 20;   // the adapter tensors (a r16 q/k/v/o/gate/rel set is ~40 MB)
         load(m, gguf_path, want_ctx, threads, cpu_exps, park_copy && serve);
+        if (!lora_path.empty()) load_lora(m, lora_path, lora_user_scale);
         if (m.spec) {
             DsparkTarget tgt{m.tok_embd, m.tok_norm, m.output};
             m.dspark = dspark_load(dspark_path, m.gpu, tgt, m.n_ctx, dspark_prefix);

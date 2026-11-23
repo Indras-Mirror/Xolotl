@@ -87,7 +87,7 @@ static void addto(std::vector<float>& a, const std::vector<float>& b) {
 }
 
 struct Args {
-    std::string gguf, data, eval, out = "/media/Crucial1TB/xolotl-train/runs", run = "inkling-lora", save, targets = "q,k,v,o,gate,rel";
+    std::string gguf, data, eval, out = "/media/Crucial1TB/xolotl-train/runs", run = "inkling-lora", save, targets = "q,k,v,o,gate,rel", init_from, resume;
     int rank = 16, steps = 0, warmup = 10, max_t = 2048, threads = 8, eval_every = 0, eval_n = 16, save_every = 0, seed = 0, ce_chunk = 256;
     int check = 0, fd = 0, overfit = 0;
     float alpha = 32.0f, lr = 1e-4f, clip = 1.0f, init_b = 0.0f, lr_min = 0.1f;
@@ -459,6 +459,30 @@ struct Trainer {
     std::vector<std::vector<int32_t>> route_ids;
     ggml_tensor* route_rec = nullptr;
 
+    // --init-from <adapter.gguf>: start from a saved adapter (same targets + rank; alpha taken from the file)
+    void init_from(const std::string& path) {
+        ggml_context* c = nullptr;
+        gguf_init_params gp = {false, &c};
+        gguf_context* g = gguf_init_from_file(path.c_str(), gp);
+        if (!g) die("--init-from: cannot read " + path);
+        const int64_t ka = gguf_find_key(g, "adapter.lora.alpha");
+        if (ka >= 0) { a.alpha = gguf_get_val_f32(g, ka); scale = a.alpha / (float) a.rank; }
+        int n = 0;
+        for (Adapter& x : ad) {
+            const std::string base = ggml_get_name(x.W);
+            ggml_tensor* ta = ggml_get_tensor(c, (base + ".lora_a").c_str());
+            ggml_tensor* tb = ggml_get_tensor(c, (base + ".lora_b").c_str());
+            if (!ta || !tb) die("--init-from: no adapter for " + base);
+            if ((size_t) ggml_nelements(ta) != x.A.size() || (size_t) ggml_nelements(tb) != x.B.size()) die("--init-from: shape mismatch " + base);
+            std::memcpy(x.A.data(), ta->data, x.A.size() * 4);
+            std::memcpy(x.B.data(), tb->data, x.B.size() * 4);
+            ++n;
+        }
+        std::fprintf(stderr, "[train] --init-from %s: %d adapters, alpha %.3g\n", path.c_str(), n, a.alpha);
+        gguf_free(g);
+        ggml_free(c);
+    }
+
     void zero_grads() { for (Adapter& x : ad) { std::fill(x.gA.begin(), x.gA.end(), 0.0f); std::fill(x.gB.begin(), x.gB.end(), 0.0f); } }
     double grad_norm() const {
         double s = 0;
@@ -495,6 +519,52 @@ struct Trainer {
         const double p = (double) (step - a.warmup) / std::max(1, a.steps - a.warmup);
         return (float) (a.lr * (a.lr_min + (1 - a.lr_min) * 0.5 * (1 + std::cos(M_PI * std::min(1.0, p)))));
     }
+    // optimizer state next to an adapter: "<adapter>.state" = magic, version, step, then per adapter its name and the
+    // AdamW moments (mA vA mB vB). With the adapter it resumes a run exactly (the data order is a function of seed + step).
+    void save_state(const std::string& path, long step) const {
+        const std::string tmp = path + ".tmp";
+        FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (!f) die("--train: cannot write " + tmp);
+        const uint32_t hd[4] = {0x534C4958u /* "XILS" */, 1u, (uint32_t) ad.size(), (uint32_t) a.rank};
+        const int64_t st = step;
+        std::fwrite(hd, sizeof hd, 1, f); std::fwrite(&st, sizeof st, 1, f);
+        for (const Adapter& x : ad) {
+            const std::string n = ggml_get_name(x.W);
+            const uint32_t ln = (uint32_t) n.size();
+            std::fwrite(&ln, 4, 1, f); std::fwrite(n.data(), 1, ln, f);
+            for (const std::vector<float>* v : {&x.mA, &x.vA, &x.mB, &x.vB}) std::fwrite(v->data(), 4, v->size(), f);
+        }
+        if (std::fclose(f) != 0 || std::rename(tmp.c_str(), path.c_str()) != 0) die("--train: cannot write " + path);
+    }
+    long load_state(const std::string& path) {
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) return -1;
+        uint32_t hd[4]; int64_t st = 0;
+        if (std::fread(hd, sizeof hd, 1, f) != 1 || hd[0] != 0x534C4958u || hd[1] != 1u || hd[2] != ad.size() || hd[3] != (uint32_t) a.rank ||
+            std::fread(&st, sizeof st, 1, f) != 1) die("--resume: " + path + " does not match this run (adapters / rank)");
+        for (Adapter& x : ad) {
+            uint32_t ln = 0;
+            std::string n;
+            if (std::fread(&ln, 4, 1, f) != 1 || ln > 4096) die("--resume: bad state file " + path);
+            n.resize(ln);
+            if (std::fread(n.data(), 1, ln, f) != ln || n != ggml_get_name(x.W)) die("--resume: state file adapter order differs: " + n);
+            for (std::vector<float>* v : {&x.mA, &x.vA, &x.mB, &x.vB})
+                if (std::fread(v->data(), 4, v->size(), f) != v->size()) die("--resume: short state file " + path);
+        }
+        std::fclose(f);
+        return (long) st;
+    }
+    // --save P [--save-every N]: P-step000400.gguf kept per checkpoint, P = the latest adapter, P.state = its optimizer state
+    void checkpoint(long step) {
+        const std::string stem = a.save.size() > 5 && a.save.compare(a.save.size() - 5, 5, ".gguf") == 0 ? a.save.substr(0, a.save.size() - 5) : a.save;
+        char sfx[32];
+        std::snprintf(sfx, sizeof sfx, "-step%06ld.gguf", step);
+        save(stem + sfx);
+        save(a.save + ".tmp");
+        if (std::rename((a.save + ".tmp").c_str(), a.save.c_str()) != 0) die("--train: cannot write " + a.save);
+        save_state(a.save + ".state", step);
+        std::fprintf(stderr, "[train] checkpoint step %ld: %s%s (+ %s, %s.state)\n", step, stem.c_str(), sfx, a.save.c_str(), a.save.c_str());
+    }
     void save(const std::string& path) {
         std::vector<LoraTensorPair> v;
         for (const Adapter& x : ad) {
@@ -521,6 +591,10 @@ static int gate_check(Trainer& tr, const Window& w0, int T) {
     ggml_tensor* lg = tr.logits_of(gg.c, ggml_reshape_2d(gg.c, tx, tr.h.n_embd, T));
     gg.run(tr.be, nullptr, {lg});
     const std::vector<float> a = fetch(lg);
+    if (const char* lp = std::getenv("XOLOTL_INKLING_CHECK_LOGITS")) {   // the train chain's logits [T][n_vocab], for --dump compares
+        if (FILE* f = std::fopen(lp, "wb")) { std::fwrite(a.data(), 4, a.size(), f); std::fclose(f); }
+    }
+    if (!tr.a.init_from.empty() && m.lora.empty()) load_lora(m, tr.a.init_from, 1.0f);   // W7: the engine's --lora path
     state_reset(m);
     std::vector<float> b;
     std::vector<std::vector<float>> taps;
@@ -650,6 +724,8 @@ int inkling_train_main(int argc, char** argv) {
         else if (k == "--init-b") a.init_b = (float) std::atof(v().c_str());
         else if (k == "--ce-chunk") a.ce_chunk = std::max(16, std::atoi(v().c_str()));
         else if (k == "--check") a.check = std::atoi(v().c_str());
+        else if (k == "--init-from") a.init_from = v();
+        else if (k == "--resume") a.resume = v();
         else if (k == "--fd") a.fd = 1;
         else if (k == "--overfit") a.overfit = std::atoi(v().c_str());
         else if (a.gguf.empty() && k[0] != '-') a.gguf = k;
@@ -658,7 +734,9 @@ int inkling_train_main(int argc, char** argv) {
     if (a.gguf.empty() || a.data.empty()) {
         std::fprintf(stderr, "usage: xolotl-inkling --train <model.gguf> --data windows.jsonl [--eval heldout.jsonl] [--steps N]\n"
                              "       [--rank 16] [--alpha 32] [--lr 1e-4] [--targets q,k,v,o,gate,rel] [--max-t 2048] [--save a.gguf]\n"
-                             "       gates: --check T | --fd [--init-b 0.01] | --overfit N\n");
+                             "       gates: --check T [--init-from ADAPTER] | --fd [--init-b 0.01] | --overfit N\n"
+                             "       checkpoints: --save P --save-every N (P-stepNNNNNN.gguf kept, P = latest, P.state = optimizer)\n"
+                             "       --resume P continues a run (weights + optimizer state + step); SIGTERM/Ctrl-C checkpoints first\n");
         return 2;
     }
     // the reference graph only: every fused (custom) op off, controllers on their base tensors
@@ -678,6 +756,20 @@ int inkling_train_main(int argc, char** argv) {
         if (!a.eval.empty()) ew = load_windows(a.eval, a.max_t);
         std::fprintf(stderr, "[train] %zu train windows, %zu eval windows\n", tw.size(), ew.size());
         Trainer tr(m, a);
+        if (!a.init_from.empty()) tr.init_from(a.init_from);
+        long start = 0;   // --resume <adapter.gguf>: its weights + "<adapter>.state" (AdamW moments, step); the run continues
+        if (!a.resume.empty()) {
+            tr.init_from(a.resume);
+            start = tr.load_state(a.resume + ".state");
+            if (start < 0) {   // a numbered checkpoint has no state: weights only, step from the name, moments restart at 0
+                const size_t q = a.resume.rfind("-step");
+                start = q == std::string::npos ? 0 : std::atol(a.resume.c_str() + q + 5);
+                std::fprintf(stderr, "[train] --resume: no %s.state - weights only, AdamW moments restart, step %ld\n", a.resume.c_str(), start);
+            } else {
+                std::fprintf(stderr, "[train] --resume: step %ld (weights + optimizer state)\n", start);
+            }
+            if (start >= a.steps) die("--resume: the run already reached step " + std::to_string(start) + " (--steps " + std::to_string(a.steps) + ")");
+        }
         if (a.check) return gate_check(tr, tw[0], a.check);
         if (a.fd) return gate_fd(tr, tw[0]);
 
@@ -698,9 +790,11 @@ int inkling_train_main(int argc, char** argv) {
         for (size_t i = 0; i < order.size(); ++i) order[i] = i;
         std::shuffle(order.begin(), order.end(), rng);
         const double e0 = eval_loss();
-        if (std::isfinite(e0)) { std::fprintf(stderr, "[train] step 0 eval %.4f\n", e0); met.log(0, {{"eval_loss", e0}}); }
+        if (std::isfinite(e0)) { std::fprintf(stderr, "[train] step %ld eval %.4f\n", start, e0); met.log(start, {{"eval_loss", e0}}); }
         double first = NAN;
-        for (long step = 1; step <= a.steps; ++step) {
+        static volatile sig_atomic_t g_stop = 0;   // SIGTERM (systemctl stop) / SIGINT: checkpoint after this step, exit 0
+        if (!a.save.empty()) { auto on_sig = [](int) { g_stop = 1; }; signal(SIGTERM, on_sig); signal(SIGINT, on_sig); }
+        for (long step = start + 1; step <= a.steps; ++step) {
             const Window& w = a.overfit ? tw[0] : tw[order[(size_t) (step - 1) % order.size()]];
             const auto t0 = std::chrono::steady_clock::now();
             tr.zero_grads();
@@ -716,9 +810,9 @@ int inkling_train_main(int argc, char** argv) {
             double el = NAN;
             if (a.eval_every && step % a.eval_every == 0) { el = eval_loss(); std::fprintf(stderr, "[train] step %ld eval %.4f\n", step, el); }
             met.log(step, {{"loss", loss}, {"eval_loss", el}, {"lr", lr}, {"gnorm", gn}, {"window_tokens", (double) w.ids.size()}, {"step_s", dt}});
-            if (!a.save.empty() && a.save_every && step % a.save_every == 0) tr.save(a.save);
+            if (!a.save.empty() && ((a.save_every && step % a.save_every == 0) || step == a.steps || g_stop)) tr.checkpoint(step);
+            if (g_stop) { std::fprintf(stderr, "[train] stopped by signal after step %ld (resume: --resume %s)\n", step, a.save.c_str()); return 0; }
         }
-        if (!a.save.empty()) tr.save(a.save);
         if (a.overfit) {
             const double last = tr.step_window(tw[0], false);
             std::printf("OVERFIT %d steps: loss %.4f -> %.4f\n", a.overfit, first, last);

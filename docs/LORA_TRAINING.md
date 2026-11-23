@@ -5,6 +5,11 @@
 > next-token loss, lowers the loss on held-out windows it never saw: **1.4116 -> 1.3197 (-6.5 %)** in 36 steps (~6 min).
 > It is research code: no one-command "fine-tune my model" yet, and the adapter is not served by Xolotl yet (llama.cpp
 > loads it). Nothing here changes inference: the served engines, their defaults and their outputs are untouched.
+>
+> **23 Nov 2026: Inkling-2-Mini, the whole model.** A LoRA on all 24 layers of Inkling-2-Mini (XQ, 13.9 GB), trained
+> through the full looped forward (48 slot visits) on the served quantized weights, on one RTX 4090: held-out loss
+> **1.492 -> 1.243 after 100 steps (-16.7 %), 1.212 after 400 (-18.8 %)**. Xolotl serves the adapter itself
+> (`xolotl-inkling --serve ... --lora adapter.gguf`). See [Inkling-2-Mini](#inkling-2-mini-the-whole-model-on-one-4090).
 
 Goal: train LoRA adapters on the MoE models Xolotl already serves (Hy4-flash, Qwen3.8-Flash-Next / QFN, later
 DeepSeek-V4.1) on one PC - an RTX 4090 24 GB, ~110 GB RAM, NVMe - with the base weights **frozen and quantized exactly
@@ -78,6 +83,60 @@ from token 0, so it is not the checkpoint restore: the serve path reads the wind
 turn boundaries). Which of the two the served model really computes is the open question; the slow path is the one
 the gates above verified.
 
+## Inkling-2-Mini: the whole model on one 4090
+
+Inkling-2-Mini (24 physical layers run as 48 slot visits through a 3-pass loop core, 128 experts / top-8) fits in
+VRAM (XQ 13.9 GB), so here the trainer runs **the entire model** every step, with no capture pass.
+
+1. **Data.** `tools/train/harness_build_inkling.py` renders your agent transcripts with Inkling's own chat template
+   and tokenizer (reasoning kept in history, as the serve renders it) into windows of up to 3,200 tokens. The loss
+   covers the assistant's turns only. `--heldout-only` renders the held-out conversations as an eval set;
+   `check_harness_inkling.py` gates both (prefix-free ids, decode round-trip, mask = assistant turns, no leak).
+2. **Train.** `xolotl-inkling --train <model.gguf> --data windows.jsonl --eval eval.jsonl ...`
+   (`src/program/inkling_train.cpp`). Rank-16 adapters on `attn_q / k / v / output / gate / rel` of every layer
+   (144 adapters, 9.78M parameters); the base weights stay frozen and quantized exactly as served (XQ experts, Q6_K
+   head). Per step: the slot visits run forward one by one, the head gives the cross-entropy gradient (chunked over the
+   real vocabulary, softcap included), then each visit's graph runs backward in reverse order (a vector-Jacobian
+   product per visit; the loop's message bank and depth mixing are carried as a stream DAG); AdamW on the host.
+   The backward through the frozen 4-bit experts is a new ggml op, `GGML_OP_MUL_MAT_ID_BACK` (CPU + CUDA).
+3. **Checkpoints.** `--save P --save-every N` keeps `P-stepNNNNNN.gguf` at every checkpoint (check any of them with
+   `--eval`, or serve it), `P` is always the latest adapter and `P.state` its AdamW state. `--resume P` continues the
+   run from that step with the same data order; stopping the unit (SIGTERM) or Ctrl-C writes a checkpoint first.
+4. **Serve.** `xolotl-inkling --serve --native <model.gguf> --lora adapter.gguf [--lora-scale S]` applies the adapter
+   in the same graph hook the trainer uses (`G::mm`).
+
+Gates, all before the first real run (numbers in [docs/train/INKLING_TRAIN_PLAN.md](train/INKLING_TRAIN_PLAN.md)):
+the training graph reproduces the engine's forward **bit for bit** (every slot and all logits, with f16 K/V like the
+cache); every new backward rule passes finite differences on CPU and CUDA vs CPU (the softmax-mask rule against a
+double-precision reference, `tools/train/smgrad_ref.cpp`); a directional finite difference along the gradient agrees
+within 3.5 % for every adapter type (0.36 % overall) with MoE routing held fixed, as the gradient assumes; a 20-step
+overfit on one real window takes the loss from 1.227 to 0.0002.
+
+```bash
+# windows from your transcripts + the request your harness sends (see "Run it (QFN)" step 1 for the capture server)
+INKLING_PACK=<pack dir> python3 tools/train/harness_build_inkling.py --chats chats.jsonl --req req.json --out data/
+INKLING_PACK=<pack dir> python3 tools/train/harness_build_inkling.py --chats chats.jsonl --req req.json --out eval/ --heldout-only
+# train (T <= 2048 fits 24 GB; eval every 100 steps)
+xolotl-inkling --train Inkling-2-Mini-XQ.gguf --data data/windows.jsonl --eval eval/windows.jsonl --eval-n 32 \
+    --eval-every 100 --steps 400 --warmup 30 --lr 1e-4 --max-t 2048 --save runs/r1/adapter.gguf --save-every 100
+# continue it later (weights + optimizer state + step)
+xolotl-inkling --train Inkling-2-Mini-XQ.gguf --data data/windows.jsonl ... --steps 800 --save runs/r1/adapter.gguf --resume runs/r1/adapter.gguf
+# serve it
+xolotl-inkling --serve --native Inkling-2-Mini-XQ.gguf --lora runs/r1/adapter.gguf
+```
+
+### Results (23 Nov 2026, RTX 4090)
+
+| run | data | steps | held-out loss (base -> end) | time |
+| --- | --- | --- | --- | --- |
+| overfit gate | 1 window (T 512) | 20 | 1.227 -> 0.0002 (train window) | 1 min |
+| harness r1 | 15,227 windows (13.8M loss tokens), T <= 2048, no tool-schema prefix | 100 | **1.492 -> 1.243 (-16.7 %)** | ~12 min |
+| harness r1 (same run) | | 400 | **1.492 -> 1.212 (-18.8 %)** | ~50 min |
+
+Held-out = 32 windows from 14 conversations the builder kept out of training. Step time 3.0 / 5.7 / 14 s at T = 512 /
+1024 / 2048, VRAM peak 15.8 / 15.9 / 17.4 GB. Not done yet: training behind the 23K-token tool-schema prefix (carry its
+per-slot K/V and conv state in as constants), the adapter on real agent tasks, and speed (W8).
+
 ## What is in
 
 | piece | where | gate |
@@ -94,6 +153,8 @@ the gates above verified.
 | QFN top-4 stack forward + prefix carry + YaRN + layer-47 selection replay | `tools/train/qfn_topk.hpp`, `qfn_topk_gate.cpp`, `qfn_topk_long.cpp` | 25-token smoke: top-1 25/25; real 21,686-position window: loss 1.7798 vs engine 1.7795 |
 | **GPU trainer** (per-layer backward graphs, shared allocator, host AdamW, metrics, adapter) | `tools/train/qfn_harness_train.cpp`, `metrics.hpp`, `lossplot.py` | step-0 loss = base (1.7780); held-out loss falls (table above) |
 | CUDA fixes for training shapes: OUT_PROD with a cuBLAS-invalid view stride, REPEAT_BACK past the grid-z limit | `tools/xolotl/ggml/xolotl-ggml.patch` | backward-only ops; the trainer runs where it crashed before |
+| Inkling backward rules: `GGML_OP_MUL_MAT_ID_BACK` (activation gradient through frozen quantized experts), TANH, L2_NORM, FILL, batched GET_ROWS_BACK, the softmax **mask** gradient (Inkling's learned relative bias is the mask), broadcast SUB | same patch | FD on CPU (negative controls), CUDA vs CPU for every XQ expert type; softmax mask vs a double-precision reference |
+| **Inkling-2-Mini trainer** (whole model, per-slot VJP, stream DAG, chunked CE head, AdamW, adapter GGUF, `--check` / `--fd` / `--overfit` gates) and **`--lora` at serve time** | `src/program/inkling_train.cpp`, `inkling_main.cpp` | train graph == engine forward bit for bit; held-out loss falls (table above) |
 | Adapter files in **llama.cpp's LoRA GGUF format** | `tools/train/lora_gguf.hpp`, `lora_bin_to_gguf.cpp` | llama.cpp itself loads the QFN adapter and generates (with a negative control); scale convention checked against llama.cpp's apply path |
 
 The Hy4-flash engine (`tools/hy4/`, `-DHY4` targets, off unless you build them) ships in the same change: its
@@ -104,8 +165,12 @@ unchanged; Hy4 builds use 16).
 ## What is not done
 
 - **A long run and a behavioural check.** The pipeline is proven on held-out loss; next: the full window set, then the
-  adapter on real agent tasks. Serving it in Xolotl needs a merged clone pack (the engine has no LoRA path for these
-  tensors yet); llama.cpp can load it today.
+  adapter on real agent tasks. QFN: serving it in Xolotl needs a merged clone pack (the engine has no LoRA path for
+  these tensors yet); llama.cpp can load it today. Inkling-2-Mini: served by Xolotl (`--lora`).
+- **Inkling-2-Mini behind its tool-schema prefix**: the harness windows assume a 23K-token system prompt + tool
+  schemas the first run trained without; next is carrying the prefix's per-slot K/V and conv state into the training
+  graph as constants (and query-chunked attention backward for the long global slots). Then speed: a step is still
+  ~150-180 tokens/s.
 - **Fast capture parity** (above): find why the serve path's window rows differ from the one-shot path.
 - DeepSeek-V4.1 wiring (it shares the hyper-connection / MLA / indexer ops, so it follows QFN).
 - LoRA on the routed experts themselves, full fine-tuning, more than one GPU: out of scope for v1.

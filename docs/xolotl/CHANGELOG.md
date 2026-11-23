@@ -8,6 +8,31 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### LoRA training for Inkling-2-Mini, the whole model on one RTX 4090, and `--lora` at serve time (23 Nov)
+
+- **`xolotl-inkling --train`** trains rank-16 LoRA adapters on every layer of Inkling-2-Mini (attention q / k / v /
+  output / gate / rel, 144 adapters, 9.78M parameters) through the full looped forward (48 slot visits), with the base
+  weights frozen and quantized exactly as served. On the QuetzaCodetl harness data (15,227 windows, T <= 2048):
+  held-out loss **1.492 -> 1.243 in 100 steps (-16.7 %)**, 1.212 at 400 (-18.8 %). 3.0 / 5.7 / 14 s a step at
+  T = 512 / 1024 / 2048, 15.8-17.4 GB VRAM. How-to and gates: [docs/LORA_TRAINING.md](../LORA_TRAINING.md#inkling-2-mini-the-whole-model-on-one-4090).
+- **Checkpoints and resume.** `--save P --save-every N` keeps `P-stepNNNNNN.gguf` per checkpoint, `P` = the latest
+  adapter, `P.state` = the AdamW state; `--resume P` continues the run exactly; `systemctl stop` / Ctrl-C writes a
+  checkpoint before exiting.
+- **`xolotl-inkling --serve ... --lora adapter.gguf [--lora-scale S]`** serves an adapter (llama.cpp LoRA GGUF format,
+  what `--train` writes). Gate: with the adapter on both sides the training graph and the engine's forward agree bit
+  for bit; the fused serve path stays within the same 4 % of the trainer with or without the adapter, while the
+  adapter itself moves the logits by ~110 %. Without `--lora` nothing changes.
+- **New ggml backward** (in `tools/xolotl/ggml/xolotl-ggml.patch`, inference untouched): `GGML_OP_MUL_MAT_ID_BACK`, the
+  activation gradient through frozen quantized experts (CPU + CUDA, every XQ expert type), TANH, L2_NORM, FILL, batched
+  GET_ROWS_BACK, the softmax mask gradient, broadcast SUB. Each has a finite-difference test in test-backend-ops
+  (`tools/train/test-backend-ops-train.patch`); the softmax mask rule is also checked against a double-precision
+  reference (`tools/train/smgrad_ref.cpp`).
+- **Harness data for Inkling**: `tools/train/harness_build_inkling.py` (+ `--heldout-only` eval sets) and
+  `check_harness_inkling.py`.
+- Found on the way: the fused CUDA top-k MoE router and the unfused graph give losses 0.8 % apart on Inkling. The
+  kernel is right (they agree to 1.6e-7 at the first slot; new test-backend-ops cases at Inkling's 128 experts / top-8);
+  the gap is rounding amplified through the 48 looped visits, the same size as f16 vs f32 attention.
+
 ### Inkling-2-Mini: `--vram-budget-mib` fixed, 96 fewer decode launches, numeric reasoning effort (23 Nov)
 
 - **`--vram-budget-mib` works again** (the mode that splits experts between VRAM and pinned RAM for 12-16 GB cards).

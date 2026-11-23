@@ -12,6 +12,11 @@
 
 ## Latest
 
+- **23 Nov, night** - **LoRA training for Inkling-2-Mini on one RTX 4090, the whole model**: `xolotl-inkling --train`
+  puts adapters on all 24 layers and trains through the full looped forward on the served quantized weights; on our agent
+  transcripts held-out loss drops **-16.7 % in 100 steps** (-18.8 % at 400). Checkpoints every N steps with exact
+  `--resume`, and Xolotl serves the result: `--serve ... --lora adapter.gguf`.
+  [LORA_TRAINING.md](docs/LORA_TRAINING.md#inkling-2-mini-the-whole-model-on-one-4090) · [CHANGELOG](docs/xolotl/CHANGELOG.md#lora-training-for-inkling-2-mini-the-whole-model-on-one-rtx-4090-and---lora-at-serve-time-23-nov).
 - **23 Nov** - **Inkling-2-Mini**: `--vram-budget-mib` (12-16 GB cards, experts split between VRAM and RAM) works again: prompt
   chunks crashed in MMQ (a token named one shared zero row several times) and staged copies piled up in VRAM; 96 fewer
   decode launches a token (K+V prepare and q+rel clip each in one launch, 4-row loop controller), bit-identical; the
