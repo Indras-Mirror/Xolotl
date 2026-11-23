@@ -8,6 +8,13 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Monitor: the queued count includes requests waiting beyond the engine's batch slots (24 Nov, #147)
+
+- In parallel mode a request enters the server's live set at once and its `queued` flag is cleared, so the Monitor
+  showed 0 waiting while the engine had requests queued behind its batch slots. The count now includes live requests
+  beyond the engine's slots (one slot when the engine runs requests one at a time).
+- Thanks: **lodos2005** (Hakan Yavuz) for the fix (#147, first contribution).
+
 ### Windows fixes for the DeepSeek V4.1 engine and its picture reader; a tool-call loop guard in the server (24 Nov)
 
 - **#144** (fast mode on Windows): every `XOLOTL_*` name now works on Windows too (it was copied onto `STRATA_*` on Linux
