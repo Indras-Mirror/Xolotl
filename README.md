@@ -12,61 +12,23 @@
 
 ## Latest
 
-- **24 Nov** - **Windows fixes + loop guard**: `XOLOTL_*` names and `;`-separated fast-mode sidecar lists on Windows,
-  the dense requant cache next to the model, the picture reader's VRAM lend on the server's keyed path (thanks
-  kelheor, #144-#146); a tool-call loop guard ported from Delta (musicurgy) / Project Maya.
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#windows-fixes-for-the-deepseek-v41-engine-and-its-picture-reader-a-tool-call-loop-guard-in-the-server-24-nov).
-- **24 Nov** - **Inkling-2-Mini LoRA training behind the real 23K-token harness prompt**: the prompt's per-slot K/V and
-  conv state are carried into training (bit for bit with the engine up to 23K tokens), snapshotted once and reused by
-  every window. A coding-weighted run drops held-out loss **-15.6 % in 300 steps**; on LiveCodeBench-20 the adapter is
-  level with base within noise (13 vs 15 of 20), so the data side is the open question.
-  [LORA_TRAINING.md](docs/LORA_TRAINING.md#inkling-2-mini-the-whole-model-on-one-4090) · [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-lora-training-behind-the-real-harness-prompt-prompt-carry-bit-for-bit-with-the-engine-24-nov).
-- **23 Nov, night** - **LoRA training for Inkling-2-Mini on one RTX 4090, the whole model**: `xolotl-inkling --train`
-  puts adapters on all 24 layers and trains through the full looped forward on the served quantized weights; on our agent
-  transcripts held-out loss drops **-16.7 % in 100 steps** (-18.8 % at 400). Checkpoints every N steps with exact
-  `--resume`, and Xolotl serves the result: `--serve ... --lora adapter.gguf`.
-  [LORA_TRAINING.md](docs/LORA_TRAINING.md#inkling-2-mini-the-whole-model-on-one-4090) · [CHANGELOG](docs/xolotl/CHANGELOG.md#lora-training-for-inkling-2-mini-the-whole-model-on-one-rtx-4090-and---lora-at-serve-time-23-nov).
-- **23 Nov** - **Inkling-2-Mini**: `--vram-budget-mib` (12-16 GB cards, experts split between VRAM and RAM) works again: prompt
-  chunks crashed in MMQ (a token named one shared zero row several times) and staged copies piled up in VRAM; 96 fewer
-  decode launches a token (K+V prepare and q+rel clip each in one launch, 4-row loop controller), bit-identical; the
-  server takes a numeric `reasoning_effort` (0 .. 0.99) like llama.cpp. Loop count checked against
-  [drhb's looped-transformer study](https://drhb.github.io/blog/posts/looped-transformers/): 3 passes stays best (ppl 6.71; 2: 12.06, 4: 11.23, 6: 7.07).
-- **22 Nov, late** - **Inkling-2-Mini decode 118 -> 127 tok/s** (30K 108 -> 118, 117K 93 -> 100): the loop
-  controllers fused into three kernels on exact BF16 weights, the per-expert scales folded into existing kernels;
-  2,111 -> 1,482 kernels a token. [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-decode-118---127-toks-fused-loop-controllers-folded-expert-scales-bf16-router-22-nov-late).
-- **22 Nov, evening** - **Inkling-2-Mini at 512K context on one RTX 4090**: the quantised K/V cache (`--kv-type
-  k8v4`) now runs on the fast kernels (107K-token prefill in 29 s, was ~130 tok/s), its 4-bit value leg is
-  Hadamard-rotated by default (-33 % of the 4-bit noise, no speed cost), and long-context decode near the card's
-  memory bandwidth: **477K tokens 30 -> 55 tok/s**, 117K 65 -> 93 (new decode attention kernel), plus fixes for
-  multi-turn graph reuse and long quantised prompts.
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-512k-context-on-one-rtx-4090-with-k8v4-on-the-fast-kernels-4-bit-v-leg-hadamard-rotated-22-nov-evening).
-- **22 Nov** - **Inkling-2-Mini XQ re-released as "Unbound"** ([HF](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored), same file name and size): nokeep's
-  convolution-aware refusal edit at strength 4 replaces the first release's ARA edit. Closer to the official model
-  (held-out KL 0.028, top-1 92.8 %), MATH-24 88.9 % (was 83.3 %), HumanEval 21/21, tools 9/10, Gauntlet v3 4/7.
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-xq-re-released-as-unbound-22-nov).
-- **22 Nov** - **Inkling-2-Mini prefill 1.2K -> 4.2K tok/s at 32K** (tensor-core prompt attention with the relative
-  bias in-kernel, ported from Basalt; 2048-row prompt chunks), **decode 93 -> 113 tok/s**, 136 tok/s with the DSpark
-  drafter, on one RTX 4090. Quality checked against the NVFP4 parent.
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-prefill-12k---42k-toks-at-32k-decode-93---113-toks-dspark-136-toks-22-nov).
-- **21 Nov** - **[Inkling-2-Mini](docs/INKLING.md)** (Thinking Machines, 26B looped MoE, 3B active, ~5.4B effective per token with its 3x loop) on
-  its own engine, `xolotl-inkling`: **93 tok/s decode** on one RTX 4090 after kernel fusion (from 57), 1.1K+ tok/s
-  prefill. Our abliterated 13.93 GB XQ quant (first release, ARA edit; replaced by Unbound on 22 Nov) matched its
-  parents (MMLU-100 76 %, HumanEval, tool use) and refused 4/100 harmful prompts: [IndrasMirror/Inkling-2-Mini-XQ-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored).
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-decode-67---93-toks-fused-conv-situ-and-stream-stack-kernels-21-nov-evening).
-- **21 Nov** - LoRA training on the served MoE models, **proven end to end** on QFN (-6.5 % held-out loss in ~6 min
-  on a 4090): [docs/LORA_TRAINING.md](docs/LORA_TRAINING.md).
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#lora-training-proven-end-to-end-on-qfn-a-harness-adapter-trained-from-the-served-engines-activations-21-nov-later).
-- **19 Nov** - DeepSeek-V4.1 decode switches on by default: fast-mode agent tasks ~40 -> **42.7 tok/s**.
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#deepseek-v41-decode-switches-on-by-default-agent-tasks-427-toks-19-nov).
-- **18 Nov** - Looped transformers in the dense engine (SenseNova-Loop-9B, 3,027 tok/s prompt, 45 tok/s decode).
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#looped-transformers-in-the-dense-engine-sensenova-loop-9b-18-nov).
-- **14 Nov** - Qwen3.8-27B with DFlash2: **171 -> 204 tok/s**, same text bit for bit.
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#qwen38-27b-with-dflash2-the-8-token-verify-gets-cheaper-171---204-toks-14-nov).
-- **13 Nov** - [Muse Glimmer 30B](docs/GLIMMER.md) natively at 512K on one 24 GB card, up to 379 tok/s with DFlash.
-  [CHANGELOG](docs/xolotl/CHANGELOG.md#muse-glimmer-30b-natively-at-512k-13-nov).
-- **8 Nov** - [Gauntlet v3](#what-one-pc-can-do) is the main table: every model on the same hard agentic tasks.
-- **7 Nov** - [DeepSeek-V4.1 fast mode](#fast-mode-deepseek-v41) (41 tok/s on agent tasks, same score) and
-  [Xolotl Direct](docs/XOLOTL_DIRECT.md) (NVMe straight into VRAM, experimental).
+One line each; the detail, numbers and credits are in [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
+
+- **24 Nov** - Windows fixes for the V4.1 engine + picture reader (thanks kelheor, #144-#146) and a tool-call loop guard (from Delta / Project Maya). [more](docs/xolotl/CHANGELOG.md#windows-fixes-for-the-deepseek-v41-engine-and-its-picture-reader-a-tool-call-loop-guard-in-the-server-24-nov)
+- **24 Nov** - Inkling-2-Mini LoRA training behind the real 23K-token harness prompt, bit for bit with the engine: held-out loss -15.6 %, LiveCodeBench level. [more](docs/xolotl/CHANGELOG.md#inkling-2-mini-lora-training-behind-the-real-harness-prompt-prompt-carry-bit-for-bit-with-the-engine-24-nov)
+- **23 Nov** - [LoRA training](docs/LORA_TRAINING.md#inkling-2-mini-the-whole-model-on-one-4090) for the whole Inkling-2-Mini on one RTX 4090 (-16.7 % held-out loss in 100 steps), served with `--lora`. [more](docs/xolotl/CHANGELOG.md#lora-training-for-inkling-2-mini-the-whole-model-on-one-rtx-4090-and---lora-at-serve-time-23-nov)
+- **23 Nov** - Inkling-2-Mini: `--vram-budget-mib` for 12-16 GB cards works again, 96 fewer decode launches a token, numeric `reasoning_effort`.
+- **22 Nov** - Inkling-2-Mini decode 118 -> **127 tok/s** (fused loop controllers, folded expert scales). [more](docs/xolotl/CHANGELOG.md#inkling-2-mini-decode-118---127-toks-fused-loop-controllers-folded-expert-scales-bf16-router-22-nov-late)
+- **22 Nov** - Inkling-2-Mini at **512K context** on one 4090: `k8v4` on the fast kernels, 477K-token decode 30 -> 55 tok/s. [more](docs/xolotl/CHANGELOG.md#inkling-2-mini-512k-context-on-one-rtx-4090-with-k8v4-on-the-fast-kernels-4-bit-v-leg-hadamard-rotated-22-nov-evening)
+- **22 Nov** - Inkling-2-Mini XQ re-released as **"Unbound"** ([HF](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQ-Uncensored)): KL 0.028, MATH-24 88.9 %. [more](docs/xolotl/CHANGELOG.md#inkling-2-mini-xq-re-released-as-unbound-22-nov)
+- **22 Nov** - Inkling-2-Mini prefill 1.2K -> **4.2K tok/s** at 32K, decode 93 -> 113 (136 with DSpark). [more](docs/xolotl/CHANGELOG.md#inkling-2-mini-prefill-12k---42k-toks-at-32k-decode-93---113-toks-dspark-136-toks-22-nov)
+- **21 Nov** - [Inkling-2-Mini](docs/INKLING.md) on its own engine, `xolotl-inkling`: 93 tok/s decode on one 4090, plus our 13.93 GB XQ quant. [more](docs/xolotl/CHANGELOG.md#inkling-2-mini-decode-67---93-toks-fused-conv-situ-and-stream-stack-kernels-21-nov-evening)
+- **21 Nov** - [LoRA training](docs/LORA_TRAINING.md) on the served MoE models, proven end to end on QFN. [more](docs/xolotl/CHANGELOG.md#lora-training-proven-end-to-end-on-qfn-a-harness-adapter-trained-from-the-served-engines-activations-21-nov-later)
+- **19 Nov** - DeepSeek-V4.1 decode switches on by default: agent tasks ~40 -> **42.7 tok/s**. [more](docs/xolotl/CHANGELOG.md#deepseek-v41-decode-switches-on-by-default-agent-tasks-427-toks-19-nov)
+- **18 Nov** - Looped transformers in the dense engine (SenseNova-Loop-9B). [more](docs/xolotl/CHANGELOG.md#looped-transformers-in-the-dense-engine-sensenova-loop-9b-18-nov)
+- **14 Nov** - Qwen3.8-27B with DFlash2: 171 -> **204 tok/s**, same text bit for bit. [more](docs/xolotl/CHANGELOG.md#qwen38-27b-with-dflash2-the-8-token-verify-gets-cheaper-171---204-toks-14-nov)
+- **13 Nov** - [Muse Glimmer 30B](docs/GLIMMER.md) at 512K on one 24 GB card, up to 379 tok/s. [more](docs/xolotl/CHANGELOG.md#muse-glimmer-30b-natively-at-512k-13-nov)
+- **8 Nov** - [Gauntlet v3](#what-one-pc-can-do) is the main table. **7 Nov** - [V4.1 fast mode](#fast-mode-deepseek-v41) (41 tok/s on agent tasks) and [Xolotl Direct](docs/XOLOTL_DIRECT.md).
 
 Everything else, in full, with PR numbers and who did it: [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md)
 (web search choices, the L20 tables, the 10-11 Nov fixes, CPU expert splits, LFM3-Omni and more).
