@@ -87,13 +87,17 @@ static void addto(std::vector<float>& a, const std::vector<float>& b) {
 }
 
 struct Args {
-    std::string gguf, data, eval, out = "/media/Crucial1TB/xolotl-train/runs", run = "inkling-lora", save, targets = "q,k,v,o,gate,rel", init_from, resume;
+    std::string gguf, data, eval, out = "/media/Crucial1TB/xolotl-train/runs", run = "inkling-lora", save, targets = "q,k,v,o,gate,rel", init_from, resume, prefix_file;
     int rank = 16, steps = 0, warmup = 10, max_t = 2048, threads = 8, eval_every = 0, eval_n = 16, save_every = 0, seed = 0, ce_chunk = 256;
-    int check = 0, fd = 0, overfit = 0;
+    int check = 0, fd = 0, overfit = 0, check_prefix = 0, max_prefix = 0, shuffle = 1;
     float alpha = 32.0f, lr = 1e-4f, clip = 1.0f, init_b = 0.0f, lr_min = 0.1f;
 };
 
-struct Window { std::vector<int32_t> ids; std::vector<uint8_t> mask; };
+struct Window {
+    std::vector<int32_t> ids; std::vector<uint8_t> mask;
+    std::shared_ptr<const std::vector<int32_t>> prefix;   // W9: context before the window (no loss, carried as engine state)
+    std::vector<int32_t> context;   // W9 with --prefix: the conversation tokens between the shared prompt and this window
+};
 
 // {"ids":[...], "mask":[...], ...} per line
 static bool parse_int_array(const std::string& s, const char* key, std::vector<long long>& out) {
@@ -120,11 +124,21 @@ static std::vector<Window> load_windows(const std::string& path, int max_t) {
     std::ifstream f(path);
     if (!f) die("--train: cannot read " + path);
     std::string line;
-    std::vector<long long> ids, mask;
+    std::vector<long long> ids, mask, pre;
+    std::shared_ptr<const std::vector<int32_t>> last_pre;   // consecutive windows of one request share their prefix
     while (std::getline(f, line)) {
         if (line.empty() || !parse_int_array(line, "ids", ids)) continue;
         if (!parse_int_array(line, "mask", mask) || mask.size() != ids.size()) die("--train: a window without a matching mask in " + path);
         Window x;
+        if (parse_int_array(line, "prefix", pre) && !pre.empty()) {   // a per-window context (Elixir requests)
+            if (!last_pre || last_pre->size() != pre.size() || !std::equal(pre.begin(), pre.end(), last_pre->begin(),
+                                                                             [](long long a, int32_t b) { return a == b; })) {
+                auto v = std::make_shared<std::vector<int32_t>>(pre.begin(), pre.end());
+                last_pre = v;
+            }
+            x.prefix = last_pre;
+        }
+        if (parse_int_array(line, "context", pre) && !pre.empty()) x.context.assign(pre.begin(), pre.end());
         const size_t n = std::min<size_t>(ids.size(), (size_t) max_t);
         for (size_t i = 0; i < n; ++i) { x.ids.push_back((int32_t) ids[i]); x.mask.push_back(mask[i] ? 1 : 0); }
         int nl = 0;
@@ -225,29 +239,122 @@ struct Trainer {
     }
 
     // host masks / relative distances for cells = positions [0, T) (the chunk starts at 0, no carried prefix yet)
-    void chunk_inputs(G1& gg, Step& st, int T) {
-        const int64_t cells = T;
-        std::vector<float> mf((size_t) cells * T), ms((size_t) cells * T);
-        std::vector<int32_t> rf((size_t) cells * T), rs((size_t) cells * T);
-        for (int t = 0; t < T; ++t)
-            for (int64_t j = 0; j < cells; ++j) {
-                const int64_t d = t - j;
-                const size_t k = (size_t) t * cells + j;
-                mf[k] = d >= 0 ? 0.0f : -INFINITY;
-                rf[k] = d >= 0 && d < h.rel_extent ? (int32_t) d : h.rel_extent;
-                ms[k] = d >= 0 && d < h.n_swa ? 0.0f : -INFINITY;
-                rs[k] = d >= 0 && d < h.n_swa ? (int32_t) d : h.n_swa;
+    // W9 prefix carry: the context before a window runs through the inference engine once (no gradient, base weights,
+    // served kernels); each slot visit of the window then attends to that slot's cached K/V (global slots: every
+    // prefix position = the first n_pre cache cells; sliding slots: the last n_swa-1 positions, gathered from the ring)
+    // and starts its convolutions from the slot's conv state. Consecutive windows whose prefix extends the fed one
+    // only prefill the new tokens (append-only, as the engine resumes requests).
+    std::shared_ptr<const std::vector<int32_t>> global_prefix;   // --prefix: one context for every window (harness prompt)
+    std::vector<int32_t> pre_fed;            // the ids the engine's state holds
+    int64_t n_pre = 0, n_pre_swa = 0;        // the current window's prefix length / its visible sliding tail
+    std::vector<int32_t> swa_cells;          // ring cells of the sliding tail, in position order
+    double prefill_s = 0;
+    int64_t prefill_tok = 0;
+    // the engine state right after the shared prompt (--prefix): every slot's conv state, the sliding rings and their
+    // position map (global cells below the prompt length are never overwritten by later positions, so they need no
+    // copy). The conv state is recurrent - without this every window would re-prefill the whole prompt.
+    struct Snap { std::vector<int32_t> ids; ggml_context* ctx = nullptr; ggml_backend_buffer_t buf = nullptr;
+                  std::vector<std::pair<ggml_tensor*, ggml_tensor*>> pairs; std::vector<int64_t> ring_pos; bool valid = false; } snap;
+    void snap_take() {
+        if (!snap.ctx) {
+            ggml_init_params ip = {ggml_tensor_overhead() * (m.S.size() * 3 + 4), nullptr, true};
+            snap.ctx = ggml_init(ip);
+            for (Slot& z : m.S) {
+                snap.pairs.push_back({z.conv, ggml_dup_tensor(snap.ctx, z.conv)});
+                if (z.swa) { snap.pairs.push_back({z.k_cache, ggml_dup_tensor(snap.ctx, z.k_cache)}); snap.pairs.push_back({z.v_cache, ggml_dup_tensor(snap.ctx, z.v_cache)}); }
             }
+            snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, m.gpu ? m.gpu : m.cpu);
+            if (!snap.buf) die("--train: cannot allocate the prompt snapshot");
+            std::fprintf(stderr, "[train] prompt snapshot: %.0f MiB\n", ggml_backend_buffer_get_size(snap.buf) / 1048576.0);
+        }
+        for (auto& [src, dst] : snap.pairs) ggml_backend_tensor_copy(src, dst);
+        snap.ring_pos = m.ring_pos;
+        snap.ids = pre_fed;
+        snap.valid = true;
+    }
+    void snap_restore() {
+        for (auto& [src, dst] : snap.pairs) ggml_backend_tensor_copy(dst, src);
+        m.ring_pos = snap.ring_pos;
+        pre_fed = snap.ids;
+    }
+    static bool starts_with(const std::vector<int32_t>& a, const std::vector<int32_t>& p) {
+        return a.size() >= p.size() && std::equal(p.begin(), p.end(), a.begin());
+    }
+    void set_prefix(const std::vector<int32_t>* ids, bool served = true) {
+        if (!ids || ids->empty()) { n_pre = n_pre_swa = 0; swa_cells.clear(); return; }
+        // the shared prompt first: from the snapshot when the engine holds something else past it
+        if (global_prefix && !global_prefix->empty() && starts_with(*ids, *global_prefix)) {
+            size_t c = 0;
+            while (c < pre_fed.size() && c < ids->size() && pre_fed[c] == (*ids)[c]) ++c;
+            const bool rollback = c < pre_fed.size() && c >= global_prefix->size();   // diverges after the prompt
+            const bool fresh = !starts_with(pre_fed, *global_prefix);
+            if (rollback || fresh) {
+                if (snap.valid) snap_restore();
+                else { state_reset(m); pre_fed.clear(); prefill(*global_prefix, served); snap_take(); }
+            }
+        }
+        if ((int64_t) ids->size() + 2 * std::min(a.max_t, 4096) > m.n_ctx) die("--train: a prefix of " + std::to_string(ids->size()) +
+                                                               " tokens needs --max-prefix >= that (context " + std::to_string(m.n_ctx) + ")");
+        size_t common = 0;
+        while (common < pre_fed.size() && common < ids->size() && pre_fed[common] == (*ids)[common]) ++common;
+        if (common < pre_fed.size()) { state_reset(m); pre_fed.clear(); common = 0; }
+        if (common < ids->size()) prefill(*ids, served);
+        n_pre = (int64_t) ids->size();
+        n_pre_swa = std::min<int64_t>(n_pre, h.n_swa - 1);
+        swa_cells.assign((size_t) n_pre_swa, -1);
+        for (int64_t j = 0; j < m.ring; ++j) {
+            const int64_t pos = m.ring_pos[j];
+            if (pos >= n_pre - n_pre_swa && pos < n_pre) swa_cells[(size_t) (pos - (n_pre - n_pre_swa))] = (int32_t) j;
+        }
+        for (int32_t c : swa_cells) if (c < 0) die("--train: a sliding-window prefix position is not in the ring");
+    }
+
+    // feed ids[pre_fed.size():] (pre_fed must be a prefix of ids) through the engine
+    void prefill(const std::vector<int32_t>& ids, bool served) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const int64_t from = (int64_t) pre_fed.size();
+        const bool was = inkling_train_mode();
+        inkling_train_mode() = !served;    // served: the fused serve kernels, as the context is computed at serve time
+        drop_graph(m);
+        std::vector<float> lg;
+        for (int64_t p = from; p < (int64_t) ids.size();) {
+            const int T = chunk_len(m, p, (int64_t) ids.size() - p);
+            forward(m, ids.data() + p, T, p, 1, lg);
+            p += T;
+        }
+        drop_graph(m);
+        inkling_train_mode() = was;
+        pre_fed.assign(ids.begin(), ids.end());
+        prefill_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        prefill_tok += (int64_t) ids.size() - from;
+    }
+
+    void chunk_inputs(G1& gg, Step& st, int T) {
+        // cells: global = the n_pre prefix positions then the window; sliding = the n_pre_swa tail then the window
+        auto mk = [&](int64_t npre, int64_t win, bool swa, ChunkIn& ci) {
+            const int64_t cells = npre + T;
+            std::vector<float> mk_((size_t) cells * T);
+            std::vector<int32_t> rp((size_t) cells * T);
+            for (int t = 0; t < T; ++t)
+                for (int64_t j = 0; j < cells; ++j) {
+                    const int64_t d = (npre + t) - j;   // distance in positions (the tail is contiguous up to the window)
+                    const size_t k = (size_t) t * cells + j;
+                    const bool vis = d >= 0 && (!swa || d < win);
+                    mk_[k] = vis ? 0.0f : -INFINITY;
+                    rp[k] = swa ? (vis ? (int32_t) d : (int32_t) win) : (d >= 0 && d < h.rel_extent ? (int32_t) d : h.rel_extent);
+                }
+            ci.cells = cells;
+            ci.mask = gg.f32(mk_.data(), cells, T); ci.rp = gg.i32(rp.data(), cells, T);
+        };
         ChunkIn cf, cs;
-        cf.cells = cs.cells = cells;
-        cf.mask = gg.f32(mf.data(), cells, T); cf.rp = gg.i32(rf.data(), cells, T);
-        cs.mask = gg.f32(ms.data(), cells, T); cs.rp = gg.i32(rs.data(), cells, T);
+        mk(n_pre, 0, false, cf);
+        mk(n_pre_swa, h.n_swa, true, cs);
         st.ck_full = {cf};
         st.ck_swa = {cs};
     }
     ggml_tensor* tau_input(G1& gg, int T) {   // build()'s log-scaled positions
         std::vector<float> pf(T);
-        for (int t = 0; t < T; ++t) pf[t] = (float) t;
+        for (int t = 0; t < T; ++t) pf[t] = (float) (n_pre + t);   // absolute positions (W9: after the prefix)
         ggml_tensor* posf = gg.f32(pf.data(), T);
         ggml_tensor* tau = ggml_scale_bias(gg.c, posf, 1.0f, 1.0f);
         tau = ggml_log(gg.c, ggml_clamp(gg.c, ggml_scale(gg.c, tau, 1.0f / (float) h.log_floor), 1.0f, INFINITY));
@@ -261,8 +368,26 @@ struct Trainer {
         chunk_inputs(gg, st, T);
         G g{m, h, gg.c, gg.gf, st, T, 0};
         g.train = true;
-        std::vector<float> zc((size_t) (h.n_conv - 1) * h.n_chan(), 0.0f);
-        g.tconv = ggml_reshape_2d(gg.c, gg.f32(zc.data(), h.n_conv - 1, h.n_chan()), h.n_conv - 1, h.n_chan());
+        if (n_pre > 0) {   // W9: the slot's conv state and cached K/V after the prefix (read in place, constants)
+            Slot& z = m.S[(size_t) io.il];
+            g.tconv = ggml_view_2d(gg.c, z.conv, h.n_conv - 1, h.n_chan(), z.conv->nb[1], 0);
+            const int64_t hd = h.hd, nkv = h.n_head_kv;
+            if (!h.swa[io.ip]) {
+                g.tk_pre = ggml_cast(gg.c, ggml_view_3d(gg.c, z.k_cache, hd, nkv, n_pre, z.k_cache->nb[1], z.k_cache->nb[2], 0), GGML_TYPE_F32);
+                g.tv_pre = ggml_cast(gg.c, ggml_view_3d(gg.c, z.v_cache, hd, nkv, n_pre, z.v_cache->nb[1], z.v_cache->nb[2], 0), GGML_TYPE_F32);
+            } else {
+                ggml_tensor* idx = gg.i32(swa_cells.data(), n_pre_swa);
+                auto tail = [&](ggml_tensor* cache) {
+                    ggml_tensor* rows = ggml_get_rows(gg.c, ggml_reshape_2d(gg.c, cache, hd * nkv, cache->ne[2]), idx);   // [hd*nkv, n] f32
+                    return ggml_reshape_3d(gg.c, rows, hd, nkv, n_pre_swa);
+                };
+                g.tk_pre = tail(z.k_cache);
+                g.tv_pre = tail(z.v_cache);
+            }
+        } else {
+            std::vector<float> zc((size_t) (h.n_conv - 1) * h.n_chan(), 0.0f);
+            g.tconv = ggml_reshape_2d(gg.c, gg.f32(zc.data(), h.n_conv - 1, h.n_chan()), h.n_conv - 1, h.n_chan());
+        }
         g.tau = tau_input(gg, T);
         auto in = [&](int id) {
             ggml_tensor* t = ggml_reshape_2d(gg.c, gg.f32(X[id].data(), h.n_embd, T), h.n_embd, T);
@@ -411,6 +536,12 @@ struct Trainer {
 
     // one window: loss, and (grads) the adapter gradients accumulated into ad[*].gA/gB
     double step_window(const Window& w, bool grads) {
+        if (w.prefix) set_prefix(w.prefix.get());
+        else if (global_prefix && !w.context.empty()) {   // the shared prompt + this window's conversation context
+            std::vector<int32_t> full(*global_prefix);
+            full.insert(full.end(), w.context.begin(), w.context.end());
+            set_prefix(&full);
+        } else set_prefix(global_prefix.get());
         const int T = (int) w.ids.size();
         std::vector<std::vector<float>> X;
         const std::vector<float> xf = forward_streams(w.ids, X);
@@ -582,8 +713,13 @@ struct Trainer {
 // --check T: the train graph chain (per-slot graphs, no cache) vs the engine's own forward over the same tokens
 static int gate_check(Trainer& tr, const Window& w0, int T) {
     Model& m = tr.m;
-    std::vector<int32_t> ids(w0.ids.begin(), w0.ids.begin() + std::min<size_t>(T, w0.ids.size()));
+    // --check-prefix P (W9): the first P ids are the prefix (carried engine state), the next T the window
+    const size_t P = (size_t) std::max(0, tr.a.check_prefix);
+    if (P + 2 > w0.ids.size()) die("--check-prefix: the window is too short");
+    std::vector<int32_t> pre(w0.ids.begin(), w0.ids.begin() + P);
+    std::vector<int32_t> ids(w0.ids.begin() + P, w0.ids.begin() + std::min<size_t>(P + T, w0.ids.size()));
     T = (int) ids.size();
+    tr.set_prefix(P ? &pre : nullptr, false);   // the reference (unfused) kernels on both sides
     std::vector<std::vector<float>> X;
     const std::vector<float> xf = tr.forward_streams(ids, X);
     G1 gg(4096);
@@ -595,10 +731,10 @@ static int gate_check(Trainer& tr, const Window& w0, int T) {
         if (FILE* f = std::fopen(lp, "wb")) { std::fwrite(a.data(), 4, a.size(), f); std::fclose(f); }
     }
     if (!tr.a.init_from.empty() && m.lora.empty()) load_lora(m, tr.a.init_from, 1.0f);   // W7: the engine's --lora path
-    state_reset(m);
+    if (!P) state_reset(m);   // with a prefix the engine continues from the state the train side read
     std::vector<float> b;
     std::vector<std::vector<float>> taps;
-    forward(m, ids.data(), T, 0, T, b, &taps);
+    forward(m, ids.data(), T, (int64_t) P, T, b, &taps);
     for (const SlotIO& io : tr.plan) {   // per visit: the train chain's stream vs the engine's l_out
         if ((size_t) io.il >= taps.size() || taps[io.il].empty()) continue;
         const std::vector<float>& x = X[io.out];
@@ -624,7 +760,7 @@ static int gate_check(Trainer& tr, const Window& w0, int T) {
         const double r = std::sqrt(num / std::max(den, 1e-30));
         worst = std::max(worst, r); sum += r; agree += ia == ib;
     }
-    std::printf("CHECK T=%d: logits rel err mean %.3e worst %.3e, top-1 agree %d/%d\n", T, sum / T, worst, agree, T);
+    std::printf("CHECK T=%d prefix %zu: logits rel err mean %.3e worst %.3e, top-1 agree %d/%d\n", T, P, sum / T, worst, agree, T);
     std::fflush(stdout);
     return worst < 1e-2 && agree >= T - 1 ? 0 : 1;
 }
@@ -726,6 +862,10 @@ int inkling_train_main(int argc, char** argv) {
         else if (k == "--check") a.check = std::atoi(v().c_str());
         else if (k == "--init-from") a.init_from = v();
         else if (k == "--resume") a.resume = v();
+        else if (k == "--prefix") a.prefix_file = v();
+        else if (k == "--max-prefix") a.max_prefix = std::atoi(v().c_str());
+        else if (k == "--check-prefix") a.check_prefix = std::atoi(v().c_str());
+        else if (k == "--no-shuffle") a.shuffle = 0;
         else if (k == "--fd") a.fd = 1;
         else if (k == "--overfit") a.overfit = std::atoi(v().c_str());
         else if (a.gguf.empty() && k[0] != '-') a.gguf = k;
@@ -748,14 +888,28 @@ int inkling_train_main(int argc, char** argv) {
     setenv("XOLOTL_INKLING_STACKQ", "0", 1);
     try {
         Model m;
-        m.ubatch = std::max(512, a.max_t);
-        load(m, a.gguf, std::max<int64_t>(4096, a.max_t + 256), a.threads, "", false);
+        m.ubatch = std::max(512, std::min(a.max_t, 4096));   // prefill chunks / check windows (the ring holds n_swa + this)
+        // the engine holds prefixes (prefill chunks) + a check window; windows themselves never enter its cache
+        load(m, a.gguf, std::max<int64_t>(4096, (int64_t) a.max_prefix + std::max(a.check_prefix, 0) + 2 * std::min(a.max_t, 4096) + 512), a.threads, "", false);
         if (ggml_backend_buffer_is_host(m.output->buffer)) die("--train: the head weight is not on the GPU");
         std::vector<Window> tw = load_windows(a.data, a.max_t), ew;
         if (tw.empty()) die("--train: no windows in " + a.data);
         if (!a.eval.empty()) ew = load_windows(a.eval, a.max_t);
         std::fprintf(stderr, "[train] %zu train windows, %zu eval windows\n", tw.size(), ew.size());
         Trainer tr(m, a);
+        if (!a.prefix_file.empty()) {   // {"tokens": [...]} (harness_build*.py prefix.json) or a bare id array
+            std::ifstream pf(a.prefix_file);
+            if (!pf) die("--prefix: cannot read " + a.prefix_file);
+            std::stringstream ss; ss << pf.rdbuf();
+            std::string js = ss.str();
+            std::vector<long long> v;
+            if (!parse_int_array(js, "tokens", v)) {   // a bare array
+                if (!parse_int_array("{\"tokens\": " + js + "}", "tokens", v)) die("--prefix: no token ids in " + a.prefix_file);
+            }
+            tr.global_prefix = std::make_shared<std::vector<int32_t>>(v.begin(), v.end());
+            if ((int64_t) v.size() > a.max_prefix) die("--prefix: " + std::to_string(v.size()) + " tokens; pass --max-prefix >= that");
+            std::fprintf(stderr, "[train] --prefix %s: %zu tokens before every window\n", a.prefix_file.c_str(), v.size());
+        }
         if (!a.init_from.empty()) tr.init_from(a.init_from);
         long start = 0;   // --resume <adapter.gguf>: its weights + "<adapter>.state" (AdamW moments, step); the run continues
         if (!a.resume.empty()) {
@@ -781,14 +935,20 @@ int inkling_train_main(int argc, char** argv) {
             if (ew.empty()) return NAN;
             double s = 0;
             const int n = std::min<int>(a.eval_n, (int) ew.size());
-            for (int i = 0; i < n; ++i) s += tr.step_window(ew[i], false);
+            static const bool each = std::getenv("XOLOTL_INKLING_EVAL_EACH") != nullptr;   // gates: every window's loss
+            for (int i = 0; i < n; ++i) {
+                const double l = tr.step_window(ew[i], false);
+                if (each) std::fprintf(stderr, "[train] eval window %d loss %.9f (prefill %lld tok, %.1f s so far)\n", i, l,
+                                       (long long) tr.prefill_tok, tr.prefill_s);
+                s += l;
+            }
             return s / n;
         };
         if (a.overfit) { a.steps = a.overfit; tr.a.steps = a.overfit; }
         std::mt19937 rng(a.seed);
         std::vector<size_t> order(tw.size());
         for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-        std::shuffle(order.begin(), order.end(), rng);
+        if (a.shuffle) std::shuffle(order.begin(), order.end(), rng);   // --no-shuffle: file order (windows sharing a prefix stay together)
         const double e0 = eval_loss();
         if (std::isfinite(e0)) { std::fprintf(stderr, "[train] step %ld eval %.4f\n", start, e0); met.log(start, {{"eval_loss", e0}}); }
         double first = NAN;
