@@ -56,7 +56,63 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
          ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
          return out;
      }
-@@ -8312,6 +8334,7 @@
+@@ -5690,6 +5712,9 @@
+         }
+ 
+         ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
++        if (type_a == GGML_TYPE_F32 && type_b == GGML_TYPE_F32) {
++            ggml_set_param(b);   // Xolotl: MUL_MAT_ID backward w.r.t. b (frozen experts); F32 only: quantized
++        }                        // experts quantize b to Q8 on the CPU, which makes the FD check noisy
+         ggml_set_name(b, "b");
+ 
+         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+@@ -5734,6 +5759,45 @@
+ };
+ 
+ // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
++// Xolotl (LoRA training): GGML_OP_MUL_MAT_ID_BACK - the activation gradient of mul_mat_id through frozen experts of any
++// type, checked backend vs CPU (the CPU op is checked against finite differences through test_mul_mat_id's grad mode)
++struct test_mul_mat_id_back : public test_case {
++    const ggml_type type_a;
++    const int n_mats;
++    const int n_used;
++    const bool b;   // b was broadcast in the forward (ne11 == 1)
++    const int64_t m, n, k;
++    const bool skip;
++
++    std::string vars() override { return VARS_TO_STR8(type_a, n_mats, n_used, b, m, n, k, skip); }
++
++    double max_nmse_err() override { return 1e-6; }
++
++    test_mul_mat_id_back(ggml_type type_a = GGML_TYPE_F32, int n_mats = 8, int n_used = 2, bool b = false,
++            int64_t m = 32, int64_t n = 32, int64_t k = 32, bool skip = false)
++        : type_a(type_a), n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k), skip(skip) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
++        ggml_set_name(as, "as");
++        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
++        ggml_set_name(ids, "ids");
++        if (n_used != n_mats) {
++            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
++            ggml_set_name(ids, "view_of_ids");
++        }
++        ggml_tensor * g = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n_used, n);
++        ggml_set_name(g, "g");
++        ggml_tensor * out = ggml_mul_mat_id_back(ctx, as, g, ids, b ? 1 : n_used);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        init_mul_mat_id_tensors(ctx, n_mats, skip);
++    }
++};
++
+ struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
+     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
+             int n_mats = 8, int n_used = 2, bool b = false,
+@@ -8312,6 +8376,7 @@
          const std::array<int64_t, 4> ne_a = noncontig_rows ?
              std::array<int64_t, 4>{ ne[1], ne[0], ne[2], ne[3] } : ne;
          ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
@@ -64,7 +120,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
          ggml_set_name(a, "a");
  
          if (noncontig_rows) {
-@@ -8328,6 +8351,10 @@
+@@ -8328,6 +8393,10 @@
  
          return out;
      }
@@ -75,7 +131,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
  };
  
  // GGML_OP_ACC
-@@ -8400,6 +8427,7 @@
+@@ -8400,6 +8469,7 @@
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
@@ -83,7 +139,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
          ggml_set_name(a, "a");
  
          ggml_tensor * out = circular
-@@ -9040,8 +9068,9 @@
+@@ -9040,8 +9110,9 @@
      const ggml_type              type;
      const std::array<int64_t, 4> ne_lhs;
      const std::array<int64_t, 4> ne_rhs;
@@ -94,7 +150,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
  
      uint64_t op_flops(ggml_tensor * t) override {
          GGML_UNUSED(t);
-@@ -9054,9 +9083,10 @@
+@@ -9054,9 +9125,10 @@
  
      test_solve_tri(ggml_type type = GGML_TYPE_F32,
              std::array<int64_t, 4> ne_lhs = { 10, 10, 4, 3 },
@@ -107,7 +163,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne_lhs[0], ne_lhs[1], ne_lhs[2], ne_lhs[3]);
-@@ -9067,7 +9097,7 @@
+@@ -9067,7 +9139,7 @@
          ggml_set_param(b);
          ggml_set_name(b, "b");
  
@@ -116,7 +172,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
          ggml_set_name(out, "out");
  
          return out;
-@@ -9078,6 +9108,15 @@
+@@ -9078,6 +9150,15 @@
              if (strcmp(t->name, "a") == 0) {
                  // note: avoid zeros in the diagonal
                  init_tensor_tril(t, 0.1, 1.0f);
@@ -132,24 +188,33 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
              } else {
                  init_tensor_uniform(t, -1.0f, 1.0f);
              }
-@@ -11551,6 +11590,16 @@
+@@ -11541,6 +11622,25 @@
          }
      }
  
-+    // Xolotl (LoRA training): mul_mat backward through a frozen quantized weight = out_prod(W, dy^T), weight-shaped.
-+    // m 4096 x k 20000 makes the CUDA path dequantize in two row chunks (256 MiB of F32 each).
-+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_XS,
-+                             GGML_TYPE_MXFP4, GGML_TYPE_Q2_K, GGML_TYPE_F16, GGML_TYPE_BF16}) {
-+        for (bool tb : {false, true}) {
-+            test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 1536, 7, 3072, {1, 1}, {1, 1}, tb));
-+            test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 4096, 8, 20000, {1, 1}, {1, 1}, tb));
++    // Xolotl (LoRA training): MUL_MAT_ID_BACK, every expert type in the Inkling XQ file plus the common ones
++    for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
++                        GGML_TYPE_Q2_0, GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
++                        GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL}) {
++        for (bool bc : {false, true}) {
++            test_cases.emplace_back(new test_mul_mat_id_back(t, 16, 4, bc, 96, 37, 256));
 +        }
++        test_cases.emplace_back(new test_mul_mat_id_back(t, 8, 1, false, 64, 9, 256));             // one-hot routing
++        test_cases.emplace_back(new test_mul_mat_id_back(t, 16, 4, false, 64, 21, 512, true));     // skipped ids
++    }
++    // Inkling-sized, the expert types the XQ file really has per tensor: gate_up [2304 -> 2304] with b broadcast,
++    // down [1152 -> 2304] (32-wide blocks only: 1152 is not a multiple of 256)
++    for (ggml_type t : {GGML_TYPE_Q2_0, GGML_TYPE_NVFP4, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
++        test_cases.emplace_back(new test_mul_mat_id_back(t, 128, 8, true,  2304, 64, 2304));
++    }
++    for (ggml_type t : {GGML_TYPE_Q2_0, GGML_TYPE_NVFP4, GGML_TYPE_IQ4_NL}) {
++        test_cases.emplace_back(new test_mul_mat_id_back(t, 128, 8, false, 2304, 64, 1152));
 +    }
 +
-     // ne2 sweep to cover the cublasSgemmStridedBatched path (dps2 == 1, ne2 > 1)
-     for (int64_t ne2 : {1, 8, 16, 32}) {
-         test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
-@@ -12028,6 +12077,9 @@
+     // Xolotl (LoRA training): mul_mat backward through a frozen quantized weight = out_prod(W, dy^T), weight-shaped.
+     // m 4096 x k 20000 makes the CUDA path dequantize in two row chunks (256 MiB of F32 each).
+     for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_XS,
+@@ -12028,6 +12128,9 @@
      test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 256, 1, 8, 16 }));
  
      test_cases.emplace_back(new test_solve_tri());
