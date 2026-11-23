@@ -12,6 +12,11 @@
 
 ## Latest
 
+- **24 Nov** - **Inkling-2-Mini LoRA training behind the real 23K-token harness prompt**: the prompt's per-slot K/V and
+  conv state are carried into training (bit for bit with the engine up to 23K tokens), snapshotted once and reused by
+  every window. A coding-weighted run drops held-out loss **-15.6 % in 300 steps**; on LiveCodeBench-20 the adapter is
+  level with base within noise (13 vs 15 of 20), so the data side is the open question.
+  [LORA_TRAINING.md](docs/LORA_TRAINING.md#inkling-2-mini-the-whole-model-on-one-4090) · [CHANGELOG](docs/xolotl/CHANGELOG.md#inkling-2-mini-lora-training-behind-the-real-harness-prompt-prompt-carry-bit-for-bit-with-the-engine-24-nov).
 - **23 Nov, night** - **LoRA training for Inkling-2-Mini on one RTX 4090, the whole model**: `xolotl-inkling --train`
   puts adapters on all 24 layers and trains through the full looped forward on the served quantized weights; on our agent
   transcripts held-out loss drops **-16.7 % in 100 steps** (-18.8 % at 400). Checkpoints every N steps with exact

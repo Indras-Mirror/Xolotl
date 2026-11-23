@@ -8,6 +8,22 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Inkling-2-Mini LoRA training behind the real harness prompt: prompt carry, bit for bit with the engine (24 Nov)
+
+- **Prompt carry** (`--prefix prompt.json`, or a per-window `"prefix"` / `"context"`): the context before a window runs
+  through the inference engine once; each slot visit attends to that slot's cached K/V and starts from its conv state.
+  The state after the shared prompt is snapshotted, so windows restore it instead of re-reading it, and a growing
+  conversation prefills only its new tokens. `tools/train/harness_subwindows.py` cuts windows to fit behind the prompt.
+- **Gate:** `--check T --check-prefix P` matches the engine bit for bit at every prefix tried, up to the full
+  23,061-token harness prompt (top-1 64/64). The first version drifted by 3-6e-2: not wrong state, but Inkling's
+  f16-accumulated attention product depends on the cell layout, so the trainer now pads its cells to the engine's
+  256-multiple and the gate reads sliding slots in the engine's order.
+- **Harness r2:** 22,921 coding-weighted sub-windows behind the 23K prompt, held-out loss **1.382 -> 1.166 (-15.6 %)**
+  in 300 steps (87 min). LiveCodeBench-20 with the adapter: 13/20 vs base 15/20, inside the noise: lower transcript loss
+  is not yet better coding. How-to and numbers: [docs/LORA_TRAINING.md](../LORA_TRAINING.md#inkling-2-mini-the-whole-model-on-one-4090).
+- `harness_build_inkling.py --mask-errors`: leave out of the loss an assistant turn whose tool call came back as an error.
+- Known limit: one training attention tensor spans at most 65,535 cells, so prefix + window stays under ~65K for now.
+
 ### LoRA training for Inkling-2-Mini, the whole model on one RTX 4090, and `--lora` at serve time (23 Nov)
 
 - **`xolotl-inkling --train`** trains rank-16 LoRA adapters on every layer of Inkling-2-Mini (attention q / k / v /

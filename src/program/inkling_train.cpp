@@ -87,7 +87,7 @@ static void addto(std::vector<float>& a, const std::vector<float>& b) {
 }
 
 struct Args {
-    std::string gguf, data, eval, out = "/media/Crucial1TB/xolotl-train/runs", run = "inkling-lora", save, targets = "q,k,v,o,gate,rel", init_from, resume, prefix_file;
+    std::string gguf, data, eval, out = "runs", run = "inkling-lora", save, targets = "q,k,v,o,gate,rel", init_from, resume, prefix_file;
     int rank = 16, steps = 0, warmup = 10, max_t = 2048, threads = 8, eval_every = 0, eval_n = 16, save_every = 0, seed = 0, ce_chunk = 256;
     int check = 0, fd = 0, overfit = 0, check_prefix = 0, max_prefix = 0, shuffle = 1;
     float alpha = 32.0f, lr = 1e-4f, clip = 1.0f, init_b = 0.0f, lr_min = 0.1f;
@@ -130,7 +130,7 @@ static std::vector<Window> load_windows(const std::string& path, int max_t) {
         if (line.empty() || !parse_int_array(line, "ids", ids)) continue;
         if (!parse_int_array(line, "mask", mask) || mask.size() != ids.size()) die("--train: a window without a matching mask in " + path);
         Window x;
-        if (parse_int_array(line, "prefix", pre) && !pre.empty()) {   // a per-window context (Elixir requests)
+        if (parse_int_array(line, "prefix", pre) && !pre.empty()) {   // a per-window context (an agent request: the whole conversation before the reply)
             if (!last_pre || last_pre->size() != pre.size() || !std::equal(pre.begin(), pre.end(), last_pre->begin(),
                                                                              [](long long a, int32_t b) { return a == b; })) {
                 auto v = std::make_shared<std::vector<int32_t>>(pre.begin(), pre.end());

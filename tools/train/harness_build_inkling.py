@@ -149,6 +149,8 @@ def main():
     ap.add_argument("--sources", default="quetza,quetza-conductor,claude-code,claude-data")
     ap.add_argument("--heldout-frac", type=float, default=0.02)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--mask-errors", action="store_true",
+                    help="mask an assistant turn whose tool call came back is_error (failed command, rejected edit, denial)")
     ap.add_argument("--limit", type=int, default=0, help="stop after N conversations")
     ap.add_argument("--heldout-only", action="store_true",
                     help="render ONLY the held-out conversations (eval windows; use a different --out)")
@@ -182,7 +184,7 @@ def main():
           flush=True)
 
     st = {"convs_seen": 0, "convs_used": 0, "convs_heldout": 0, "windows": 0, "tokens": 0, "loss_tokens": 0,
-          "turns_trained": 0, "turns_masked_tool": 0, "turns_masked_producer": 0, "first_stripped": 0,
+          "turns_trained": 0, "turns_masked_tool": 0, "turns_masked_producer": 0, "turns_masked_error": 0, "first_stripped": 0,
           "split_mismatch": 0, "prefix_mismatch": 0, "render_error": 0, "window_dropped_over_cap": 0,
           "window_no_span": 0, "prefix_n": len(prefix_ids), "heldout_frac": a.heldout_frac, "seed": a.seed, "heldout_only": a.heldout_only,
           "by_producer": {}, "heldout_ids": []}
@@ -236,6 +238,17 @@ def main():
                 return "tool"
             return None
 
+        def errored(j):   # rest[j] is an assistant turn: did one of its tool calls come back is_error in rest[j + 1]?
+            if not a.mask_errors or j + 1 >= len(rest):
+                return None
+            ids = {blk.get("id") for blk in rest[j]["content"] if blk["type"] == "tool_use"}
+            if not ids:
+                return None
+            for blk in rest[j + 1]["content"]:
+                if blk.get("type") == "tool_result" and blk.get("is_error") and (blk.get("tool_use_id") in ids or "call" in ids):
+                    return "error"
+            return None
+
         try:
             first, rest = conv[0], conv[1:]
             first_text, _ = b.render([first])
@@ -282,7 +295,7 @@ def main():
                     for k in range(1, len(msgs)):
                         if msgs[k]["role"] != "assistant":
                             continue
-                        why = trainable(msgs[k])
+                        why = trainable(msgs[k]) or errored(start + k - 1)
                         if why:
                             st["turns_masked_" + why] += 1
                             continue
