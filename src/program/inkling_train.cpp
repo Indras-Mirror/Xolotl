@@ -247,6 +247,7 @@ struct Trainer {
     std::shared_ptr<const std::vector<int32_t>> global_prefix;   // --prefix: one context for every window (harness prompt)
     std::vector<int32_t> pre_fed;            // the ids the engine's state holds
     int64_t n_pre = 0, n_pre_swa = 0;        // the current window's prefix length / its visible sliding tail
+    bool swa_full = false;                   // --check gate: sliding slots read the whole prefix (the engine's layout)
     std::vector<int32_t> swa_cells;          // ring cells of the sliding tail, in position order
     double prefill_s = 0;
     int64_t prefill_tok = 0;
@@ -300,7 +301,11 @@ struct Trainer {
         if (common < pre_fed.size()) { state_reset(m); pre_fed.clear(); common = 0; }
         if (common < ids->size()) prefill(*ids, served);
         n_pre = (int64_t) ids->size();
-        n_pre_swa = std::min<int64_t>(n_pre, h.n_swa - 1);
+        // sliding slots read the last n_swa-1 prefix positions; the --check gate (swa_full) reads every prefix cell,
+        // the far ones masked, in the engine's own cell order: the engine's f16-accumulated attention product depends
+        // on where masked cells sit, so only the identical layout is bit-exact (one masked head cell: 2.9e-3)
+        n_pre_swa = swa_full ? n_pre : std::min<int64_t>(n_pre, h.n_swa - 1);
+        if (swa_full && n_pre + std::min(a.max_t, 4096) > m.ring) die("--check-prefix: the sliding ring is too small for the gate layout");
         swa_cells.assign((size_t) n_pre_swa, -1);
         for (int64_t j = 0; j < m.ring; ++j) {
             const int64_t pos = m.ring_pos[j];
@@ -329,10 +334,11 @@ struct Trainer {
         prefill_tok += (int64_t) ids.size() - from;
     }
 
+    static int64_t cells_of(int64_t npre, int T) { return (npre + T + 255) / 256 * 256; }
     void chunk_inputs(G1& gg, Step& st, int T) {
         // cells: global = the n_pre prefix positions then the window; sliding = the n_pre_swa tail then the window
         auto mk = [&](int64_t npre, int64_t win, bool swa, ChunkIn& ci) {
-            const int64_t cells = npre + T;
+            const int64_t cells = cells_of(npre, T);   // npre + T, padded with masked cells (j > npre + t) like the engine
             std::vector<float> mk_((size_t) cells * T);
             std::vector<int32_t> rp((size_t) cells * T);
             for (int t = 0; t < T; ++t)
@@ -387,6 +393,14 @@ struct Trainer {
         } else {
             std::vector<float> zc((size_t) (h.n_conv - 1) * h.n_chan(), 0.0f);
             g.tconv = ggml_reshape_2d(gg.c, gg.f32(zc.data(), h.n_conv - 1, h.n_chan()), h.n_conv - 1, h.n_chan());
+        }
+        {   // masked zero cells up to the engine's 256-multiple (see G::tpad)
+            const int64_t npre = h.swa[io.ip] ? n_pre_swa : n_pre;
+            const int64_t pad = cells_of(npre, T) - (npre + T);
+            if (pad > 0) {
+                std::vector<float> zp((size_t) h.hd * h.n_head_kv * pad, 0.0f);
+                g.tpad = ggml_reshape_3d(gg.c, gg.f32(zp.data(), h.hd, h.n_head_kv, pad), h.hd, h.n_head_kv, pad);
+            }
         }
         g.tau = tau_input(gg, T);
         auto in = [&](int id) {
@@ -719,6 +733,7 @@ static int gate_check(Trainer& tr, const Window& w0, int T) {
     std::vector<int32_t> pre(w0.ids.begin(), w0.ids.begin() + P);
     std::vector<int32_t> ids(w0.ids.begin() + P, w0.ids.begin() + std::min<size_t>(P + T, w0.ids.size()));
     T = (int) ids.size();
+    tr.swa_full = !std::getenv("XOLOTL_INKLING_CHECK_TAIL");   // =1: the training layout (sliding tail), to compare in f32
     tr.set_prefix(P ? &pre : nullptr, false);   // the reference (unfused) kernels on both sides
     std::vector<std::vector<float>> X;
     const std::vector<float> xf = tr.forward_streams(ids, X);
@@ -889,8 +904,17 @@ int inkling_train_main(int argc, char** argv) {
     try {
         Model m;
         m.ubatch = std::max(512, std::min(a.max_t, 4096));   // prefill chunks / check windows (the ring holds n_swa + this)
+        // --check-prefix: the gate's sliding slots read the whole prefix in ring order, so the ring must hold prefix + window
+        // (load() sizes the ring from ubatch; the prefill chunks keep the normal ubatch, restored after the load)
+        const int ub0 = m.ubatch;
+        if (a.check && a.check_prefix > 0) m.ubatch = std::max<int>(m.ubatch, a.check_prefix + std::min(a.max_t, 4096));
         // the engine holds prefixes (prefill chunks) + a check window; windows themselves never enter its cache
         load(m, a.gguf, std::max<int64_t>(4096, (int64_t) a.max_prefix + std::max(a.check_prefix, 0) + 2 * std::min(a.max_t, 4096) + 512), a.threads, "", false);
+        m.ubatch = ub0;
+        if (a.check && a.check_prefix > 0) {   // gate: short prefill chunks (few attention chunks a slot over the big ring) and a
+            m.ubatch = std::min(ub0, 1024);     // budget that keeps the check window's attention one softmax, like the train side
+            m.attn_budget = std::max<int64_t>(m.attn_budget, ((int64_t) a.check_prefix + a.check + 255) / 256 * 256 * a.check * 32);
+        }
         if (ggml_backend_buffer_is_host(m.output->buffer)) die("--train: the head weight is not on the GPU");
         std::vector<Window> tw = load_windows(a.data, a.max_t), ew;
         if (tw.empty()) die("--train: no windows in " + a.data);

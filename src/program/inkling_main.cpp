@@ -1380,6 +1380,7 @@ struct G {                     // graph-building context
     bool train = false;
     ggml_tensor* tconv = nullptr;                        // [n_conv-1, n_chan], the slot's conv history
     ggml_tensor *tk_pre = nullptr, *tv_pre = nullptr;    // [hd, nkv, n_pre] carried K (clipped) / V (normed), or null
+    ggml_tensor *tpad = nullptr;   // --train: [hd, nkv, n] zero cells after the window (masked), so the cell count is the engine's 256-multiple
     const std::unordered_map<const ggml_tensor*, Lora>* lora = nullptr;
     float lora_scale = 1.0f;
     ggml_tensor* fixed_ids = nullptr;    // train gates: replay these top-k ids [k, T] (frozen routing = a smooth loss)
@@ -1859,6 +1860,9 @@ struct G {                     // graph-building context
             ggml_tensor* Ka = Kc;   // [hd, nkv, T] (clipped)
             ggml_tensor* Va = Vc;   // [hd, nkv, T] (normed)
             if (tk_pre) { Ka = ggml_concat(c, tk_pre, Ka, 2); Va = ggml_concat(c, tv_pre, Va, 2); }
+            // pad to the engine's cell layout (a multiple of 256, masked): a ragged cell count makes the f16 attention
+            // products take another kernel / reduction blocking than the engine's, which broke --check-prefix exactness
+            if (tpad) { Ka = ggml_concat(c, Ka, tpad, 2); Va = ggml_concat(c, Va, tpad, 2); }
             GGML_ASSERT(Ka->ne[2] == ci.cells && Va->ne[2] == ci.cells);
             // XOLOTL_INKLING_TRAIN_KV16=1 (the --check gate): K/V as f16 tensors, so both attention products run the cache path's precision
             static const bool kv16 = std::getenv("XOLOTL_INKLING_TRAIN_KV16") != nullptr;
@@ -1873,6 +1877,8 @@ struct G {                     // graph-building context
             kq = ggml_soft_max_ext(c, kq, mask_h, 1.0f / std::sqrt((float) hd), 0.0f);
             ggml_soft_max_add_sinks(kq, m.zsink);
             ggml_tensor* at = ggml_mul_mat(c, vt, kq);                                      // [hd, T, nh]
+            static const bool at32 = std::getenv("XOLOTL_INKLING_TRAIN_ATTN_F32") != nullptr;   // f32 accumulation (layout-order test)
+            if (at32) ggml_prec_set_acc(at, GGML_PREC_F32);
             o = ggml_cont_2d(c, ggml_permute(c, at, 0, 2, 1, 3), (int64_t) hd * nh, T);
         }
         if (!o && pattn_use(m, (int) T) && kst && vst && y.rel_bias_pad && kv_fused_type(z.k_cache->type) && kv_fused_type(z.v_cache->type)) {
