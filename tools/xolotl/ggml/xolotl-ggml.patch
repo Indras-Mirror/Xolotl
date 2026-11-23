@@ -1,5 +1,5 @@
 diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
-index 1cd81ee..f9d6602 100644
+index 1cd81eeae..f9d660259 100644
 --- a/ggml/include/ggml-cuda.h
 +++ b/ggml/include/ggml-cuda.h
 @@ -24,6 +24,35 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
@@ -1590,7 +1590,7 @@ index 3c5bea5f4..89e759fb2 100644
 +
 +void ggml_cuda_op_dsv41_kv_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index aff687a..48ee6af 100644
+index aff687a9a..48ee6af93 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -764,6 +764,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -2893,7 +2893,7 @@ index 33936acae..cb6ff367c 100644
                  }
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index ed8554b14..0884baa55 100644
+index ed8554b14..2c873827f 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1093,6 +1093,15 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -3209,7 +3209,27 @@ index ed8554b14..0884baa55 100644
              }
          } break;
          case GGML_OP_SQR: {
-@@ -7048,7 +7282,9 @@ static void ggml_compute_backward(
+@@ -6991,6 +7225,19 @@ static void ggml_compute_backward(
+                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, grad, src0, eps));
+             }
+         } break;
++        case GGML_OP_L2_NORM: {     // Xolotl: y = x / max(|x|, eps): dx = (g - y <y,g> [|x| > eps]) / max(|x|, eps)
++            if (src0_needs_grads) {
++                const float eps = ggml_get_op_params_f32(tensor, 0);
++                struct ggml_tensor * x0  = ggml_is_contiguous(src0) ? src0 : ggml_cont(ctx, src0);
++                struct ggml_tensor * nrm = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, x0)));
++                struct ggml_tensor * dot = ggml_sum_rows(ctx, ggml_mul(ctx, tensor, grad));
++                dot = ggml_mul(ctx, dot, ggml_step(ctx, ggml_scale_bias(ctx, nrm, 1.0f, -eps)));
++                struct ggml_tensor * num = ggml_sub(ctx, ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad), ggml_mul(ctx, tensor, dot));
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, num, ggml_clamp(ctx, nrm, eps, INFINITY)));
++            }
++        } break;
++        case GGML_OP_FILL: {        // Xolotl: the output is a constant, src0 takes no gradient
++        } break;
+         case GGML_OP_MUL_MAT: {
+             // https://cs231n.github.io/optimization-2/#staged
+             // # forward pass
+@@ -7048,7 +7295,9 @@ static void ggml_compute_backward(
              if (src0_needs_grads) {
                  float s;
                  memcpy(&s, tensor->op_params, sizeof(float));
@@ -3220,7 +3240,7 @@ index ed8554b14..0884baa55 100644
              }
          } break;
          case GGML_OP_SET: {
-@@ -7094,10 +7330,11 @@ static void ggml_compute_backward(
+@@ -7094,10 +7343,11 @@ static void ggml_compute_backward(
              // same as cpy
              if (src0_needs_grads) {
                  GGML_ASSERT(!cgraph->grads[isrc0] || ggml_is_contiguous(cgraph->grads[isrc0]));
@@ -3234,7 +3254,7 @@ index ed8554b14..0884baa55 100644
              }
          } break;
          case GGML_OP_RESHAPE: {
-@@ -7145,12 +7382,14 @@ static void ggml_compute_backward(
+@@ -7145,12 +7395,14 @@ static void ggml_compute_backward(
                  axb[axis1] = 1;
                  axb[axis2] = 2;
                  axb[axis3] = 3;
@@ -3251,7 +3271,7 @@ index ed8554b14..0884baa55 100644
              }
          } break;
          case GGML_OP_GET_ROWS: {
-@@ -7161,6 +7400,12 @@ static void ggml_compute_backward(
+@@ -7161,6 +7413,12 @@ static void ggml_compute_backward(
                  // noop
              }
          } break;
@@ -3264,7 +3284,7 @@ index ed8554b14..0884baa55 100644
          case GGML_OP_DIAG_MASK_INF: {
              if (src0_needs_grads) {
                  /* ggml_diag_mask_inf_impl() shouldn't be here */
-@@ -7270,6 +7515,12 @@ static void ggml_compute_backward(
+@@ -7270,6 +7528,18 @@ static void ggml_compute_backward(
                          ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, grad, src0));
                      }
                  } break;
@@ -3274,10 +3294,16 @@ index ed8554b14..0884baa55 100644
 +                            ggml_mul(ctx, grad, ggml_mul(ctx, tensor, ggml_scale_bias(ctx, tensor, -1.0f, 1.0f))));
 +                    }
 +                } break;
++                case GGML_UNARY_OP_TANH: {      // Xolotl: d tanh = 1 - y^2
++                    if (src0_needs_grads) {
++                        ggml_add_or_set(ctx, cgraph, isrc0,
++                            ggml_mul(ctx, grad, ggml_scale_bias(ctx, ggml_sqr(ctx, tensor), -1.0f, 1.0f)));
++                    }
++                } break;
                  case GGML_UNARY_OP_EXP: {
                      if (src0_needs_grads) {
                          ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, tensor, grad));
-@@ -7309,11 +7560,101 @@ static void ggml_compute_backward(
+@@ -7309,11 +7579,101 @@ static void ggml_compute_backward(
                          ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
                      }
                  } break;
@@ -3379,7 +3405,15 @@ index ed8554b14..0884baa55 100644
          case GGML_OP_NONE: {
              // noop
          } break;
-@@ -7494,6 +7835,17 @@ void ggml_build_backward_expand(
+@@ -7476,6 +7836,7 @@ void ggml_build_backward_expand(
+             // gradients in node->src[0] for one reason or another have no effect on output gradients
+             case GGML_OP_IM2COL:      // only used for its shape
+             case GGML_OP_IM2COL_BACK: // same as IM2COL
++            case GGML_OP_FILL:        // Xolotl: overwritten with a constant, only used for its shape
+                 ignore_src[0] = true;
+                 break;
+             case GGML_OP_UNARY: {
+@@ -7494,6 +7855,17 @@ void ggml_build_backward_expand(
                  ignore_src[1] = true;
                  break;
  

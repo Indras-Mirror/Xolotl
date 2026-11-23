@@ -1,8 +1,53 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index fe3a67c64..0a55046fd 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -4723,6 +4723,8 @@ struct test_ssm_conv : public test_case {
+@@ -2117,7 +2117,8 @@
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         const bool grad_supported = op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_NEG ||
+             op == GGML_UNARY_OP_STEP || op == GGML_UNARY_OP_RELU || op == GGML_UNARY_OP_SILU ||
+-            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS;
++            op == GGML_UNARY_OP_EXPM1 || op == GGML_UNARY_OP_SOFTPLUS ||
++            op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_SIGMOID;   // Xolotl: Inkling training
+ 
+         ggml_tensor * a;
+         if (v & 1) {
+@@ -2151,6 +2152,10 @@
+     void initialize_tensors(ggml_context * ctx) override {
+         float min = -150.f;
+         float max =  150.f;
++        if (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_SIGMOID) {   // Xolotl: keep the slope away from 0 for the grad check
++            min = -3.f;
++            max =  3.f;
++        }
+ 
+         // Keep FP16 exp/expm1 inputs in-range so all backends stay finite instead of
+         // disagreeing on whether overflow saturates to max-F16 or produces +inf.
+@@ -2166,9 +2171,24 @@
+     }
+ 
+     float grad_eps() override {
++        if (op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_SIGMOID) {
++            return 1e-1f;
++        }
+         return 15.0f;
+     }
+ 
++    bool grad_precise() override {   // Xolotl: 4-point FD for the smooth ops (2-point at 1e-2 hits f32 rounding on 5K rows)
++        return op == GGML_UNARY_OP_TANH || op == GGML_UNARY_OP_SIGMOID;
++    }
++
++    // Xolotl: the grad check's loss is an f32 SUM over 2-5K outputs; for sigmoid (all > 0) the sum reaches ~2.5K and its
++    // rounding sets a measured MAA floor of up to 6.3e-3 (tanh: 3e-4). A wrong rule scores >= 0.1, so these still gate.
++    double max_maa_err() override {
++        if (op == GGML_UNARY_OP_SIGMOID) return 1e-2;
++        if (op == GGML_UNARY_OP_TANH)    return 1e-3;
++        return test_case::max_maa_err();
++    }
++
+     std::vector<float> grad_expect() override {
+         if (op == GGML_UNARY_OP_ABS) {
+             return {-1.0f, 1.0f};
+@@ -4723,6 +4743,8 @@
      ggml_tensor * build_graph(ggml_context * ctx) override {
          ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
          ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
@@ -11,7 +56,26 @@ index fe3a67c64..0a55046fd 100644
          ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
          return out;
      }
-@@ -8400,6 +8402,7 @@ struct test_pad : public test_case {
+@@ -8312,6 +8334,7 @@
+         const std::array<int64_t, 4> ne_a = noncontig_rows ?
+             std::array<int64_t, 4>{ ne[1], ne[0], ne[2], ne[3] } : ne;
+         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
++        ggml_set_param(a);   // Xolotl: L2_NORM backward
+         ggml_set_name(a, "a");
+ 
+         if (noncontig_rows) {
+@@ -8328,6 +8351,10 @@
+ 
+         return out;
+     }
++
++    float grad_eps() override {   // Xolotl: the default 0.1 step leaves ~1e-4 of FD curvature error on |x| ~ 4.6 rows
++        return 2e-2f;
++    }
+ };
+ 
+ // GGML_OP_ACC
+@@ -8400,6 +8427,7 @@
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
@@ -19,7 +83,7 @@ index fe3a67c64..0a55046fd 100644
          ggml_set_name(a, "a");
  
          ggml_tensor * out = circular
-@@ -9040,8 +9043,9 @@ struct test_solve_tri : public test_case {
+@@ -9040,8 +9068,9 @@
      const ggml_type              type;
      const std::array<int64_t, 4> ne_lhs;
      const std::array<int64_t, 4> ne_rhs;
@@ -30,7 +94,7 @@ index fe3a67c64..0a55046fd 100644
  
      uint64_t op_flops(ggml_tensor * t) override {
          GGML_UNUSED(t);
-@@ -9054,9 +9058,10 @@ struct test_solve_tri : public test_case {
+@@ -9054,9 +9083,10 @@
  
      test_solve_tri(ggml_type type = GGML_TYPE_F32,
              std::array<int64_t, 4> ne_lhs = { 10, 10, 4, 3 },
@@ -43,7 +107,7 @@ index fe3a67c64..0a55046fd 100644
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne_lhs[0], ne_lhs[1], ne_lhs[2], ne_lhs[3]);
-@@ -9067,7 +9072,7 @@ struct test_solve_tri : public test_case {
+@@ -9067,7 +9097,7 @@
          ggml_set_param(b);
          ggml_set_name(b, "b");
  
@@ -52,7 +116,7 @@ index fe3a67c64..0a55046fd 100644
          ggml_set_name(out, "out");
  
          return out;
-@@ -9078,6 +9083,15 @@ struct test_solve_tri : public test_case {
+@@ -9078,6 +9108,15 @@
              if (strcmp(t->name, "a") == 0) {
                  // note: avoid zeros in the diagonal
                  init_tensor_tril(t, 0.1, 1.0f);
@@ -68,7 +132,7 @@ index fe3a67c64..0a55046fd 100644
              } else {
                  init_tensor_uniform(t, -1.0f, 1.0f);
              }
-@@ -11541,6 +11555,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11551,6 +11590,16 @@
          }
      }
  
@@ -85,7 +149,7 @@ index fe3a67c64..0a55046fd 100644
      // ne2 sweep to cover the cublasSgemmStridedBatched path (dps2 == 1, ne2 > 1)
      for (int64_t ne2 : {1, 8, 16, 32}) {
          test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32,
-@@ -12018,6 +12042,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -12028,6 +12077,9 @@
      test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 256, 1, 8, 16 }));
  
      test_cases.emplace_back(new test_solve_tri());
