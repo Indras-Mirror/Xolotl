@@ -37,8 +37,8 @@ coding/harness adapter.
 | W2 | TANH / L2_NORM backward, FILL ignore-src | **DONE** e54d371d2 (grad gates CPU + CUDA, negative control) |
 | W1 | `GGML_OP_MUL_MAT_ID_BACK` (dX through frozen experts), CPU + CUDA | **DONE** 23 Nov (gates below) |
 | W3 | ggml patch hygiene (train tree == patch) | done with W2/W1 (patch regenerated from the train tree) |
-| W4 | `train` variant of `G`/`layer()` | next |
-| W5 | per-slot VJP trainer | |
+| W4 | `train` variant of `G`/`layer()` | **DONE (WIP commit)** - `--check 64` bit-exact vs inference with f16 K/V |
+| W5 | per-slot VJP trainer (`src/program/inkling_train.cpp`, `xolotl-inkling --train`) | written, compiles; `--fd` gate in progress (needed batched GET_ROWS_BACK + softmax mask grad) |
 | W6 | gates: train graph == inference graph (T=64, rel err < 1e-3); per-component FD + NeMo oracle; directional FD over all adapters (eps 0.1); 20-step overfit loss drop; every adapter gets a non-zero grad | |
 | W7 | adapter loading in `xolotl-inkling` | |
 | W8 | throughput / memory tuning | |
@@ -70,6 +70,16 @@ Experts are frozen (the backward asserts no gradient is asked for `as`); ids out
   CUDA forward is not exact enough for FD at 1e-4. The chain that proves the CUDA backward is CPU-backward == FD
   plus CUDA-backward == CPU-backward.
 - Residual: no timing yet (`perf` mode only runs its own case list); measure inside a real step (W8).
+
+### W4/W5 status (23 Nov evening) - see ~/.quetza-data/RESUME-2026-11-23-INKLING-TRAIN-W5.md
+
+- `--check 64`: per-slot streams + logits **bit-exact** (0.000 rel err, top-1 64/64) vs the engine's forward when
+  `XOLOTL_INKLING_TRAIN_KV16=1` (f16 K/V operands as the cache path); f32 K/V (the training default) differs by the
+  engine's f16 attention rounding only (logits mean 4.3e-2, top-1 61/64).
+- New ggml rules needed by the full graph: batched GET_ROWS_BACK (relative-bias gather, router weights; CPU loop +
+  CUDA atomics kernel; grad cases pass CPU + CUDA) and the softmax MASK gradient (the relative bias is the mask:
+  dm = softmax_back(dy) at scale 1, repeat_back over broadcast dims). New test `test_soft_max_grad` (output op MUL ->
+  run with `-o MUL`): result pending at handoff.
 
 ## Rules
 

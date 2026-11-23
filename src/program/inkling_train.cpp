@@ -1,0 +1,692 @@
+// xolotl-inkling --train: LoRA training of Inkling-2-Mini on the served (quantised) GGUF, one GPU.
+// Included at the end of inkling_main.cpp (it uses Model, G, load(), forward(), state_reset()).
+//
+// The model is a stream DAG: every [n_embd, T] stream tensor (the embedding, each slot visit's output) gets an id on
+// the host. A slot visit reads its input stream, the depth-bank blocks before it and, in loop passes 2+, the previous
+// pass's bank and output. Training = forward every visit (no grad) keeping the streams on the host, the head CE in
+// position chunks, then one VJP graph per visit in reverse order (surrogate loss sum(out * g_out)) whose input
+// gradients are ADDED to the producers' accumulators - every consumer of a stream runs after its producer, so a
+// producer's gradient is complete when it is reached. Adapter gradients add over the three loop visits.
+// Design + gates: docs/train/INKLING_TRAIN_PLAN.md.
+
+#include "../../tools/train/lora_gguf.hpp"
+#include "../../tools/train/metrics.hpp"
+
+#include <random>
+
+namespace {   // the engine's types live in an anonymous namespace too
+namespace itrain {
+
+using xolotl::train::LoraTensorPair;
+
+// ---- one graph on the GPU backend: a no-alloc context, host inputs uploaded after allocation (QFN trainer's G1) -
+static ggml_gallocr_t g_alloc = nullptr;
+static size_t g_alloc_peak = 0;
+struct G1 {
+    ggml_context* c = nullptr;
+    ggml_cgraph* gf = nullptr;
+    std::vector<std::pair<ggml_tensor*, std::vector<uint8_t>>> up;
+    explicit G1(size_t n_nodes = 1 << 16) {
+        ggml_init_params ip = {ggml_tensor_overhead() * (n_nodes * 2) + ggml_graph_overhead_custom(n_nodes, true), nullptr, true};
+        c = ggml_init(ip);
+        gf = ggml_new_graph_custom(c, n_nodes, true);
+    }
+    ~G1() { if (c) ggml_free(c); }
+    G1(const G1&) = delete;
+    ggml_tensor* f32(const float* d, int64_t n0, int64_t n1 = 1, int64_t n2 = 1) {
+        ggml_tensor* t = ggml_new_tensor_3d(c, GGML_TYPE_F32, n0, n1, n2);
+        ggml_set_input(t);
+        up.emplace_back(t, std::vector<uint8_t>((const uint8_t*) d, (const uint8_t*) d + ggml_nbytes(t)));
+        return t;
+    }
+    ggml_tensor* i32(const int32_t* d, int64_t n0, int64_t n1 = 1) {
+        ggml_tensor* t = ggml_new_tensor_2d(c, GGML_TYPE_I32, n0, n1);
+        ggml_set_input(t);
+        up.emplace_back(t, std::vector<uint8_t>((const uint8_t*) d, (const uint8_t*) d + ggml_nbytes(t)));
+        return t;
+    }
+    // grads_of: tensors whose gradient is read back after the compute
+    void run(ggml_backend_t be, ggml_tensor* loss, const std::vector<ggml_tensor*>& outs, const std::vector<ggml_tensor*>& grads_of = {}) {
+        for (ggml_tensor* o : outs) if (o) { ggml_set_output(o); ggml_build_forward_expand(gf, o); }
+        if (loss) {
+            ggml_set_loss(loss);
+            ggml_build_forward_expand(gf, loss);
+            ggml_build_backward_expand(c, gf, nullptr);
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i)
+                if (ggml_tensor* acc = ggml_graph_get_grad_acc(gf, ggml_graph_node(gf, i))) ggml_set_input(acc);
+            for (ggml_tensor* t : grads_of) {
+                if (ggml_tensor* acc = ggml_graph_get_grad_acc(gf, t)) ggml_set_input(acc);
+                if (ggml_tensor* gr = ggml_graph_get_grad(gf, t)) ggml_set_output(gr);
+            }
+        }
+        if (!g_alloc) g_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+        if (!ggml_gallocr_alloc_graph(g_alloc, gf)) die("--train: graph allocation failed (VRAM)");
+        const size_t bs = ggml_gallocr_get_buffer_size(g_alloc, 0);
+        if (bs > g_alloc_peak) {
+            g_alloc_peak = bs;
+            std::fprintf(stderr, "[train] compute buffer grew to %.2f GiB (%d nodes)\n", bs / 1073741824.0, ggml_graph_n_nodes(gf));
+        }
+        for (auto& h : up) if (h.first->buffer) ggml_backend_tensor_set(h.first, h.second.data(), 0, h.second.size());
+        if (loss) ggml_graph_reset(gf);
+        if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) die("--train: graph compute failed");
+    }
+    std::vector<float> grad(ggml_tensor* t) {   // zeros when the tensor got no gradient
+        std::vector<float> v((size_t) ggml_nelements(t), 0.0f);
+        if (ggml_tensor* g = ggml_graph_get_grad(gf, t)) if (g->buffer) ggml_backend_tensor_get(g, v.data(), 0, v.size() * 4);
+        return v;
+    }
+};
+static std::vector<float> fetch(ggml_tensor* t) {
+    std::vector<float> v((size_t) ggml_nelements(t));
+    ggml_backend_tensor_get(t, v.data(), 0, v.size() * 4);
+    return v;
+}
+static void addto(std::vector<float>& a, const std::vector<float>& b) {
+    if (a.empty()) { a = b; return; }
+    for (size_t i = 0; i < a.size(); ++i) a[i] += b[i];
+}
+
+struct Args {
+    std::string gguf, data, eval, out = "/media/Crucial1TB/xolotl-train/runs", run = "inkling-lora", save, targets = "q,k,v,o,gate,rel";
+    int rank = 16, steps = 0, warmup = 10, max_t = 2048, threads = 8, eval_every = 0, eval_n = 16, save_every = 0, seed = 0, ce_chunk = 256;
+    int check = 0, fd = 0, overfit = 0;
+    float alpha = 32.0f, lr = 1e-4f, clip = 1.0f, init_b = 0.0f, lr_min = 0.1f;
+};
+
+struct Window { std::vector<int32_t> ids; std::vector<uint8_t> mask; };
+
+// {"ids":[...], "mask":[...], ...} per line
+static bool parse_int_array(const std::string& s, const char* key, std::vector<long long>& out) {
+    const std::string k = std::string("\"") + key + "\"";
+    size_t p = s.find(k);
+    if (p == std::string::npos) return false;
+    p = s.find('[', p);
+    if (p == std::string::npos) return false;
+    const size_t e = s.find(']', p);
+    out.clear();
+    const char* q = s.c_str() + p + 1;
+    const char* end = s.c_str() + e;
+    while (q < end) {
+        char* nx = nullptr;
+        const long long v = std::strtoll(q, &nx, 10);
+        if (nx == q) { ++q; continue; }
+        out.push_back(v);
+        q = nx;
+    }
+    return true;
+}
+static std::vector<Window> load_windows(const std::string& path, int max_t) {
+    std::vector<Window> w;
+    std::ifstream f(path);
+    if (!f) die("--train: cannot read " + path);
+    std::string line;
+    std::vector<long long> ids, mask;
+    while (std::getline(f, line)) {
+        if (line.empty() || !parse_int_array(line, "ids", ids)) continue;
+        if (!parse_int_array(line, "mask", mask) || mask.size() != ids.size()) die("--train: a window without a matching mask in " + path);
+        Window x;
+        const size_t n = std::min<size_t>(ids.size(), (size_t) max_t);
+        for (size_t i = 0; i < n; ++i) { x.ids.push_back((int32_t) ids[i]); x.mask.push_back(mask[i] ? 1 : 0); }
+        int nl = 0;
+        for (size_t i = 1; i < n; ++i) nl += x.mask[i];
+        if (n >= 2 && nl > 0) w.push_back(std::move(x));
+    }
+    return w;
+}
+
+struct Adapter {
+    int ip = 0;
+    std::string tgt;
+    ggml_tensor* W = nullptr;
+    int64_t n_in = 0, n_out = 0;
+    std::vector<float> A, B, gA, gB, mA, vA, mB, vB;
+};
+
+struct SlotIO {   // one slot visit of build(), with its stream ids
+    int il = 0, ip = 0, in = 0, out = 0, bank_out = -1;
+    std::vector<int> blocks, bank;
+};
+
+struct Trainer {
+    Model& m;
+    const Hp& h;
+    Args a;
+    ggml_backend_t be;
+    std::vector<SlotIO> plan;
+    int n_ids = 0, head_cur = 0;
+    std::vector<int> head_blocks;
+    std::vector<Adapter> ad;
+    std::vector<std::vector<int>> ad_of;   // per physical layer
+    float scale = 1.0f;
+
+    Trainer(Model& mm, const Args& aa) : m(mm), h(mm.hp), a(aa), be(mm.gpu) {
+        // the slot sequence of build(), on ids
+        int cur = n_ids++;   // 0 = the embedding
+        std::vector<int> blocks;
+        auto visit = [&](int il, int ip, const std::vector<int>& bank, int bank_out) {
+            SlotIO io;
+            io.il = il; io.ip = ip; io.in = cur; io.blocks = blocks; io.bank = bank; io.bank_out = bank_out;
+            io.out = n_ids++;
+            plan.push_back(io);
+            if (ip % h.block == 0) blocks.push_back(cur);   // layer() pushes its input as a new block
+            cur = io.out;
+        };
+        const int start = h.n_pass > 1 ? h.loop_start : h.n_phys, end = h.n_pass > 1 ? h.loop_end : h.n_phys;
+        for (int il = 0; il < start; ++il) visit(il, il, {}, -1);
+        const int prelude = cur;
+        const std::vector<int> prelude_blocks = blocks;
+        for (int pass = 0; pass < h.n_pass && start < end; ++pass) {
+            std::vector<int> bank;
+            int bank_out = -1;
+            if (pass > 0) {
+                bank.assign(blocks.begin() + (long) prelude_blocks.size() + 1, blocks.end());
+                bank_out = cur;
+                cur = prelude;
+                blocks = prelude_blocks;
+            }
+            for (int ipy = start; ipy < end; ++ipy) {
+                const int il = pass == 0 ? ipy : h.n_phys + (pass - 1) * (end - start) + (ipy - start);
+                visit(il, ipy, bank, bank_out);
+            }
+        }
+        for (int il = end; il < h.n_phys; ++il) visit(il, il, {}, -1);
+        head_cur = cur;
+        head_blocks = blocks;
+        if ((int) plan.size() != h.n_slot) die("--train: slot plan has " + std::to_string(plan.size()) + " visits, model says " + std::to_string(h.n_slot));
+
+        // adapters on base tensors
+        std::mt19937 rng(a.seed);
+        ad_of.assign(h.n_phys, {});
+        std::vector<std::string> tg;
+        { std::stringstream ss(a.targets); std::string t; while (std::getline(ss, t, ',')) if (!t.empty()) tg.push_back(t); }
+        for (int ip = 0; ip < h.n_phys; ++ip) {
+            const Layer& y = m.L[ip];
+            for (const std::string& t : tg) {
+                ggml_tensor* W = t == "q" ? y.wq : t == "k" ? y.wk : t == "v" ? y.wv : t == "o" ? y.wo : t == "gate" ? y.gate : t == "rel" ? y.rel : nullptr;
+                if (!W) die("--train: unknown or missing target " + t + " on layer " + std::to_string(ip));
+                Adapter x;
+                x.ip = ip; x.tgt = t; x.W = W; x.n_in = W->ne[0]; x.n_out = W->ne[1];
+                const size_t na = (size_t) x.n_in * a.rank, nb = (size_t) a.rank * x.n_out;
+                x.A.resize(na); x.B.assign(nb, 0.0f);
+                std::uniform_real_distribution<float> ua(-1.0f / std::sqrt((float) x.n_in), 1.0f / std::sqrt((float) x.n_in));
+                for (float& v : x.A) v = ua(rng);
+                if (a.init_b > 0) { std::normal_distribution<float> nb_(0.0f, a.init_b); for (float& v : x.B) v = nb_(rng); }
+                x.gA.assign(na, 0.0f); x.gB.assign(nb, 0.0f);
+                x.mA.assign(na, 0.0f); x.vA.assign(na, 0.0f); x.mB.assign(nb, 0.0f); x.vB.assign(nb, 0.0f);
+                ad_of[ip].push_back((int) ad.size());
+                ad.push_back(std::move(x));
+            }
+        }
+        scale = a.alpha / (float) a.rank;
+        size_t np = 0;
+        for (const Adapter& x : ad) np += x.A.size() + x.B.size();
+        std::fprintf(stderr, "[train] %zu adapters (%s, r %d, alpha %.0f), %.2f M params; %d slot visits, %d stream ids\n",
+                     ad.size(), a.targets.c_str(), a.rank, a.alpha, np / 1e6, (int) plan.size(), n_ids);
+    }
+
+    // host masks / relative distances for cells = positions [0, T) (the chunk starts at 0, no carried prefix yet)
+    void chunk_inputs(G1& gg, Step& st, int T) {
+        const int64_t cells = T;
+        std::vector<float> mf((size_t) cells * T), ms((size_t) cells * T);
+        std::vector<int32_t> rf((size_t) cells * T), rs((size_t) cells * T);
+        for (int t = 0; t < T; ++t)
+            for (int64_t j = 0; j < cells; ++j) {
+                const int64_t d = t - j;
+                const size_t k = (size_t) t * cells + j;
+                mf[k] = d >= 0 ? 0.0f : -INFINITY;
+                rf[k] = d >= 0 && d < h.rel_extent ? (int32_t) d : h.rel_extent;
+                ms[k] = d >= 0 && d < h.n_swa ? 0.0f : -INFINITY;
+                rs[k] = d >= 0 && d < h.n_swa ? (int32_t) d : h.n_swa;
+            }
+        ChunkIn cf, cs;
+        cf.cells = cs.cells = cells;
+        cf.mask = gg.f32(mf.data(), cells, T); cf.rp = gg.i32(rf.data(), cells, T);
+        cs.mask = gg.f32(ms.data(), cells, T); cs.rp = gg.i32(rs.data(), cells, T);
+        st.ck_full = {cf};
+        st.ck_swa = {cs};
+    }
+    ggml_tensor* tau_input(G1& gg, int T) {   // build()'s log-scaled positions
+        std::vector<float> pf(T);
+        for (int t = 0; t < T; ++t) pf[t] = (float) t;
+        ggml_tensor* posf = gg.f32(pf.data(), T);
+        ggml_tensor* tau = ggml_scale_bias(gg.c, posf, 1.0f, 1.0f);
+        tau = ggml_log(gg.c, ggml_clamp(gg.c, ggml_scale(gg.c, tau, 1.0f / (float) h.log_floor), 1.0f, INFINITY));
+        return ggml_reshape_3d(gg.c, ggml_scale_bias(gg.c, tau, h.log_alpha, 1.0f), 1, 1, T);
+    }
+
+    // one slot visit as a graph; ins/in_ids = its stream inputs, abs = its adapters' (A, B) inputs in ad_of order
+    ggml_tensor* slot_graph(G1& gg, Step& st, const SlotIO& io, int T, const std::vector<std::vector<float>>& X, bool vjp,
+                            std::vector<ggml_tensor*>& ins, std::vector<int>& in_ids,
+                            std::vector<std::pair<ggml_tensor*, ggml_tensor*>>& abs, std::unordered_map<const ggml_tensor*, G::Lora>& lmap) {
+        chunk_inputs(gg, st, T);
+        G g{m, h, gg.c, gg.gf, st, T, 0};
+        g.train = true;
+        std::vector<float> zc((size_t) (h.n_conv - 1) * h.n_chan(), 0.0f);
+        g.tconv = ggml_reshape_2d(gg.c, gg.f32(zc.data(), h.n_conv - 1, h.n_chan()), h.n_conv - 1, h.n_chan());
+        g.tau = tau_input(gg, T);
+        auto in = [&](int id) {
+            ggml_tensor* t = ggml_reshape_2d(gg.c, gg.f32(X[id].data(), h.n_embd, T), h.n_embd, T);
+            if (vjp) ggml_set_param(t->view_src ? t->view_src : t);
+            ins.push_back(t->view_src ? t->view_src : t);
+            in_ids.push_back(id);
+            return t;
+        };
+        ggml_tensor* cur = in(io.in);
+        std::vector<ggml_tensor*> blocks;
+        for (int b : io.blocks) blocks.push_back(in(b));
+        ggml_tensor* msgs = nullptr;
+        if (io.bank_out >= 0) {
+            std::vector<ggml_tensor*> bank;
+            for (int b : io.bank) bank.push_back(in(b));
+            ggml_tensor* bo = in(io.bank_out);
+            msgs = g.mix(bank, bo, m.L[io.ip].msg_query);
+        }
+        for (int k : ad_of[io.ip]) {
+            Adapter& x = ad[k];
+            ggml_tensor* ta = ggml_reshape_2d(gg.c, gg.f32(x.A.data(), x.n_in, a.rank), x.n_in, a.rank);
+            ggml_tensor* tb = ggml_reshape_2d(gg.c, gg.f32(x.B.data(), a.rank, x.n_out), a.rank, x.n_out);
+            if (vjp) { ggml_set_param(ta->view_src); ggml_set_param(tb->view_src); }
+            lmap[x.W] = {ta, tb};
+            abs.push_back({ta->view_src, tb->view_src});
+        }
+        g.lora = &lmap;
+        g.lora_scale = scale;
+        return g.layer(io.il, io.ip, cur, blocks, msgs);
+    }
+
+    // the head's normed stream [n_embd, T] from the last stream + the blocks
+    ggml_tensor* head_graph(G1& gg, Step& st, int T, const std::vector<std::vector<float>>& X, bool vjp,
+                            std::vector<ggml_tensor*>& ins, std::vector<int>& in_ids) {
+        G g{m, h, gg.c, gg.gf, st, T, 0};
+        g.train = true;
+        auto in = [&](int id) {
+            ggml_tensor* t = gg.f32(X[id].data(), h.n_embd, T);
+            if (vjp) ggml_set_param(t);
+            ins.push_back(t); in_ids.push_back(id);
+            return ggml_reshape_2d(gg.c, t, h.n_embd, T);
+        };
+        ggml_tensor* cur = in(head_cur);
+        std::vector<ggml_tensor*> blocks;
+        for (int b : head_blocks) blocks.push_back(in(b));
+        ggml_tensor* x = ggml_reshape_2d(gg.c, g.mix(blocks, cur, m.output_res_query), h.n_embd, T);
+        return g.rms(x, m.output_norm);
+    }
+
+    // logits of rows xs [n_embd, n] (the served head: output weight, softcap, the real vocab)
+    ggml_tensor* logits_of(ggml_context* c, ggml_tensor* xs) {
+        ggml_tensor* l = ggml_mul_mat(c, m.output, xs);
+        ggml_prec_set_acc(l, GGML_PREC_F32);
+        if (h.softcap != 0.0f) l = ggml_scale(c, ggml_tanh(c, ggml_scale(c, l, 1.0f / h.softcap)), h.softcap);
+        return ggml_cont(c, ggml_view_2d(c, l, h.n_vocab, l->ne[1], l->nb[1], 0));
+    }
+
+    std::vector<float> embed(const std::vector<int32_t>& ids) {
+        const int64_t E = h.n_embd, T = (int64_t) ids.size();
+        std::vector<float> raw((size_t) E * T);
+        const size_t rb = ggml_row_size(m.tok_embd->type, E);
+        std::vector<uint8_t> row(rb);
+        const auto* tt = ggml_get_type_traits(m.tok_embd->type);
+        for (int64_t t = 0; t < T; ++t) {
+            ggml_backend_tensor_get(m.tok_embd, row.data(), (size_t) ids[t] * m.tok_embd->nb[1], rb);
+            if (m.tok_embd->type == GGML_TYPE_F32) std::memcpy(&raw[(size_t) t * E], row.data(), rb);
+            else tt->to_float(row.data(), &raw[(size_t) t * E], E);
+        }
+        G1 gg(4096);
+        Step st;
+        G g{m, h, gg.c, gg.gf, st, (int) T, 0};
+        ggml_tensor* x = g.rms(gg.f32(raw.data(), E, T), m.tok_norm);
+        gg.run(be, nullptr, {x});
+        return fetch(x);
+    }
+
+    // forward every visit; X[id] = the streams. Returns the head's normed stream.
+    std::vector<float> forward_streams(const std::vector<int32_t>& ids, std::vector<std::vector<float>>& X) {
+        const int T = (int) ids.size();
+        X.assign(n_ids, {});
+        X[0] = embed(ids);
+        for (const SlotIO& io : plan) {
+            G1 gg;
+            Step st;
+            std::vector<ggml_tensor*> ins; std::vector<int> iid;
+            std::vector<std::pair<ggml_tensor*, ggml_tensor*>> abs;
+            std::unordered_map<const ggml_tensor*, G::Lora> lmap;
+            ggml_tensor* out = slot_graph(gg, st, io, T, X, false, ins, iid, abs, lmap);
+            gg.run(be, nullptr, {out});
+            X[io.out] = fetch(out);
+        }
+        G1 gg;
+        Step st;
+        std::vector<ggml_tensor*> ins; std::vector<int> iid;
+        ggml_tensor* xf = head_graph(gg, st, T, X, false, ins, iid);
+        gg.run(be, nullptr, {xf});
+        return fetch(xf);
+    }
+
+    // mean CE over the loss positions (row t predicts ids[t+1] where mask[t+1]); dxf (optional) = d loss / d xf
+    double head_ce(const Window& w, const std::vector<float>& xf, std::vector<float>* dxf) {
+        const int T = (int) w.ids.size();
+        const int64_t E = h.n_embd, V = h.n_vocab;
+        std::vector<int> rows;
+        for (int t = 0; t + 1 < T; ++t) if (w.mask[t + 1]) rows.push_back(t);
+        const double N = (double) rows.size();
+        if (dxf) dxf->assign((size_t) E * T, 0.0f);
+        double loss = 0;
+        for (size_t r0 = 0; r0 < rows.size(); r0 += a.ce_chunk) {
+            const int n = (int) std::min<size_t>(a.ce_chunk, rows.size() - r0);
+            std::vector<float> xs((size_t) E * n), lab((size_t) V * n, 0.0f);
+            for (int i = 0; i < n; ++i) {
+                const int t = rows[r0 + i];
+                std::memcpy(&xs[(size_t) i * E], &xf[(size_t) t * E], E * sizeof(float));
+                lab[(size_t) i * V + w.ids[t + 1]] = 1.0f;
+            }
+            G1 gg(4096);
+            ggml_tensor* tx = gg.f32(xs.data(), E, n);
+            if (dxf) ggml_set_param(tx);
+            ggml_tensor* tl = gg.f32(lab.data(), V, n);
+            ggml_tensor* ce = ggml_scale(gg.c, ggml_cross_entropy_loss(gg.c, logits_of(gg.c, ggml_reshape_2d(gg.c, tx, E, n)), ggml_reshape_2d(gg.c, tl, V, n)),
+                                         (float) (n / N));
+            gg.run(be, dxf ? ce : nullptr, {ce}, dxf ? std::vector<ggml_tensor*>{tx} : std::vector<ggml_tensor*>{});
+            loss += fetch(ce)[0];
+            if (dxf) {
+                const std::vector<float> g = gg.grad(tx);
+                for (int i = 0; i < n; ++i) std::memcpy(&(*dxf)[(size_t) rows[r0 + i] * E], &g[(size_t) i * E], E * sizeof(float));
+            }
+        }
+        return loss;
+    }
+
+    // one window: loss, and (grads) the adapter gradients accumulated into ad[*].gA/gB
+    double step_window(const Window& w, bool grads) {
+        const int T = (int) w.ids.size();
+        std::vector<std::vector<float>> X;
+        const std::vector<float> xf = forward_streams(w.ids, X);
+        std::vector<float> dxf;
+        const double loss = head_ce(w, xf, grads ? &dxf : nullptr);
+        if (!grads) return loss;
+        std::vector<std::vector<float>> GX(n_ids);
+        {   // head VJP
+            G1 gg;
+            Step st;
+            std::vector<ggml_tensor*> ins; std::vector<int> iid;
+            ggml_tensor* x = head_graph(gg, st, T, X, true, ins, iid);
+            ggml_tensor* go = gg.f32(dxf.data(), h.n_embd, T);
+            ggml_tensor* sl = ggml_sum(gg.c, ggml_mul(gg.c, x, ggml_reshape_2d(gg.c, go, h.n_embd, T)));
+            gg.run(be, sl, {}, ins);
+            for (size_t i = 0; i < ins.size(); ++i) addto(GX[iid[i]], gg.grad(ins[i]));
+        }
+        for (int k = (int) plan.size() - 1; k >= 0; --k) {   // slot VJPs, reverse order
+            const SlotIO& io = plan[k];
+            if (GX[io.out].empty()) die("--train: slot " + std::to_string(io.il) + " has no output gradient (a dropped DAG edge)");
+            G1 gg;
+            Step st;
+            std::vector<ggml_tensor*> ins; std::vector<int> iid;
+            std::vector<std::pair<ggml_tensor*, ggml_tensor*>> abs;
+            std::unordered_map<const ggml_tensor*, G::Lora> lmap;
+            ggml_tensor* out = slot_graph(gg, st, io, T, X, true, ins, iid, abs, lmap);
+            ggml_tensor* go = gg.f32(GX[io.out].data(), h.n_embd, T);
+            ggml_tensor* sl = ggml_sum(gg.c, ggml_mul(gg.c, out, ggml_reshape_2d(gg.c, go, h.n_embd, T)));
+            std::vector<ggml_tensor*> want = ins;
+            for (auto& p : abs) { want.push_back(p.first); want.push_back(p.second); }
+            gg.run(be, sl, {}, want);
+            for (size_t i = 0; i < ins.size(); ++i) addto(GX[iid[i]], gg.grad(ins[i]));
+            for (size_t j = 0; j < abs.size(); ++j) {
+                Adapter& x = ad[ad_of[io.ip][j]];
+                const std::vector<float> ga = gg.grad(abs[j].first), gb = gg.grad(abs[j].second);
+                for (size_t i = 0; i < ga.size(); ++i) x.gA[i] += ga[i];
+                for (size_t i = 0; i < gb.size(); ++i) x.gB[i] += gb[i];
+            }
+            GX[io.out].clear();
+            GX[io.out].shrink_to_fit();
+        }
+        return loss;
+    }
+
+    void zero_grads() { for (Adapter& x : ad) { std::fill(x.gA.begin(), x.gA.end(), 0.0f); std::fill(x.gB.begin(), x.gB.end(), 0.0f); } }
+    double grad_norm() const {
+        double s = 0;
+        for (const Adapter& x : ad) { for (float v : x.gA) s += (double) v * v; for (float v : x.gB) s += (double) v * v; }
+        return std::sqrt(s);
+    }
+    int zero_grad_adapters(bool b_only) const {   // adapters whose gradient is exactly zero (A is 0 while B is 0 at init)
+        int n = 0;
+        for (const Adapter& x : ad) {
+            bool zb = true, za = true;
+            for (float v : x.gB) if (v != 0.0f) { zb = false; break; }
+            for (float v : x.gA) if (v != 0.0f) { za = false; break; }
+            if (zb || (!b_only && za)) ++n;
+        }
+        return n;
+    }
+    void adamw(long step, float lr) {
+        const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
+        const double gn = grad_norm();
+        const float cf = gn > a.clip ? (float) (a.clip / gn) : 1.0f;
+        const float c1 = 1.0f - std::pow(b1, (float) step), c2 = 1.0f - std::pow(b2, (float) step);
+        auto upd = [&](std::vector<float>& p, const std::vector<float>& g, std::vector<float>& mv, std::vector<float>& vv) {
+            for (size_t i = 0; i < p.size(); ++i) {
+                const float gi = g[i] * cf;
+                mv[i] = b1 * mv[i] + (1 - b1) * gi;
+                vv[i] = b2 * vv[i] + (1 - b2) * gi * gi;
+                p[i] -= lr * (mv[i] / c1) / (std::sqrt(vv[i] / c2) + eps);
+            }
+        };
+        for (Adapter& x : ad) { upd(x.A, x.gA, x.mA, x.vA); upd(x.B, x.gB, x.mB, x.vB); }
+    }
+    float lr_at(long step) const {
+        if (step <= a.warmup) return a.lr * (float) step / (float) std::max(1, a.warmup);
+        const double p = (double) (step - a.warmup) / std::max(1, a.steps - a.warmup);
+        return (float) (a.lr * (a.lr_min + (1 - a.lr_min) * 0.5 * (1 + std::cos(M_PI * std::min(1.0, p)))));
+    }
+    void save(const std::string& path) {
+        std::vector<LoraTensorPair> v;
+        for (const Adapter& x : ad) {
+            LoraTensorPair p;
+            p.name = ggml_get_name(x.W); p.n_in = x.n_in; p.n_out = x.n_out; p.rank = a.rank; p.A = x.A; p.B = x.B;
+            v.push_back(std::move(p));
+        }
+        std::string err;
+        if (!xolotl::train::write_lora_gguf(path, "inkling2_loop", a.alpha, v, err)) die("--train: " + err);
+        std::fprintf(stderr, "[train] adapter saved: %s (%zu tensors pairs)\n", path.c_str(), v.size());
+    }
+};
+
+// ---- gates ---------------------------------------------------------------------------------------------------------
+// --check T: the train graph chain (per-slot graphs, no cache) vs the engine's own forward over the same tokens
+static int gate_check(Trainer& tr, const Window& w0, int T) {
+    Model& m = tr.m;
+    std::vector<int32_t> ids(w0.ids.begin(), w0.ids.begin() + std::min<size_t>(T, w0.ids.size()));
+    T = (int) ids.size();
+    std::vector<std::vector<float>> X;
+    const std::vector<float> xf = tr.forward_streams(ids, X);
+    G1 gg(4096);
+    ggml_tensor* tx = gg.f32(xf.data(), tr.h.n_embd, T);
+    ggml_tensor* lg = tr.logits_of(gg.c, ggml_reshape_2d(gg.c, tx, tr.h.n_embd, T));
+    gg.run(tr.be, nullptr, {lg});
+    const std::vector<float> a = fetch(lg);
+    state_reset(m);
+    std::vector<float> b;
+    std::vector<std::vector<float>> taps;
+    forward(m, ids.data(), T, 0, T, b, &taps);
+    for (const SlotIO& io : tr.plan) {   // per visit: the train chain's stream vs the engine's l_out
+        if ((size_t) io.il >= taps.size() || taps[io.il].empty()) continue;
+        const std::vector<float>& x = X[io.out];
+        const std::vector<float>& y = taps[io.il];
+        double num = 0, den = 0;
+        for (size_t i = 0; i < std::min(x.size(), y.size()); ++i) { num += (x[i] - y[i]) * (x[i] - y[i]); den += (double) y[i] * y[i]; }
+        std::printf("  slot %2d (phys %2d%s%s): stream rel err %.3e\n", io.il, io.ip, tr.h.swa[io.ip] ? ", swa" : ", global",
+                    io.bank_out >= 0 ? ", loop msg" : "", std::sqrt(num / std::max(den, 1e-30)));
+    }
+    const int64_t V = tr.h.n_vocab;
+    const int64_t Vb = (int64_t) b.size() / T;
+    double worst = 0, sum = 0;
+    int agree = 0;
+    for (int t = 0; t < T; ++t) {
+        double num = 0, den = 0;
+        int ia = 0, ib = 0;
+        for (int64_t v = 0; v < V; ++v) {
+            const double x = a[(size_t) t * V + v], y = b[(size_t) t * Vb + v];
+            num += (x - y) * (x - y); den += y * y;
+            if (x > a[(size_t) t * V + ia]) ia = (int) v;
+            if (y > b[(size_t) t * Vb + ib]) ib = (int) v;
+        }
+        const double r = std::sqrt(num / std::max(den, 1e-30));
+        worst = std::max(worst, r); sum += r; agree += ia == ib;
+    }
+    std::printf("CHECK T=%d: logits rel err mean %.3e worst %.3e, top-1 agree %d/%d\n", T, sum / T, worst, agree, T);
+    std::fflush(stdout);
+    return worst < 1e-2 && agree >= T - 1 ? 0 : 1;
+}
+
+// --fd: directional finite difference over every adapter parameter (B random so A matters): <g, d> vs FD at eps
+static int gate_fd(Trainer& tr, const Window& w) {
+    tr.zero_grads();
+    const double L0 = tr.step_window(w, true);
+    std::mt19937 rng(1234);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::vector<float>> dA(tr.ad.size()), dB(tr.ad.size());
+    double nrm = 0, gd = 0;
+    for (size_t k = 0; k < tr.ad.size(); ++k) {
+        dA[k].resize(tr.ad[k].A.size()); dB[k].resize(tr.ad[k].B.size());
+        for (float& v : dA[k]) { v = nd(rng); nrm += v * v; }
+        for (float& v : dB[k]) { v = nd(rng); nrm += v * v; }
+    }
+    nrm = std::sqrt(nrm);
+    for (size_t k = 0; k < tr.ad.size(); ++k) {
+        for (size_t i = 0; i < dA[k].size(); ++i) { dA[k][i] /= nrm; gd += (double) tr.ad[k].gA[i] * dA[k][i]; }
+        for (size_t i = 0; i < dB[k].size(); ++i) { dB[k][i] /= nrm; gd += (double) tr.ad[k].gB[i] * dB[k][i]; }
+    }
+    auto shift = [&](double s) {
+        for (size_t k = 0; k < tr.ad.size(); ++k) {
+            for (size_t i = 0; i < dA[k].size(); ++i) tr.ad[k].A[i] += (float) (s * dA[k][i]);
+            for (size_t i = 0; i < dB[k].size(); ++i) tr.ad[k].B[i] += (float) (s * dB[k][i]);
+        }
+    };
+    std::printf("FD loss %.6f, analytic <g,d> = %.6e, |g| = %.4e, zero-grad adapters %d/%zu\n", L0, gd, tr.grad_norm(),
+                tr.zero_grad_adapters(false), tr.ad.size());
+    int ok = 0, n = 0;
+    for (double eps : {1.0, 0.3, 0.1, 0.03}) {
+        shift(eps);
+        const double Lp = tr.step_window(w, false);
+        shift(-2 * eps);
+        const double Lm = tr.step_window(w, false);
+        shift(eps);
+        const double fd = (Lp - Lm) / (2 * eps);
+        const double rel = std::abs(fd - gd) / std::max(std::abs(gd), 1e-12);
+        std::printf("  eps %-5g FD %.6e  rel err %.3e\n", eps, fd, rel);
+        ++n; ok += rel < 0.05;
+    }
+    std::fflush(stdout);
+    return ok >= 1 && tr.zero_grad_adapters(false) == 0 ? 0 : 1;
+}
+
+}  // namespace itrain
+}  // namespace
+
+int inkling_train_main(int argc, char** argv) {
+    using namespace itrain;
+    Args a;
+    for (int i = 2; i < argc; ++i) {
+        const std::string k = argv[i];
+        auto v = [&]() -> std::string { if (i + 1 >= argc) die("--train: " + k + " needs a value"); return argv[++i]; };
+        if (k == "--data") a.data = v();
+        else if (k == "--eval") a.eval = v();
+        else if (k == "--out") a.out = v();
+        else if (k == "--run") a.run = v();
+        else if (k == "--save") a.save = v();
+        else if (k == "--targets") a.targets = v();
+        else if (k == "--rank") a.rank = std::atoi(v().c_str());
+        else if (k == "--alpha") a.alpha = (float) std::atof(v().c_str());
+        else if (k == "--lr") a.lr = (float) std::atof(v().c_str());
+        else if (k == "--lr-min") a.lr_min = (float) std::atof(v().c_str());
+        else if (k == "--steps") a.steps = std::atoi(v().c_str());
+        else if (k == "--warmup") a.warmup = std::atoi(v().c_str());
+        else if (k == "--max-t") a.max_t = std::atoi(v().c_str());
+        else if (k == "--threads") a.threads = std::atoi(v().c_str());
+        else if (k == "--eval-every") a.eval_every = std::atoi(v().c_str());
+        else if (k == "--eval-n") a.eval_n = std::atoi(v().c_str());
+        else if (k == "--save-every") a.save_every = std::atoi(v().c_str());
+        else if (k == "--seed") a.seed = std::atoi(v().c_str());
+        else if (k == "--clip") a.clip = (float) std::atof(v().c_str());
+        else if (k == "--init-b") a.init_b = (float) std::atof(v().c_str());
+        else if (k == "--ce-chunk") a.ce_chunk = std::max(16, std::atoi(v().c_str()));
+        else if (k == "--check") a.check = std::atoi(v().c_str());
+        else if (k == "--fd") a.fd = 1;
+        else if (k == "--overfit") a.overfit = std::atoi(v().c_str());
+        else if (a.gguf.empty() && k[0] != '-') a.gguf = k;
+        else die("--train: unknown option " + k);
+    }
+    if (a.gguf.empty() || a.data.empty()) {
+        std::fprintf(stderr, "usage: xolotl-inkling --train <model.gguf> --data windows.jsonl [--eval heldout.jsonl] [--steps N]\n"
+                             "       [--rank 16] [--alpha 32] [--lr 1e-4] [--targets q,k,v,o,gate,rel] [--max-t 2048] [--save a.gguf]\n"
+                             "       gates: --check T | --fd [--init-b 0.01] | --overfit N\n");
+        return 2;
+    }
+    // the reference graph only: every fused (custom) op off, controllers on their base tensors
+    inkling_train_mode() = true;
+    setenv("XOLOTL_INKLING_CTRL_REF", "1", 1);
+    setenv("XOLOTL_INKLING_FUSED", "0", 1);
+    setenv("XOLOTL_INKLING_PROMPT_ATTN", "0", 1);
+    setenv("XOLOTL_INKLING_DECATTN", "0", 1);
+    setenv("XOLOTL_INKLING_STACKQ", "0", 1);
+    try {
+        Model m;
+        m.ubatch = std::max(512, a.max_t);
+        load(m, a.gguf, std::max<int64_t>(4096, a.max_t + 256), a.threads, "", false);
+        if (ggml_backend_buffer_is_host(m.output->buffer)) die("--train: the head weight is not on the GPU");
+        std::vector<Window> tw = load_windows(a.data, a.max_t), ew;
+        if (tw.empty()) die("--train: no windows in " + a.data);
+        if (!a.eval.empty()) ew = load_windows(a.eval, a.max_t);
+        std::fprintf(stderr, "[train] %zu train windows, %zu eval windows\n", tw.size(), ew.size());
+        Trainer tr(m, a);
+        if (a.check) return gate_check(tr, tw[0], a.check);
+        if (a.fd) return gate_fd(tr, tw[0]);
+
+        char cfg[1024];
+        std::snprintf(cfg, sizeof cfg, "{\"model\": \"%s\", \"data\": \"%s\", \"rank\": %d, \"alpha\": %g, \"lr\": %g, \"targets\": \"%s\", \"max_t\": %d, \"steps\": %d}",
+                      a.gguf.c_str(), a.data.c_str(), a.rank, a.alpha, a.lr, a.targets.c_str(), a.max_t, a.steps);
+        xolotl::train::Metrics met(a.out, a.run, cfg);
+        auto eval_loss = [&]() -> double {
+            if (ew.empty()) return NAN;
+            double s = 0;
+            const int n = std::min<int>(a.eval_n, (int) ew.size());
+            for (int i = 0; i < n; ++i) s += tr.step_window(ew[i], false);
+            return s / n;
+        };
+        if (a.overfit) { a.steps = a.overfit; tr.a.steps = a.overfit; }
+        std::mt19937 rng(a.seed);
+        std::vector<size_t> order(tw.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::shuffle(order.begin(), order.end(), rng);
+        const double e0 = eval_loss();
+        if (std::isfinite(e0)) { std::fprintf(stderr, "[train] step 0 eval %.4f\n", e0); met.log(0, {{"eval_loss", e0}}); }
+        double first = NAN;
+        for (long step = 1; step <= a.steps; ++step) {
+            const Window& w = a.overfit ? tw[0] : tw[order[(size_t) (step - 1) % order.size()]];
+            const auto t0 = std::chrono::steady_clock::now();
+            tr.zero_grads();
+            const double loss = tr.step_window(w, true);
+            if (!std::isfinite(first)) first = loss;
+            const double gn = tr.grad_norm();
+            const float lr = tr.lr_at(step);
+            const int zb = tr.zero_grad_adapters(true);
+            tr.adamw(step, lr);
+            const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr, "[train] step %ld loss %.4f gnorm %.3e lr %.2e T %zu %.1f s%s\n", step, loss, gn, lr, w.ids.size(), dt,
+                         zb ? (" ZERO-GRAD-B " + std::to_string(zb)).c_str() : "");
+            double el = NAN;
+            if (a.eval_every && step % a.eval_every == 0) { el = eval_loss(); std::fprintf(stderr, "[train] step %ld eval %.4f\n", step, el); }
+            met.log(step, {{"loss", loss}, {"eval_loss", el}, {"lr", lr}, {"gnorm", gn}, {"window_tokens", (double) w.ids.size()}, {"step_s", dt}});
+            if (!a.save.empty() && a.save_every && step % a.save_every == 0) tr.save(a.save);
+        }
+        if (!a.save.empty()) tr.save(a.save);
+        if (a.overfit) {
+            const double last = tr.step_window(tw[0], false);
+            std::printf("OVERFIT %d steps: loss %.4f -> %.4f\n", a.overfit, first, last);
+            return last < 0.7 * first ? 0 : 1;
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "xolotl-inkling --train: %s\n", e.what());
+        return 1;
+    }
+    return 0;
+}

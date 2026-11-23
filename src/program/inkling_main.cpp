@@ -81,6 +81,7 @@ namespace inkling_stats { enum { ST_Q = 0, ST_K, ST_V, ST_O, ST_F, ST_ACT, ST_ID
 #include <deque>
 #include <functional>
 #include <map>
+#include <unordered_map>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -1345,9 +1346,12 @@ struct Step {
 
 // fused decode ops (inkling_fused.cu, needs the ggml CUDA custom-op hook): on by default when built in;
 // XOLOTL_INKLING_FUSED=0 keeps the reference op chains for A/B
+// --train (inkling_train.cpp): set once at start; every fused (custom, non-differentiable) op stays off
+inline bool& inkling_train_mode() { static bool v = false; return v; }
+
 static bool fused_on() {
     static const bool on = inkling_fused_available() && !(std::getenv("XOLOTL_INKLING_FUSED") && std::string(std::getenv("XOLOTL_INKLING_FUSED")) == "0");
-    return on;
+    return on && !inkling_train_mode();
 }
 
 struct G {                     // graph-building context
@@ -1362,6 +1366,24 @@ struct G {                     // graph-building context
     inkling_stats::Stats* st = nullptr;   // --stats: remember these tensors as graph outputs
     bool route = false;                   // --route-log: keep the routing tensors readable after the compute
     int il_cur = 0;
+
+    // --train (inkling_train.cpp): the same op sequence over one chunk, with no cache or state writes.  The slot's conv
+    // history and the K/V before the chunk come in as inputs (zeros / none when the chunk starts at position 0).
+    struct Lora { ggml_tensor *a = nullptr, *b = nullptr; };   // a [n_in, r], b [r, n_out]: y += scale * b (a x)
+    bool train = false;
+    ggml_tensor* tconv = nullptr;                        // [n_conv-1, n_chan], the slot's conv history
+    ggml_tensor *tk_pre = nullptr, *tv_pre = nullptr;    // [hd, nkv, n_pre] carried K (clipped) / V (normed), or null
+    const std::unordered_map<const ggml_tensor*, Lora>* lora = nullptr;
+    float lora_scale = 1.0f;
+    // a projection by a base weight, plus its adapter when one is attached (inference: lora == null, plain mul_mat)
+    ggml_tensor* mm(ggml_tensor* W, ggml_tensor* x) {
+        ggml_tensor* y = ggml_mul_mat(c, W, x);
+        if (lora) {
+            auto it = lora->find(W);
+            if (it != lora->end()) y = ggml_add(c, y, ggml_scale(c, ggml_mul_mat(c, it->second.b, ggml_mul_mat(c, it->second.a, x)), lora_scale));
+        }
+        return y;
+    }
 
     // --stats: keep a tensor alive past the graph so the host can read it back after the compute
     void tap(ggml_tensor* t, int kind) {
@@ -1436,7 +1458,7 @@ struct G {                     // graph-building context
         ggml_tensor* xt = T == 1 && ggml_is_contiguous(x) ? ggml_reshape_3d(c, x, 1, C, 1)   // one token: same memory
                                                           : ggml_transpose(c, ggml_reshape_3d(c, x, C, T, 1));
         ggml_tensor* X = ggml_concat(c, past, xt, 0);                                     // [K-1+T, C, 1]
-        {   // the last K-1 inputs back into the state
+        if (!train) {   // the last K-1 inputs back into the state
             ggml_tensor* src = ggml_view_2d(c, X, K - 1, C, X->nb[1], (size_t) T * X->nb[0]);
             ggml_tensor* dst = ggml_view_2d(c, state, K - 1, C, state->nb[1], (size_t) off * state->nb[1]);
             ggml_build_forward_expand(gf, ggml_cpy(c, src, dst));
@@ -1656,6 +1678,7 @@ struct G {                     // graph-building context
     ggml_tensor* layer(int il, int ip, ggml_tensor* cur, std::vector<ggml_tensor*>& blocks, ggml_tensor* messages) {
         const Layer& y = m.L[ip];
         Slot& z = m.S[il];
+        ggml_tensor* cst = train ? tconv : z.conv;   // the conv history this visit reads (and, inference, writes)
         il_cur = il;
         const bool swa = h.swa[ip];
         const int64_t E = h.n_embd, nh = h.n_head, nkv = h.n_head_kv, hd = h.hd, kgqa = h.n_kgqa();
@@ -1716,11 +1739,11 @@ struct G {                     // graph-building context
             Q = rows(0, nq); R = rows(nq, nr); Gp = rows(nq + nr, ng);
             if (all) { Kp = rows(nq + nr + ng, y.wk->ne[1]); Vp = rows(nq + nr + ng + y.wk->ne[1], y.wv->ne[1]); }
         } else {
-            Q = ggml_mul_mat(c, y.wq, in[0]);
-            R = ggml_mul_mat(c, y.rel, in[0]);
+            Q = mm(y.wq, in[0]);
+            R = mm(y.rel, in[0]);
         }
-        if (!Kp) Kp = ggml_mul_mat(c, y.wk, in[1]);
-        if (!Vp) Vp = ggml_mul_mat(c, y.wv, in[2]);
+        if (!Kp) Kp = mm(y.wk, in[1]);
+        if (!Vp) Vp = mm(y.wv, in[2]);
         // fused attention prepare (K/V conv + key clip + value rms + both cache writes, one kernel per visit);
         // XOLOTL_INKLING_PREP_REF=1 keeps the chain.  The --stats path keeps the chain (it taps nothing here, but
         // stays on the validated graph).
@@ -1728,8 +1751,8 @@ struct G {                     // graph-building context
         bool prepped = false;
         ggml_tensor *Kc = nullptr, *Vc = nullptr;
         // rotated legs: the prep kernel rotates K / V itself (XOLOTL_INKLING_PREP_ROT_REF=1: those layers take the chain)
-        const bool rot_k = !swa && m.hrot_f && !st && kv_rot_leg(z.k_cache->type);
-        const bool rot_v = !swa && m.hrot_f && !st && kv_rot_leg(z.v_cache->type);
+        const bool rot_k = !train && !swa && m.hrot_f && !st && kv_rot_leg(z.k_cache->type);
+        const bool rot_v = !train && !swa && m.hrot_f && !st && kv_rot_leg(z.v_cache->type);
         const bool rot = rot_k || rot_v;
         static const bool prep_rot_ref = std::getenv("XOLOTL_INKLING_PREP_ROT_REF") != nullptr;
         auto hrot = [&](ggml_tensor* x, ggml_tensor* M) {
@@ -1749,12 +1772,12 @@ struct G {                     // graph-building context
                                                           rot_v ? m.hrot_f : nullptr) : nullptr;
             if (pr) { ggml_build_forward_expand(gf, pr); prepped = true; }
             else {
-                Kc = convolve(Kp, y.k_conv, dk, z.conv, 0);
-                Vc = convolve(Vp, y.v_conv, dv, z.conv, kgqa);
+                Kc = convolve(Kp, y.k_conv, dk, cst, 0);
+                Vc = convolve(Vp, y.v_conv, dv, cst, kgqa);
             }
         } else {
-            Kc = convolve(Kp, y.k_conv, swa ? nullptr : ggml_mul_mat(c, y.k_conv_proj, in[1]), z.conv, 0);
-            Vc = convolve(Vp, y.v_conv, swa ? nullptr : ggml_mul_mat(c, y.v_conv_proj, in[2]), z.conv, kgqa);
+            Kc = convolve(Kp, y.k_conv, swa ? nullptr : ggml_mul_mat(c, y.k_conv_proj, in[1]), cst, 0);
+            Vc = convolve(Vp, y.v_conv, swa ? nullptr : ggml_mul_mat(c, y.v_conv_proj, in[2]), cst, kgqa);
         }
         {   // clip (+ the global layers' log-position scale) as one kernel each when fused; else the op chains
             static const bool clip_ref = std::getenv("XOLOTL_INKLING_CLIP_REF") != nullptr;
@@ -1784,8 +1807,10 @@ struct G {                     // graph-building context
         if (!prepped) {
             Vc = ggml_rms_norm(c, ggml_reshape_3d(c, Vc, hd, nkv, T), h.eps);
             if (rot_v) Vc = hrot(Vc, m.hrot_f);
-            kst = store_kv(Kc, z.k_cache, swa);
-            vst = store_kv(Vc, z.v_cache, swa);
+            if (!train) {
+                kst = store_kv(Kc, z.k_cache, swa);
+                vst = store_kv(Vc, z.v_cache, swa);
+            }
         }
         const std::vector<ChunkIn>& plan = swa ? s.ck_swa : s.ck_full;
 
@@ -1817,13 +1842,35 @@ struct G {                     // graph-building context
         const bool decattn = decattn_on();
         // prompt chunks (T > 16): flash attention on the tensor cores over the whole f16 cache, bias and sink in-kernel
         // (port of Basalt attn_prompt.cu) - no [cells, T, nh] scores, masks or V transposes. XOLOTL_INKLING_PROMPT_ATTN=1
-        if (pattn_use(m, (int) T) && kst && vst && y.rel_bias_pad && kv_fused_type(z.k_cache->type) && kv_fused_type(z.v_cache->type)) {
+        if (train) {   // --train: the chunk's own K/V (after any carried prefix), host masks, one softmax - the reference's
+                       // single-chunk path below with the cache views replaced by the fresh tensors
+            const ChunkIn& ci = plan.at(0);
+            ggml_tensor* Ka = Kc;   // [hd, nkv, T] (clipped)
+            ggml_tensor* Va = Vc;   // [hd, nkv, T] (normed)
+            if (tk_pre) { Ka = ggml_concat(c, tk_pre, Ka, 2); Va = ggml_concat(c, tv_pre, Va, 2); }
+            GGML_ASSERT(Ka->ne[2] == ci.cells && Va->ne[2] == ci.cells);
+            // XOLOTL_INKLING_TRAIN_KV16=1 (the --check gate): K/V as f16 tensors, so both attention products run the cache path's precision
+            static const bool kv16 = std::getenv("XOLOTL_INKLING_TRAIN_KV16") != nullptr;
+            if (kv16) { Ka = ggml_cast(c, Ka, GGML_TYPE_F16); Va = ggml_cast(c, Va, GGML_TYPE_F16); }   // f16 operands, as the cache path
+            ggml_tensor* kq_b = ggml_get_rows(c, get_table(), ci.rp);                       // [nh, cells, T]
+            kq_b = ggml_cont(c, ggml_permute(c, ggml_reshape_4d(c, kq_b, nh, ci.cells, T, 1), 2, 0, 1, 3));   // [cells, T, nh]
+            ggml_tensor* mask_h = ggml_add(c, kq_b, ci.mask);
+            ggml_tensor* Kv = ggml_permute(c, Ka, 0, 2, 1, 3);                                // [hd, cells, nkv]
+            ggml_tensor* vt = ggml_cont(c, ggml_transpose(c, ggml_permute(c, Va, 0, 2, 1, 3)));   // [cells, hd, nkv]
+            ggml_tensor* kq = ggml_mul_mat(c, Kv, q);                                       // [cells, T, nh]
+            ggml_prec_set_acc(kq, GGML_PREC_F32);
+            kq = ggml_soft_max_ext(c, kq, mask_h, 1.0f / std::sqrt((float) hd), 0.0f);
+            ggml_soft_max_add_sinks(kq, m.zsink);
+            ggml_tensor* at = ggml_mul_mat(c, vt, kq);                                      // [hd, T, nh]
+            o = ggml_cont_2d(c, ggml_permute(c, at, 0, 2, 1, 3), (int64_t) hd * nh, T);
+        }
+        if (!o && pattn_use(m, (int) T) && kst && vst && y.rel_bias_pad && kv_fused_type(z.k_cache->type) && kv_fused_type(z.v_cache->type)) {
             ggml_tensor* pa = inkling_attn_prompt(c, Q, z.k_cache, z.v_cache, R, sinks, y.rel_bias_pad, kst, vst, p0,
                                                   swa ? h.n_swa : 0, 1.0f / std::sqrt((float) hd));
             if (pa) o = ggml_reshape_2d(c, pa, (int64_t) hd * nh, T);
         }
         if (!o && plan.empty()) GGML_ABORT("xolotl-inkling: prompt attention refused a layer that pattn_use() admitted (a bug; XOLOTL_INKLING_PROMPT_ATTN=0 works around it)");
-        if (decattn && !fa_ok(m, (int) T) && T <= 16 && plan.size() == 1 && !m.st &&
+        if (!o && decattn && !fa_ok(m, (int) T) && T <= 16 && plan.size() == 1 && !m.st &&
             kv_fused_type(z.k_cache->type) && kv_fused_type(z.v_cache->type)) {
             const ChunkIn& ci = plan[0];
             // the relative bias computed inside the attention kernel (no table mat-mul, no [cells, T, nh] mask);
@@ -1917,10 +1964,10 @@ struct G {                     // graph-building context
             GGML_ASSERT(!gated);
             o = ggml_reshape_2d(c, ggml_mul_mat(c, m.hrot_i, ggml_reshape_2d(c, ggml_is_contiguous(o) ? o : ggml_cont(c, o), hd, nh * T)), (int64_t) hd * nh, T);
         }
-        if (!gated) o = ggml_mul(c, o, ggml_sigmoid(c, Gp ? Gp : ggml_mul_mat(c, y.gate, in[0])));
+        if (!gated) o = ggml_mul(c, o, ggml_sigmoid(c, Gp ? Gp : mm(y.gate, in[0])));
         if (st) tap(o, inkling_stats::ST_O);            // --stats: the o_proj input, exactly what wo consumes
-        o = ggml_mul_mat(c, y.wo, o);
-        o = convolve(o, y.attn_post_conv, nullptr, z.conv, 2 * kgqa);
+        o = mm(y.wo, o);
+        o = convolve(o, y.attn_post_conv, nullptr, cst, 2 * kgqa);
         if (y.wo_b) o = ggml_add(c, o, y.wo_b);
 
         if (ip % h.block == 0) { blocks.push_back(inpSA); cur = o; }     // a new residual stream starts here
@@ -1968,11 +2015,11 @@ struct G {                     // graph-building context
                     ggml_tensor* dT = ggml_cont(c, ggml_permute(c, moe_d, 1, 0, 2, 3));
                     x = ggml_reshape_2d(c, ggml_mul_mat(c, dT, ggml_reshape_3d(c, moe_wk, h.n_used, 1, T)), E, T);
                 }
-                x = convolve(x, y.ffn_post_conv, nullptr, z.conv, off);
+                x = convolve(x, y.ffn_post_conv, nullptr, cst, off);
                 cur = ggml_add(c, ffn_inp, x);
             }
         } else {
-            x = convolve(x, y.ffn_post_conv, nullptr, z.conv, 2 * kgqa + E);
+            x = convolve(x, y.ffn_post_conv, nullptr, cst, 2 * kgqa + E);
             cur = ggml_add(c, ffn_inp, x);
         }
         ggml_format_name(cur, "l_out-%d", il);
@@ -2732,7 +2779,10 @@ void usage() {
 
 }  // namespace
 
+int inkling_train_main(int argc, char** argv);   // --train: inkling_train.cpp (included at the end)
+
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--train") return inkling_train_main(argc, argv);
     std::string gguf_path, ids_arg, out_dir, cpu_exps, dspark_path, dspark_prefix;
     bool mtp = false;   // --mtp: the DSpark (MTP) drafter built into the model GGUF (tools/inkling/embed_dspark.py)
     std::string mmproj_path, vision_device = "auto";   // --mmproj: the image tower
@@ -3544,3 +3594,5 @@ int main(int argc, char** argv) {
     }
     return 0;
 }
+
+#include "inkling_train.cpp"   // --train (LoRA training on the served GGUF)
