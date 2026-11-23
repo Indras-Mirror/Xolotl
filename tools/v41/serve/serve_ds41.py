@@ -353,32 +353,40 @@ class Ds41Vision(_Vision):
         if not lazy and not self.lazy_vision and not self.elastic and (not self.per_image or self.standby):
             self._start()
 
-    def encode(self, source, keep=()):
-        if self.lend_cb is None and not self.per_image:
-            return super().encode(source, keep)
-        data = self.normalize(source if isinstance(source, bytes) else self.load(source))   # normalize is idempotent
-        if hashlib.sha256(data).hexdigest()[:32] not in self.cache:   # the key encode() uses: a picture to encode
-            if self.lend_cb is not None:
-                lend, self.lend_cb = self.lend_cb, None
-                lend()
-            if self.per_image:
-                self._spawned.wait()              # a standby still starting after the last image turn
-                if not self.alive():
-                    import time
-                    t0 = time.time()
-                    self._start()
-                    print(f"[strata] images: the image encoder started in {time.time() - t0:.1f} s", flush=True)
-        return super().encode(data, keep)
+    def _turn_start(self):
+        """Before the turn's first picture that is not cached: the lend, and for per_image the encoder process."""
+        if self.lend_cb is not None:
+            lend, self.lend_cb = self.lend_cb, None
+            lend()
+        if self.per_image:
+            self._spawned.wait()              # a standby still starting after the last image turn
+            if not self.alive():
+                import time
+                t0 = time.time()
+                self._start()
+                print(f"[strata] images: the image encoder started in {time.time() - t0:.1f} s", flush=True)
+
+    def encode_keyed(self, key, data, keep=()):
+        # #146: the server encodes through encode_keyed, so the lend / per_image start live here (encode() reaches this
+        # too, via the base class); a cached picture takes neither
+        if (self.lend_cb is not None or self.per_image) and key not in self.cache:
+            self._turn_start()
+        return super().encode_keyed(key, data, keep)
 
     def encode_all(self, sources, cancel=None):
         try:
             return super().encode_all(sources, cancel)
         finally:
-            self.lend_cb = None
-            if self.per_image and self.alive():   # before the prompt reaches the engine: its VRAM back to the cache
-                self.unload()
-                if self.standby:
-                    self._respawn()
+            self.turn_done()
+
+    def turn_done(self):
+        """The turn's pictures are encoded: an unused lend is dropped, and a per_image encoder's VRAM goes back to the
+        engine's cache before the prompt reaches it (the server calls this after a keyed turn that encoded, #146)."""
+        self.lend_cb = None
+        if self.per_image and self.alive():
+            self.unload()
+            if self.standby:
+                self._respawn()
 
     def _respawn(self):
         """standby: the next image turn's encoder starts now, in the background (it holds no VRAM until its picture)."""

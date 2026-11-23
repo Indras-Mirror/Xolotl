@@ -6414,6 +6414,10 @@ class Service:
                 hit = self.vision.encode_keyed(key, data, keep=[p for p, _ in encoded if p is not None])
             encoded.append(hit)
             refs.append(None)
+        if started:   # #146: the turn encoded: its lend/encoder lifecycle ends before the prompt reaches the engine
+            turn_done = getattr(self.vision, "turn_done", None)
+            if turn_done is not None:
+                turn_done()
         return encoded, refs
 
     def expand_image_tokens(self, ids, encoded, ends=None):
