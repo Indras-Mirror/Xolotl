@@ -92,6 +92,7 @@ from serve.responses import ResponsesError, error_body as responses_error_body  
 from serve.voice import VoiceServer, start_lazy_voice  # noqa: E402  local: the voice sidecar (ASR/TTS)
 from serve import images as images_api  # noqa: E402
 from serve import request_log as reqlog  # noqa: E402
+from serve import loop_guard  # noqa: E402  (ported from Delta 0.95 / Project Maya: a note when an agent repeats one tool call)
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -5062,6 +5063,11 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.repeat_wrap_up = True                       # ... unless the model is thinking: then the thinking is closed
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        # serve/loop_guard.py (ported from Delta 0.95, after Project Maya): the same tool call LOOP_GUARD repeats in a row,
+        # or TIMES of the last WINDOW calls with the same result, gets one note before the next turn (config "loop_guard")
+        self.loop_guard_repeats = loop_guard.REPEATS
+        self.loop_guard_window = loop_guard.TIMES
+        self.note_role = None                             # the loop guard note's role (_loop_note_role)
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.keep_cut_tool_calls = False                  # opt-in: a whole OpenAI answer keeps a call cut at the token limit (openai_collect)
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
@@ -6448,6 +6454,35 @@ class Service:
             self.prompts.forget(ids)
 
 
+    def _loop_guard(self, messages):
+        """serve/loop_guard.py (Delta 0.94/0.95, after Project Maya): a request that answers the results of a tool call
+        the model has made loop_guard_repeats times in a row with the same arguments - or one the last WINDOW calls hold
+        loop_guard_window times with the same result - gets one short note after those results, for this prompt only.
+        Any other request is returned as it came, so it renders exactly as before."""
+        hit = loop_guard.repeated(messages, self.loop_guard_repeats)
+        if hit is not None:
+            names, times = hit
+            print(f"[strata] loop guard: {names} repeated {times} times", flush=True)
+            return messages + [{"role": self._loop_note_role(), "content": loop_guard.note(names, times)}]
+        hit = loop_guard.windowed(messages, self.loop_guard_window) if self.loop_guard_repeats else None
+        if hit is None:
+            return messages
+        names, times = hit
+        print(f"[strata] loop guard: {names} made {times} times in the last {loop_guard.WINDOW} calls", flush=True)
+        return messages + [{"role": self._loop_note_role(), "content": loop_guard.window_note(names, times)}]
+
+    def _loop_note_role(self) -> str:
+        """"system" when the template takes a system message in the middle of a conversation (DeepSeek V4.1's does),
+        else "user" (Qwen's template refuses a late system message)."""
+        if self.note_role is None:
+            try:
+                self.template.render([{"role": "system", "content": "a"}, {"role": "user", "content": "b"},
+                                      {"role": "system", "content": "c"}], tools=None)
+                self.note_role = "system"
+            except Exception:  # noqa: BLE001 - any refusal: the role every template takes
+                self.note_role = "user"
+        return self.note_role
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
@@ -6474,6 +6509,7 @@ class Service:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         self._restore_reasoning(messages, log=kwargs.get("enable_thinking") is not False)
+        messages = self._loop_guard(messages)            # this prompt only; the client's conversation is not changed
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and (not self.thinking_model or kwargs.get("enable_thinking", True) is False):
             ids = ids + self.tok.encode(force, parse_special=True)
@@ -11312,6 +11348,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
+    try:                                                # serve/loop_guard.py (on unless turned off)
+        svc.loop_guard_repeats = loop_guard.setting(cfg.get("loop_guard"))
+        svc.loop_guard_window = loop_guard.window_setting(cfg.get("loop_guard"))
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}") from None
     svc.keep_cut_tool_calls = keep_cut_tool_calls_setting(cfg)
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
