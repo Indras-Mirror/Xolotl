@@ -38,7 +38,7 @@ coding/harness adapter.
 | W1 | `GGML_OP_MUL_MAT_ID_BACK` (dX through frozen experts), CPU + CUDA | **DONE** 23 Nov (gates below) |
 | W3 | ggml patch hygiene (train tree == patch) | done with W2/W1 (patch regenerated from the train tree) |
 | W4 | `train` variant of `G`/`layer()` | **DONE (WIP commit)** - `--check 64` bit-exact vs inference with f16 K/V |
-| W5 | per-slot VJP trainer (`src/program/inkling_train.cpp`, `xolotl-inkling --train`) | written, compiles; `--fd` gate in progress (needed batched GET_ROWS_BACK + softmax mask grad) |
+| W5 | per-slot VJP trainer (`src/program/inkling_train.cpp`, `xolotl-inkling --train`) | **DONE 23 Nov** - `--fd` (frozen routing) + `--overfit` pass (below) |
 | W6 | gates: train graph == inference graph (T=64, rel err < 1e-3); per-component FD + NeMo oracle; directional FD over all adapters (eps 0.1); 20-step overfit loss drop; every adapter gets a non-zero grad | |
 | W7 | adapter loading in `xolotl-inkling` | |
 | W8 | throughput / memory tuning | |
@@ -80,6 +80,27 @@ Experts are frozen (the backward asserts no gradient is asked for `as`); ids out
   CUDA atomics kernel; grad cases pass CPU + CUDA) and the softmax MASK gradient (the relative bias is the mask:
   dm = softmax_back(dy) at scale 1, repeat_back over broadcast dims). New test `test_soft_max_grad` (output op MUL ->
   run with `-o MUL`): result pending at handoff.
+
+### W5 gates (23 Nov night)
+
+- Softmax mask rule: the test-backend-ops FD reference is too noisy (f32 SUM loss); the rule is proven against a
+  double-precision analytic reference, `tools/train/smgrad_ref.cpp` (16/16 at < 1e-7, gradient ~0.5).
+  `test_soft_max_grad` now runs at the measured floor (max_maa_err 1e-2): 16/16 CPU + CUDA. SOFT_MAX_BACK / REPEAT_BACK
+  CUDA == CPU.
+- New rule: broadcast SUB backward (repeat_back of the subtrahend's gradient); `test_sub_bcast_grad` 3/3.
+- `--fd` redesigned: steps along the gradient (d = g_S/|g_S|, per target set) instead of a random direction (a random
+  unit direction over 9.78 M params has <g,d> ~ |g|/sqrt(N), below the forward's noise). Routing is **frozen** for the
+  gate (base forward's top-k ids replayed; `XOLOTL_INKLING_FD_FREE_ROUTING=1` to keep it live): with live routing, tiny
+  steps flip near-tie expert choices and the loss jumps. Result at eps 0.1: all 0.36 %, q 1.7 %, k 2.1 %, v 3.5 %
+  (0.27 % at 0.03), o 2.4 %, gate 2.0 %, rel 1.1 %; 0/144 zero-grad adapters. Smaller eps = q8/f16 rounding steps.
+- Fused CUDA top-k MoE router vs unfused (`GGML_CUDA_DISABLE_FUSION=1` or `XOLOTL_INKLING_ROUTER_REF=1`): loss 2.2912
+  vs 2.2719 on w64. Slot 0 (identical inputs) agrees to 1.6e-7; the gap grows over the 48 visits (median 3e-4 at slot 1,
+  2.6 % at slot 47) = ulp differences amplified by routing flips + rounding, same size as the f16-vs-f32 K/V gap.
+  The kernel is correct (new TOPK_MOE cases at Inkling's shape, 128 experts / top-8 / T 64 + 512: 16/16).
+  `XOLOTL_INKLING_DUMP_STREAMS=<file>` dumps every slot's output stream for such comparisons.
+- `--overfit 20 --lr 1e-3` on a real harness window (`gate/h512.jsonl`): loss 1.227 -> 0.0002 (w512 is repeated text,
+  base loss 0.009 - useless for this gate). Step time / VRAM peak (frozen weights 13.9 GB): T=512 3.0 s / 15.8 GB,
+  T=1024 5.7 s / 15.9 GB, T=2048 14.0 s / 17.4 GB (~150-180 tok/s).
 
 ## Rules
 

@@ -291,6 +291,9 @@ struct Trainer {
         }
         g.lora = &lmap;
         g.lora_scale = scale;
+        const size_t v = (size_t) (&io - plan.data());
+        if (route_mode == 2) g.fixed_ids = gg.i32(route_ids.at(v).data(), h.n_used, T);
+        if (route_mode == 1 && !vjp) g.ids_out = &route_rec;
         return g.layer(io.il, io.ip, cur, blocks, msgs);
     }
 
@@ -350,9 +353,20 @@ struct Trainer {
             std::vector<ggml_tensor*> ins; std::vector<int> iid;
             std::vector<std::pair<ggml_tensor*, ggml_tensor*>> abs;
             std::unordered_map<const ggml_tensor*, G::Lora> lmap;
+            route_rec = nullptr;
             ggml_tensor* out = slot_graph(gg, st, io, T, X, false, ins, iid, abs, lmap);
-            gg.run(be, nullptr, {out});
+            gg.run(be, nullptr, {out, route_rec});
             X[io.out] = fetch(out);
+            if (const char* dp = std::getenv("XOLOTL_INKLING_DUMP_STREAMS")) {   // debug: every slot's output stream
+                static FILE* df = std::fopen(dp, "wb");
+                if (df) { std::fwrite(X[io.out].data(), 4, X[io.out].size(), df); std::fflush(df); }
+            }
+            if (route_rec) {   // a strided view over the full argsort: read row by row
+                std::vector<int32_t>& r = route_ids[(size_t) (&io - plan.data())];
+                r.resize((size_t) h.n_used * T);
+                for (int t = 0; t < T; ++t)
+                    ggml_backend_tensor_get(route_rec, &r[(size_t) t * h.n_used], (size_t) t * route_rec->nb[1], (size_t) h.n_used * 4);
+            }
         }
         G1 gg;
         Step st;
@@ -440,6 +454,10 @@ struct Trainer {
         }
         return loss;
     }
+
+    int route_mode = 0;   // gates: 0 = free routing, 1 = record each visit's top-k ids, 2 = replay them
+    std::vector<std::vector<int32_t>> route_ids;
+    ggml_tensor* route_rec = nullptr;
 
     void zero_grads() { for (Adapter& x : ad) { std::fill(x.gA.begin(), x.gA.end(), 0.0f); std::fill(x.gB.begin(), x.gB.end(), 0.0f); } }
     double grad_norm() const {
@@ -539,44 +557,66 @@ static int gate_check(Trainer& tr, const Window& w0, int T) {
 
 // --fd: directional finite difference over every adapter parameter (B random so A matters): <g, d> vs FD at eps
 static int gate_fd(Trainer& tr, const Window& w) {
+    // Directional FD along the gradient itself: d = g_S / |g_S| over a subset S of the adapters, so the analytic
+    // directional derivative is |g_S| (a random direction over ~10M params gives <g,d> ~ |g|/sqrt(N), lost in the
+    // forward's noise). S = all adapters, then each target type; a gradient that is wrong for one target shows there.
+    // XOLOTL_INKLING_FD_FREE_ROUTING=1 keeps routing live; default = the base forward's top-k ids replayed (a perturbed
+    // forward that flips an expert choice makes the loss jump, which the gradient - routing held fixed - cannot see)
+    const bool frozen = std::getenv("XOLOTL_INKLING_FD_FREE_ROUTING") == nullptr;
+    tr.route_ids.assign(tr.plan.size(), {});
     tr.zero_grads();
+    if (frozen) {
+        tr.route_mode = 1;
+        const double Lf = tr.step_window(w, false);
+        tr.route_mode = 2;
+        const double Lr = tr.step_window(w, false);
+        std::printf("free-routing loss %.7f, replayed %.7f\n", Lf, Lr);
+    }
     const double L0 = tr.step_window(w, true);
-    std::mt19937 rng(1234);
-    std::normal_distribution<float> nd(0.0f, 1.0f);
-    std::vector<std::vector<float>> dA(tr.ad.size()), dB(tr.ad.size());
-    double nrm = 0, gd = 0;
-    for (size_t k = 0; k < tr.ad.size(); ++k) {
-        dA[k].resize(tr.ad[k].A.size()); dB[k].resize(tr.ad[k].B.size());
-        for (float& v : dA[k]) { v = nd(rng); nrm += v * v; }
-        for (float& v : dB[k]) { v = nd(rng); nrm += v * v; }
-    }
-    nrm = std::sqrt(nrm);
-    for (size_t k = 0; k < tr.ad.size(); ++k) {
-        for (size_t i = 0; i < dA[k].size(); ++i) { dA[k][i] /= nrm; gd += (double) tr.ad[k].gA[i] * dA[k][i]; }
-        for (size_t i = 0; i < dB[k].size(); ++i) { dB[k][i] /= nrm; gd += (double) tr.ad[k].gB[i] * dB[k][i]; }
-    }
-    auto shift = [&](double s) {
-        for (size_t k = 0; k < tr.ad.size(); ++k) {
-            for (size_t i = 0; i < dA[k].size(); ++i) tr.ad[k].A[i] += (float) (s * dA[k][i]);
-            for (size_t i = 0; i < dB[k].size(); ++i) tr.ad[k].B[i] += (float) (s * dB[k][i]);
+    std::printf("routing %s\n", frozen ? "frozen (base top-k replayed)" : "free");
+    std::vector<std::vector<float>> gA(tr.ad.size()), gB(tr.ad.size());
+    for (size_t k = 0; k < tr.ad.size(); ++k) { gA[k] = tr.ad[k].gA; gB[k] = tr.ad[k].gB; }
+    // forward noise floor: the same parameters twice more
+    const double L1 = tr.step_window(w, false), L2 = tr.step_window(w, false);
+    std::printf("FD loss %.7f (repeat %.7f %.7f -> noise %.2e), |g| = %.4e, zero-grad adapters %d/%zu\n", L0, L1, L2,
+                std::max(std::abs(L1 - L0), std::abs(L2 - L0)), tr.grad_norm(), tr.zero_grad_adapters(false), tr.ad.size());
+    std::vector<std::string> sets = {"all"};
+    for (const auto& x : tr.ad) if (std::find(sets.begin(), sets.end(), x.tgt) == sets.end()) sets.push_back(x.tgt);
+    int fails = 0;
+    for (const std::string& S : sets) {
+        auto in = [&](size_t k) { return S == "all" || tr.ad[k].tgt == S; };
+        double nrm = 0;
+        for (size_t k = 0; k < tr.ad.size(); ++k) if (in(k)) {
+            for (float v : gA[k]) nrm += (double) v * v;
+            for (float v : gB[k]) nrm += (double) v * v;
         }
-    };
-    std::printf("FD loss %.6f, analytic <g,d> = %.6e, |g| = %.4e, zero-grad adapters %d/%zu\n", L0, gd, tr.grad_norm(),
-                tr.zero_grad_adapters(false), tr.ad.size());
-    int ok = 0, n = 0;
-    for (double eps : {1.0, 0.3, 0.1, 0.03}) {
-        shift(eps);
-        const double Lp = tr.step_window(w, false);
-        shift(-2 * eps);
-        const double Lm = tr.step_window(w, false);
-        shift(eps);
-        const double fd = (Lp - Lm) / (2 * eps);
-        const double rel = std::abs(fd - gd) / std::max(std::abs(gd), 1e-12);
-        std::printf("  eps %-5g FD %.6e  rel err %.3e\n", eps, fd, rel);
-        ++n; ok += rel < 0.05;
+        nrm = std::sqrt(nrm);
+        if (nrm == 0) { std::printf("  [%s] |g| = 0\n", S.c_str()); ++fails; continue; }
+        auto shift = [&](double s) {
+            const double c = s / nrm;
+            for (size_t k = 0; k < tr.ad.size(); ++k) if (in(k)) {
+                for (size_t i = 0; i < gA[k].size(); ++i) tr.ad[k].A[i] += (float) (c * gA[k][i]);
+                for (size_t i = 0; i < gB[k].size(); ++i) tr.ad[k].B[i] += (float) (c * gB[k][i]);
+            }
+        };
+        double best = 1e30;
+        std::printf("  [%s] |g_S| = %.6e:", S.c_str(), nrm);
+        for (double eps : {0.1, 0.03, 0.01, 0.003}) {
+            shift(eps);
+            const double Lp = tr.step_window(w, false);
+            shift(-2 * eps);
+            const double Lm = tr.step_window(w, false);
+            shift(eps);
+            const double fd = (Lp - Lm) / (2 * eps);
+            const double rel = std::abs(fd - nrm) / nrm;
+            best = std::min(best, rel);
+            std::printf("  eps %g FD %.6e (%.1e)", eps, fd, rel);
+        }
+        std::printf("  -> best %.2e %s\n", best, best < 0.05 ? "OK" : "FAIL");
+        std::fflush(stdout);
+        fails += best >= 0.05;
     }
-    std::fflush(stdout);
-    return ok >= 1 && tr.zero_grad_adapters(false) == 0 ? 0 : 1;
+    return fails == 0 && tr.zero_grad_adapters(false) == 0 ? 0 : 1;
 }
 
 }  // namespace itrain

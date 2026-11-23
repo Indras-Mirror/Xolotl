@@ -3321,7 +3321,7 @@ index 33936acae..cb6ff367c 100644
                  }
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index ed8554b14..81277c19a 100644
+index ed8554b14..4ce68a2d5 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1093,6 +1093,15 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -3684,7 +3684,20 @@ index ed8554b14..81277c19a 100644
  struct ggml_tensor * ggml_dsv4_hc_pre(
          struct ggml_context * ctx,
          struct ggml_tensor  * x,
-@@ -6931,7 +7194,11 @@ static void ggml_compute_backward(
+@@ -6911,7 +7174,11 @@ static void ggml_compute_backward(
+                 ggml_add_or_set(ctx, cgraph, isrc0, grad);
+             }
+             if (src1_needs_grads) {
+-                ggml_sub_or_set(ctx, cgraph, isrc1, grad);
++                struct ggml_tensor * tmp = grad;
++                if (!ggml_are_same_shape(src0, src1)) {   // Xolotl: a broadcast subtrahend (e.g. a row max / row statistic)
++                    tmp = ggml_repeat_back(ctx, tmp, src1);
++                }
++                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
+             }
+         } break;
+         case GGML_OP_MUL: {
+@@ -6931,7 +7198,11 @@ static void ggml_compute_backward(
                  ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, grad, src1));
              }
              if (src1_needs_grads) {
@@ -3697,7 +3710,7 @@ index ed8554b14..81277c19a 100644
              }
          } break;
          case GGML_OP_SQR: {
-@@ -6991,6 +7258,25 @@ static void ggml_compute_backward(
+@@ -6991,6 +7262,25 @@ static void ggml_compute_backward(
                  ggml_add_or_set(ctx, cgraph, isrc0, ggml_rms_norm_back(ctx, grad, src0, eps));
              }
          } break;
@@ -3723,7 +3736,7 @@ index ed8554b14..81277c19a 100644
          case GGML_OP_MUL_MAT: {
              // https://cs231n.github.io/optimization-2/#staged
              // # forward pass
-@@ -7048,7 +7334,9 @@ static void ggml_compute_backward(
+@@ -7048,7 +7338,9 @@ static void ggml_compute_backward(
              if (src0_needs_grads) {
                  float s;
                  memcpy(&s, tensor->op_params, sizeof(float));
@@ -3734,7 +3747,7 @@ index ed8554b14..81277c19a 100644
              }
          } break;
          case GGML_OP_SET: {
-@@ -7094,10 +7382,11 @@ static void ggml_compute_backward(
+@@ -7094,10 +7386,11 @@ static void ggml_compute_backward(
              // same as cpy
              if (src0_needs_grads) {
                  GGML_ASSERT(!cgraph->grads[isrc0] || ggml_is_contiguous(cgraph->grads[isrc0]));
@@ -3748,7 +3761,7 @@ index ed8554b14..81277c19a 100644
              }
          } break;
          case GGML_OP_RESHAPE: {
-@@ -7145,12 +7434,14 @@ static void ggml_compute_backward(
+@@ -7145,12 +7438,14 @@ static void ggml_compute_backward(
                  axb[axis1] = 1;
                  axb[axis2] = 2;
                  axb[axis3] = 3;
@@ -3765,7 +3778,7 @@ index ed8554b14..81277c19a 100644
              }
          } break;
          case GGML_OP_GET_ROWS: {
-@@ -7161,6 +7452,12 @@ static void ggml_compute_backward(
+@@ -7161,6 +7456,12 @@ static void ggml_compute_backward(
                  // noop
              }
          } break;
@@ -3778,7 +3791,7 @@ index ed8554b14..81277c19a 100644
          case GGML_OP_DIAG_MASK_INF: {
              if (src0_needs_grads) {
                  /* ggml_diag_mask_inf_impl() shouldn't be here */
-@@ -7185,7 +7482,17 @@ static void ggml_compute_backward(
+@@ -7185,7 +7486,17 @@ static void ggml_compute_backward(
  
                  ggml_add_or_set(ctx, cgraph, isrc0, ggml_soft_max_ext_back(ctx, grad, tensor, scale, max_bias));
              }
@@ -3797,7 +3810,7 @@ index ed8554b14..81277c19a 100644
          } break;
          case GGML_OP_ROPE: {
              if (src0_needs_grads) {
-@@ -7270,6 +7577,18 @@ static void ggml_compute_backward(
+@@ -7270,6 +7581,18 @@ static void ggml_compute_backward(
                          ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, grad, src0));
                      }
                  } break;
@@ -3816,7 +3829,7 @@ index ed8554b14..81277c19a 100644
                  case GGML_UNARY_OP_EXP: {
                      if (src0_needs_grads) {
                          ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, tensor, grad));
-@@ -7309,11 +7628,101 @@ static void ggml_compute_backward(
+@@ -7309,11 +7632,101 @@ static void ggml_compute_backward(
                          ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
                      }
                  } break;
@@ -3918,7 +3931,25 @@ index ed8554b14..81277c19a 100644
          case GGML_OP_NONE: {
              // noop
          } break;
-@@ -7476,6 +7885,7 @@ void ggml_build_backward_expand(
+@@ -7323,6 +7736,17 @@ static void ggml_compute_backward(
+         } //break;
+     }
+ 
++    for (int k = 0; k < 3; k++) {   // Xolotl: name the op whose backward rule produced a wrong-shaped gradient
++        const struct ggml_tensor * sk = tensor->src[k];
++        const size_t ik = k == 0 ? isrc0 : k == 1 ? isrc1 : isrc2;
++        const bool nk = k == 0 ? src0_needs_grads : k == 1 ? src1_needs_grads : src2_needs_grads;
++        if (nk && !ggml_are_same_shape(sk, cgraph->grads[ik])) {
++            const struct ggml_tensor * gk = cgraph->grads[ik];
++            fprintf(stderr, "ggml_compute_backward: backward of %s '%s' src%d '%s' ne [%lld %lld %lld %lld] grad op %s ne [%lld %lld %lld %lld]\n",
++                ggml_op_desc(tensor), tensor->name, k, sk->name, (long long) sk->ne[0], (long long) sk->ne[1], (long long) sk->ne[2], (long long) sk->ne[3],
++                ggml_op_desc(gk), (long long) gk->ne[0], (long long) gk->ne[1], (long long) gk->ne[2], (long long) gk->ne[3]);
++        }
++    }
+     GGML_ASSERT(!src0_needs_grads || ggml_are_same_shape(src0, cgraph->grads[isrc0]));
+     GGML_ASSERT(!src1_needs_grads || ggml_are_same_shape(src1, cgraph->grads[isrc1]));
+     GGML_ASSERT(!src2_needs_grads || ggml_are_same_shape(src2, cgraph->grads[isrc2]));
+@@ -7476,6 +7900,7 @@ void ggml_build_backward_expand(
              // gradients in node->src[0] for one reason or another have no effect on output gradients
              case GGML_OP_IM2COL:      // only used for its shape
              case GGML_OP_IM2COL_BACK: // same as IM2COL
@@ -3926,7 +3957,7 @@ index ed8554b14..81277c19a 100644
                  ignore_src[0] = true;
                  break;
              case GGML_OP_UNARY: {
-@@ -7494,6 +7904,17 @@ void ggml_build_backward_expand(
+@@ -7494,6 +7919,17 @@ void ggml_build_backward_expand(
                  ignore_src[1] = true;
                  break;
  

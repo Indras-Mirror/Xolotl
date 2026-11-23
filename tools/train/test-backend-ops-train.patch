@@ -76,7 +76,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
          ggml_set_name(b, "b");
  
          ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
-@@ -5734,6 +5760,81 @@
+@@ -5734,6 +5760,108 @@
  };
  
  // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
@@ -113,6 +113,33 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
 +        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
 +            init_tensor_uniform(t, -2.0f, 2.0f);
 +        }
++    }
++    // The FD reference is noisy here (2-point at eps 0.1: MAA 1e-4..3.3e-3; smaller eps is worse, f32 SUM-loss rounding).
++    // The rule itself is checked against a double-precision analytic reference (Xolotl tools/train/smgrad_ref.cpp:
++    // tree: 16/16 at <1e-7); a wrong rule shows as an error the size of the gradient itself (0.2-1 here).
++    double max_maa_err() override { return 1e-2; }
++};
++
++// Xolotl (LoRA training): broadcast SUB backward (the subtrahend's gradient is summed over its broadcast dims).
++// out = (a - b) * w so the gradient is not a constant; output op MUL -> run with `-o MUL`.
++struct test_sub_bcast_grad : public test_case {
++    const std::array<int64_t, 4> ne;
++    const std::array<int64_t, 4> ne_b;
++    std::string vars() override { return VARS_TO_STR2(ne, ne_b); }
++    test_sub_bcast_grad(std::array<int64_t, 4> ne = {16, 5, 4, 3}, std::array<int64_t, 4> ne_b = {1, 5, 4, 3})
++        : ne(ne), ne_b(ne_b) {}
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_param(a);
++        ggml_set_name(a, "a");
++        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_b.data());
++        ggml_set_param(b);
++        ggml_set_name(b, "b_sub");
++        ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_name(w, "w");
++        ggml_tensor * out = ggml_mul(ctx, ggml_sub(ctx, a, b), w);
++        ggml_set_name(out, "out");
++        return out;
 +    }
 +};
 +
@@ -158,7 +185,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
  struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
      test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
              int n_mats = 8, int n_used = 2, bool b = false,
-@@ -6354,12 +6455,13 @@
+@@ -6354,12 +6482,13 @@
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne[0], ne[1], ne[2]*nr23[0], ne[3]*nr23[1]);
@@ -173,7 +200,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
              ggml_set_name(mask, "mask");
          }
  
-@@ -8312,6 +8414,7 @@
+@@ -8312,6 +8441,7 @@
          const std::array<int64_t, 4> ne_a = noncontig_rows ?
              std::array<int64_t, 4>{ ne[1], ne[0], ne[2], ne[3] } : ne;
          ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
@@ -181,7 +208,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
          ggml_set_name(a, "a");
  
          if (noncontig_rows) {
-@@ -8328,6 +8431,10 @@
+@@ -8328,6 +8458,10 @@
  
          return out;
      }
@@ -192,7 +219,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
  };
  
  // GGML_OP_ACC
-@@ -8400,6 +8507,7 @@
+@@ -8400,6 +8534,7 @@
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
@@ -200,7 +227,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
          ggml_set_name(a, "a");
  
          ggml_tensor * out = circular
-@@ -9040,8 +9148,9 @@
+@@ -9040,8 +9175,9 @@
      const ggml_type              type;
      const std::array<int64_t, 4> ne_lhs;
      const std::array<int64_t, 4> ne_rhs;
@@ -211,7 +238,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
  
      uint64_t op_flops(ggml_tensor * t) override {
          GGML_UNUSED(t);
-@@ -9054,9 +9163,10 @@
+@@ -9054,9 +9190,10 @@
  
      test_solve_tri(ggml_type type = GGML_TYPE_F32,
              std::array<int64_t, 4> ne_lhs = { 10, 10, 4, 3 },
@@ -224,7 +251,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne_lhs[0], ne_lhs[1], ne_lhs[2], ne_lhs[3]);
-@@ -9067,7 +9177,7 @@
+@@ -9067,7 +9204,7 @@
          ggml_set_param(b);
          ggml_set_name(b, "b");
  
@@ -233,7 +260,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
          ggml_set_name(out, "out");
  
          return out;
-@@ -9078,6 +9188,15 @@
+@@ -9078,6 +9215,15 @@
              if (strcmp(t->name, "a") == 0) {
                  // note: avoid zeros in the diagonal
                  init_tensor_tril(t, 0.1, 1.0f);
@@ -249,7 +276,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
              } else {
                  init_tensor_uniform(t, -1.0f, 1.0f);
              }
-@@ -11541,6 +11660,35 @@
+@@ -11541,6 +11687,39 @@
          }
      }
  
@@ -262,6 +289,10 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
 +            }
 +        }
 +    }
++    // Xolotl (LoRA training): broadcast SUB backward
++    test_cases.emplace_back(new test_sub_bcast_grad({16, 5, 4, 3}, {1, 5, 4, 3}));   // a row statistic
++    test_cases.emplace_back(new test_sub_bcast_grad({16, 5, 4, 3}, {16, 1, 4, 3}));
++    test_cases.emplace_back(new test_sub_bcast_grad({16, 5, 4, 3}, {1, 1, 1, 1}));
 +
 +    // Xolotl (LoRA training): MUL_MAT_ID_BACK, every expert type in the Inkling XQ file plus the common ones
 +    for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K,
@@ -285,7 +316,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
      // Xolotl (LoRA training): mul_mat backward through a frozen quantized weight = out_prod(W, dy^T), weight-shaped.
      // m 4096 x k 20000 makes the CUDA path dequantize in two row chunks (256 MiB of F32 each).
      for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_XS,
-@@ -12028,6 +12176,9 @@
+@@ -12028,6 +12207,9 @@
      test_cases.emplace_back(new test_diag(GGML_TYPE_F32, { 256, 1, 8, 16 }));
  
      test_cases.emplace_back(new test_solve_tri());
@@ -295,3 +326,12 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
      test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 11, 11, 1, 1 }, { 5, 11, 1, 1 }));
      test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 17, 17, 2, 4 }, { 9, 17, 2, 4 }));
      test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 30, 30, 7, 1 }, { 8, 30, 7, 1 }));
+@@ -12396,6 +12578,8 @@
+                     test_cases.emplace_back(new test_topk_moe({160, 4, 1, 1}, 160, with_norm, bias_probs, gate, scale_w));
+                     test_cases.emplace_back(new test_topk_moe({256, 22, 1, 1}, 6, with_norm, bias_probs, gate, scale_w)); // Used by DeepSeek-V4
+                     test_cases.emplace_back(new test_topk_moe({288, 22, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Used by StepFun 3.7
++                    test_cases.emplace_back(new test_topk_moe({128, 64, 1, 1}, 8, with_norm, bias_probs, gate, scale_w)); // Xolotl: Inkling-2-Mini
++                    test_cases.emplace_back(new test_topk_moe({128, 512, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));
+                     // rows at and just past the limit where one block still covers all rows
+                     test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 4, with_norm, bias_probs, gate, scale_w));
+                     test_cases.emplace_back(new test_topk_moe({32, 8, 1, 1}, 8, with_norm, bias_probs, gate, scale_w));

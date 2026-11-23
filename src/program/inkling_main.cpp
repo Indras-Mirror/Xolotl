@@ -1375,6 +1375,8 @@ struct G {                     // graph-building context
     ggml_tensor *tk_pre = nullptr, *tv_pre = nullptr;    // [hd, nkv, n_pre] carried K (clipped) / V (normed), or null
     const std::unordered_map<const ggml_tensor*, Lora>* lora = nullptr;
     float lora_scale = 1.0f;
+    ggml_tensor* fixed_ids = nullptr;    // train gates: replay these top-k ids [k, T] (frozen routing = a smooth loss)
+    ggml_tensor** ids_out = nullptr;     // train gates: record the top-k ids this visit chose
     // a projection by a base weight, plus its adapter when one is attached (inference: lora == null, plain mul_mat)
     ggml_tensor* mm(ggml_tensor* W, ggml_tensor* x) {
         ggml_tensor* y = ggml_mul_mat(c, W, x);
@@ -1513,6 +1515,8 @@ struct G {                     // graph-building context
         ggml_tensor* probs = ggml_sigmoid(c, logits);
         ggml_tensor* sel = y.probs_b ? ggml_add(c, probs, y.probs_b) : probs;
         ggml_tensor* ids = ggml_argsort_top_k(c, sel, (int) k);                  // [k, T]
+        if (train && fixed_ids) ids = fixed_ids;
+        if (train && ids_out) *ids_out = ids;
         ggml_tensor* w = ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, NE, T), ids);   // [1, k, T]
         w = ggml_reshape_2d(c, w, k, T);
         // clamp (not + eps): the exact op sequence ggml-cuda fuses into one top-k MoE router kernel (llama.cpp's
