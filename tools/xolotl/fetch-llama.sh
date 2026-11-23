@@ -26,5 +26,9 @@ if ! git -C "$DST" diff --quiet || [ "$(git -C "$DST" rev-parse --short=8 HEAD)"
     echo "fetch-llama: $DST does not carry the current xolotl-ggml.patch - resetting it to $PIN first"
 fi
 git -C "$DST" checkout -q -f "$PIN"
+# files the patch itself creates survive the checkout as untracked leftovers of the previous patch and make `git apply`
+# refuse ("already exists in working directory"), leaving a pristine tree without the patch: clear exactly those
+new_files=$(awk '/^--- \/dev\/null/{getline; sub(/^\+\+\+ b\//, ""); print}' "$PATCH")
+[ -n "$new_files" ] && git -C "$DST" clean -fq -- $new_files
 git -C "$DST" apply "$PATCH"
 echo "fetch-llama: $DST = llama.cpp $PIN + xolotl-ggml.patch"
