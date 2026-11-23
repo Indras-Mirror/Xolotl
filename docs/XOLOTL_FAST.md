@@ -70,7 +70,7 @@ The same tasks solved and missed in both modes (04 is missed sometimes in each; 
 
 | switch                             | what                                                                                   |
 | ---------------------------------- | -------------------------------------------------------------------------------------- |
-| `XOLOTL_SHADOW=<file>[:<file>...]` | the sidecar files (the `.list`)                                                        |
+| `XOLOTL_SHADOW=<file>[:<file>...]` | the sidecar files (the `.list`); on Windows `;` between files, as `--engram` (a drive's `:` must not split) |
 | `XOLOTL_SHADOW_FROM=39,11`         | when building: which expert types get a 2-bit copy (39 = MXFP4, 11 = Q3_K)             |
 | `XOLOTL_SHADOW_TYPE=10`            | when building: the 2-bit format (10 = Q2_K, the default; 42 = Q2_0, the first version) |
 | `XOLOTL_SHADOW_IMATRIX=<file>`     | when building: weight the 2-bit fit by an importance matrix                            |
@@ -78,3 +78,7 @@ The same tasks solved and missed in both modes (04 is missed sometimes in each; 
 | `XOLOTL_SHADOW_THREADS=16`         | when building: CPU threads                                                             |
 
 **Turn it off:** unset `XOLOTL_SHADOW`.
+
+On Windows both names work too (`set XOLOTL_SHADOW=C:\fast\V4.fast.x41s.g10d42;C:\fast\V4.fast.x41s`); a `.list`
+written by `--build-shadow` uses the platform's separator. A Windows `.list` built before 24 Nov 2026 is `:`-joined:
+replace the `:` between files with `;` (a one-file list works either way).

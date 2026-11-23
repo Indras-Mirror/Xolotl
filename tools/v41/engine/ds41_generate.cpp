@@ -462,15 +462,21 @@ ImatAcc g_imat;
 // reads it (the Xolotl name wins when both are set), so XOLOTL_ARENA_PIN_AFTER=0 == STRATA_ARENA_PIN_AFTER=0.  The
 // STRATA_* names keep working unchanged; the code reads only STRATA_* (upstream Strata syncs stay conflict-free).
 void xolotl_env_aliases() {
-#ifndef _WIN32
     std::vector<std::pair<std::string, std::string>> al;
+#ifdef _WIN32
+    for (char ** e = _environ; e && *e; ++e) {
+#else
     for (char ** e = environ; e && *e; ++e) {
+#endif
         const char * kv = *e;
         if (std::strncmp(kv, "XOLOTL_", 7) != 0) continue;
         const char * eq = std::strchr(kv, '=');
         if (!eq || eq == kv + 7) continue;
         al.push_back({"STRATA_" + std::string(kv + 7, eq), std::string(eq + 1)});
     }
+#ifdef _WIN32
+    for (const auto & [k, v] : al) _putenv_s(k.c_str(), v.c_str());     // copies the value (_putenv keeps the pointer) (#144)
+#else
     for (const auto & [k, v] : al) setenv(k.c_str(), v.c_str(), 1);
 #endif
 }

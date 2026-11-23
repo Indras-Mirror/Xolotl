@@ -701,8 +701,9 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
             const char * ce = std::getenv("STRATA_DENSE_REQUANT_CACHE");
             if (ce && *ce) rq_dir = std::strcmp(ce, "0") == 0 ? "" : ce;
             else if (model.size() > 0) {
+                // both separators: a Windows model path is "C:\...\x.gguf", where a '/' split finds nothing (#145)
                 const std::string mp0 = model.shard(0).path();
-                const size_t sl0 = mp0.find_last_of('/');
+                const size_t sl0 = mp0.find_last_of("/\\");
                 rq_dir = (sl0 == std::string::npos ? std::string(".") : mp0.substr(0, sl0)) + "/xolotl-cache";
                 if (ds41_sys::mkdir(rq_dir.c_str()) != 0 && errno != EEXIST) {
                     std::fprintf(stderr, "dense requant cache: cannot create %s (%s) - off (STRATA_DENSE_REQUANT_CACHE=<dir> to choose one)\n",
@@ -722,7 +723,7 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
             ds41_sys::FileStat st;
             const std::string mp = model.shard(0).path();
             if (want > 0 && ds41_sys::stat_file(mp.c_str(), &st)) {
-                const size_t sl = mp.find_last_of('/');
+                const size_t sl = mp.find_last_of("/\\");     // the bare file name, never the drive or folders (#145)
                 char key[160];
                 std::snprintf(key, sizeof key, ".%llx.%llx.%s.%s.h%d.dense-rq", (unsigned long long) st.size,
                               (unsigned long long) st.mtime, rq != GGML_TYPE_COUNT ? ggml_type_name(rq) : "none",

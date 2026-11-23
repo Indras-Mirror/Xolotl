@@ -9384,6 +9384,12 @@ void Ds41FileBlobs::give_bounce(uint8_t* p) const {
 //   header: "X41SHAD1", u64 model file size, u64 n, u64 data start, i32 gate/up type, i32 down type; then
 //           n x {i32 layer, i32 expert, u64 offset}
 namespace {
+// the sidecar path-list separator, the --engram rule: on Windows a drive letter's ':' must not split "C:\a;D:\b" (#144)
+#ifdef _WIN32
+constexpr char kShadowSep = ';';
+#else
+constexpr char kShadowSep = ':';
+#endif
 struct ShadowHead { char magic[8]; uint64_t src_size, n, data; int32_t gu_type, d_type; };
 struct ShadowEnt { int32_t l, e; uint64_t off; };
 struct ShadowFile { std::string path; int fd = -1, dfd = -1; int32_t gu = -1, d = -1; std::vector<ShadowEnt> ent; };
@@ -9507,7 +9513,7 @@ bool Ds41FileBlobs::open(std::string& err) {
         if (mf >= 0) ds41_sys::close(mf);
         std::string list(sv), why;
         for (size_t a = 0; a <= list.size();) {
-            const size_t b = std::min(list.find(':', a), list.size());
+            const size_t b = std::min(list.find(kShadowSep, a), list.size());
             if (b > a) { shf.emplace_back(); shf.back().path = list.substr(a, b - a); }
             a = b + 1;
         }
@@ -10217,7 +10223,7 @@ bool Ds41FileBlobs::build_shadow(const std::string& out, const std::vector<int>&
         ds41_sys::close(G.fd);
         G.fd = -1;
         if (std::rename((G.path + ".tmp").c_str(), G.path.c_str()) != 0) { err = "cannot rename " + G.path + ".tmp"; return false; }
-        list += (list.empty() ? "" : ":") + G.path;
+        list += (list.empty() ? std::string() : std::string(1, kShadowSep)) + G.path;
         std::fprintf(stderr, "build-shadow: %s: %zu experts as %s / %s (%.2f GB)\n", G.path.c_str(), G.ent.size(), shadow_tname(G.gu).c_str(),
                      shadow_tname(G.d).c_str(), (double) (G.data + G.ent.size() * G.stride) / 1e9);
     }
