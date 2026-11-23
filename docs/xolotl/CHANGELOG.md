@@ -8,6 +8,24 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Windows fixes for the DeepSeek V4.1 engine and its picture reader; a tool-call loop guard in the server (24 Nov)
+
+- **#144** (fast mode on Windows): every `XOLOTL_*` name now works on Windows too (it was copied onto `STRATA_*` on Linux
+  only), and the `XOLOTL_SHADOW` / `STRATA_SHADOW` list - and the `.list` that `--build-shadow` writes - uses `;` on
+  Windows, as `--engram` does, so a drive letter's `:` no longer splits it. A Windows `.list` built before this is
+  `:`-joined: replace the `:` between files with `;` ([XOLOTL_FAST.md](../XOLOTL_FAST.md)).
+- **#145** (dense requant cache on Windows): the model path is split on `/` and `\`, so the cache lands in
+  `xolotl-cache` next to the model under the model's own file name, and later starts read it back (~25 s of a load).
+- **#146** (`lend_mib` / `per_image`): the server's keyed picture path now takes the turn's VRAM lend before the first
+  picture it has to encode and stops a `per_image` encoder (standby respawn included) before the prompt reaches the
+  engine; a picture already encoded takes neither. New-picture turns were 3.5-4x slower without it on Windows.
+- **Loop guard** (`serve/loop_guard.py`, on by default, config `"loop_guard"`): an agent that makes the same tool call 4
+  times in a row, or one of its last turn's calls 3 times in its last 12 with the same result, gets one short note
+  before its next turn (that prompt only; nothing is blocked).
+- Thanks: **kelheor** for #144-#146, each with a reproduction on Windows and a proposed fix; the loop guard and its 32
+  tests are from **musicurgy**'s [Delta Inference Engine](https://github.com/musicurgy/delta-inference-engine) 0.95
+  (MIT), whose design follows [Project Maya](https://github.com/mw00/project-maya)'s (MIT).
+
 ### Inkling-2-Mini LoRA training behind the real harness prompt: prompt carry, bit for bit with the engine (24 Nov)
 
 - **Prompt carry** (`--prefix prompt.json`, or a per-window `"prefix"` / `"context"`): the context before a window runs

@@ -12,6 +12,10 @@
 
 ## Latest
 
+- **24 Nov** - **Windows fixes + loop guard**: `XOLOTL_*` names and `;`-separated fast-mode sidecar lists on Windows,
+  the dense requant cache next to the model, the picture reader's VRAM lend on the server's keyed path (thanks
+  kelheor, #144-#146); a tool-call loop guard ported from Delta (musicurgy) / Project Maya.
+  [CHANGELOG](docs/xolotl/CHANGELOG.md#windows-fixes-for-the-deepseek-v41-engine-and-its-picture-reader-a-tool-call-loop-guard-in-the-server-24-nov).
 - **24 Nov** - **Inkling-2-Mini LoRA training behind the real 23K-token harness prompt**: the prompt's per-slot K/V and
   conv state are carried into training (bit for bit with the engine up to 23K tokens), snapshotted once and reused by
   every window. A coding-weighted run drops held-out loss **-15.6 % in 300 steps**; on LiveCodeBench-20 the adapter is
