@@ -6834,7 +6834,9 @@ class Service:
         with self.reasoning_mu:
             written = self.recent_reasoning.setdefault(key, [])
             written.append((end, reasoning))
-            del written[:-32]
+            # a turn claims the oldest unclaimed entry that fits it (_reasoning_for), so dropping an entry would shift
+            # every later turn's thinking by one and the prompt would leave the cache at the oldest of them: keep many
+            del written[:-1024]
             self.recent_reasoning.move_to_end(key)
             # every turn of a long agent thread keeps its thinking: a turn whose thinking was forgotten renders without
             # it, and the prompt leaves the conversation cache at that turn (~2 KB each)
@@ -6852,11 +6854,13 @@ class Service:
     def _restore_reasoning_locked(self, messages, log):
         if not self.recent_reasoning:
             return
+        claimed: dict[str, set[int]] = {}   # per answer: the remembered replies earlier turns of this request took
         for i, m in enumerate(messages):
             if m.get("role") != "assistant" or (m.get("reasoning_content") or "").strip():
                 continue
             key = self._answer_key(m.get("content"), m.get("tool_calls"))
-            r = self._reasoning_for(self.recent_reasoning.get(key), messages[i - 1] if i else None)
+            r = self._reasoning_for(self.recent_reasoning.get(key), messages[i - 1] if i else None,
+                                    claimed.setdefault(key, set()))
             if r:
                 m["reasoning_content"] = r
                 self.recent_reasoning.move_to_end(key)   # a conversation in use keeps its turns' thinking
@@ -6869,10 +6873,17 @@ class Service:
                       f"last {len(self.recent_reasoning)}; nearest ({len(best)} chars) differs at char {n}", flush=True)
 
     @staticmethod
-    def _reasoning_for(written, before):
+    def _reasoning_for(written, before, claimed=None):
         """The thinking of the reply that wrote this turn: among the replies with this answer, the one whose prompt
         ended with the message this turn follows.  No such reply, none: another turn's thinking would change this
-        turn's text from one request to the next, and every request would leave the conversation cache there."""
+        turn's text from one request to the next, and every request would leave the conversation cache there.
+
+        An agent repeats itself (the same tool call after the same tool output), so several replies can fit one turn.
+        The turns take them in the order they were written: the oldest unclaimed fitting reply (`claimed` holds the
+        entries earlier turns of this request took).  Taking the newest instead gave every older repeat the newest
+        thinking, so each new repeat rewrote a turn in the middle of the history and the whole prompt was read again
+        (an agent loop re-read 65K tokens on every turn).  In order, a turn keeps its thinking from one request to the
+        next and the newest turn gets the thinking it was written with."""
         if not written or before is None:
             return None
         text = before.get("content")
@@ -6881,9 +6892,13 @@ class Service:
         tail = text.strip()[-48:] if isinstance(text, str) else ""
         if not tail:
             return None
-        for ctx, r in reversed(written):   # only the template's turn markers may follow it
+        for n, (ctx, r) in enumerate(written):   # only the template's turn markers may follow it
+            if claimed is not None and n in claimed:
+                continue
             at = ctx.rfind(tail)
             if at >= 0 and len(ctx) - at - len(tail) <= 80:
+                if claimed is not None:
+                    claimed.add(n)
                 return r
         return None
 

@@ -150,5 +150,37 @@ class RestoreReasoningToolCall(unittest.TestCase):
         self.assertIn("<think>\nplan the call\n</think>", prompt)
 
 
+class RestoreReasoningRepeatedCall(unittest.TestCase):
+    """An agent loop repeats one tool call after the same tool output: each repeat keeps the thinking it was written
+    with from one request to the next (the newest-first lookup gave every older repeat the newest thinking, so each new
+    repeat rewrote a turn in the middle of the history and the engine read the whole prompt again)."""
+
+    def test_repeats_keep_their_thinking(self):
+        svc = Service.__new__(Service)
+        svc.recent_reasoning, svc.reasoning_mu = __import__("collections").OrderedDict(), __import__("threading").Lock()
+        call = [{"id": "c", "type": "function", "function": {"name": "Bash", "arguments": json.dumps({"command": "adb devices"})}}]
+        key = Service._answer_key("", call)
+        out = "List of devices attached\nemulator-5554\tdevice\n"
+        tools = ["starting\n" + out, out, out, out, out]
+
+        def conv(n):
+            m = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+            for i in range(n):
+                m += [{"role": "assistant", "content": "", "tool_calls": call}, {"role": "tool", "content": tools[i]}]
+            return m
+
+        seen = []
+        for i in range(len(tools)):
+            before = "go" if i == 0 else tools[i - 1]
+            svc.recent_reasoning.setdefault(key, []).append(("<|tool|>" + before + "<|end|><|model|>", f"think {i}"))
+            m = conv(i + 1)
+            svc._restore_reasoning_locked(m, False)
+            got = [x.get("reasoning_content") for x in m if x["role"] == "assistant"]
+            self.assertEqual(got, [f"think {k}" for k in range(i + 1)])   # every turn its own, the newest included
+            for old in seen:                                               # and no earlier turn ever changes
+                self.assertEqual(got[:len(old)], old)
+            seen.append(got)
+
+
 if __name__ == "__main__":
     unittest.main()
