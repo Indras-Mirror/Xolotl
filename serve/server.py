@@ -3482,6 +3482,8 @@ class Vision:
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
     sends the same picture again (every turn, with most clients) encodes it once."""
 
+    in_engine = False   # set per config in __init__; the default covers an instance built without it (tests, embedders)
+
     @staticmethod
     def work_dir() -> Path:
         """#480: the directory for the encoder's files.  The engine reads the embeddings file named in a `GENI` line
