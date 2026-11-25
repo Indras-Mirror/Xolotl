@@ -47,6 +47,13 @@ struct ErnieGraphConfig {
     int64_t  ctx_max = 65536;           ///< positions the window / compressor caches cover (compressed rows = ctx_max/128)
     int      max_pass = 512;            ///< tokens a pass may carry (the prefill chunk size)
     bool     kv_f16 = true;             ///< the window K rows and compressed rows at F16 (the reference's cache type)
+    /// The MLA layers' cache rows ([kv_c | k_pe | idx_k], one per position: ~96 % of the KV at long context).
+    /// GGML_TYPE_F16 (default, = kv_f16), GGML_TYPE_Q8_0 or GGML_TYPE_Q4_0.  A quantised cache is written as is and
+    /// dequantised (to F16) over the cells a pass reads.  `mla_hadamard`: each row segment (kv_c, k_pe, idx_k) stored
+    /// Hadamard-rotated (the queries rotated alike, the attention output rotated back): dot products are unchanged
+    /// and the 4-bit blocks see no outlier channels.  Default: on for Q4_0, off otherwise.
+    ggml_type mla_kv_type = GGML_TYPE_F16;
+    int      mla_hadamard = -1;         ///< -1 = auto (Q4_0 only), 0 = off, 1 = on
     /// Optional directional ablation at load: a file of
     /// int32 n_layer, int32 n_embd, then float r[n_layer][n_embd] (unit vectors; a zero row = that layer untouched).
     /// Every matrix that writes the residual in layer l (attn_output_b / MLA attn_output, ffn_routed_up, ffn_down_shexp; ffn_down on
@@ -97,10 +104,13 @@ public:
     bool read_pre(std::vector<float> & pre);
 
     /// Conversation reuse: every cache is position-indexed except the window ring and the pending 128-block of
-    /// compressor projections, so a snapshot is those two (~0.8 MB) + the position.
-    bool snapshot(int pos);
-    bool restore();
-    int snapshot_pos() const;
+    /// compressor projections, so a snapshot is those two (~0.8 MB) + the position.  `slot` (0..kSnapSlots-1) keeps
+    /// several at once (serve mode: position 0 and the last prompt's end).  A slot is only valid while the positions
+    /// before it still hold the tokens it was taken over: restoring an EARLIER slot and reading past it invalidates it.
+    static constexpr int kSnapSlots = 4;
+    bool snapshot(int pos, int slot = 0);
+    bool restore(int slot = 0);
+    int snapshot_pos(int slot = 0) const;
 
     int pass_size() const;
     int pass_pos0() const;

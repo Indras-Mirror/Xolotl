@@ -175,6 +175,8 @@ struct ErnieGraph::Impl {
     ggml_tensor * pos_ramp = nullptr;   // F32 [cmax + 1]  +i
     ggml_tensor * j_ramp = nullptr;     // F32 [crows]     position index of each MLA cache row
     int64_t crows = 0;                  // MLA cache rows: ctx_max rounded up to 256 (CUDA flash-attn key multiple)
+    bool mla_rot = false;               // the MLA cache rows are Hadamard-rotated (ErnieGraphConfig::mla_hadamard)
+    ggml_tensor * had_kl = nullptr, * had_dr = nullptr, * had_id = nullptr;   // normalised Sylvester H [n, n], F32
     struct Layer {
         ggml_tensor * raw = nullptr;      // [DH, RAW]      window K = V, post-RoPE
         ggml_tensor * pend_kv = nullptr;  // [DH, 128]      the pending block's wkv projections
@@ -183,8 +185,11 @@ struct ErnieGraph::Impl {
         ggml_tensor * mla = nullptr;      // MLA layers: [704, crows] one cache row per position
     };
     std::vector<Layer> ly;
-    std::vector<std::vector<uint8_t>> snap_raw, snap_kv, snap_sc;
-    int snap_pos = -1;
+    struct Snap {
+        std::vector<std::vector<uint8_t>> raw, kv, sc;
+        int pos = -1;
+    };
+    Snap snaps[ErnieGraph::kSnapSlots];
 
     // ---- per-pass inputs (ictx / ibuf)
     ggml_context * ictx = nullptr;
@@ -529,7 +534,8 @@ static bool alloc_state(ErnieGraph::Impl & im, std::string & err) {
     for (int64_t l = 0; l < im.nl; ++l) {
         auto & L = im.ly[(size_t) l];
         if (!im.g.is_hca(l)) {
-            L.mla = T(kv_type, { im.g.kv_lora + im.g.d_rope + im.g.idx_key_dim, im.crows });
+            const ggml_type mt = im.cfg.mla_kv_type == GGML_TYPE_F16 ? kv_type : im.cfg.mla_kv_type;
+            L.mla = T(mt, { im.g.kv_lora + im.g.d_rope + im.g.idx_key_dim, im.crows });
             continue;
         }
         L.raw = T(kv_type, { im.DH, im.RAW });
@@ -538,9 +544,27 @@ static bool alloc_state(ErnieGraph::Impl & im, std::string & err) {
         L.comp = T(kv_type, { im.DH, im.cmax + 1 });
     }
     if (im.g.has_mla) im.j_ramp = T(GGML_TYPE_F32, { im.crows });
+    im.mla_rot = im.g.has_mla && (im.cfg.mla_hadamard > 0 || (im.cfg.mla_hadamard < 0 && im.cfg.mla_kv_type == GGML_TYPE_Q4_0));
+    if (im.mla_rot) {
+        im.had_kl = T(GGML_TYPE_F32, { im.g.kv_lora, im.g.kv_lora });
+        im.had_dr = T(GGML_TYPE_F32, { im.g.d_rope, im.g.d_rope });
+        im.had_id = T(GGML_TYPE_F32, { im.g.idx_key_dim, im.g.idx_key_dim });
+    }
     im.sbuf = ggml_backend_alloc_ctx_tensors(im.sctx, im.backend);
     if (!im.sbuf) { err = "cannot allocate the state"; return false; }
     ggml_backend_buffer_clear(im.sbuf, 0);
+    if (im.mla_rot) {
+        // Sylvester H_n / sqrt(n): symmetric and orthogonal, its own inverse
+        for (ggml_tensor * h : { im.had_kl, im.had_dr, im.had_id }) {
+            const int64_t nn = h->ne[0];
+            if (nn & (nn - 1)) { err = "mla_hadamard: segment width " + std::to_string(nn) + " is not a power of two"; return false; }
+            std::vector<float> m((size_t) (nn * nn));
+            const float sc = 1.0f / std::sqrt((float) nn);
+            for (int64_t i = 0; i < nn; ++i)
+                for (int64_t j = 0; j < nn; ++j) m[(size_t) (i * nn + j)] = (__builtin_popcountll((unsigned long long) (i & j)) & 1) ? -sc : sc;
+            ggml_backend_tensor_set(h, m.data(), 0, m.size() * sizeof(float));
+        }
+    }
 
     ggml_init_params ip = { ggml_tensor_overhead() * 64, nullptr, true };
     im.ictx = ggml_init(ip);
@@ -647,7 +671,9 @@ ggml_backend_t ErnieGraph::backend() const { return p_->backend; }
 const std::string & ErnieGraph::last_error() const { return p_->err; }
 int ErnieGraph::pass_size() const { return p_->n; }
 int ErnieGraph::pass_pos0() const { return p_->pos0; }
-int ErnieGraph::snapshot_pos() const { return p_->snap_pos; }
+int ErnieGraph::snapshot_pos(int slot) const {
+    return slot >= 0 && slot < kSnapSlots ? p_->snaps[slot].pos : -1;
+}
 
 // ================================================================== begin
 
@@ -808,7 +834,15 @@ static ggml_tensor * build_mla(ErnieGraph::Impl & im, ggml_context * gc, ggml_cg
     ggml_tensor * qabs = ernie_mm(gc, im.BL(il, "attn_k_b.weight"), qn_p);                     // [KL, n, NH]
     qabs = ggml_cont(gc, ggml_permute(gc, qabs, 0, 2, 1, 3));                                  // [KL, NH, n]
     b.tap("q_nope_absorbed-" + sl, qabs);
-    ggml_tensor * Qcur = ggml_concat(gc, qabs, q_pe, 0);                                       // [KROW, NH, n]
+    // a rotated cache: rotate the queries alike (q.k is unchanged under an orthogonal H applied to both)
+    auto hrot = [&](ggml_tensor * h, ggml_tensor * x) {   // H x over dim 0, any shape
+        const int64_t w = x->ne[0];
+        ggml_tensor * x2 = ggml_reshape_2d(gc, ggml_cont(gc, x), w, ggml_nelements(x) / w);
+        return ggml_reshape(gc, ggml_mul_mat(gc, h, x2), x);
+    };
+    ggml_tensor * q_pe_r = q_pe;
+    if (im.mla_rot) { qabs = hrot(im.had_kl, qabs); q_pe_r = hrot(im.had_dr, q_pe); }
+    ggml_tensor * Qcur = ggml_concat(gc, qabs, q_pe_r, 0);                                     // [KROW, NH, n]
     b.tap("Qcur-" + sl, Qcur);
 
     // ---- indexer key: LayerNorm (w + b, eps 1e-6), NEOX RoPE on the first d_rope
@@ -819,13 +853,17 @@ static ggml_tensor * build_mla(ErnieGraph::Impl & im, ggml_context * gc, ggml_cg
     b.tap("indexer_k-" + sl, ik);
 
     // ---- this pass's cache rows [kv_c | k_pe | idx_k] at their positions; every read below goes through `cw`
-    ggml_tensor * kcur = ggml_concat(gc, ggml_concat(gc, kvc, ggml_reshape_2d(gc, kpe, DR, n), 0),
-                                     ggml_reshape_2d(gc, ik, ID, n), 0);                       // [ROW, n]
+    ggml_tensor * kpe2 = ggml_reshape_2d(gc, kpe, DR, n), * ik2 = ggml_reshape_2d(gc, ik, ID, n), * kvc2 = kvc;
+    if (im.mla_rot) { kvc2 = hrot(im.had_kl, kvc); kpe2 = hrot(im.had_dr, kpe2); ik2 = hrot(im.had_id, ik2); }
+    ggml_tensor * kcur = ggml_concat(gc, ggml_concat(gc, kvc2, kpe2, 0), ik2, 0);              // [ROW, n]
     b.tap("Kcur-" + sl, kcur);
     ggml_tensor * cache = im.ly[(size_t) il].mla;
-    ggml_tensor * cw = ggml_set_rows(gc, cache, cache->type == GGML_TYPE_F32 ? kcur : ggml_cast(gc, kcur, cache->type),
+    const bool mq = ggml_is_quantized(cache->type);
+    ggml_tensor * cw = ggml_set_rows(gc, cache, (cache->type == GGML_TYPE_F32 || mq) ? kcur : ggml_cast(gc, kcur, cache->type),
                                      b.v1(im.i_pos, n, 0));
     ggml_build_forward_expand(gf, cw);
+    if (mq)   // every read below wants F16 rows: dequantise the M cells this pass reads (Q8_0 / Q4_0 -> F32 -> F16)
+        cw = ggml_cast(gc, ggml_cast(gc, ggml_view_2d(gc, cw, cw->ne[0], M, cw->nb[1], 0), GGML_TYPE_F32), GGML_TYPE_F16);
 
     // ---- the mask over the first M cells: d = p_t - j; causal s0 = [d >= 0]
     ggml_tensor * jr = ggml_reshape_2d(gc, ggml_view_1d(gc, im.j_ramp, M, 0), M, 1);
@@ -838,6 +876,7 @@ static ggml_tensor * build_mla(ErnieGraph::Impl & im, ggml_context * gc, ggml_cg
         // indexer query / head weights; score[j, t] = sum_h relu(q_h . k_j) w_h
         ggml_tensor * iq = ggml_reshape_3d(gc, ernie_mm(gc, im.BL(il, "indexer.attn_q_b.weight"), qr), ID, IH, n);
         iq = rope(iq, GGML_ROPE_TYPE_NEOX, 0);
+        if (im.mla_rot) iq = hrot(im.had_id, iq);   // the cached idx_k is rotated
         b.tap("indexer_q-" + sl, iq);
         ggml_tensor * iw = ggml_scale(gc, ernie_mm(gc, im.BL(il, "indexer.proj.weight"), xn),
                                       1.0f / std::sqrt((float) (ID * IH)));                    // [IH, n]
@@ -875,6 +914,7 @@ static ggml_tensor * build_mla(ErnieGraph::Impl & im, ggml_context * gc, ggml_cg
     if (ernie_prec_f32()) ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
     ggml_flash_attn_ext_add_sinks(o, im.BL(il, "attn_sinks.weight"));
     o = ggml_reshape_3d(gc, o, KL, NH, n);                                                     // the latent per head
+    if (im.mla_rot) o = hrot(im.had_kl, o);   // V was the rotated kv_c: rotate the weighted sum back (H = H^-1)
 
     // ---- per-head V expansion v_b[h] (v_b [KL, DV, NH]), the VHA mix, the gate, wo
     ggml_tensor * op = ggml_cont(gc, ggml_permute(gc, o, 0, 2, 1, 3));                         // [KL, n, NH]
@@ -1351,33 +1391,37 @@ static void set_bytes(ggml_tensor * t, const std::vector<uint8_t> & src) {
     ggml_backend_tensor_set(t, src.data(), 0, src.size());
 }
 
-bool ErnieGraph::snapshot(int pos) {
+bool ErnieGraph::snapshot(int pos, int slot) {
     Impl & im = *p_;
-    im.snap_raw.resize(im.ly.size());
-    im.snap_kv.resize(im.ly.size());
-    im.snap_sc.resize(im.ly.size());
+    if (slot < 0 || slot >= kSnapSlots) { im.err = "snapshot: slot " + std::to_string(slot) + " out of range"; return false; }
+    Impl::Snap & sn = im.snaps[slot];
+    sn.raw.resize(im.ly.size());
+    sn.kv.resize(im.ly.size());
+    sn.sc.resize(im.ly.size());
     for (size_t l = 0; l < im.ly.size(); ++l) {
         if (!im.ly[l].raw) continue;   // MLA: rows by absolute position, rewritten past the snapshot
-        get_bytes(im.ly[l].raw, im.snap_raw[l]);
-        get_bytes(im.ly[l].pend_kv, im.snap_kv[l]);
-        get_bytes(im.ly[l].pend_sc, im.snap_sc[l]);
+        get_bytes(im.ly[l].raw, sn.raw[l]);
+        get_bytes(im.ly[l].pend_kv, sn.kv[l]);
+        get_bytes(im.ly[l].pend_sc, sn.sc[l]);
     }
-    im.snap_pos = pos;
+    sn.pos = pos;
     return true;
 }
 
-bool ErnieGraph::restore() {
+bool ErnieGraph::restore(int slot) {
     Impl & im = *p_;
-    if (im.snap_pos < 0 || im.snap_raw.size() != im.ly.size()) { im.err = "restore: no snapshot"; return false; }
+    if (slot < 0 || slot >= kSnapSlots) { im.err = "restore: slot " + std::to_string(slot) + " out of range"; return false; }
+    const Impl::Snap & sn = im.snaps[slot];
+    if (sn.pos < 0 || sn.raw.size() != im.ly.size()) { im.err = "restore: no snapshot in slot " + std::to_string(slot); return false; }
     for (size_t l = 0; l < im.ly.size(); ++l) {
         if (!im.ly[l].raw) continue;
-        set_bytes(im.ly[l].raw, im.snap_raw[l]);
-        set_bytes(im.ly[l].pend_kv, im.snap_kv[l]);
-        set_bytes(im.ly[l].pend_sc, im.snap_sc[l]);
+        set_bytes(im.ly[l].raw, sn.raw[l]);
+        set_bytes(im.ly[l].pend_kv, sn.kv[l]);
+        set_bytes(im.ly[l].pend_sc, sn.sc[l]);
     }
-    im.next_pos = im.snap_pos;
+    im.next_pos = sn.pos;
     im.n = 0;
-    im.pos0 = im.snap_pos;
+    im.pos0 = sn.pos;
     return true;
 }
 

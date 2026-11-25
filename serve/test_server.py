@@ -6449,3 +6449,15 @@ class PrepareCancelled(unittest.TestCase):
             ids, _, _ = svc.prepare(self.msgs(), None, {}, cancel=threading.Event())
             self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
             svc.embeddings.path.unlink(missing_ok=True)
+
+
+
+class DrySamplingKeysTest(unittest.TestCase):
+    def test_dry_only_when_set(self):
+        from serve.server import StrataEngine
+        self.assertNotIn("dry_", StrataEngine.sampling_keys({"temperature": 0.7}))
+        k = StrataEngine.sampling_keys({"dry_multiplier": 0.8, "dry_base": 1.75, "dry_allowed_length": 2,
+                                        "dry_penalty_last_n": -1})
+        for part in (" dry_multiplier=0.8", " dry_base=1.75", " dry_allowed_length=2", " dry_penalty_last_n=-1"):
+            self.assertIn(part, k)
+        self.assertNotIn("dry_", StrataEngine.sampling_keys({"dry_multiplier": 0, "dry_base": 2.0}))

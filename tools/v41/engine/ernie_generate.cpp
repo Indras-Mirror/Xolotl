@@ -30,6 +30,13 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <iostream>
+#include <mutex>
+#include <random>
+#include <thread>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -55,6 +62,15 @@ struct Args {
     int layer_lo = 0, layer_hi = -1;    // --layers lo:hi (a dev file that holds only those layers)
     float temp = 0.0f;
     bool cuda = false, quiet = false, no_tier = false;
+    // the expert tier's switches (Ds41MoeConfig; the same flags as ds41_generate)
+    float skip_miss = 0.0f, skip_file = 0.0f;
+    bool vram_lru = false, arena_adapt = false, arena_skip_resident = false, chunk_mmq = false, chunk_prestage = false;
+    bool chunk_prefetch = true;
+    int remote_device = -1;
+    double remote_gib = 0.0;
+    std::string kv_mla = "f16";         // --kv-mla f16|q8_0|q4_0 (ErnieGraphConfig::mla_kv_type)
+    int kv_hadamard = -1;               // --kv-hadamard 0|1 (-1 = auto: on for q4_0)
+    bool serve = false;                 // --serve: the server's engine line protocol on stdin/stdout (serve_loop)
     std::string experts = "cpu";        // --experts cpu|gpu (the tier's backend)
     double arena_gib = 8.0;
     int64_t slots = 0;
@@ -109,6 +125,7 @@ void usage(std::FILE* out) {
 }
 
 bool parse(int argc, char** argv, Args& a) {
+    for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--serve") a.serve = true;
     for (int i = 1; i < argc; ++i) {
         const std::string f = argv[i];
         auto next = [&]() -> const char* { return (i + 1 < argc) ? argv[++i] : nullptr; };
@@ -151,9 +168,31 @@ bool parse(int argc, char** argv, Args& a) {
         else if (f == "--batch-out") { if (!(v = next())) return false; a.batch_out = v; }
         else if (f == "--batch-logits") { if (!(v = next())) return false; a.batch_logits = v; }
         else if (f == "-h" || f == "--help") { usage(stdout); return false; }
+        else if (f == "--serve") a.serve = true;
+        else if (f == "--kv-mla") { if (!(v = next())) return false; a.kv_mla = v; }
+        else if (f == "--kv-hadamard") { if (!(v = next())) return false; a.kv_hadamard = std::atoi(v); }
+        else if (f == "--skip-miss") { if (!(v = next())) return false; a.skip_miss = (float) std::atof(v); }
+        else if (f == "--skip-file") { if (!(v = next())) return false; a.skip_file = (float) std::atof(v); }
+        else if (f == "--vram-lru") a.vram_lru = true;
+        else if (f == "--no-vram-lru") a.vram_lru = false;
+        else if (f == "--arena-adapt") a.arena_adapt = true;
+        else if (f == "--arena-skip-resident") a.arena_skip_resident = true;
+        else if (f == "--chunk-mmq") a.chunk_mmq = true;
+        else if (f == "--no-chunk-mmq") a.chunk_mmq = false;
+        else if (f == "--chunk-prestage") a.chunk_prestage = true;
+        else if (f == "--no-chunk-prefetch") a.chunk_prefetch = false;
+        else if (f == "--remote-device") { if (!(v = next())) return false; a.remote_device = std::atoi(v); }
+        else if (f == "--remote-gib") { if (!(v = next())) return false; a.remote_gib = std::atof(v); }
         else if (!f.empty() && f[0] != '-') {
             if (!a.model.empty()) { std::fprintf(stderr, "the model is given twice (%s, %s)\n", a.model.c_str(), f.c_str()); return false; }
             a.model = f;
+        }
+        else if (a.serve && f.size() > 2 && f[0] == '-' && f[1] == '-') {
+            // the server adds options meant for other engines (profiles, drafting, layer splits): say so and go on,
+            // taking a following non-flag word as its value
+            std::fprintf(stderr, "serve: ignoring %s", f.c_str());
+            if (i + 1 < argc && argv[i + 1][0] != '-') std::fprintf(stderr, " %s", argv[++i]);
+            std::fprintf(stderr, " (not an ernie_generate option)\n");
         }
         else { std::fprintf(stderr, "unknown argument %s\n", f.c_str()); return false; }
     }
@@ -174,7 +213,7 @@ bool parse(int argc, char** argv, Args& a) {
         std::fprintf(stderr, "--bos and --no-bos are mutually exclusive\n");
         return false;
     }
-    return !a.ids_csv.empty() || !a.ids_file.empty() || a.have_prompt || a.have_decode || !a.batch.empty();
+    return !a.ids_csv.empty() || !a.ids_file.empty() || a.have_prompt || a.have_decode || !a.batch.empty() || a.serve;
 }
 
 std::vector<int> parse_ids(const std::string& csv) {
@@ -386,11 +425,338 @@ bool write_dump(const std::string& dir, const std::vector<ErnieGraphTap>& taps, 
     return true;
 }
 
+/// --count-routes: ADD the counts gathered since the last flush to FILE (atomic rename), then zero them.
+bool flush_route_counts(const std::string& path, std::string& err) {
+    std::vector<int64_t> c;
+    if (!read_counts(path, g_route_counts.size(), c, err, true)) return false;
+    for (size_t i = 0; i < c.size(); ++i) c[i] += g_route_counts[i];
+    const std::string tmpf = path + ".tmp";
+    std::FILE* f = std::fopen(tmpf.c_str(), "wb");
+    if (!f || std::fwrite(c.data(), sizeof(int64_t), c.size(), f) != c.size() || std::fclose(f) != 0 ||
+        std::rename(tmpf.c_str(), path.c_str()) != 0) {
+        err = "cannot write " + path;
+        return false;
+    }
+    std::fill(g_route_counts.begin(), g_route_counts.end(), 0);
+    return true;
+}
+
+// ================================================================== --serve
+// The server's engine line protocol (serve/server.py StrataEngine; the same lines ds41_generate speaks):
+//   in:  GEN <max_new> [temperature=F top_p=F top_k=N min_p=F seed=N prefill=1 ...] <ids csv> | STOP | QUIT
+//   out: INFO ctx=.. , READY <ctx> stop   once, after loading
+//        RESUME <reused>                  per request: prompt tokens not read again
+//        PP <read> <total> <ms> <tok/s>   after every prompt chunk (also the server's heartbeat)
+//        T <id>                           per generated token (a stop token is sent too, then the request ends)
+//        DONE <gen> <prompt> <prompt_ms> <decode_ms> <finish> 0 0 <reused>     finish: stop | length | cancel | error
+//        ERR <why>                        then DONE ... error
+// Unknown keys on a GEN line are ignored (penalties, grammar: not in this engine).  One request at a time.
+//
+// Conversation reuse: `hist` is exactly the tokens the caches hold.  Snapshot slot 0 = position 0, slot 1 = the end of
+// the last prompt (with that row's logits).  A request whose prompt extends `hist` reads only the new tokens in place;
+// one that shares the last prompt (an agent turn whose history dropped the thinking, a regenerate) restores slot 1; any
+// other rewinds to slot 0 and reads everything.
+
+struct Sampling {
+    float temp = 0.0f, top_p = 1.0f, min_p = 0.0f;
+    int top_k = 64;
+    bool has_seed = false;
+    uint64_t seed = 0;
+    // repetition penalties over the last `penalty_last_n` tokens (llama.cpp's rules)
+    float penalty_repeat = 1.0f, penalty_freq = 0.0f, penalty_present = 0.0f;
+    int penalty_last_n = 64;
+    // DRY ("don't repeat yourself", llama.cpp's parameter names): a token that would extend a sequence already seen
+    // in the context by n >= allowed_length tokens loses multiplier * base^(n - allowed_length) from its logit.
+    // A match never crosses a sequence breaker (a token whose text holds a newline, ':', '"' or '*').
+    float dry_multiplier = 0.0f, dry_base = 1.75f;
+    int dry_allowed_length = 2, dry_penalty_last_n = -1;   // -1 = the whole context
+    bool active() const {
+        return penalty_repeat != 1.0f || penalty_freq != 0.0f || penalty_present != 0.0f || dry_multiplier > 0.0f;
+    }
+};
+
+/// The penalties and DRY on `lg` in place, from `hist` (everything the context holds, newest last).
+void apply_penalties(std::vector<float>& lg, const std::vector<int>& hist, const Sampling& s, const std::vector<char>& breaker) {
+    const int64_t N = (int64_t) hist.size(), V = (int64_t) lg.size();
+    if (N == 0) return;
+    if (s.penalty_repeat != 1.0f || s.penalty_freq != 0.0f || s.penalty_present != 0.0f) {
+        const int64_t w = s.penalty_last_n < 0 ? N : std::min<int64_t>(N, s.penalty_last_n);
+        std::vector<std::pair<int, int>> cnt;   // (token, count), small: at most w entries
+        for (int64_t i = N - w; i < N; ++i) {
+            const int t = hist[(size_t) i];
+            auto it = std::find_if(cnt.begin(), cnt.end(), [&](const auto& c) { return c.first == t; });
+            if (it == cnt.end()) cnt.emplace_back(t, 1); else ++it->second;
+        }
+        for (const auto& c : cnt) {
+            if (c.first < 0 || c.first >= V) continue;
+            float& l = lg[(size_t) c.first];
+            if (s.penalty_repeat != 1.0f) l = l > 0.0f ? l / s.penalty_repeat : l * s.penalty_repeat;
+            l -= (float) c.second * s.penalty_freq + s.penalty_present;
+        }
+    }
+    if (s.dry_multiplier > 0.0f && N >= 2) {
+        const int64_t start = s.dry_penalty_last_n > 0 ? std::max<int64_t>(0, N - s.dry_penalty_last_n) : 0;
+        auto brk = [&](int t) { return t >= 0 && (size_t) t < breaker.size() && breaker[(size_t) t]; };
+        constexpr int kMaxMatch = 64;   // base^(n - allowed) past this would only overflow
+        std::vector<std::pair<int, int>> best;   // (token, longest match it would extend)
+        const int64_t last = N - 1;
+        for (int64_t j = start + 1; j < N; ++j) {   // hist[j] followed the context ending at j - 1
+            int k = 0;
+            while (k < kMaxMatch && j - 1 - k >= start && hist[(size_t) (j - 1 - k)] == hist[(size_t) (last - k)] &&
+                   !brk(hist[(size_t) (last - k)]))
+                ++k;
+            if (k < s.dry_allowed_length) continue;
+            const int t = hist[(size_t) j];
+            if (brk(t)) continue;
+            auto it = std::find_if(best.begin(), best.end(), [&](const auto& b) { return b.first == t; });
+            if (it == best.end()) best.emplace_back(t, k); else it->second = std::max(it->second, k);
+        }
+        for (const auto& b : best)
+            if (b.first >= 0 && b.first < V)
+                lg[(size_t) b.first] -= s.dry_multiplier * std::pow(s.dry_base, (float) (b.second - s.dry_allowed_length));
+    }
+}
+
+/// Greedy at temperature 0; otherwise the top_k (<= 64) candidates, softmax at `temp`, then min_p and top_p.
+int sample(const std::vector<float>& lg, const Sampling& s, std::mt19937_64& rng) {
+    const int n = (int) lg.size();
+    if (s.temp <= 0.0f || n == 0) return argmax(lg.data(), n);
+    const int k = std::max(1, std::min({ s.top_k > 0 ? s.top_k : 64, 64, n }));
+    std::vector<int> idx((size_t) n);
+    for (int i = 0; i < n; ++i) idx[(size_t) i] = i;
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int x, int y) { return lg[(size_t) x] > lg[(size_t) y]; });
+    idx.resize((size_t) k);
+    std::vector<double> p((size_t) k);
+    const double mx = lg[(size_t) idx[0]];
+    double sum = 0.0;
+    for (int i = 0; i < k; ++i) sum += p[(size_t) i] = std::exp(((double) lg[(size_t) idx[(size_t) i]] - mx) / s.temp);
+    for (double& v : p) v /= sum;
+    int keep = k;
+    if (s.min_p > 0.0f)
+        for (int i = 1; i < keep; ++i) if (p[(size_t) i] < s.min_p * p[0]) { keep = i; break; }
+    if (s.top_p < 1.0f) {
+        double c = 0.0;
+        for (int i = 0; i < keep; ++i) { c += p[(size_t) i]; if (c >= s.top_p) { keep = i + 1; break; } }
+    }
+    double tot = 0.0;
+    for (int i = 0; i < keep; ++i) tot += p[(size_t) i];
+    double r = std::uniform_real_distribution<double>(0.0, tot)(rng);
+    for (int i = 0; i < keep; ++i) { r -= p[(size_t) i]; if (r <= 0.0) return idx[(size_t) i]; }
+    return idx[(size_t) (keep - 1)];
+}
+
+int serve_loop(const Args& a, ErnieGraph& eg, Ds41MoeTier* tier, int il0, int il1, const std::vector<int>& stop_ids,
+               const std::vector<char>& breaker) {
+    std::mutex qm;
+    std::condition_variable qc;
+    std::deque<std::string> q;
+    std::thread reader([&] {
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            std::lock_guard<std::mutex> lk(qm);
+            q.push_back(line);
+            qc.notify_one();
+        }
+        std::lock_guard<std::mutex> lk(qm);
+        q.push_back("QUIT");   // stdin closed: the server is gone
+        qc.notify_one();
+    });
+    reader.detach();
+    auto pop = [&]() -> std::string {
+        std::unique_lock<std::mutex> lk(qm);
+        qc.wait(lk, [&] { return !q.empty(); });
+        std::string l = q.front();
+        q.pop_front();
+        return l;
+    };
+    auto stop_pending = [&]() -> bool {
+        std::lock_guard<std::mutex> lk(qm);
+        for (auto it = q.begin(); it != q.end(); ++it)
+            if (*it == "STOP") { q.erase(it); return true; }
+        return false;
+    };
+    auto is_stop = [&](int t) { return std::find(stop_ids.begin(), stop_ids.end(), t) != stop_ids.end(); };
+    auto now_ms = [] {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+
+    const int ctxv = (int) a.ctx;
+    const int chunk_max = a.prefill_chunk > 0 ? a.prefill_chunk : 128;   // > 128 runs out of VRAM beside an auto cache
+    std::string err;
+    if (!eg.snapshot(0, 0)) { std::fprintf(stderr, "serve: snapshot: %s\n", eg.last_error().c_str()); return 1; }
+    std::vector<int> hist;
+    bool s1_valid = false;
+    std::vector<float> s1_logits;
+    std::random_device rd;
+
+    std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) (tier ? tier->resident() : 0),
+                (long long) (tier ? tier->arena_experts() : 0));
+    std::printf("READY %d stop\n", ctxv);
+    std::fflush(stdout);
+    std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d, %zu stop ids)\n", ctxv, chunk_max, stop_ids.size());
+
+    for (;;) {
+        const std::string line = pop();
+        if (line == "QUIT") break;
+        if (line.empty() || line == "STOP") continue;   // a STOP after the request already ended
+        if (line.rfind("GEN ", 0) != 0) {
+            const std::string cmd = line.substr(0, line.find(' '));
+            std::printf("ERR %s is not supported by ernie_generate\n", cmd.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        // ---- parse: GEN <max_new> [k=v ...] <ids> ----
+        std::vector<std::string> f;
+        for (size_t p = 0; p < line.size();) {
+            const size_t e = line.find(' ', p);
+            const size_t end = e == std::string::npos ? line.size() : e;
+            if (end > p) f.push_back(line.substr(p, end - p));
+            p = end + 1;
+        }
+        Sampling sp;
+        int max_new = f.size() > 1 ? std::atoi(f[1].c_str()) : 0;
+        std::vector<int> ids;
+        for (size_t i = 2; i < f.size(); ++i) {
+            const size_t eq = f[i].find('=');
+            if (eq == std::string::npos) { ids = parse_ids(f[i]); continue; }
+            const std::string k = f[i].substr(0, eq), v = f[i].substr(eq + 1);
+            if (k == "temperature") sp.temp = (float) std::atof(v.c_str());
+            else if (k == "top_p") sp.top_p = (float) std::atof(v.c_str());
+            else if (k == "top_k") sp.top_k = std::atoi(v.c_str());
+            else if (k == "min_p") sp.min_p = (float) std::atof(v.c_str());
+            else if (k == "seed") { sp.has_seed = true; sp.seed = std::strtoull(v.c_str(), nullptr, 10); }
+            else if (k == "prefill" && v == "1") max_new = 0;
+            else if (k == "penalty_repeat") sp.penalty_repeat = (float) std::atof(v.c_str());
+            else if (k == "penalty_freq") sp.penalty_freq = (float) std::atof(v.c_str());
+            else if (k == "penalty_present") sp.penalty_present = (float) std::atof(v.c_str());
+            else if (k == "penalty_last_n") sp.penalty_last_n = std::atoi(v.c_str());
+            else if (k == "dry_multiplier") sp.dry_multiplier = (float) std::atof(v.c_str());
+            else if (k == "dry_base") sp.dry_base = (float) std::atof(v.c_str());
+            else if (k == "dry_allowed_length") sp.dry_allowed_length = std::atoi(v.c_str());
+            else if (k == "dry_penalty_last_n") sp.dry_penalty_last_n = std::atoi(v.c_str());
+        }
+        const int total = (int) ids.size();
+        auto fail = [&](const std::string& why, int reused) {
+            std::printf("ERR %s\n", why.c_str());
+            std::printf("DONE 0 %d 0.0 0.0 error 0 0 %d\n", total, reused);
+            std::fflush(stdout);
+        };
+        if (ids.empty()) { fail("empty prompt", 0); continue; }
+        if (total + std::max(0, max_new) + 8 > ctxv) {
+            fail("prompt " + std::to_string(total) + " + max_new " + std::to_string(max_new) + " exceeds the context " +
+                 std::to_string(ctxv) + " (start the engine with a larger --ctx)", 0);
+            continue;
+        }
+        const double tp0 = now_ms();
+        // ---- reuse ----
+        size_t L = 0;
+        while (L < hist.size() && L < ids.size() && hist[L] == ids[L]) ++L;
+        const int s1_pos = eg.snapshot_pos(1);
+        std::vector<float> logits;
+        int reused = 0;
+        bool ok = true;
+        if (s1_valid && s1_pos == total && L >= (size_t) s1_pos && !s1_logits.empty()) {
+            // the same prompt again (regenerate / a retry): its last row's logits are kept, nothing to read
+            if (hist.size() != (size_t) s1_pos) ok = eg.restore(1);
+            hist.resize((size_t) s1_pos);
+            reused = total;
+            logits = s1_logits;
+        } else {
+            const size_t Lc = std::min(L, ids.size() - 1);   // the last prompt token is always read (its logits)
+            if (Lc == hist.size()) {
+                reused = (int) Lc;                          // the prompt extends the caches: read on in place
+            } else if (s1_valid && s1_pos >= 0 && (size_t) s1_pos <= Lc) {
+                ok = eg.restore(1);
+                hist.resize((size_t) s1_pos);
+                reused = s1_pos;
+            } else {
+                ok = eg.restore(0);
+                hist.clear();
+                s1_valid = false;                           // the positions under slot 1 are about to be rewritten
+                reused = 0;
+            }
+        }
+        if (!ok) { fail("restore: " + eg.last_error(), 0); hist.clear(); s1_valid = false; continue; }
+        std::printf("RESUME %d\n", reused);
+        std::fflush(stdout);
+        // ---- prompt ----
+        int64_t pos = reused;
+        bool cancelled = false;
+        while (pos < total) {
+            const int n = (int) std::min<int64_t>(chunk_max, total - pos);
+            const bool last = pos + n == total;
+            std::vector<float> lg;
+            if (!run_pass(eg, tier, il0, il1, ids.data() + pos, n, pos, nullptr, last ? &lg : nullptr, err)) {
+                ok = false;
+                break;
+            }
+            hist.insert(hist.end(), ids.begin() + pos, ids.begin() + pos + n);
+            pos += n;
+            if (last) logits = std::move(lg);
+            const double ms = now_ms() - tp0;
+            std::printf("PP %lld %d %.0f %.1f\n", (long long) pos, total, ms, 1000.0 * (double) (pos - reused) / std::max(ms, 1e-9));
+            std::fflush(stdout);
+            if (!last && stop_pending()) { cancelled = true; break; }
+        }
+        if (!ok) { fail("prompt: " + err, reused); hist.clear(); s1_valid = false; continue; }
+        const double prompt_ms = now_ms() - tp0;
+        if (cancelled) {
+            std::printf("DONE 0 %d %.1f 0.0 cancel 0 0 %d\n", total, prompt_ms, reused);
+            std::fflush(stdout);
+            continue;
+        }
+        if (reused < total || !s1_valid || s1_pos != total) {   // the next turn's restore point
+            if (eg.snapshot((int) pos, 1)) { s1_valid = true; s1_logits = logits; }
+            else { s1_valid = false; std::fprintf(stderr, "serve: snapshot: %s\n", eg.last_error().c_str()); }
+        }
+        if (max_new <= 0) {
+            std::printf("DONE 0 %d %.1f 0.0 length 0 0 %d\n", total, prompt_ms, reused);
+            std::fflush(stdout);
+            continue;
+        }
+        // ---- decode ----
+        std::mt19937_64 rng(sp.has_seed ? sp.seed : (((uint64_t) rd() << 32) ^ rd()));
+        const double td0 = now_ms();
+        int gen = 0;
+        const char* finish = "length";
+        if (sp.active()) apply_penalties(logits, hist, sp, breaker);
+        int next = sample(logits, sp, rng);
+        for (;;) {
+            std::printf("T %d\n", next);
+            std::fflush(stdout);
+            ++gen;
+            if (is_stop(next)) { finish = "stop"; break; }
+            if (gen >= max_new || pos + 1 >= ctxv) break;
+            if (stop_pending()) { finish = "cancel"; break; }
+            std::vector<float> lg;
+            if (!run_pass(eg, tier, il0, il1, &next, 1, pos, nullptr, &lg, err)) { ok = false; break; }
+            hist.push_back(next);
+            ++pos;
+            if (sp.active()) apply_penalties(lg, hist, sp, breaker);
+            next = sample(lg, sp, rng);
+        }
+        if (!ok) {
+            std::printf("ERR decode: %s\n", err.c_str());
+            finish = "error";
+            hist.clear();
+            s1_valid = false;
+        }
+        std::printf("DONE %d %d %.1f %.1f %s 0 0 %d\n", gen, total, prompt_ms, now_ms() - td0, finish, reused);
+        std::fflush(stdout);
+        // the routing profile a later start seeds from (--rank-counts): kept current after every request
+        if (!g_route_counts.empty() && !flush_route_counts(a.count_routes, err))
+            std::fprintf(stderr, "serve: --count-routes: %s\n", err.c_str());
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     Args a;
     if (!parse(argc, argv, a)) { usage(stderr); return 2; }
+    if (a.serve) a.quiet = true;   // stdout is the protocol: the run's notes go to stderr (the server's log)
     g_ds41 = a.ds41_decode;
     g_pf = a.pf;
 
@@ -457,7 +823,7 @@ int main(int argc, char** argv) {
         if (batch_ids.empty()) { std::fprintf(stderr, "--batch: no prompts in %s\n", a.batch.c_str()); return 2; }
         if (ids.empty()) ids = batch_ids[0];
     }
-    if (ids.empty()) { std::fprintf(stderr, "empty prompt\n"); return 2; }
+    if (ids.empty() && !a.serve) { std::fprintf(stderr, "empty prompt\n"); return 2; }
 
     // ---- tokenizer (decode only) from the GGUF's own vocabulary ----
     std::vector<std::string> tokens;
@@ -492,6 +858,16 @@ int main(int argc, char** argv) {
         tcfg.arena_gib = a.arena_gib;
         tcfg.max_arena_gib = a.arena_gib;
         tcfg.slots = a.slots > 0 ? a.slots : 0;   // 0 = auto (sized at the seed from the free VRAM)
+        tcfg.skip_miss = a.skip_miss;
+        tcfg.skip_file = a.skip_file;
+        tcfg.vram_lru = a.vram_lru;
+        tcfg.arena_adapt = a.arena_adapt;
+        tcfg.arena_skip_resident = a.arena_skip_resident;
+        tcfg.chunk_mmq = a.chunk_mmq;
+        tcfg.chunk_prestage = a.chunk_prestage;
+        tcfg.chunk_prefetch = a.chunk_prefetch;
+        tcfg.remote_device = a.remote_device;
+        tcfg.remote_gib = a.remote_gib;
         tier.reset(new Ds41MoeTier());
         if (!tier->init(gm, src.get(), tcfg, err)) { std::fprintf(stderr, "tier init: %s\n", err.c_str()); return 1; }
         if (!a.count_routes.empty()) {
@@ -502,10 +878,14 @@ int main(int argc, char** argv) {
 
     // ---- the dense graphs ----
     ErnieGraphConfig cfg;
-    cfg.n_threads = a.threads;
-    cfg.ctx_max = a.ctx;
     cfg.abl_file = a.abl_file;
     cfg.abl_scale = a.abl_scale;
+    cfg.n_threads = a.threads;
+    cfg.ctx_max = a.ctx;
+    if (a.kv_mla == "q8_0") cfg.mla_kv_type = GGML_TYPE_Q8_0;
+    else if (a.kv_mla == "q4_0") cfg.mla_kv_type = GGML_TYPE_Q4_0;
+    else if (a.kv_mla != "f16") { std::fprintf(stderr, "--kv-mla: f16, q8_0 or q4_0 (got %s)\n", a.kv_mla.c_str()); return 2; }
+    cfg.mla_hadamard = a.kv_hadamard;
     if (a.cuda) {
 #ifdef ERNIE_HAVE_CUDA
         cfg.backend = ggml_backend_cuda_init(0);
@@ -583,6 +963,35 @@ int main(int argc, char** argv) {
                     s.fwait_ms, s.gap_ms, s.wall_ms);
         tier->reset_stats();
     };
+    if (a.serve) {
+        // stop ids: <|ernie:im_end|> (the end of a turn) and the GGUF's eos
+        std::vector<int> stop_ids;
+        if (eog_id >= 0) stop_ids.push_back(eog_id);
+        {
+            std::unique_ptr<GgufModel> m(new GgufModel(GgufModel::open(a.model)));
+            const MetaValue* e = m->meta().get("tokenizer.ggml.eos_token_id");
+            if (e) {
+                const int id = (int) e->u;
+                if (std::find(stop_ids.begin(), stop_ids.end(), id) == stop_ids.end()) stop_ids.push_back(id);
+            }
+        }
+        // DRY's sequence breakers: every token whose text holds a newline, ':', '"' or '*' (llama.cpp's defaults)
+        // (through the tokenizer: the GGUF vocabulary list read above can come back short)
+        std::vector<char> breaker((size_t) eg.geom().vocab, 0);
+        {
+            ErnieTokenizer btk;
+            std::string bterr;
+            if (!ernie_tokenizer_load(a.model, btk, bterr)) { std::fprintf(stderr, "tokenizer: %s\n", bterr.c_str()); return 1; }
+            for (size_t t = 0; t < breaker.size(); ++t) {
+                std::string tx;
+                try { tx = ernie_tokenizer_decode(btk, std::vector<int>{ (int) t }); } catch (const std::exception&) { continue; }
+                breaker[t] = tx.find_first_of("\n:\"*") != std::string::npos;
+            }
+            const std::vector<int> e = ernie_tokenizer_encode(btk, "<|ernie:im_end|>", true);
+            if (e.size() == 1 && std::find(stop_ids.begin(), stop_ids.end(), e[0]) == stop_ids.end()) stop_ids.push_back(e[0]);
+        }
+        return serve_loop(a, eg, tier.get(), il0, il1, stop_ids, breaker);
+    }
     // ---- --batch: every prompt from position 0 in this one load ----
     if (!batch_ids.empty()) {
         if (!eg.snapshot(0)) { std::fprintf(stderr, "snapshot: %s\n", eg.last_error().c_str()); return 1; }
@@ -755,20 +1164,9 @@ int main(int argc, char** argv) {
     if (g_pred_n > 0 && !a.quiet)
         std::printf("predict: %lld routed, %.1f %% in the guessed top 8, %.1f %% in the top 16\n", (long long) g_pred_n,
                     100.0 * g_pred_in8 / g_pred_n, 100.0 * g_pred_in16 / g_pred_n);
-    if (!g_route_counts.empty()) {
-        std::vector<int64_t> c;
-        if (!read_counts(a.count_routes, g_route_counts.size(), c, err, true)) {
-            std::fprintf(stderr, "--count-routes: %s\n", err.c_str());
-            return 1;
-        }
-        for (size_t i = 0; i < c.size(); ++i) c[i] += g_route_counts[i];
-        const std::string tmpf = a.count_routes + ".tmp";
-        std::FILE* f = std::fopen(tmpf.c_str(), "wb");
-        if (!f || std::fwrite(c.data(), sizeof(int64_t), c.size(), f) != c.size() || std::fclose(f) != 0 ||
-            std::rename(tmpf.c_str(), a.count_routes.c_str()) != 0) {
-            std::fprintf(stderr, "--count-routes: cannot write %s\n", a.count_routes.c_str());
-            return 1;
-        }
+    if (!g_route_counts.empty() && !flush_route_counts(a.count_routes, err)) {
+        std::fprintf(stderr, "--count-routes: %s\n", err.c_str());
+        return 1;
     }
 
     if (!a.out_text.empty()) {

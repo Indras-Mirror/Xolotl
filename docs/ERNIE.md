@@ -1,8 +1,8 @@
 # ERNIE-5.5-Flash on Xolotl (preview)
 
-> **Draft / preview.** The engine runs ERNIE-5.5-Flash correctly, but it is a command-line generator for now
-> (`ernie_generate`, no server yet), it has been tested on one GGUF layout, and the speed work is still going on.
-> Faster decode, the server and a quant of our own come next. Numbers and flags below may change.
+> **Draft / preview.** The engine runs ERNIE-5.5-Flash correctly and serves it through Xolotl's OpenAI / Anthropic
+> server, but it has been tested on one GGUF layout so far and the speed work is still going on. Faster decode
+> (speculative decoding, the 2-bit expert shadow) and a quant of our own come next. Numbers and flags may change.
 
 Baidu's [ERNIE-5.5-Flash-Preview](https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview) (Apache 2.0) is a 280B MoE
 with about 14B active parameters per token. `ernie_generate` is Xolotl's engine for it. It reuses the DeepSeek-V4.1
@@ -75,9 +75,32 @@ cmake --build build --target ernie_generate -j
 | `--ds41-decode 0` | one-token steps through the DeepSeek-V4.1 decode path, with the next layer's experts guessed ahead |
 | `--batch F`, `--batch-out F`, `--batch-logits F` | many prompts in one load (0x1E-separated), greedy continuations and last-row logits |
 | `--abl F`, `--abl-scale S` | directional ablation at load from a direction file (format in `ernie_graph.hpp`) |
+| `--kv-mla f16\|q8_0\|q4_0` | the MLA layers' KV rows (~96 % of the KV at long context): q8_0 halves it, q4_0 quarters it (Hadamard-rotated by default, `--kv-hadamard 0\|1`) |
+| `--vram-lru` / `--arena-adapt` | the VRAM cache / the RAM arena follow the conversation (least-recently-used replacement) |
+| `--arena-skip-resident` | experts the VRAM cache holds stay out of the RAM arena (room for the next-ranked ones) |
+| `--skip-miss W` / `--skip-file W` | decode: drop a VRAM-miss (or NVMe-only) expert weighing under W of the token's routing weight. A quality trade: measure first |
+| `--remote-device N` | a second CUDA card holds and computes the next-ranked experts |
 | `--stats` | the tier's hit / miss / timing counters |
 
 Rendered chat text uses ERNIE's own special tokens; pass `--no-bos` when the text already starts with them.
+
+## Serving
+
+```bash
+python3 tools/strata_tokenizer.py --gguf ERNIE-5.5-Flash.gguf --out ernie-tokenizer      # the tokenizer pack (pre ernie5)
+# edit configs/xol-ernie.json: the GGUF path, the tokenizer folder (ernie-tokenizer/tokenizer), --arena-gib
+python3 -m serve.server --engine strata --config configs/xol-ernie.json --port 8140
+```
+
+`ernie_generate --serve` speaks the server's engine protocol: prompt progress, STOP, sampling (temperature, top_p,
+top_k up to 64, min_p, seed), repetition / frequency / presence penalties and DRY (`dry_multiplier`, `dry_base`,
+`dry_allowed_length`, `dry_penalty_last_n`, llama.cpp's names, per request or in the config's `sampling`).
+A follow-up turn reads only its new tokens: the engine keeps the conversation and a snapshot at the last prompt's end.
+The prompt is Baidu's own renderer (`serve/ernie_encoding.py`, vendored from the model repo), with
+`reasoning_effort` low / medium / high and thinking on or off; `serve/ernie.py` turns ERNIE's
+`<ernie:think>` / `<ernie:tool_call>` output into the server's reasoning, answer and tool-call events.
+`--count-routes` adds every request's routing to the profile `--rank-counts` seeds from, so the caches learn what
+you use. One request at a time for now.
 
 ## Credits
 

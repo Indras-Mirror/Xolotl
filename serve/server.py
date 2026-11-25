@@ -1980,6 +1980,17 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        # DRY (llama.cpp's names; sent only when set: an engine without DRY ignores keys it does not know)
+        dm = sampling.get("dry_multiplier")
+        if isinstance(dm, (int, float)) and not isinstance(dm, bool) and float(dm) > 0.0:
+            keys += f" dry_multiplier={float(dm)!r}"
+            db = sampling.get("dry_base")
+            if isinstance(db, (int, float)) and not isinstance(db, bool) and float(db) > 1.0:
+                keys += f" dry_base={float(db)!r}"
+            for k in ("dry_allowed_length", "dry_penalty_last_n"):
+                v = sampling.get(k)
+                if isinstance(v, int) and not isinstance(v, bool):
+                    keys += f" {k}={v}"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -5124,6 +5135,25 @@ class Service:
             self.reasoning_close_text = inkling.REASONING_CLOSE
             self.reasoning_wrap_up_text = inkling.REASONING_WRAP_UP
             self.answer_open_text = inkling.ANSWER_OPEN
+        elif family == "ernie5_5":
+            # ERNIE-5.5-Flash: <ernie:think>...</ernie:think> then the answer, calls as an <ernie:tool_call> block of
+            # <invoke name=..><parameter name=..> elements, the turn ended by <|ernie:im_end|>.  serve/ernie.py reads them
+            # as the Qwen form and renders with Baidu's own renderer (serve/ernie_encoding.py)
+            from serve import ernie
+            stops = set()
+            try:
+                stops.update(int(i) for i in self.tok.encode(ernie.END, parse_special=True))
+            except Exception:                               # a tokenizer without the marker: the generic end ids below
+                pass
+            eos = (getattr(self.tok, "special_ids", None) or {}).get("eos")
+            if eos is not None:
+                stops.add(int(eos))
+            self.stop_ids = stops or self.stop_ids
+            self.parser_cls = ernie.ErnieOutputParser
+            self._force_text = ernie.to_ernie_force
+            self.reasoning_close_text = ernie.REASONING_CLOSE
+            self.reasoning_wrap_up_text = ernie.REASONING_WRAP_UP
+            self.answer_open_text = ernie.ANSWER_OPEN
         import serve.frontend as _frontend
         _frontend.use_family(family)
 
@@ -6210,6 +6240,10 @@ class Service:
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         kwargs = {k: v for k, v in kwargs.items() if k != CACHE_MARK_KEY}
+        if self.family == "ernie5_5":
+            # ERNIE-5.5-Flash: Baidu's renderer (serve/ernie_encoding.py), its reasoning_effort low / medium / high
+            from serve import ernie
+            return ernie.render(messages, tools, kwargs)
         if self.family in ("inkling2", "inkling2_loop"):
             # Inkling-2-Mini's template has no generation prompt (the model writes <|message_model|> itself) and takes
             # its thinking effort as a template variable; serve/inkling.py renders it (parity-tested against the
@@ -10597,6 +10631,14 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
             if not number or value != int(value) or value < 0:
                 raise SystemExit(f"[strata] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
             out[key] = int(value)
+        elif key in ("dry_multiplier", "dry_base"):
+            if not number or value < 0:
+                raise SystemExit(f"[strata] config sampling.{key}={value!r}: expected a number >= 0")
+            out[key] = float(value)
+        elif key in ("dry_allowed_length", "dry_penalty_last_n"):
+            if not number or value != int(value) or value < -1:
+                raise SystemExit(f"[strata] config sampling.{key}={value!r}: expected an integer >= -1")
+            out[key] = int(value)
         elif key == "seed":
             if not number or value != int(value) or value <= 0:
                 raise SystemExit(f"[strata] config sampling.seed={value!r}: expected a positive integer")
@@ -10707,7 +10749,8 @@ def check_request_sampling(req) -> None:
             req["penalty_last_n"] = rl      # 0 and -1 (off / the whole context) keep the engine's default window
     for key, integer in (("temperature", False), ("top_p", False), ("min_p", False), ("presence_penalty", False),
                          ("frequency_penalty", False), ("repetition_penalty", False), ("top_k", True),
-                         ("penalty_last_n", True), ("seed", True)):
+                         ("penalty_last_n", True), ("seed", True), ("dry_multiplier", False), ("dry_base", False),
+                         ("dry_allowed_length", True), ("dry_penalty_last_n", True)):
         value = (req or {}).get(key)
         if value is None:
             continue
@@ -10752,6 +10795,7 @@ MODEL_CARD_SAMPLING = {
     # Inkling-2-Mini: its generation_config.json recommends temperature 1.0 with do_sample (no top_p/top_k given, so
     # the engine's own off values stay)
     "inkling2": {"thinking": {"temperature": 1.0}, "instruct": {"temperature": 1.0}},
+    "ernie5_5": {"thinking": {"temperature": 1.0, "top_p": 0.95}, "instruct": {"temperature": 1.0, "top_p": 0.95}},
     "inkling2_loop": {"thinking": {"temperature": 1.0}, "instruct": {"temperature": 1.0}},
 }
 
@@ -11242,7 +11286,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "muse-glimmer", "inkling2", "inkling2_loop")
+        svc.set_family(svc.model_arch if svc.model_arch in ("deepseek41", "muse-glimmer", "inkling2", "inkling2_loop", "ernie5_5")
                        else None)
         requested = cfg.get("parallel")
         if requested is None:
