@@ -43,7 +43,7 @@ constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ2_XS = 17, k
 /// TQK5X / TQK4X (224 / 225, computed codebook) and TQK5T / TQK4T (226 / 227, table): a block of 128 values is
 /// {fp16 d; 32 steps of K bits}, 2 + 4 K bytes (tools/trellis/tqenc.hpp).  The Gyro-L pair types TQP5 / TQP6 / TQP7
 /// (147-149, the registered ggml types of the same fork) are the same block with 64 steps of 2 weights: 2 + 8 K bytes
-/// (tools/trellis/tqenc_pair.hpp).  They go through the same entry points below.
+/// (the pair-trellis layout).  They go through the same entry points below.
 constexpr int kTQK6 = 145, kTQK7 = 146, kTQP5 = 147, kTQP6 = 148, kTQP7 = 149, kTQK5X = 224, kTQK4X = 225, kTQK5T = 226,
               kTQK4T = 227;
 constexpr int tq_kbits(int type) {
