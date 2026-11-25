@@ -23,13 +23,16 @@ namespace {
 
 int kbits_of(int type) {
     switch (type) {
-        case 145: return 6;
-        case 146: return 7;
-        case 224: case 226: return 5;
-        case 225: case 227: return 4;
+        case 145: case 148: return 6;   // TQK6, TQP6
+        case 146: case 149: return 7;   // TQK7, TQP7
+        case 147: case 224: case 226: return 5;   // TQP5, TQK5X, TQK5T
+        case 225: case 227: return 4;             // TQK4X, TQK4T
         default: return 0;
     }
 }
+// 147-149: the Gyro-L pair layout, 2 weights a step (8 K stream bytes a block) against the quad layout's 4 (4 K)
+bool pair_of(int type) { return kc::tq_pair_layout(type); }
+size_t block_bytes_of(int type) { return kc::tq_block_bytes(type); }
 constexpr int kActTq = 100;   // IqCpu::gu_act / d_act of these types: the layout below
 
 // an activation of k values: k / 32 F32 scales, then k int8
@@ -49,6 +52,16 @@ void dots(int type, const uint8_t* w, size_t rb, int n, const void* const* act, 
     for (int t = 0; t < nt; ++t) {
         unpack(act[t], n, unp[(size_t) t]);
         ap[t] = &unp[(size_t) t];
+    }
+    if (pair_of(type)) {   // The pair layout's own kernels (tq_cpu.cpp's rows_pair_on: AVX-512 takes the AVX2 pair kernel)
+        switch (kc::tq_isa()) {
+#if defined(__x86_64__) || defined(_M_X64)
+            case kc::TqIsa::avx512:
+            case kc::TqIsa::avx2: kc::tq_detail::tq_rows_avx2_tqp(kc::tq_kbits(type), w, rb, n, ap, nt, out, r0, r1); break;
+#endif
+            default: kc::tq_detail::tq_rows_scalar_tqp(kc::tq_kbits(type), w, rb, n, ap, nt, out, r0, r1); break;
+        }
+        return;
     }
     const int kb = kc::tq_kbits(type);
     const int16_t* tab = kc::tq_state_table_for(type);
@@ -76,8 +89,8 @@ bool tq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err
     f.n_embd = n_embd;
     f.n_ff = n_ff;
     f.gu_act = f.d_act = kActTq;
-    f.gu_row = (size_t) (n_embd / 128) * (2 + 4 * kbits_of(tg));
-    f.d_row = (size_t) (n_ff / 128) * (2 + 4 * kbits_of(td));
+    f.gu_row = (size_t) (n_embd / 128) * block_bytes_of(tg);
+    f.d_row = (size_t) (n_ff / 128) * block_bytes_of(td);
     f.act_bytes = act_bytes_of(n_embd);
     f.h_bytes = act_bytes_of(n_ff);
     return true;

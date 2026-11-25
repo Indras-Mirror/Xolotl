@@ -1,0 +1,86 @@
+# ERNIE-5.5-Flash on Xolotl (preview)
+
+> **Draft / preview.** The engine runs ERNIE-5.5-Flash correctly, but it is a command-line generator for now
+> (`ernie_generate`, no server yet), it has been tested on one GGUF layout, and the speed work is still going on.
+> Faster decode, the server and a quant of our own come next. Numbers and flags below may change.
+
+Baidu's [ERNIE-5.5-Flash-Preview](https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview) (Apache 2.0) is a 280B MoE
+with about 14B active parameters per token. `ernie_generate` is Xolotl's engine for it. It reuses the DeepSeek-V4.1
+routed-expert tier (VRAM cache, RAM arena, NVMe file tier) with ERNIE's own geometry and activation, and runs the
+dense half as per-layer ggml graphs.
+
+| | |
+|---|---|
+| layers | 43: layer 0 dense, layers 1-42 MoE |
+| attention | 37 HCA layers (compressed KV, 128-token windows) + 6 MLA/DSA layers (7, 14, 21, 28, 35, 42) |
+| experts | 512 routed, top-10, plus 1 shared. The experts work in a 2048-wide latent (`fc1_latent_proj` 4096 -> 2048, then `fc2_latent_proj` back), SiTU activation |
+| residual | 4-stream mHC (hyper-connections) |
+| expert weights read per token | about 5.3B |
+
+## Which GGUFs it reads
+
+The tensor names and metadata of **llama.cpp PR [#31925](https://github.com/ggml-org/llama.cpp/pull/31925)**
+("model : add ERNIE 5.5", by FakerVSdonk), at its commit `7d9d5c351`. That PR is still a draft, so its names can
+change before it merges; if a GGUF made by a later version of the PR fails to load, please open an issue with the
+error line.
+
+Tested so far:
+
+- MXFP4 routed experts with a Q8_0 dense half (154 GB), converted from Baidu's FP8 safetensors with
+  `tools/ernie/ernie_gguf.py`.
+- The engine's expert kernels cover the usual ggml types (Q2_K-Q8_0, IQ1_M-IQ4_XS, MXFP4) through the same tier
+  DeepSeek-V4.1 uses, but on ERNIE only MXFP4 has been run end to end. Other quants should work; reports welcome.
+
+## Correctness
+
+Checked against the PR's own llama.cpp build on the same file:
+
+- next-token KL 0.004 on a near-tie token over a full 43-layer pass
+- teacher-forced NLL 0.093 vs llama-perplexity's 0.080 on the same rows (the gap is ggml's Q8 activation rounding,
+  traced tensor by tensor with `tools/ernie/ernie_compare.py`)
+- tokenizer: identical ids to `llama-tokenize` on the test strings (`tools/v41/engine/test_ernie_tokenize.sh`)
+
+`tools/ernie/README_REF.md` has the numpy reference (`ernie_ref.py`, straight from the FP8 safetensors) and the
+tensor-by-tensor comparison against the PR.
+
+## Speed (RTX 4090, Ryzen 7 5700X, 110 GB RAM, one NVMe, the 154 GB MXFP4 file)
+
+| | tok/s |
+|---|---:|
+| decode | 4.46 |
+| prefill | 12.9 |
+
+This file is bigger than RAM plus VRAM, so about 15 % of expert reads still go to the NVMe drive, and that is where
+most of the time goes. A smaller quant that fits in RAM, and the DeepSeek-V4.1 decode stack (speculative decode,
+cache adaptation), are the next steps.
+
+## Build and run
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build --target ernie_generate -j
+
+# the best decode settings measured so far
+./build/ernie_generate -m ERNIE-5.5-Flash.gguf -p "Write a haiku about rivers." -n 128 \
+    --experts gpu --cuda --slots 0 --threads 7 --arena-gib 64 --ds41-decode 0 --prefill-chunk 128
+```
+
+| flag | what it does |
+|---|---|
+| `--experts gpu` / `--cuda` | routed experts on the GPU tier / the dense graphs on the GPU |
+| `--arena-gib G` | RAM for routed experts (set it to what you can spare) |
+| `--slots 0` | VRAM expert slots, 0 = all free VRAM minus 1 GiB (so only one run per card) |
+| `--prefill-chunk 128` | prompt passes of at most 128 tokens (512 runs out of VRAM on a 24 GB card) |
+| `--count-routes F` / `--rank-counts F` | record which experts a workload uses, then fill VRAM and RAM with the most used first. Without a profile the cache fills in index order and decode is about 3x slower |
+| `--ds41-decode 0` | one-token steps through the DeepSeek-V4.1 decode path, with the next layer's experts guessed ahead |
+| `--batch F`, `--batch-out F`, `--batch-logits F` | many prompts in one load (0x1E-separated), greedy continuations and last-row logits |
+| `--abl F`, `--abl-scale S` | directional ablation at load from a direction file (format in `ernie_graph.hpp`) |
+| `--stats` | the tier's hit / miss / timing counters |
+
+Rendered chat text uses ERNIE's own special tokens; pass `--no-bos` when the text already starts with them.
+
+## Credits
+
+Model by Baidu. GGUF layout and the reference implementation we checked against: llama.cpp PR #31925 by
+FakerVSdonk. Engine work in this repo builds on the DeepSeek-V4.1 engine and its contributors (see
+[CREDITS.md](../CREDITS.md)).

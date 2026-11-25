@@ -5,11 +5,16 @@
 // it the same way and only the differences are new.
 //
 //   1. `ErnieGeometry` is every number a Phase-2/3 kernel depends on, read from the GGUF's own `ernie5_5.*`
-//      keys - D=4096, 44 blocks (43 trunk + 1 MTP), 64 q / 1 kv heads, HCA head 512, MLA head 256 / kv_lora
-//      512 / q_lora 1024, o_groups 8, 512 experts top-10, expert dim 2048 in a 2048-d latent, dense lead FFN
-//      14336, hc 4 (Sinkhorn 20), window 128, the per-layer `compress_ratios` (0 = MLA, 128 = HCA), the
-//      indexer 64/128/2048, situ betas, YaRN factor 16 / orig 65536, compress rope base 160000, MultiMax.
-//      A key that is absent is an error, not a default.
+//      keys - D=4096, 64 q / 1 kv heads, HCA head 512, MLA head 256 / kv_lora 512 / q_lora 1024, o_groups 8,
+//      512 experts top-10, expert dim 2048 in a 2048-d latent, dense lead FFN 14336, hc 4 (Sinkhorn 20),
+//      window 128, the per-layer `compress_ratios` (0 = MLA, 128 = HCA), the indexer 64/128/2048, situ betas,
+//      YaRN factor 16 / orig 65536, compress rope base 160000, MultiMax.  A key that is absent is an error, not
+//      a default.
+//
+//      Two released layouts share the block map: the **Base** file (44 blocks = 43 trunk + the MTP/nextn block,
+//      37 HCA + 7 MLA) and the **Preview** file (43 trunk blocks, 37 HCA + 6 MLA, `nextn_predict_layers 0`; its
+//      DSpark drafts are a separate sidecar, see `ernie_dspark_expected_tensors`).  A `--layers N` test export is
+//      the same map truncated to the first N blocks.
 //
 //   2. `check_ernie_model` resolves the FULL tensor map: every name in the file must be one this model
 //      predicts, and every predicted tensor must be present.  The per-layer set is conditional exactly as the
@@ -116,7 +121,8 @@ struct ErnieGeometry {
     int64_t hc_dim() const { return hc * n_embd; }                   ///< hc*D = 16384
     int64_t hc_mix_dim() const { return (2 + hc) * hc; }             ///< (2+hc)*hc = 24
     int64_t hca_heads_dim() const { return n_head * d_head_hca; }    ///< n_heads*d_h_hca = 32768
-    int64_t o_group_dim() const { return hca_heads_dim() / o_groups; }  ///< = 4096
+    int64_t n_heads_group() const { return o_groups ? n_head / o_groups : 0; }  ///< heads per output group
+    int64_t o_group_dim() const { return o_groups ? hca_heads_dim() / o_groups : 0; }  ///< = 4096
     int64_t mla_qk_nope() const { return d_head_mla_k - d_rope; }    ///< 256 - 64 = 192
     int64_t mla_heads_dim() const { return n_head * d_head_mla_v; }  ///< = 16384
 
@@ -172,6 +178,9 @@ inline std::string ernie_key_i64_arr(const GgufFile& g, const char* key, std::ve
 }
 
 /// The cheap architecture check: `general.architecture == "ernie5_5"` and the values a kernel would branch on.
+/// `block_count` is not pinned to 44: the Preview export has 43, and a `--layers N` test export is truncated.
+/// Instead the count must agree with `attention.compress_ratios` (every block has a ratio, every ratio is one
+/// of the two supported kinds), which is the invariant the loader and `ernie_expected_tensors` both rely on.
 inline std::string check_architecture_ernie(const GgufFile& g) {
     const MetaValue* arch = g.get("general.architecture");
     if (!arch) return "missing general.architecture";
@@ -181,7 +190,6 @@ inline std::string check_architecture_ernie(const GgufFile& g) {
         uint64_t want;
     };
     const Req reqs[] = {
-        {"ernie5_5.block_count", 44},
         {"ernie5_5.embedding_length", 4096},
         {"ernie5_5.attention.head_count", 64},
         {"ernie5_5.attention.head_count_kv", 1},
@@ -195,6 +203,23 @@ inline std::string check_architecture_ernie(const GgufFile& g) {
         if (!v) return std::string("missing ") + r.key;
         if (v->u != r.want)
             return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
+    }
+    const MetaValue* bc = g.get("ernie5_5.block_count");
+    if (!bc) return "missing ernie5_5.block_count";
+    if (bc->u == 0 || bc->u > 1024) return "ernie5_5.block_count = " + std::to_string(bc->u) + " is out of range";
+    const MetaValue* cr = g.get("ernie5_5.attention.compress_ratios");
+    if (!cr || cr->type != MetaType::ARRAY) return "missing ernie5_5.attention.compress_ratios";
+    if (cr->count < bc->u)
+        return "ernie5_5.attention.compress_ratios has " + std::to_string(cr->count) +
+               " entries, need block_count (" + std::to_string(bc->u) + ")";
+    if (cr->items.size() < bc->u)
+        return "ernie5_5.attention.compress_ratios: only " + std::to_string(cr->items.size()) +
+               " items were read (reader sample cap), need block_count";
+    for (size_t i = 0; i < (size_t)bc->u; ++i) {
+        const double r = cr->items[i].num();
+        if (r != 0 && r != 128)
+            return "ernie5_5.attention.compress_ratios[" + std::to_string(i) + "] = " + std::to_string((int)r) +
+                   " (only 0 = MLA, 128 = HCA)";
     }
     return {};  // empty == ok
 }
@@ -418,8 +443,8 @@ inline std::vector<ErnieTensorSpec> ernie_expected_tensors(const ErnieGeometry& 
             v.push_back(spec(p + "attn_output_a.weight", {(uint64_t)g.o_group_dim(), ol, og}, TC::Weight));
             v.push_back(spec(p + "attn_output_b.weight", {og * ol, D}, TC::Weight));
             v.push_back(spec(p + "attn_gate.weight", {rq, og * ol}, TC::Weight));
-            v.push_back(spec(p + "attn_compressor_wkv.weight", {D, dh}, TC::Weight));
-            v.push_back(spec(p + "attn_compressor_wgate.weight", {D, dh}, TC::Weight));
+            v.push_back(spec(p + "attn_compressor_kv.weight", {D, dh}, TC::Weight));
+            v.push_back(spec(p + "attn_compressor_gate.weight", {D, dh}, TC::Weight));
             v.push_back(spec(p + "attn_compressor_ape.weight", {dh, ratio}, TC::Float));
             v.push_back(spec(p + "attn_compressor_norm.weight", {dh}, TC::Float));
         } else {
@@ -481,6 +506,99 @@ inline std::vector<ErnieTensorSpec> ernie_expected_tensors(const ErnieGeometry& 
             v.push_back(spec(p + "nextn.hc_head_base.weight", {hc}, TC::Float));
             v.push_back(spec(p + "nextn.hc_head_scale.weight", {1}, TC::Float));
         }
+    }
+    return v;
+}
+
+/// The Preview's DSpark drafter geometry.  DSpark is NOT part of the trunk GGUF (llama.cpp's PR asserts one
+/// nextn block and has none); it ships as a sidecar with its own architecture tag and this map.
+///
+/// Three draft blocks, each a window-only HCA-shaped decoder that reuses the trunk's attention width.  The
+/// context K/V is supplied by ONE shared projection over the feature-averaged target hidden state
+/// (`context_wkv_proj`, a merge of each draft block's `linear_kv_proj`), so a draft block has no `attn_kv`
+/// of its own.  What the draft blocks do NOT have is the trunk's 128:1 compressor: they attend the 128-token
+/// window plus the injected context rows.
+///
+/// INFERRED (shard 128 was not downloaded when this map was written): the per-block tensor set follows
+/// vLLM-ERNIE's `Ernie5_5DSparkModel` / `_map_weights` (dspark.py), and the shared `context_wkv_proj` is the
+/// concatenation of the three draft blocks' `linear_kv_proj` weights.  A converter that meets a compressor
+/// tensor or a differently shaped `linear_kv_proj` under `model.mtp.*` must fail loudly, not guess.
+struct ErnieDsparkGeometry {
+    int64_t n_draft = 0;                 ///< draft blocks (3)
+    int64_t block_size = 0;              ///< DSpark block size (7)
+    int64_t markov_rank = 0;             ///< markov / confidence embedding rank (256)
+    int64_t noise_token = 0;             ///< mask/noise token id (1024)
+    std::vector<int64_t> target_layers;  ///< target layer ids whose features feed the drafter ({40,41,42})
+};
+
+/// Every tensor the Preview DSpark sidecar predicts.  Names: `dspark.blk.<i>.*` per draft block, and the
+/// shared feature/head tensors directly under `dspark.*`.  Shapes are GGUF order.
+inline std::vector<ErnieTensorSpec> ernie_dspark_expected_tensors(
+        const ErnieGeometry& g, const ErnieDsparkGeometry& d) {
+    using ernie_detail::spec;
+    using TC = ErnieTypeClass;
+    std::vector<ErnieTensorSpec> v;
+
+    const uint64_t D = (uint64_t)g.n_embd;
+    const uint64_t hc = (uint64_t)g.hc;
+    const uint64_t hcm = (uint64_t)g.hc_mix_dim();
+    const uint64_t hcd = (uint64_t)g.hc_dim();
+    const uint64_t V = (uint64_t)g.vocab_size;
+    const uint64_t rq = (uint64_t)g.r_q;
+    const uint64_t nh = (uint64_t)g.n_head;
+    const uint64_t dh = (uint64_t)g.d_head_hca;
+    const uint64_t og = (uint64_t)g.o_groups, ol = (uint64_t)g.o_lora;
+    const uint64_t lat = (uint64_t)g.n_embd_lat;
+    const uint64_t fe = (uint64_t)g.n_ff_exp;
+    const uint64_t ne = (uint64_t)g.n_expert;
+    const uint64_t se = (uint64_t)g.n_expert_shared;
+    const uint64_t nd = (uint64_t)d.n_draft;
+    const uint64_t rank = (uint64_t)d.markov_rank;
+
+    // shared feature path + heads
+    v.push_back(spec("dspark.main_proj.weight", {(uint64_t)d.target_layers.size() * D, D}, TC::Weight));
+    v.push_back(spec("dspark.main_norm.weight", {D}, TC::Float));
+    v.push_back(spec("dspark.context_wkv_proj.weight", {D, nd * dh}, TC::Weight));
+    v.push_back(spec("dspark.norm.weight", {D}, TC::Float));
+    v.push_back(spec("dspark.hc_head_fn.weight", {hcd, hc}, TC::Float));
+    v.push_back(spec("dspark.hc_head_base.weight", {hc}, TC::Float));
+    v.push_back(spec("dspark.hc_head_scale.weight", {1}, TC::Float));
+    v.push_back(spec("dspark.markov_head.embed.weight", {rank, V}, TC::Weight));
+    v.push_back(spec("dspark.markov_head.head.weight", {rank, V}, TC::Weight));
+    v.push_back(spec("dspark.confidence_head.proj.weight", {D + rank, 1}, TC::Float));
+
+    for (int64_t i = 0; i < d.n_draft; ++i) {
+        const std::string p = "dspark.blk." + std::to_string(i) + ".";
+        v.push_back(spec(p + "attn_norm.weight", {D}, TC::Float));
+        v.push_back(spec(p + "ffn_norm.weight", {D}, TC::Float));
+        v.push_back(spec(p + "hc_attn_fn.weight", {hcd, hcm}, TC::Float));
+        v.push_back(spec(p + "hc_attn_base.weight", {hcm}, TC::Float));
+        v.push_back(spec(p + "hc_attn_scale.weight", {3}, TC::Float));
+        v.push_back(spec(p + "hc_ffn_fn.weight", {hcd, hcm}, TC::Float));
+        v.push_back(spec(p + "hc_ffn_base.weight", {hcm}, TC::Float));
+        v.push_back(spec(p + "hc_ffn_scale.weight", {3}, TC::Float));
+        v.push_back(spec(p + "attn_sinks.weight", {nh}, TC::Float));
+        v.push_back(spec(p + "attn_vha.weight", {nh, nh}, TC::Float));
+        v.push_back(spec(p + "attn_q_a.weight", {D, rq}, TC::Weight));
+        v.push_back(spec(p + "attn_q_a_norm.weight", {rq}, TC::Float));
+        v.push_back(spec(p + "attn_q_b.weight", {rq, nh * dh}, TC::Weight));
+        v.push_back(spec(p + "attn_kv_a_norm.weight", {dh}, TC::Float));
+        v.push_back(spec(p + "attn_output_a.weight", {(uint64_t)g.o_group_dim(), ol, og}, TC::Weight));
+        v.push_back(spec(p + "attn_output_b.weight", {og * ol, D}, TC::Weight));
+        v.push_back(spec(p + "attn_gate.weight", {rq, og * ol}, TC::Weight));
+        // latent MoE, identical to a trunk MoE block
+        v.push_back(spec(p + "ffn_gate_inp.weight", {D, 2 * ne}, TC::Float));
+        v.push_back(spec(p + "exp_probs_b.bias", {ne}, TC::Float));
+        v.push_back(spec(p + "exp_scale.weight", {ne}, TC::Float));
+        v.push_back(spec(p + "ffn_routed_down.weight", {D, lat}, TC::Weight));
+        v.push_back(spec(p + "ffn_routed_up.weight", {lat, D}, TC::Weight));
+        v.push_back(spec(p + "ffn_routed_norm.weight", {lat}, TC::Float));
+        v.push_back(spec(p + "ffn_gate_exps.weight", {lat, fe, ne}, TC::Weight));
+        v.push_back(spec(p + "ffn_down_exps.weight", {fe, lat, ne}, TC::Weight));
+        v.push_back(spec(p + "ffn_up_exps.weight", {lat, fe, ne}, TC::Weight));
+        v.push_back(spec(p + "ffn_gate_shexp.weight", {D, fe * se}, TC::Weight));
+        v.push_back(spec(p + "ffn_down_shexp.weight", {fe * se, D}, TC::Weight));
+        v.push_back(spec(p + "ffn_up_shexp.weight", {D, fe * se}, TC::Weight));
     }
     return v;
 }

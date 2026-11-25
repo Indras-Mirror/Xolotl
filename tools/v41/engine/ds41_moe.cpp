@@ -2097,6 +2097,9 @@ bool ds41_moe_blob_layout(const Ds41MoeGeom& g, cpu::NativeFmt& f, std::string& 
         return false;
     }
     f.swiglu_limit = g.swiglu_limit;
+    f.act = g.act;
+    f.situ_beta = g.situ_beta;
+    f.situ_beta_l = g.situ_beta_l;
     return true;
 }
 
@@ -2109,6 +2112,9 @@ bool ds41_moe_class_layout(const Ds41MoeGeom& g, int64_t c, cpu::NativeFmt& f, s
         return false;
     }
     f.swiglu_limit = g.swiglu_limit;
+    f.act = g.act;
+    f.situ_beta = g.situ_beta;
+    f.situ_beta_l = g.situ_beta_l;
     return true;
 }
 
@@ -2130,6 +2136,9 @@ bool ds41_moe_layer_layout(const Ds41MoeGeom& g, int64_t l, cpu::NativeFmt& f, s
         return false;
     }
     f.swiglu_limit = g.swiglu_limit;
+    f.act = g.act;
+    f.situ_beta = g.situ_beta;
+    f.situ_beta_l = g.situ_beta_l;
     return true;
 }
 
@@ -2153,6 +2162,20 @@ bool ds41_moe_geom_from_gguf(const std::string& gguf, Ds41MoeGeom& g, std::strin
                 return false;
             }
             *k.second = v;
+        }
+        if (arch == "ernie5_5") {
+            // ERNIE-5.5: the experts run in the LATENT space between fc1_latent_proj / fc2_latent_proj, so the tier's
+            // input width is expert_latent_length, not the trunk's embedding_length.  SiTU, never the SwiGLU clamp.
+            if (!meta_i64(f, arch + ".expert_latent_length", v) || v <= 0) {
+                err = "ernie5_5 GGUF without a positive expert_latent_length";
+                return false;
+            }
+            g.n_embd = v;
+            g.act = cpu::NativeAct::SiTU;
+            if (const MetaValue* b = f.get(arch + ".activation.situ_beta"); b && b->is_num() && b->num() > 0.0)
+                g.situ_beta = (float) b->num();
+            if (const MetaValue* bl = f.get(arch + ".activation.situ_linear_beta"); bl && bl->is_num() && bl->num() > 0.0)
+                g.situ_beta_l = (float) bl->num();
         }
         // every layer's three expert types; a layer with none of the tensors has no routed experts (MiMo's layer 0)
         const char* roles[3] = {"gate", "up", "down"};
@@ -2506,6 +2529,9 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     gp.arena.n_experts = geom.n_experts;
     gp.gl = strata::kernels::native_expert_layout(geom.gu_type, geom.d_type, geom.n_embd, geom.n_ff);
     gp.gl.swiglu_limit = geom.swiglu_limit;
+    gp.gl.act = (int) geom.act;
+    gp.gl.situ_beta = geom.situ_beta;
+    gp.gl.situ_beta_l = geom.situ_beta_l;
     gp.gll.assign((size_t) NCL, gp.gl);
     for (int64_t l = 0; l < NCL; ++l) {   // l = a class (= the layer unless per-expert)
         if (!geom.per_expert() && !geom.routed(l)) continue;
@@ -2519,6 +2545,9 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
         }
         strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout3(gt, ut, dt, geom.n_embd, geom.n_ff);
         L.swiglu_limit = geom.swiglu_limit;
+        L.act = (int) geom.act;
+        L.situ_beta = geom.situ_beta;
+        L.situ_beta_l = geom.situ_beta_l;
         if ((int64_t) L.bytes != im_->bl[(size_t) l]) {
             err = "layer " + std::to_string(l) + ": GPU blob " + std::to_string(L.bytes) + " != CPU blob " +
                   std::to_string(im_->bl[(size_t) l]);
@@ -6728,7 +6757,7 @@ int64_t chunk_stride(Ds41MoeImpl& im, int64_t layer) {
 #if defined(DS4_MOE_MMQ)
     Gpu& gp = *im.gpu;
     namespace mmq = strata::prefill::mmq;
-    if (!im.cfg.chunk_mmq || !mmq::built()) return BL;
+    if (!im.cfg.chunk_mmq || !mmq::built() || gp.gll[(size_t) layer].act != 0) return BL;   // the MMQ path has no SiTU
     const MmqPlan P = mmq_plan(gp.gll[(size_t) layer], BL);
     return P.ok ? P.SL : BL;
 #else
@@ -7395,7 +7424,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
 #if defined(DS4_MOE_MMQ)
     namespace mmq = strata::prefill::mmq;
     MmqPlan MP;
-    if (im.cfg.chunk_mmq && mmq::built()) {
+    if (im.cfg.chunk_mmq && mmq::built() && GL.act == 0) {   // the MMQ path folds SwiGLU only
         if (gp.m_ok.size() != gp.gll.size()) gp.m_ok.assign(gp.gll.size(), -1);
         int8_t& ok = gp.m_ok[(size_t) CI];
         MP = mmq_plan(GL, BL);

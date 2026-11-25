@@ -77,6 +77,12 @@ struct Ds41MoeGeom {
     /// `deepseek4.swiglu_clamp_exp` (10.0 on every layer of the 0731 GGUF; one value - the tier has one format):
     /// gate -> min(gate, lim), up -> clamp(up, -lim, lim) before the SwiGLU.  +inf = no clamp.
     float swiglu_limit = std::numeric_limits<float>::infinity();
+    /// The expert nonlinearity (native_expert.hpp's NativeAct).  SwiGLU - clamped for DeepSeek-V4, unclamped with
+    /// `swiglu_limit` +inf for every other model - is the default and changes nothing.  ERNIE-5.5's `ernie5_5` arch
+    /// takes SiTU (beta 4, beta_l 25 from its metadata, never clamped): `n_embd` is then the LATENT width the experts
+    /// read (`expert_latent_length`), not the trunk's `embedding_length`.
+    cpu::NativeAct act = cpu::NativeAct::SwiGLU;
+    float situ_beta = 4.0f, situ_beta_l = 25.0f;
     /// PER-LAYER FORMATS (MiMo-V2.6-Flash GSQ-RCO picks a format per tensor: gate, up and down independently).
     /// Empty = every layer is `gu_type`/`gu_type`/`d_type` (DeepSeek-V4: the uniform path, unchanged).  Otherwise
     /// `n_layers` entries each, indexed by the MODEL's layer number; -1 = that layer has no routed experts (MiMo's

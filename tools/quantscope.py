@@ -122,6 +122,7 @@ GGML_TYPES = {
     30: "BF16", 34: "TQ1_0", 35: "TQ2_0", 39: "MXFP4",
     42: "Q2_0",  # ISTA-DASLab GSQ-RCO 2-bit (Strata, llama.cpp fork type)
     143: "PTQ1_0", 144: "TQ2_T", 145: "TQK6", 146: "TQK7",  # agentionai Gyro (tools/gguf_reader.py has the block sizes)
+    147: "TQP5", 148: "TQP6", 149: "TQP7",  # the same fork's pair layout (Gyro-L)
 }
 
 

@@ -60,6 +60,11 @@ struct NativeExpertLayout {
     // DeepSeek-V4's SwiGLU clamp (swiglu_clamp_exp): gate -> min(gate, lim), up -> clamp(up, -lim, lim) before
     // silu(gate) * up.  +inf (native_expert_layout's default, every other model) = no clamp, the same bits as before.
     float swiglu_limit = std::numeric_limits<float>::infinity();
+    // The expert nonlinearity: 0 = the clamped SwiGLU above (every model before ERNIE; those kernels are unchanged),
+    // 1 = ERNIE-5.5's SiTU: beta*tanh(gate/beta)*sigmoid(gate) * beta_l*tanh(up/beta_l), never clamped.  The fused
+    // SwiGLU layouts are refused for it and the generic gate/up + fold path runs, with the fold kernels taking act.
+    int act = 0;
+    float situ_beta = 4.0f, situ_beta_l = 25.0f;
     size_t tail_off = 0;                // NVFP4: {s_gate, s_up, s_down, 0} at the blob's end; 0 = none
     // APR (prism.hadamard): the down weights are Hadamard-folded, so native_expert_grouped rotates h before
     // quantizing it (hadamard_rows).  had_block 0 = none; d_signs is a DEVICE vector of n_ff signs or nullptr.

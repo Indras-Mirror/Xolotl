@@ -572,10 +572,16 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
 }
 
 __global__ void swiglu_kernel(const float* __restrict__ g, const float* __restrict__ u, int n, float lim,
-                              float* __restrict__ h) {
+                              float* __restrict__ h, int act = 0, float beta = 4.0f, float beta_l = 25.0f) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float gv = g[i], uv = u[i];
+    if (act != 0) {   // ERNIE-5.5's SiTU: beta*tanh(gate/beta)*sigmoid(gate) * beta_l*tanh(up/beta_l), no clamp
+        const float a = beta * tanhf(gv / beta);
+        const float b = beta_l > 0.0f ? beta_l * tanhf(uv / beta_l) : uv;
+        h[i] = a / (1.0f + expf(-gv)) * b;
+        return;
+    }
     if (lim > 0.0f) {
         gv = fminf(gv, lim);
         uv = fminf(fmaxf(uv, -lim), lim);
@@ -2331,13 +2337,14 @@ void route(const float* logits, const float* bias, int n, int k, int T, float ro
                                    vl != nullptr ? *vl : none);
 }
 
-void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s) {
+void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s, int act, float beta,
+            float beta_l) {
 #if defined(STRATA_METAL)
     // declared here rather than in the header: the header carries the other entry points, this one is only used here
     namespace mh = strata::dsv41::metal_host;
-    if (n > 0 && mh::swiglu(g, u, n, lim, h)) return;
+    if (act == 0 && n > 0 && mh::swiglu(g, u, n, lim, h)) return;
 #endif
-    if (n > 0) strata_ds4_launch(swiglu_kernel, cdiv(n, kThreads), kThreads, 0, s, g, u, n, lim, h);
+    if (n > 0) strata_ds4_launch(swiglu_kernel, cdiv(n, kThreads), kThreads, 0, s, g, u, n, lim, h, act, beta, beta_l);
 }
 
 void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,

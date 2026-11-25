@@ -226,7 +226,7 @@ __global__ void __launch_bounds__(256) set_kernel(const SetArgs a, int dbg) {
 #pragma unroll
             for (int j = 0; j < NT; ++j) {
                 const int col = c0 + wn * (16 * NT) + j * 16 + l16;
-                if (GU) a.h[lr * a.ldo + col] = __half_as_ushort(__float2half_rn(swiglu(acc[0][i][j][q], acc[1][i][j][q], a.limit)));
+                if (GU) a.h[lr * a.ldo + col] = __half_as_ushort(__float2half_rn(expert_act(a.act, acc[0][i][j][q], acc[1][i][j][q], a.limit, a.beta, a.beta_l)));
                 else a.y[lr * a.ldo + col] = acc[0][i][j][q];
             }
         }

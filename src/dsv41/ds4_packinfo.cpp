@@ -29,7 +29,7 @@ namespace {
 
 bool device_type(const std::string& t) {
     static const std::set<std::string> ok = [] {
-        std::set<std::string> s = {"MXFP4", "TQK6", "TQK7", "TQK5X", "TQK4X", "TQK5T", "TQK4T"};   // ds4_gguf.cu / trellis
+        std::set<std::string> s = {"MXFP4", "TQK6", "TQK7", "TQP5", "TQP6", "TQP7", "TQK5X", "TQK4X", "TQK5T", "TQK4T"};   // ds4_gguf.cu / trellis
         for (int ty = 0; ty < 64; ++ty) {
             const char* n = gguf::iq::name(ty);
             if (n && std::strcmp(n, "?") != 0 && gguf::iq::supported(ty)) s.insert(n);

@@ -439,9 +439,98 @@ int native_gu_mt_min(int gu_type) {
     return iq3s_one && gu_type == 21 ? 1 : mt_min;
 }
 
+// ------------------------------------------------ SiTU (any non-SwiGLU activation)
+// The fused gate/up kernels fold silu(g) * u inside their decode loops, so an activation other than SwiGLU takes the raw
+// row sums and folds them here.  The raw kernels below are the ones native_gu_rows already trusts (the same runs, the
+// same bits, the same per-token arithmetic at any group size); a type with no raw-rows kernel (MXFP4, NVFP4, ...) uses
+// ggml-cpu's per-row vec_dot, which is the SwiGLU path's own fallback.  `SwiGLU` never enters this code: its dispatch
+// above is unchanged and compiles to the same instructions.
+void gu_raw_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* gp,
+                 float* const* up, int r0, int r1) {
+    const int n = (int) f.n_embd;
+    const int R = r1 - r0;
+    const bool mixed = f.up_type >= 0 && f.up_type != f.gu_type;
+    const size_t urow = mixed ? f.up_row : f.gu_row;
+    static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
+    static const bool avx2 = cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr;
+    // The kernels take rows local to the weights pointer they are given (native_gu_rows' own callers pass
+    // blob + r0 * row / rows 0..R), so every branch below reads (gate, up) rows [r0, r1) relative to the pointers.
+    const uint8_t* gw = blob + (size_t) r0 * f.gu_row;
+    const uint8_t* uw = blob + f.up_off + (size_t) r0 * urow;
+    if (!mixed && tq_rows_own(f.gu_type)) {   // the trellis types: their raw dots (Q8_0 activations)
+        tq_rows(tq_isa(), f.gu_type, gw, f.gu_row, n, act, nt, gp, 0, R);
+        tq_rows(tq_isa(), f.gu_type, uw, urow, n, act, nt, up, 0, R);
+        return;
+    }
+    if (!mixed && avx512 && iq512x_supported(f.gu_type)) {
+        iq512x_rows(f.gu_type, gw, f.gu_row, n, act, nt, gp, 0, R);
+        iq512x_rows(f.gu_type, uw, urow, n, act, nt, up, 0, R);
+        return;
+    }
+    if (!mixed && avx2 && iq256x_supported(f.gu_type)) {
+        iq256x_rows(f.gu_type, gw, f.gu_row, n, act, nt, gp, 0, R);
+        iq256x_rows(f.gu_type, uw, urow, n, act, nt, up, 0, R);
+        return;
+    }
+    if (!mixed && f.gu_type == kPtq1Type) {   // PTQ1_0: its Q8_0 rows (native_gu_rows' own kernel)
+        ptq1_0_rows_q8_0(gw, f.gu_row, n, act, nt, gp, 0, R);
+        ptq1_0_rows_q8_0(uw, urow, n, act, nt, up, 0, R);
+        return;
+    }
+    if (!mixed && f.gu_type == kQ2_0Type && cpu_avx2_ok()) {   // Q2_0 rows
+        q2_0_rows_q8_0(gw, f.gu_row, n, act, nt, gp, 0, R);
+        q2_0_rows_q8_0(uw, urow, n, act, nt, up, 0, R);
+        return;
+    }
+    // Q4_K / Q5_1 / Q8_0 (kq256_rows' list) and, mixed or not, every remaining type: ggml's per-row vec_dot.
+    static const bool kq_rows = std::getenv("STRATA_NO_SITU_KQ") == nullptr;   // (A/B: the ggml dot instead)
+    if (!mixed && kq_rows && kq256_supported(f.gu_type) && cpu_avx2_ok() && f.tail_off == 0) {
+        kq256_rows(f.gu_type, gw, f.gu_row, n, act, nt, gp, 0, R);
+        kq256_rows(f.gu_type, uw, urow, n, act, nt, up, 0, R);
+        return;
+    }
+    const ggml_type_traits_cpu* tr = traits(f.gu_type);
+    const ggml_type_traits_cpu* ur = mixed ? traits(f.up_type) : tr;
+    if (tr == nullptr || tr->vec_dot == nullptr || ur == nullptr || ur->vec_dot == nullptr) return;   // no arithmetic (f.n_ = 0)
+    for (int r = 0; r < R; ++r) {
+        const uint8_t* gr = gw + (size_t) r * f.gu_row;
+        const uint8_t* uu = uw + (size_t) r * urow;
+        for (int t = 0; t < nt; ++t) {
+            float g = 0.f, u = 0.f;
+            tr->vec_dot(n, &g, 0, gr, 0, act[t], 0, 1);
+            ur->vec_dot(n, &u, 0, uu, 0, act[t], 0, 1);
+            gp[t][r] = g;
+            up[t][r] = u;
+        }
+    }
+}
+
+/// Gate/up rows with an activation other than SwiGLU: the raw sums, then native_act_value.  `ff[t][r0 + i]`.
+void native_gu_rows_act(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
+                        int r0, int r1) {
+    const int R = r1 - r0;
+    if (R <= 0) return;
+    thread_local std::vector<float> gb, ub;
+    gb.resize((size_t) nt * (size_t) R);
+    ub.resize((size_t) nt * (size_t) R);
+    float* gp[MAXT];
+    float* up[MAXT];
+    for (int t = 0; t < nt; ++t) { gp[t] = gb.data() + (size_t) t * R; up[t] = ub.data() + (size_t) t * R; }
+    gu_raw_rows(f, blob, act, nt, gp, up, r0, r1);
+    for (int t = 0; t < nt; ++t)
+        for (int i = 0; i < R; ++i)
+            ff[t][r0 + i] = native_act_value(f.act, gp[t][i], up[t][i], f.swiglu_limit, f.situ_beta, f.situ_beta_l);
+}
+
 template <NativeArithmetic Arithmetic>
 void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    // ERNIE-5.5's SiTU (or any non-SwiGLU activation): the same rows, the activation folded in F32.  SwiGLU, the
+    // default, never reaches this branch - the dispatch below is the one every previous model compiles to.
+    if (f.act != NativeAct::SwiGLU) {
+        native_gu_rows_act(f, blob, act, nt, ff, r0, r1);
+        return;
+    }
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the

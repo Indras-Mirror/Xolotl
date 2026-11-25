@@ -18,6 +18,22 @@
 
 namespace strata::ds4::gguf::iq {
 
+/// The expert nonlinearity, one definition for every iq TU.  act 0 = DeepSeek-V4's clamped SwiGLU (limit <= 0: none),
+/// the arithmetic every model before ERNIE uses; act 1 = ERNIE-5.5's SiTU (llama-graph.cpp's LLM_FFN_SITU:
+/// beta*tanh(gate/beta)*sigmoid(gate) * beta_l*tanh(up/beta_l), no clamp; beta_l <= 0 leaves the up term linear).
+__device__ __forceinline__ float expert_act(int act, float gv, float uv, float limit, float beta, float beta_l) {
+    if (act != 0) {
+        const float a = beta * tanhf(gv / beta);
+        const float b = beta_l > 0.0f ? beta_l * tanhf(uv / beta_l) : uv;
+        return __fmul_rn(__fdiv_rn(a, __fadd_rn(1.0f, expf(-gv))), b);
+    }
+    if (limit > 0.0f) {
+        gv = fminf(gv, limit);
+        uv = fminf(fmaxf(uv, -limit), limit);
+    }
+    return __fmul_rn(__fdiv_rn(gv, __fadd_rn(1.0f, expf(-gv))), uv);
+}
+
 // ggml type ids
 constexpr int kQ5_K = 13, kQ6_K = 14;   // (the dense matrices' K-quants, GEMV only)
 constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ1_S = 19,
@@ -25,12 +41,23 @@ constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ2_XS = 17, k
 
 /// The trellis types (Strata's, ds4_tq.cu): ggml's TQK6 / TQK7 (145 / 146, the table codebook) and the experimental
 /// TQK5X / TQK4X (224 / 225, computed codebook) and TQK5T / TQK4T (226 / 227, table): a block of 128 values is
-/// {fp16 d; 32 steps of K bits}, 2 + 4 K bytes (tools/trellis/tqenc.hpp).  They go through the same entry points below.
-constexpr int kTQK6 = 145, kTQK7 = 146, kTQK5X = 224, kTQK4X = 225, kTQK5T = 226, kTQK4T = 227;
+/// {fp16 d; 32 steps of K bits}, 2 + 4 K bytes (tools/trellis/tqenc.hpp).  The Gyro-L pair types TQP5 / TQP6 / TQP7
+/// (147-149, the registered ggml types of the same fork) are the same block with 64 steps of 2 weights: 2 + 8 K bytes
+/// (tools/trellis/tqenc_pair.hpp).  They go through the same entry points below.
+constexpr int kTQK6 = 145, kTQK7 = 146, kTQP5 = 147, kTQP6 = 148, kTQP7 = 149, kTQK5X = 224, kTQK4X = 225, kTQK5T = 226,
+              kTQK4T = 227;
 constexpr int tq_kbits(int type) {
-    return type == kTQK6 ? 6 : type == kTQK7 ? 7 : (type == kTQK5X || type == kTQK5T) ? 5 : (type == kTQK4X || type == kTQK4T) ? 4 : 0;
+    return type == kTQK6 || type == kTQP6 ? 6
+           : type == kTQK7 || type == kTQP7 ? 7
+           : (type == kTQK5X || type == kTQK5T || type == kTQP5) ? 5
+           : (type == kTQK4X || type == kTQK4T) ? 4
+                                               : 0;
 }
+/// The pair layout (types 147-149): 2 weights a step, 8 K stream bytes a block.  The quad layout (the others): 4 a step.
+constexpr bool tq_pair(int type) { return type >= kTQP5 && type <= kTQP7; }
 constexpr bool is_tq(int type) { return tq_kbits(type) > 0; }
+/// Bytes of one 128-value block of a trellis type (0: not one of them).
+constexpr int tq_block_bytes(int type) { return is_tq(type) ? 2 + (tq_pair(type) ? 8 : 4) * tq_kbits(type) : 0; }
 
 /// Whether the device kernels take this ggml type.
 bool supported(int type);
@@ -57,6 +84,10 @@ struct Args {
     size_t tr[3] = {0, 0, 0};   // the roles' offsets in a blob
     int n_embd = 0, n_ff = 0;
     float limit = 0.0f;
+    // The expert nonlinearity: 0 = the clamped SwiGLU above (every model before ERNIE; unchanged), 1 = ERNIE-5.5's
+    // SiTU (beta*tanh(gate/beta)*sigmoid(gate) * beta_l*tanh(up/beta_l), no clamp).  See iq::expert_act.
+    int act = 0;
+    float beta = 4.0f, beta_l = 25.0f;
     const int8_t* xq = nullptr;
     const float* xd = nullptr;
     const int8_t* hq = nullptr;
@@ -83,6 +114,8 @@ struct SetArgs {
     int row0 = 0, max_rows = 0, n_exp = 0;
     int n_embd = 0, n_ff = 0;
     float limit = 0.0f;
+    int act = 0;                       // 0 = the clamped SwiGLU, 1 = ERNIE-5.5's SiTU (as Args)
+    float beta = 4.0f, beta_l = 25.0f;
     const float* xf = nullptr;
     const int* idx = nullptr;
     const uint16_t* xh = nullptr;
@@ -116,7 +149,8 @@ bool f16_rows_ok(int type);
 /// dst[r] = x[idx[r]] for r < n (FP16 rows of k values; x ldx apart, dst k apart)
 void gather_f16(const uint16_t* x, int ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s);
 /// h[r][c] = FP16 of the tiles' clamped SwiGLU of gu[r][c] (gate) and gu[r][ff + c] (up), F32 rows ld apart
-void swiglu_f16(const float* gu, int ld, int n, int ff, float limit, uint16_t* h, int ldh, cudaStream_t s);
+void swiglu_f16(const float* gu, int ld, int n, int ff, float limit, uint16_t* h, int ldh, cudaStream_t s,
+                int act = 0, float beta = 4.0f, float beta_l = 25.0f);
 /// The light form alone (the set's experts of at most 16 rows; the others untouched), for any of these types and MXFP4
 /// (tg / td 39: ds4_gguf.cu's experts): false (nothing launched) when it is switched off - the caller's tiles take every
 /// expert then; true: they take those of more rows (skip_le 16).

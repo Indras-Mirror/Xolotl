@@ -1237,7 +1237,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                     q2_rows_any(mjobs_[e].blob + nfmt->up_off, nfmt->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
                     for (int t = 0; t < mjobs_[e].nt; ++t)
                         for (int r = r0; r < r1; ++r)
-                            sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
+                            sb.ff[t][r] = native_act_value(nfmt->act, gbuf[t][r], ubuf[t][r], nfmt->swiglu_limit,
+                                                           nfmt->situ_beta, nfmt->situ_beta_l);
                 } else if (mode_ == 5) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];

@@ -662,7 +662,7 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
             for (int i = 0; i < NE; ++i)
                 if (i < ne) {
                     const float gv = lanes_sum<RW>(ag[i]), uv = lanes_sum<RW>(au[i]);
-                    if (lane == 0) a.h[(size_t) es[i] * a.n_ff + row] = swiglu(gv, uv, a.limit);
+                    if (lane == 0) a.h[(size_t) es[i] * a.n_ff + row] = expert_act(a.act, gv, uv, a.limit, a.beta, a.beta_l);
                 }
         }
     }
@@ -807,7 +807,7 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
 #pragma unroll
         for (int j = 0; j < TN; ++j) {
             const int c = c0 + tx * TN + j;
-            if (GATE_UP) a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(swiglu(ag[i][j], au[i][j], a.limit)));
+            if (GATE_UP) a.h[lr * a.ldo + c] = __half_as_ushort(__float2half_rn(expert_act(a.act, ag[i][j], au[i][j], a.limit, a.beta, a.beta_l)));
             else a.y[lr * a.ldo + c] = ag[i][j];
         }
     }
@@ -896,7 +896,7 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
         const int r = i / BN, c = i % BN;
         if (r >= nr) continue;
         const size_t lr = (size_t) (r0 + r);
-        if (GATE_UP) a.h[lr * a.ldo + c0 + c] = __half_as_ushort(__float2half_rn(swiglu(O.g[r][c], O.u[r][c], a.limit)));
+        if (GATE_UP) a.h[lr * a.ldo + c0 + c] = __half_as_ushort(__float2half_rn(expert_act(a.act, O.g[r][c], O.u[r][c], a.limit, a.beta, a.beta_l)));
         else a.y[lr * a.ldo + c0 + c] = O.g[r][c];
     }
 }
@@ -1012,7 +1012,7 @@ __device__ __forceinline__ void light_item(const SetArgs& a, const int8_t* __res
             const float v1 = GATE_UP ? warp_sum(a1[i]) : 0.0f;
             if (lane == 0) {
                 const size_t lr = (size_t) (lo + i);
-                if (GATE_UP) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(swiglu(v0, v1, a.limit)));
+                if (GATE_UP) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(expert_act(a.act, v0, v1, a.limit, a.beta, a.beta_l)));
                 else a.y[lr * a.ldo + row] = v0;
             }
         }
@@ -1076,7 +1076,7 @@ __global__ void __launch_bounds__(kThreads) light_kernel_rows(const SetArgs a, c
             const float v1 = GATE_UP ? warp_sum(a1[i]) : 0.0f;
             if (lane == 0) {
                 const size_t lr = (size_t) (lo + i);
-                if (GATE_UP) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(swiglu(v0, v1, a.limit)));
+                if (GATE_UP) a.h[lr * a.ldo + row] = __half_as_ushort(__float2half_rn(expert_act(a.act, v0, v1, a.limit, a.beta, a.beta_l)));
                 else a.y[lr * a.ldo + row] = v0;
             }
         }
@@ -1478,7 +1478,7 @@ int block_values(int t) {
 }
 
 int block_bytes(int t) {
-    if (is_tq(t)) return 2 + 4 * tq_kbits(t);
+    if (is_tq(t)) return tq_block_bytes(t);
     switch (t) {
         case kIQ2_XXS: return Ty<kIQ2_XXS>::B;
         case kIQ2_XS: return Ty<kIQ2_XS>::B;
@@ -1506,6 +1506,9 @@ const char* name(int t) {
         case kTQK4X: return "TQK4X";
         case kTQK5T: return "TQK5T";
         case kTQK4T: return "TQK4T";
+        case kTQP5: return "TQP5";
+        case kTQP6: return "TQP6";
+        case kTQP7: return "TQP7";
         case kIQ2_XXS: return "IQ2_XXS";
         case kIQ2_XS: return "IQ2_XS";
         case kIQ2_S: return "IQ2_S";
@@ -1656,12 +1659,13 @@ __global__ void __launch_bounds__(kThreads) gather_f16_kernel(const uint16_t* __
     }
 }
 __global__ void __launch_bounds__(kThreads) swiglu_f16_kernel(const float* __restrict__ gu, int ld, int n, int ff,
-                                                               float limit, uint16_t* __restrict__ h, int ldh) {
+                                                               float limit, uint16_t* __restrict__ h, int ldh,
+                                                               int act, float beta, float beta_l) {
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < (long long) n * ff;
          i += (long long) gridDim.x * blockDim.x) {
         const int r = (int) (i / ff), c = (int) (i % ff);
         const float* g = gu + (size_t) r * ld;
-        h[(size_t) r * ldh + c] = __half_as_ushort(__float2half_rn(swiglu(g[c], g[ff + c], limit)));
+        h[(size_t) r * ldh + c] = __half_as_ushort(__float2half_rn(expert_act(act, g[c], g[ff + c], limit, beta, beta_l)));
     }
 }
 static unsigned grid_for(long long items) {
@@ -1687,8 +1691,10 @@ bool f16_rows(int type, const uint8_t* w, int k, int n, uint16_t* dst, int ldd, 
 void gather_f16(const uint16_t* x, int ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s) {
     strata_ds4_launch(gather_f16_kernel, grid_for((long long) n * (k / 8)), kThreads, 0, s, x, ldx, idx, n, k, dst);
 }
-void swiglu_f16(const float* gu, int ld, int n, int ff, float limit, uint16_t* h, int ldh, cudaStream_t s) {
-    strata_ds4_launch(swiglu_f16_kernel, grid_for((long long) n * ff), kThreads, 0, s, gu, ld, n, ff, limit, h, ldh);
+void swiglu_f16(const float* gu, int ld, int n, int ff, float limit, uint16_t* h, int ldh, cudaStream_t s, int act,
+                float beta, float beta_l) {
+    strata_ds4_launch(swiglu_f16_kernel, grid_for((long long) n * ff), kThreads, 0, s, gu, ld, n, ff, limit, h, ldh, act,
+                      beta, beta_l);
 }
 
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {

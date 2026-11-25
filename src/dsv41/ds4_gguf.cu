@@ -495,6 +495,8 @@ struct MxArgs {
     size_t tr[3];
     int n_embd, n_ff;
     float limit;
+    int act = 0;        // 0 = the clamped SwiGLU, 1 = ERNIE-5.5's SiTU (ds4_iq.cuh's Args::act)
+    float beta = 4.0f, beta_l = 25.0f;
     const int8_t* xq;   // x rounded to int8 (a token's: row 0; a window's: row t), q8_quant's rows of n_embd
     const float* xd;
     const int8_t* hq;   // h rounded to int8, row e = the entry, rows of n_ff
@@ -578,7 +580,7 @@ __global__ void __launch_bounds__(kThreads) mx_gate_up_kernel(const MxArgs a) {
         for (int i = 0; i < NE; ++i)
             if (i < ne) {
                 const float gv = warp_sum(ag[i]), uv = warp_sum(au[i]);
-                if (lane == 0) a.h[(size_t) es[i] * a.n_ff + row] = swiglu(gv, uv, a.limit);
+                if (lane == 0) a.h[(size_t) es[i] * a.n_ff + row] = expert_act(a.act, gv, uv, a.limit, a.beta, a.beta_l);
             }
     }
 }
@@ -684,6 +686,8 @@ struct SetK {
     int row0;
     int n_embd, n_ff;
     float limit;
+    int act = 0;          // 0 = the clamped SwiGLU, 1 = ERNIE-5.5's SiTU
+    float beta = 4.0f, beta_l = 25.0f;
     const float* xf;      // gate / up: F32 input rows x[idx[local]] (ldx)
     const int* idx;
     const __half* xh;     // down: F16 rows (ldx)
@@ -776,7 +780,7 @@ __global__ void __launch_bounds__(kThreads) mx_set_kernel(const SetK a) {
 #pragma unroll
         for (int j = 0; j < TN; ++j) {
             const int c = c0 + tx * TN + j;
-            if (GATE_UP) a.h[lr * a.ldo + c] = __float2half_rn(swiglu(ag[i][j], au[i][j], a.limit));
+            if (GATE_UP) a.h[lr * a.ldo + c] = __float2half_rn(expert_act(a.act, ag[i][j], au[i][j], a.limit, a.beta, a.beta_l));
             else a.y[lr * a.ldo + c] = ag[i][j];
         }
     }
@@ -872,7 +876,7 @@ __global__ void __launch_bounds__(kThreads) mx_set_tc_kernel(const SetK a) {
         const int r = i / BN, c = i % BN;
         if (r >= nr) continue;
         const size_t lr = (size_t) (r0 + r);
-        if (GATE_UP) a.h[lr * a.ldo + c0 + c] = __float2half_rn(swiglu(O.g[r][c], O.u[r][c], a.limit));
+        if (GATE_UP) a.h[lr * a.ldo + c0 + c] = __float2half_rn(expert_act(a.act, O.g[r][c], O.u[r][c], a.limit, a.beta, a.beta_l));
         else a.y[lr * a.ldo + c0 + c] = O.g[r][c];
     }
 }
@@ -999,7 +1003,7 @@ __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
         const int r = i / BN, cc = i % BN;
         if (r >= nr) continue;
         const size_t lr = (size_t) (r0 + r);
-        if (GATE_UP) a.h[lr * a.ldo + c0 + cc] = __float2half_rn(swiglu(O.g[r][cc], O.u[r][cc], a.limit));
+        if (GATE_UP) a.h[lr * a.ldo + c0 + cc] = __float2half_rn(expert_act(a.act, O.g[r][cc], O.u[r][cc], a.limit, a.beta, a.beta_l));
         else a.y[lr * a.ldo + c0 + cc] = O.g[r][cc];
     }
 }
@@ -1104,12 +1108,16 @@ size_t row_stride(const x3::Mat& m) {   // values (BF16) or bytes (MXFP4, Q8_0, 
                                : (size_t) m.k;
 }
 // a layer's low-bit experts as ds4_iq's arguments (false: its types not covered - printed)
-bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq::Args& ia, const char* who) {
+bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq::Args& ia, const char* who,
+             int act = 0, float beta = 4.0f, float beta_l = 25.0f) {
     ia = iq::Args{};
     for (int r = 0; r < 3; ++r) ia.tr[r] = lay.trellis[r];
     ia.n_embd = n_embd;
     ia.n_ff = n_ff;
     ia.limit = limit;
+    ia.act = act;
+    ia.beta = beta;
+    ia.beta_l = beta_l;
     ia.tg = expert_type(lay, 0);
     ia.td = expert_type(lay, 2);
     if (ia.tg != expert_type(lay, 1) || !iq::supported(ia.tg) || !iq::supported(ia.td) || n_embd % iq::block_values(ia.tg) != 0 ||
@@ -1372,12 +1380,16 @@ void launch_groups(const MxArgs& m, int rows, int groups, int ne_max, cudaStream
     else if (ne_max <= 8) Kern<8>::run(m, grid, s);
     else Kern<16>::run(m, grid, s);
 }
-MxArgs mx_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit) {
+MxArgs mx_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, int act = 0, float beta = 4.0f,
+               float beta_l = 25.0f) {
     MxArgs m{};
     for (int r = 0; r < 3; ++r) m.tr[r] = lay.trellis[r];
     m.n_embd = n_embd;
     m.n_ff = n_ff;
     m.limit = limit;
+    m.act = act;
+    m.beta = beta;
+    m.beta_l = beta_l;
     return m;
 }
 }  // namespace
@@ -1388,7 +1400,7 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
     if (sc == nullptr) return;
     if (!mx_experts(a.lay)) {   // low-bit experts: ds4_iq's kernels
         iq::Args ia;
-        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_gate_up")) return;
+        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_gate_up", a.act, a.beta, a.beta_l)) return;
         ia.plan_ptr = a.plan_ptr;
         ia.h = h;
         ia.xq = sc->xq;
@@ -1398,7 +1410,7 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
         check("moe_gate_up");
         return;
     }
-    MxArgs m = mx_args(a.lay, a.n_embd, a.n_ff, a.limit);
+    MxArgs m = mx_args(a.lay, a.n_embd, a.n_ff, a.limit, a.act, a.beta, a.beta_l);
     m.plan_ptr = a.plan_ptr;
     m.x = x;
     m.h = h;
@@ -1421,7 +1433,7 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     if (!mx_geometry("moe_down", a.k, a.n_embd, a.n_ff) || h == nullptr) return;
     Scratch* sc = scratch(s);
     if (sc == nullptr) return;
-    MxArgs m = mx_args(a.lay, a.n_embd, a.n_ff, a.limit);
+    MxArgs m = mx_args(a.lay, a.n_embd, a.n_ff, a.limit, a.act, a.beta, a.beta_l);
     m.plan_ptr = a.plan_ptr;
     m.h = const_cast<float*>(h);
     m.part = sc->part;
@@ -1430,7 +1442,7 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     q8_quant(h, (size_t) a.n_ff, a.k, a.n_ff, sc->hq, sc->hd, s);
     if (!mx_experts(a.lay)) {   // low-bit experts: ds4_iq's down, then the same combine
         iq::Args ia;
-        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down")) return;
+        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down", a.act, a.beta, a.beta_l)) return;
         ia.plan_ptr = a.plan_ptr;
         ia.part = sc->part;
         ia.hq = sc->hq;
@@ -1470,7 +1482,7 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
         std::fprintf(stderr, "ds4 gguf win_experts: not covered (T %d)\n", a.T);
         return false;
     }
-    MxArgs m = mx_args(a.lay, a.n_embd, a.n_ff, a.limit);
+    MxArgs m = mx_args(a.lay, a.n_embd, a.n_ff, a.limit, a.act, a.beta, a.beta_l);
     m.grp_ptr = a.grp_ptr;
     m.grp_start = a.grp_start;
     m.grp_ent = a.grp_ent;
@@ -1489,7 +1501,7 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     const bool mx = mx_experts(a.lay);
     iq::Args ia;
     if (!mx) {   // low-bit experts: ds4_iq's kernels on the same groups and scratch
-        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "win_experts")) return false;
+        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "win_experts", a.act, a.beta, a.beta_l)) return false;
         ia.grp_ptr = a.grp_ptr;
         ia.grp_start = a.grp_start;
         ia.grp_ent = a.grp_ent;
@@ -1562,6 +1574,9 @@ iq::SetArgs iq_set(const x3::SetArgs& sa) {   // a set as ds4_iq's arguments (th
     q.n_embd = sa.n_embd;
     q.n_ff = sa.n_ff;
     q.limit = sa.limit;
+    q.act = sa.act;
+    q.beta = sa.beta;
+    q.beta_l = sa.beta_l;
     q.xf16 = sa.x16;
     q.skip_ge = sa.skip_ge;
 #if defined(STRATA_METAL)
@@ -1578,7 +1593,7 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
     if (!mx_geometry("set_gate_up", 1, sa.n_embd, sa.n_ff)) return;
     if (!mx_experts(sa.lay)) {   // low-bit experts: ds4_iq's sets
         iq::Args ia;
-        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_gate_up")) return;
+        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_gate_up", sa.act, sa.beta, sa.beta_l)) return;
         iq::SetArgs q = iq_set(sa);
         q.xf = x;
         q.idx = row_idx;
@@ -1618,6 +1633,9 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
     k.n_embd = sa.n_embd;
     k.n_ff = sa.n_ff;
     k.limit = sa.limit;
+    k.act = sa.act;
+    k.beta = sa.beta;
+    k.beta_l = sa.beta_l;
     k.xf = x;
     k.idx = row_idx;
     k.ldx = ldx;
@@ -1639,7 +1657,7 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
     if (!mx_geometry("set_down", 1, sa.n_embd, sa.n_ff)) return;
     if (!mx_experts(sa.lay)) {   // low-bit experts: ds4_iq's sets
         iq::Args ia;
-        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_down")) return;
+        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_down", sa.act, sa.beta, sa.beta_l)) return;
         iq::SetArgs q = iq_set(sa);
         q.xh = h16;
         q.ldx = ldh;

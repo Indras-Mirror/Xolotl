@@ -91,6 +91,19 @@ strata::ErnieGeometry artifact_geometry() {
     return g;
 }
 
+// The Preview artifact's geometry (`config.json`, 2026-11-24): 43 trunk blocks, 6 MLA + 37 HCA,
+// num_nextn_predict_layers 0 (the DSpark drafts are a sidecar, not a nextn block).
+strata::ErnieGeometry preview_geometry() {
+    strata::ErnieGeometry g = artifact_geometry();
+    g.n_layer_all = 43;
+    g.n_layer_nextn_requested = 0;
+    g.n_layer_nextn = 0;
+    g.compress_ratios = {128, 128, 128, 128, 128, 128, 128, 0,   128, 128, 128, 128, 128, 128, 0,
+                         128, 128, 128, 128, 128, 128, 0,   128, 128, 128, 128, 128, 128, 0,
+                         128, 128, 128, 128, 128, 128, 0,   128, 128, 128, 128, 128, 128, 0};
+    return g;
+}
+
 bool has_name(const std::vector<strata::ErnieTensorSpec>& v, const std::string& n) {
     for (const auto& s : v) if (s.name == n) return true;
     return false;
@@ -148,6 +161,56 @@ void unit_tests() {
     shape_is("token_embd.weight", {4096, 201216}, "token_embd is [D, vocab]");
 }
 
+// ---- the Preview: 43 trunk blocks, no nextn block, and the DSpark sidecar map
+void preview_tests() {
+    const strata::ErnieGeometry g = preview_geometry();
+    const auto t = strata::ernie_expected_tensors(g);
+    check(t.size() == 1471, "Preview map has 1471 tensors (43 blocks, no MTP)");
+    check(g.n_layer() == 43 && g.n_layer_nextn == 0, "Preview: 43 trunk layers, zero nextn blocks");
+
+    int hca = 0, mla = 0;
+    for (int64_t i = 0; i < g.n_layer_all; ++i) (g.is_hca(i) ? hca : mla)++;
+    check(hca == 37 && mla == 6, "Preview: 37 HCA blocks, 6 MLA+DSA blocks");
+
+    check(has_name(t, "blk.42.indexer.proj.weight") && !has_name(t, "blk.42.attn_compressor_ape.weight"),
+          "blk.42 (the last Preview block) is MLA+DSA, not HCA");
+    check(has_name(t, "blk.6.attn_compressor_ape.weight") && !has_name(t, "blk.6.indexer.proj.weight"),
+          "blk.6 is HCA with its own compressor");
+    check(has_name(t, "output.weight") && has_name(t, "output_hc_fn.weight"),
+          "the Preview file keeps the trunk head and its mHC head mixer");
+    bool any_nextn = false, any_mtp_block = false;
+    for (const auto& s : t) {
+        if (s.name.find(".nextn.") != std::string::npos) any_nextn = true;
+        if (s.name.rfind("blk.43.", 0) == 0) any_mtp_block = true;
+    }
+    check(!any_nextn && !any_mtp_block, "Preview map has no nextn tensors and no blk.43");
+
+    // ---- DSpark sidecar
+    strata::ErnieDsparkGeometry d;
+    d.n_draft = 3;
+    d.block_size = 7;
+    d.markov_rank = 256;
+    d.noise_token = 1024;
+    d.target_layers = {40, 41, 42};
+    const auto s = strata::ernie_dspark_expected_tensors(g, d);
+    check(s.size() == 97, "DSpark sidecar map has 97 tensors (10 shared + 3 x 29 draft)");
+    auto sshape = [&](const char* n, std::initializer_list<uint64_t> want, const char* what) {
+        const strata::ErnieTensorSpec* e = find_spec(s, n);
+        check(e != nullptr && e->shape == std::vector<uint64_t>(want), what);
+    };
+    sshape("dspark.main_proj.weight", {12288, 4096}, "DSpark main_proj is [3*D, D]");
+    sshape("dspark.context_wkv_proj.weight", {4096, 1536}, "DSpark context_wkv_proj merges 3 x head_dim");
+    sshape("dspark.markov_head.embed.weight", {256, 201216}, "DSpark markov embed is [rank, vocab]");
+    sshape("dspark.confidence_head.proj.weight", {4352, 1}, "DSpark confidence head is [D+rank, 1]");
+    sshape("dspark.blk.0.attn_q_b.weight", {1024, 32768}, "DSpark draft attn_q_b has the HCA head width");
+    sshape("dspark.blk.0.ffn_gate_exps.weight", {2048, 2048, 512},
+           "DSpark draft experts are [latent, n_ff_exp, n_expert]");
+    check(has_name(s, "dspark.blk.0.attn_kv_a_norm.weight") && !has_name(s, "dspark.blk.0.attn_kv.weight"),
+          "DSpark draft has the context K/V norm but no attn_kv of its own");
+    check(!has_name(s, "dspark.blk.0.attn_compressor_ape.weight"),
+          "DSpark draft is window-only: no compressor");
+}
+
 void real_shard(const std::string& path) {
     strata::GgufFile f(path);
     std::printf("  opened %s: %zu tensors\n", path.c_str(), f.tensors().size());
@@ -162,7 +225,11 @@ void real_shard(const std::string& path) {
     check(err.empty(), err.empty() ? "every ernie5_5.* key read into ErnieGeometry" : err.c_str());
     if (!err.empty()) return;
 
-    check(g.n_embd == 4096 && g.n_layer_all == 44 && g.n_layer() == 43, "D=4096, 44 blocks, 43 trunk layers");
+    // The same binary gates the Base file (44 blocks), the Preview trunk (43) and a `--layers N` test export.
+    const bool base44 = g.n_layer_all == 44;
+    check(g.n_embd == 4096 && g.n_layer() >= 1, "D=4096 and at least one trunk layer");
+    check(base44 ? g.n_layer() == 43 : g.n_layer() == g.n_layer_all,
+          base44 ? "Base: 44 blocks, 43 trunk layers" : "Preview/truncated: every block is a trunk layer");
     check(g.n_head == 64 && g.n_head_kv == 1 && g.d_rope == 64, "64 q heads / 1 kv head / rope 64");
     check(g.d_head_hca == 512 && g.d_head_mla_k == 256 && g.d_head_mla_v == 256 && g.kv_lora == 512,
           "HCA head 512 (key_length_swa); MLA head 256/256; kv_lora 512");
@@ -181,8 +248,14 @@ void real_shard(const std::string& path) {
     check(g.compress_rope_base == 160000, "compress rope base 160000");
     check(g.n_swa == 128, "sliding window 128");
     check(g.vocab_size == 201216 && g.tokenizer_pre == "ernie5", "vocab 201216 from the tokenizer array, pre 'ernie5'");
-    check(g.n_layer_nextn_requested == 1 && g.n_layer_nextn == 1, "nextn requested 1 and present (blk.43 has nextn.*)");
-    check(g.compress_ratios.size() == 44, "compress_ratios covers every block");
+    if (base44) {
+        check(g.n_layer_nextn_requested == 1 && g.n_layer_nextn == 1,
+              "Base: nextn requested 1 and present (blk.43 has nextn.*)");
+    } else {
+        check(g.n_layer_nextn_requested == 0 && g.n_layer_nextn == 0,
+              "Preview/truncated: nextn_predict_layers 0, no MTP block");
+    }
+    check((int64_t)g.compress_ratios.size() >= g.n_layer_all, "compress_ratios covers every block");
 
     // ---- the map: zero unknowns, every present tensor matching its spec
     const auto want = strata::ernie_expected_tensors(g);
@@ -209,9 +282,22 @@ void real_shard(const std::string& path) {
                              : first_bad.c_str());
 
     const auto missing = strata::ernie_missing_tensors(want, finder);
-    check(want.size() == 1514, "the map has 1514 tensors");
-    check(missing.size() == 695, "695 tensors are in later shards (the big projections)");
-    check(want.size() - missing.size() == f.tensors().size(), "present + missing == 1514");
+    const size_t want_all = base44 ? 1514 : (g.n_layer_all == 43 ? 1471 : 0);
+    if (want_all) check(want.size() == want_all, base44 ? "the map has 1514 tensors" : "the Preview map has 1471 tensors");
+    if (base44) {
+        check(missing.size() == 695, "695 tensors are in later shards (the big projections)");
+    } else {
+        // A `--experts skip` export is trunk-only on purpose; everything else must be present.
+        const strata::MetaValue* skip = f.get("ernie5_5.dev_experts_skipped");
+        const bool experts_skipped = skip != nullptr && skip->u != 0;
+        size_t unexpected = 0;
+        for (const auto& n : missing)
+            if (!(experts_skipped && n.find("_exps.") != std::string::npos)) ++unexpected;
+        check(unexpected == 0, experts_skipped
+                                       ? "trunk-only export (dev_experts_skipped): every non-expert tensor is present"
+                                       : "a whole Preview/truncated export has every predicted tensor");
+    }
+    check(want.size() - missing.size() == f.tensors().size(), "present + missing == the map size");
 
     size_t missing_not_weight = 0;
     for (const auto& n : missing) {
@@ -226,6 +312,7 @@ void real_shard(const std::string& path) {
 
 int main(int argc, char** argv) {
     unit_tests();
+    preview_tests();
     const std::string path =
             argc > 1 ? argv[1]
                      : (std::getenv("ERNIE_GGUF")

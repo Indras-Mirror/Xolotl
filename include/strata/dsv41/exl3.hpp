@@ -102,6 +102,8 @@ struct MoeArgs {
     ExpertLayout lay;
     int k = 8, n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;   // 0: no clamp
+    int act = 0;          // 0: the clamped SwiGLU (every model before ERNIE), 1: ERNIE-5.5's SiTU
+    float beta = 4.0f, beta_l = 25.0f;
 };
 void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
@@ -130,6 +132,8 @@ struct WinArgs {
     ExpertLayout lay;
     int T = 0, k = 8, n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
+    int act = 0;          // 0: the clamped SwiGLU, 1: ERNIE-5.5's SiTU (as MoeArgs)
+    float beta = 4.0f, beta_l = 25.0f;
     // (given) the combine first waits on the device until *wait_ptr == wait_val (the host's answer to the CPU lane's
     // part arrives while the device computes the experts); cpu_flag may be null (no CPU part)
     const unsigned* wait_ptr = nullptr;
@@ -154,6 +158,8 @@ struct SetArgs {
     int max_rows = 0;   // the most rows one expert of the set has
     int n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
+    int act = 0;          // 0: the clamped SwiGLU, 1: ERNIE-5.5's SiTU (as MoeArgs)
+    float beta = 4.0f, beta_l = 25.0f;
     // gate / up: the caller's F16 copy of the activations (row_idx picks the rows).  The tiles round F32 to F16 for
     // their shared-memory tile anyway, so the same values come out; this only saves the F32 read of the same rows by
     // every column block of an expert (18-36 reads of 1.8-3.7 MB on a prompt) - MarLin's "small operand cheap".

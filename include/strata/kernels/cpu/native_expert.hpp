@@ -7,6 +7,8 @@
 // controls whether grouping tokens may change the selected row arithmetic.
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -29,6 +31,25 @@ inline constexpr int kNativeFFMax = 2304;   // xolotl: the MAX over every merged
 /// Arithmetic fixed for one pool batch. WindowInvariant preserves the legacy singleton result at every width.
 enum class NativeArithmetic { Default, WindowInvariant };
 
+/// The routed expert's elementwise nonlinearity.  `SwiGLU` is DeepSeek-V4's (the default: clamped silu(gate) * up,
+/// bit for bit the arithmetic every model before ERNIE used).  `SiTU` is ERNIE-5.5's
+/// (llama-graph.cpp's LLM_FFN_SITU): beta*tanh(gate/beta)*sigmoid(gate) * beta_l*tanh(up/beta_l), no clamp.
+enum class NativeAct : int { SwiGLU = 0, SiTU = 1 };
+
+/// One expert row's hidden value from its gate and up pre-activations.  SwiGLU: gate -> min(gate, lim),
+/// up -> clamp(up, -lim, lim), lim = +inf (the default) is the unclamped arithmetic unchanged.  SiTU: beta_l <= 0 leaves
+/// the up term linear (llama.cpp's `lb > 0` branch).
+inline float native_act_value(NativeAct act, float g, float u, float lim, float beta = 4.0f, float beta_l = 25.0f) {
+    if (act == NativeAct::SiTU) {
+        const float a = beta * std::tanh(g / beta);
+        const float b = beta_l > 0.0f ? beta_l * std::tanh(u / beta_l) : u;
+        return (a / (1.0f + std::exp(-g))) * b;
+    }
+    g = std::min(g, lim);
+    u = std::min(std::max(u, -lim), lim);
+    return (g / (1.0f + std::exp(-g))) * u;
+}
+
 /// One layer's native expert geometry.
 struct NativeFmt {
     int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down
@@ -46,6 +67,10 @@ struct NativeFmt {
     /// DeepSeek-V4's SwiGLU clamp (`swiglu_clamp_exp`): gate -> min(gate, lim), up -> clamp(up, -lim, lim) before
     /// silu(gate) * up.  +inf (the default, every other model) = no clamp, bit-identical to the unclamped kernels.
     float swiglu_limit = std::numeric_limits<float>::infinity();
+    /// The expert nonlinearity (see NativeAct).  SwiGLU, the default, is every previous model's path and its kernels.
+    NativeAct act = NativeAct::SwiGLU;
+    /// SiTU's betas (`ernie5_5.activation.situ_beta` / `situ_linear_beta`); ignored for SwiGLU.
+    float situ_beta = 4.0f, situ_beta_l = 25.0f;
     /// NVFP4 (ggml type 40) only: the blob ends with {s_gate, s_up, s_down, 0} at this offset, the per-expert
     /// weight_scale_2 the block format has no room for (tools/iq_pack.py). 0 = no tail. Each scale goes on its own
     /// projection's FP32 output: gate * s_gate, up * s_up, down * s_down. Do not fold s_down into up: the hidden

@@ -2174,13 +2174,33 @@ __global__ void hadamard_rows_kernel(const T* __restrict__ x, T* __restrict__ y,
     st_f<T>(y + at, hbuf[i] * scale);
 }
 
+// The expert nonlinearity: NativeExpertLayout::act 0 = DeepSeek-V4's clamped SwiGLU (lim +inf = none; fminf/fmaxf with
+// inf are exact, so this is the unclamped arithmetic bit for bit), 1 = ERNIE-5.5's SiTU (llama-graph.cpp's
+// LLM_FFN_SITU: beta*tanh(gate/beta)*sigmoid(gate) * beta_l*tanh(up/beta_l), no clamp; beta_l <= 0 leaves up linear).
+__device__ __forceinline__ float expert_act(int act, float g, float u, float lim, float beta, float beta_l) {
+    if (act != 0) {
+        const float a = beta * tanhf(g / beta);
+        const float b = beta_l > 0.0f ? beta_l * tanhf(u / beta_l) : u;
+#if defined(__HIPCC__)
+        return (a / (1.0f + __expf(-g))) * b;
+#else
+        return __fmul_rn(a / (1.0f + __expf(-g)), b);
+#endif
+    }
+    const float gg = fminf(g, lim), uu = fminf(fmaxf(u, -lim), lim);
+#if defined(__HIPCC__)
+    return (gg / (1.0f + __expf(-gg))) * uu;
+#else
+    return __fmul_rn(gg / (1.0f + __expf(-gg)), uu);
+#endif
+}
+
 // lim: DeepSeek-V4's SwiGLU clamp (NativeExpertLayout::swiglu_limit); +inf = none (fminf/fmaxf with inf are exact)
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
-                                      long long n, float lim) {
+                                      long long n, float lim, int act, float beta, float beta_l) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float g = fminf(gate[i], lim);
-    h[i] = (g / (1.0f + __expf(-g))) * fminf(fmaxf(up[i], -lim), lim);
+    h[i] = expert_act(act, gate[i], up[i], lim, beta, beta_l);
 }
 
 template<int TD>
@@ -2829,19 +2849,15 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
                                                                   const float* __restrict__ up,
                                                                   const int32_t* __restrict__ grp_start,
                                                                   const int32_t* __restrict__ n_groups, int n_ff,
-                                                                  block_q8_1* __restrict__ hq, float lim) {
+                                                                  block_q8_1* __restrict__ hq, float lim,
+                                                                  int act, float beta, float beta_l) {
 #if defined(__HIPCC__)
 #pragma clang fp contract(off)
 #endif
     const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
     for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
          i += (long long) gridDim.x * blockDim.x) {
-        const float g = fminf(gate[i], lim), u = fminf(fmaxf(up[i], -lim), lim);
-#if defined(__HIPCC__)
-        const float h = (g / (1.0f + __expf(-g))) * u;
-#else
-        const float h = __fmul_rn(g / (1.0f + __expf(-g)), u);
-#endif
+        const float h = expert_act(act, gate[i], up[i], lim, beta, beta_l);
         q8_1_store(h, hq, i);
     }
 }
@@ -3968,7 +3984,7 @@ void s26_launch_l(const NativeExpertLayout& L, int64_t cap_groups, cudaStream_t 
     if (FQ) {
         s26_swiglu_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, hq, nh);
     } else {
-        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.swiglu_limit);
+        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.swiglu_limit, L.act, L.situ_beta, L.situ_beta_l);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     }
     const dim3 gd((unsigned) (L.n_embd / (8 * RD)), (unsigned) cap_groups);
@@ -6452,8 +6468,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
     // STRATA_EXPERT_NIBBLE (nib_layout): only the gate/up step below takes another kernel (launch_gu_nib, in place of
     // launch_gu); SwiGLU, the q8_1 quantization and the down rows (GGUF, at L.down_off) are the layout's own
+    // ERNIE-5.5's SiTU: the layouts below fold silu() into their own kernels, so a non-SwiGLU activation takes the
+    // gate/up + fold path (whose fold kernels take act).  SwiGLU (act 0) keeps every layout exactly as before.
+    const bool situ = L.act != 0;
     static const bool v2 = [] { const char* v = std::getenv("STRATA_EXPERT_V2"); return v && v[0] == '1'; }();
-    if (v2 && !nib_layout(L) && L.gu_type == 21 && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640) {   // S26: see s26_gu_l_kernel
+    if (v2 && !situ && !nib_layout(L) && L.gu_type == 21 && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640) {   // S26: see s26_gu_l_kernel
         // S26 STRATA_TSUM=1: the sums as one transposed butterfly per warp (s26_tsum.cuh; bitwise the same values)
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
         // (+ down rows' items spread evenly over the lanes, one load group: bitwise, harness 1.09-1.12x vs 1.03-1.06x;
@@ -6485,7 +6504,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }();
     // Qwen3.6-35B-A3B (n_embd 2048, n_ff 512, Q4_K / Q5_K gate+up, Q5_K down): the same kernels, the geometry only sizes the grid
     const bool q36geo = L.n_embd == 2048 && L.n_ff == 512 && L.d_type == 13;
-    if (v2k && (L.gu_type == 12 || L.gu_type == 13) &&
+    if (v2k && !situ && (L.gu_type == 12 || L.gu_type == 13) &&
         (((L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 && L.n_ff == 640) || q36geo)) {
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
         const long long nh = (long long) cap_entries * L.n_ff;
@@ -6525,7 +6544,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool fused_gu = !nib_layout(L) && em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
+    const bool fused_gu = !situ && !nib_layout(L) && em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
                           L.n_ff % 32 == 0;
     if (fused_gu && g_exp_phase != 2) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
@@ -6547,7 +6566,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #else
     const bool gs_layout = true;
 #endif
-    if (gs_layout && !nib_layout(L) && g_exp_phase == 0 && !v1 && gu_swiglu_on() && !(expdec_mode() && !g_old_kernels && expdec_gu_ok(L))) {
+    if (gs_layout && !situ && !nib_layout(L) && g_exp_phase == 0 && !v1 && gu_swiglu_on() && !(expdec_mode() && !g_old_kernels && expdec_gu_ok(L))) {
         switch (L.gu_type) {
 #define STRATA_GS(T) case T: gs_done = launch_gu_swiglu<T>(L, gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, hq); break;
             STRATA_GU_FMTS(STRATA_GS)
@@ -6562,7 +6581,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (g_exp_phase != 2 && !gs_done) {
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool lds_gu = !nib_layout(L) && (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8) && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23);
+    const bool lds_gu = !situ && !nib_layout(L) && (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8) && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23);
     if (lds_gu) {
         const dim3 gl((unsigned) ((2 * L.n_ff + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
@@ -6608,7 +6627,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         else { std::fprintf(stderr, "native_expert_grouped: gate %d / up %d\n", L.gu_type, L.up_type); std::exit(1); }
     } else if (prom_gu(L, gy, prom_large, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up)) {
         // PROM prompt-batch kernel (fork slice xk-kernels); the SwiGLU + q8_1 pass below is the caller's
-    } else if (!expdec_gu(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up))   // STRATA_EXPDEC=1
+    } else if (situ || !expdec_gu(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up))   // STRATA_EXPDEC=1
     switch (L.gu_type) {
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         STRATA_GU_FMTS(STRATA_GU)
@@ -6632,13 +6651,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
     // APR: Hadamard-folded down weights take the rotated h, so h exists as floats first (the separate passes)
     if (sw_v1 || L.had_block > 0) {
-        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.swiglu_limit);   // xolotl: DeepSeek-V4 clamp
+        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.swiglu_limit, L.act, L.situ_beta, L.situ_beta_l);   // xolotl: DeepSeek-V4 clamp
         if (L.had_block > 0)   // APR: the down weights are Hadamard-folded, so is their input (in place, every entry row)
             hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     } else {
         swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
-                                                                                (int) L.n_ff, hq, L.swiglu_limit);
+                                                                                (int) L.n_ff, hq, L.swiglu_limit,
+                                                                                L.act, L.situ_beta, L.situ_beta_l);
     }
     check("native_expert_grouped/swiglu");
     }

@@ -19,6 +19,10 @@
   tower follow llama.cpp PR #32694 by [Pedro Cuenca](https://github.com/pcuenca) (MIT). Our release's refusal edit
   is [nokeep](https://huggingface.co/nokeepai/Inkling-2-Mini-Unbound)'s convolution-aware "Unbound" edit; its DSpark
   drafter GGUF was converted by [unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF).
+- ERNIE-5.5-Flash by [Baidu](https://huggingface.co/baidu/ERNIE-5.5-Flash-Preview) (Apache 2.0); the engine reads the GGUF
+  layout of llama.cpp PR [#31925](https://github.com/ggml-org/llama.cpp/pull/31925) by
+  [FakerVSdonk](https://github.com/FakerVSdonk), and was checked tensor by tensor against that PR's build and the
+  vLLM-ERNIE model code.
 - Muse Glimmer by Meta Superintelligence Labs; its engine follows llama.cpp's Muse Glimmer support (ggml-org/llama.cpp
   #26841: graph, chat parser, mtmd projector). The abliterated build it was measured with is darkc0de's, quantised by bartowski. Its DFlash drafter is Meta's; the drafter graph follows llama.cpp's `src/models/dflash.cpp`.
 

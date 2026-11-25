@@ -117,8 +117,21 @@ GPT4O_PATTERN = (
 # `inkling2` is Inkling-2-Mini's name for the GPT-4o (o200k) pattern: its tokenizer.json's pre_tokenizer is
 # GPT4O_PATTERN verbatim, and the HF conversion's ignore_merges changes no id (the merges are complete: measured,
 # 0 differences on 200 strings), so the pack and the GGUF's `tokenizer.ggml.pre` can both say it.
+# The `ernie5` pre-tokenizer (ERNIE-5.5-Flash; llama.cpp PR #31925's `tokenizer_pre == "ernie5"`,
+# LLAMA_VOCAB_PRE_TYPE_ERNIE5 in src/llama-vocab.cpp L335-345): the DeepSeek-V3 sequence with ONE change - digit runs
+# are cut RIGHT-ALIGNED in groups of three (`\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))`), so "1234567" is "1" "234" "567".
+# ERNIE's tokenizer.json says the same thing with a different spelling (Digits, an isolated \p{Nd}{1,510} split, a
+# 1-2 digit head pattern); the llama.cpp form is the one the GGUF's `tokenizer.ggml.pre = ernie5` selects, so it is
+# the one transcribed here (and gated against `llama-tokenize` of the same file).
+ERNIE5_PATTERNS = (
+    r"\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
 PRE_PATTERNS = {
     "qwen35": [QWEN35_PATTERN],
+    "ernie5": ERNIE5_PATTERNS,
     "joyai-llm": JOYAI_LLM_PATTERNS,
     "lfm2": [LLAMA3_PATTERN],
     "llama4": [GPT4O_PATTERN],
@@ -137,6 +150,7 @@ DEEPSEEK3_PATTERNS = (
     r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
+
 
 
 def _sequence_findall(patterns, text: str) -> list[str]:
@@ -780,9 +794,26 @@ def main() -> int:
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", help="tokenizer/ directory to write (required unless --encode*)")
     ap.add_argument("--check", action="store_true", help="round-trip a corpus and report")
+    # text -> ids for the engine's --ids-file (a prompt the gates and the PR comparison can share)
+    ap.add_argument("--encode", metavar="TEXT", help="print the token ids of TEXT (comma separated)")
+    ap.add_argument("--encode-file", metavar="F", help="the same, for a file's whole contents")
+    ap.add_argument("--bos", action="store_true", help="with --encode*: prepend the BOS id")
     args = ap.parse_args()
+    if args.encode is not None or args.encode_file is not None:
+        tk = Tokenizer.from_gguf(args.gguf)
+        if args.encode_file is not None:
+            text = pathlib.Path(args.encode_file).read_text(encoding="utf-8")
+        else:
+            text = args.encode
+        ids = tk.encode(text)
+        if args.bos:
+            ids = [int(tk.special_ids.get("tokenizer.ggml.bos_token_id", 2))] + ids
+        print(",".join(str(i) for i in ids))
+        return 0
+    if not args.out:
+        ap.error("--out is required (or use --encode TEXT)")
     cfg = extract(args.gguf, args.out)
     print("tokenizer/: vocab %d, merges %d, pre %s, specials %s"
           % (cfg["vocab_size"], cfg["n_merges"], cfg["pre"], cfg["special_ids"]))

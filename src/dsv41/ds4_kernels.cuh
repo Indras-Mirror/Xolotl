@@ -107,7 +107,8 @@ void route(const float* logits, const float* bias, int n, int k, int T, float ro
            cudaStream_t s, const float* bias_vl = nullptr, const VlBits* vl = nullptr);
 
 /// h = silu(min(g, lim)) * clamp(u, -lim, lim)  (lim <= 0: no clamp); n values.
-void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s);
+void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s, int act = 0,
+            float beta = 4.0f, float beta_l = 25.0f);
 
 /// The ratio-r compressor over a window: token t (position p0 + t) takes slot (p0 + t) % r of the state; each token that
 /// completes a group writes the group's pooled latent (softmax over the slots, per value, then rmsnorm(w)) to the next

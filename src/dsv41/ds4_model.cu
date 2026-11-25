@@ -467,6 +467,10 @@ struct Geo {
         k_exp = 0, ff = 0, win = 0, hc = 0, sinkhorn = 0, ix_heads = 0, ix_hd = 0, ix_topk = 0, cand_src = -1,
         cand_topk = 0, cand_blk = 0, orig_ctx = 0, eos = 1;
     float eps = 1e-20f, hc_eps = 1e-6f, route_scale = 1.0f, lim = 0.0f;
+    // ERNIE-5.5's expert / FFN activation (SiTU): 0 = the clamped SwiGLU every model before it uses.  Detected by its
+    // metadata's presence, so a DS4.1 pack (no such key) keeps act 0 and the kernels' arithmetic bit for bit.
+    int act = 0;
+    float situ_beta = 4.0f, situ_beta_l = 25.0f;
     double rope_theta = 1e4, comp_theta = 1e4, factor = 1.0, beta_fast = 32, beta_slow = 1;
     std::vector<int> ratios, kv_src, ix_src, eg_layers;
     // the DSpark drafter (the checkpoint's mtp.* blocks): a block of [seed, noise x (block - 1)] through n_mtp blocks
@@ -489,6 +493,11 @@ struct Geo {
         eos = (int) p.num("eos_token_id", 1);
         eps = (float) p.num("rms_norm_eps", 1e-20), hc_eps = (float) p.num("hc_eps", 1e-6);
         route_scale = (float) p.num("routed_scaling_factor", 1.0), lim = (float) p.num("swiglu_limit", 0.0);
+        if (p.get("activation.situ_beta") != nullptr) {   // ERNIE-5.5: SiTU, never the SwiGLU clamp
+            act = 1;
+            situ_beta = (float) p.num("activation.situ_beta", 4.0);
+            situ_beta_l = (float) p.num("activation.situ_linear_beta", 25.0);
+        }
         rope_theta = p.num("rope_theta", 1e4), comp_theta = p.num("compress_rope_theta", 1e4);
         factor = p.num("rope_scaling.factor", 1.0), beta_fast = p.num("rope_scaling.beta_fast", 32);
         beta_slow = p.num("rope_scaling.beta_slow", 1);
@@ -1868,7 +1877,8 @@ struct Model::Impl {
     // expert's matrix r at the same stride from expert 0's in one file (the GGUF's [n_exp][out][in] tensor)
     // (the other block types: lay.fmt stays kFmtMXFP4 - read in place as these - and lay.K[r] is role r's ggml type)
     static int gg_type_of(const std::string& dtype) {
-        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 145, 146, 224, 225, 226, 227})
+        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 145, 146, 147, 148, 149, 224, 225,
+                      226, 227})
             if (dtype == gg::type_name(t)) return t;
         return -1;
     }
@@ -4183,6 +4193,9 @@ struct Model::Impl {
                 sa.n_embd = D;
                 sa.n_ff = FF;
                 sa.limit = g.lim;
+sa.act = g.act;
+sa.beta = g.situ_beta;
+sa.beta_l = g.situ_beta_l;
                 // gate / up read the layer's F16 copy of the activations (the same rounding the tiles make for their
                 // shared tile): with 18-36 column blocks an expert the F32 rows were read that many times
                 sa.x16 = strata::ds4::gate_up_x16_default(defaults_026()) ? c.x16 : nullptr;
@@ -8271,7 +8284,7 @@ struct Model::Impl {
         // the shared expert into acc while the host waits for the bounds
         if (!gemm(d, c, l.s1, c.x16, D, T, c.sg, FF, 0.0f, err) || !gemm(d, c, l.s3, c.x16, D, T, c.su, FF, 0.0f, err))
             return false;
-        swiglu(c.sg, c.su, T * FF, g.lim, c.sg, s);
+        swiglu(c.sg, c.su, T * FF, g.lim, c.sg, s, g.act, g.situ_beta, g.situ_beta_l);
         x3::rows_f16(c.sg, FF, nullptr, T, FF, c.sh16, s);
         if (!gemm(d, c, l.s2, c.sh16, FF, T, c.acc, D, 0.0f, err)) return false;
         prof_mark(d, 2);
@@ -10228,7 +10241,7 @@ struct Model::Impl {
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
                           na[1]);
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
-            swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
+            swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s, g.act, g.situ_beta, g.situ_beta_l);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
             prof_mark(d, 2);
             const x3::ExpertLayout& lay = nm > 1 ? l.hlay : l.lay;
@@ -10243,6 +10256,9 @@ struct Model::Impl {
                 ma.n_embd = D;
                 ma.n_ff = FF;
                 ma.limit = g.lim;
+ma.act = g.act;
+ma.beta = g.situ_beta;
+ma.beta_l = g.situ_beta_l;
                 const bool mx = lay.fmt == gg::kFmtMXFP4;
                 if (zc_stage_buf != nullptr && l.zc_tab != nullptr)   // (the store's experts copied to VRAM at the PCIe rate first)
                     zc_stage(d.plan_ptr, d.ridx, l.zc_tab, l.k_exp, zc_stage_buf, zc_stride, l.blob, s);
@@ -10304,6 +10320,9 @@ struct Model::Impl {
                 wa.n_embd = D;
                 wa.n_ff = FF;
                 wa.limit = g.lim;
+wa.act = g.act;
+wa.beta = g.situ_beta;
+wa.beta_l = g.situ_beta_l;
                 if (!(lay.fmt == gg::kFmtMXFP4 ? gg::win_experts(wa, s) : x3::win_experts(wa, s))) {
                     err = "exl3 win_experts failed";
                     return false;
@@ -10355,7 +10374,7 @@ struct Model::Impl {
 #endif
         if (ds4_dbg("DS4_DBG_MOE")) { dbg_nf("x", l.il, d.x, (size_t) T * D); dbg_nf("sg", l.il, d.sg, (size_t) T * g.ff); dbg_nf("su", l.il, d.su, (size_t) T * g.ff);
             std::fprintf(stderr, "DBG s1 fmt=%d K=%d k=%d n=%d ld=%d raw=%p\n", l.s1.fmt, l.s1.K, l.s1.k, l.s1.n, l.s1.ld, (void*) l.s1.raw); }
-        swiglu(d.sg, d.su, T * g.ff, g.lim, d.sh, s);
+        swiglu(d.sg, d.su, T * g.ff, g.lim, d.sh, s, g.act, g.situ_beta, g.situ_beta_l);
         if (ds4_dbg("DS4_DBG_MOE")) dbg_nf("sh", l.il, d.sh, (size_t) T * g.ff);
         if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, g.ff, D)}, err)) return false;
         const double tw = now_ms();
@@ -10455,7 +10474,7 @@ struct Model::Impl {
             if (!mv_n(d, j, nj, err)) return false;
             dump_sub(d, "xg", l.il, p0, nrows, d.xg, (size_t) nrows * g.ff * 4);
             dump_sub(d, "xu", l.il, p0, nrows, d.xu, (size_t) nrows * g.ff * 4);
-            swiglu(d.xg, d.xu, nrows * g.ff, g.lim, d.xhh, s);
+            swiglu(d.xg, d.xu, nrows * g.ff, g.lim, d.xhh, s, g.act, g.situ_beta, g.situ_beta_l);
             dump_sub(d, "xhh", l.il, p0, nrows, d.xhh, (size_t) nrows * g.ff * 4);
             nj = 0;
             for (int i = 0; i < nvex; ++i)
