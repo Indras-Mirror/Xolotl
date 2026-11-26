@@ -38,8 +38,24 @@
 #include <cuda_runtime.h>
 
 #include <signal.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX              // windows.h's min/max macros break std::min and std::max below
+#endif
+#include <windows.h>          // CreatePipe/CreateProcess: the speech helper is a child process (pipe, fork, execv are POSIX)
+#include <fcntl.h>            // _O_WRONLY, _O_RDONLY
+#include <io.h>               // _open_osfhandle
+#include <stdio.h>
+#include <sys/types.h>        // declares off_t itself: read before the macro below, not again after it
+#define off_t int64_t         // MSVC's off_t is 32-bit; the seeks below cast 64-bit offsets through it
+#define fseeko(f, o, w) _fseeki64((f), (o), (w))
+#else
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -638,10 +654,64 @@ bool parse_ids(const char* p, std::vector<int32_t>& ids) {
 struct SpeechChild {
     std::string exe, mmproj, model;
     bool gpu = true;
+#ifdef _WIN32
+    HANDLE proc = nullptr;
+#else
     pid_t pid = -1;
+#endif
     FILE *to = nullptr, *from = nullptr;
     int n_embd = 0, rate = 0, n_cb = 0;
     bool configured() const { return !exe.empty() && !mmproj.empty(); }
+#ifdef _WIN32
+    bool alive() const { return proc != nullptr; }
+    void start() {
+        SECURITY_ATTRIBUTES sa{ sizeof sa, nullptr, TRUE };
+        HANDLE a_r = nullptr, a_w = nullptr, b_r = nullptr, b_w = nullptr;
+        if (!CreatePipe(&a_r, &a_w, &sa, 0) || !CreatePipe(&b_r, &b_w, &sa, 0)) die("speech: pipe failed");
+        SetHandleInformation(a_w, HANDLE_FLAG_INHERIT, 0);   // only the child's ends are inheritable
+        SetHandleInformation(b_r, HANDLE_FLAG_INHERIT, 0);
+        std::string cmd = "\"" + exe + "\" --mmproj \"" + mmproj + "\" --model \"" + model + "\"" + (gpu ? " --gpu" : "");
+        STARTUPINFOA si{};
+        si.cb = sizeof si;
+        si.dwFlags = STARTF_USESTDHANDLES;                   // the child: stdin <- a, stdout -> b, stderr = the engine's log
+        si.hStdInput = a_r;
+        si.hStdOutput = b_w;
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+            std::fprintf(stderr, "xolotl-lfm3: cannot run %s (CreateProcess error %lu)\n", exe.c_str(), GetLastError());
+            CloseHandle(a_r); CloseHandle(a_w); CloseHandle(b_r); CloseHandle(b_w);
+            die("speech: cannot start the speech helper");
+        }
+        CloseHandle(pi.hThread);
+        proc = pi.hProcess;
+        CloseHandle(a_r);                                    // the parent keeps only its own ends
+        CloseHandle(b_w);
+        to = _fdopen(_open_osfhandle(reinterpret_cast<intptr_t>(a_w), _O_WRONLY), "wb");
+        from = _fdopen(_open_osfhandle(reinterpret_cast<intptr_t>(b_r), _O_RDONLY), "rb");
+        int32_t hdr[4];
+        if (!r(hdr, sizeof hdr) || hdr[0] != 0x3150534c) { kill_now(); die("speech: xolotl-lfm3-speech did not start (its reason is in this log)"); }
+        n_embd = hdr[1]; rate = hdr[2]; n_cb = hdr[3];
+    }
+    void stop() {                                            // QUIT and wait (park, exit)
+        if (proc == nullptr) return;
+        const int32_t q = 4;
+        if (to) { std::fwrite(&q, sizeof q, 1, to); std::fclose(to); to = nullptr; }
+        if (from) { std::fclose(from); from = nullptr; }
+        WaitForSingleObject(proc, INFINITE);
+        CloseHandle(proc);
+        proc = nullptr;
+    }
+    void kill_now() {                                        // after a protocol error
+        if (proc == nullptr) return;
+        TerminateProcess(proc, 1);
+        WaitForSingleObject(proc, INFINITE);
+        if (to) { std::fclose(to); to = nullptr; }
+        if (from) { std::fclose(from); from = nullptr; }
+        CloseHandle(proc);
+        proc = nullptr;
+    }
+#else
     bool alive() const { return pid > 0; }
     void start() {
         int a[2], b[2];
@@ -686,6 +756,7 @@ struct SpeechChild {
         waitpid(pid, &st, 0);
         pid = -1;
     }
+#endif
     bool w(const void* p, size_t n) { return std::fwrite(p, 1, n, to) == n; }
     bool r(void* p, size_t n) { return std::fread(p, 1, n, from) == n; }
     [[noreturn]] void broke() { kill_now(); die("speech: the xolotl-lfm3-speech process stopped answering"); }
@@ -864,7 +935,9 @@ int main(int argc, char** argv) {
     }
     if (gguf_path.empty() || (!serve && !dump)) { usage(); return 2; }
     speech.model = gguf_path;
+#ifdef SIGPIPE                                             // MSVC's signal.h has no SIGPIPE (a write to a closed pipe returns an error there)
     signal(SIGPIPE, SIG_IGN);                              // a speech child that died is an error line, not the engine's end
+#endif
 
     Model m;
     m.ubatch = std::max(16, ubatch);
