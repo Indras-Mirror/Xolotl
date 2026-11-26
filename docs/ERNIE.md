@@ -17,6 +17,18 @@ dense half as per-layer ggml graphs.
 | residual | 4-stream mHC (hyper-connections) |
 | expert weights read per token | about 5.3B |
 
+## Get the model
+
+Our quant: **[IndrasMirror/ERNIE-5.5-Flash-XQ-Uncensored](https://huggingface.co/IndrasMirror/ERNIE-5.5-Flash-XQ-Uncensored)**
+(99.9 GB; routed experts at 2.65 bits per weight on average in IQ2 / IQ3 types, everything else Q8_0; uncensored). It
+fits a 24 GB GPU plus ~96 GB of RAM with every expert resident. It comes as 10 parts; join them after the download:
+
+```bash
+hf download IndrasMirror/ERNIE-5.5-Flash-XQ-Uncensored --local-dir ernie-xq
+cd ernie-xq && sha256sum -c SHA256SUMS
+cat ERNIE-5.5-Flash-XQ-Uncensored.gguf.part-* > ERNIE-5.5-Flash-XQ-Uncensored.gguf && rm ERNIE-5.5-Flash-XQ-Uncensored.gguf.part-*
+```
+
 ## Which GGUFs it reads
 
 The tensor names and metadata of **llama.cpp PR [#31925](https://github.com/ggml-org/llama.cpp/pull/31925)**
@@ -28,8 +40,9 @@ Tested so far:
 
 - MXFP4 routed experts with a Q8_0 dense half (154 GB), converted from Baidu's FP8 safetensors with
   `tools/ernie/ernie_gguf.py`.
+- [our XQ file](https://huggingface.co/IndrasMirror/ERNIE-5.5-Flash-XQ-Uncensored) (99.9 GB, IQ2 / IQ3 routed experts).
 - The engine's expert kernels cover the usual ggml types (Q2_K-Q8_0, IQ1_M-IQ4_XS, MXFP4) through the same tier
-  DeepSeek-V4.1 uses, but on ERNIE only MXFP4 has been run end to end. Other quants should work; reports welcome.
+  DeepSeek-V4.1 uses, but on ERNIE only MXFP4 and the IQ2 / IQ3 types of our XQ file have been run end to end. Other quants should work; reports welcome.
 
 ## Correctness
 
@@ -62,7 +75,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_
 cmake --build build --target ernie_generate -j
 
 # the best decode settings measured so far
-./build/ernie_generate -m ERNIE-5.5-Flash.gguf -p "Write a haiku about rivers." -n 128 \
+./build/ernie_generate -m ernie-xq/ERNIE-5.5-Flash-XQ-Uncensored.gguf -p "Write a haiku about rivers." -n 128 \
     --experts gpu --cuda --slots 2300 --threads 7 --arena-gib 80 --ds41-decode 0 --prefill-chunk 256
 ```
 

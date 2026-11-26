@@ -161,7 +161,7 @@ pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up
 | [LFM3-Omni engine](docs/LFM3.md)                   | pictures, audio, video and speech on a 2B model, park/unpark beside a big one     |
 | [Muse Glimmer engine](docs/GLIMMER.md)             | Meta's dense 30B at 512K on 24 GB, its channel / ATEM tool-call format, pictures  |
 | [Inkling-2-Mini engine](docs/INKLING.md)           | Thinking Machines' looped MoE: 512K on 24 GB, DSpark drafter, pictures, our quant |
-| [ERNIE-5.5-Flash engine (preview)](docs/ERNIE.md)  | Baidu's 280B latent MoE: which GGUFs it reads, correctness checks, flags        |
+| [ERNIE-5.5-Flash engine (preview)](docs/ERNIE.md)  | Baidu's 280B latent MoE: our [XQ file on HF](https://huggingface.co/IndrasMirror/ERNIE-5.5-Flash-XQ-Uncensored), which GGUFs it reads, flags |
 | [Qwen3.8-27B dense howto](docs/dense/HOWTO.md)     | dense vs MoE paths, binaries, configs, MTP (by Mirko Perrone, also in Italian)    |
 | [Setting up with an agent](AGENTS.md)              | the build-and-serve steps for an AI agent (or a person) setting Xolotl up         |
 | [Qwen3.8 / upstream Strata](README.strata.md)      | the Strata engine this grew from                                                  |
