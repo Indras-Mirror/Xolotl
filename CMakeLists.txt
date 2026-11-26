@@ -243,6 +243,11 @@ elseif(STRATA_ENABLE_CUDA)
   # DLL's import library).  MSVC with a CUDA 12.x toolkit - the experimental Pascal/Volta build - then fails with
   # LNK1169 (every cudart symbol defined twice); GNU ld lets it pass.  That build links the shared runtime alone.  The
   # ready-made engine (CUDA 13, no STRATA_EXPERIMENTAL_SM60) is unchanged; -DCMAKE_CUDA_RUNTIME_LIBRARY overrides.
+  # #148: every MSVC build with a CUDA 12.x toolkit hits it, not only the SM60 one; the version is known after
+  # find_package(CUDAToolkit) below, and the property is read when targets are created, so it is set there too.
+  if(DEFINED CMAKE_CUDA_RUNTIME_LIBRARY)
+    set(_strata_cuda_rt_given ON)
+  endif()
   if(MSVC AND STRATA_EXPERIMENTAL_SM60 AND NOT DEFINED CMAKE_CUDA_RUNTIME_LIBRARY)
     set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
   endif()
@@ -264,6 +269,9 @@ elseif(STRATA_ENABLE_CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
   find_package(CUDAToolkit REQUIRED)
+  if(MSVC AND NOT _strata_cuda_rt_given AND CUDAToolkit_VERSION VERSION_LESS 13.0)
+    set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)   # #148 (CUDA 12.8, sm_86): LNK1169/LNK2005 with the static default
+  endif()
   option(STRATA_EXPERIMENTAL_SM60 "community build for GPUs below compute capability 7.5: Pascal sm_60, Volta sm_70 (#236)" OFF)
   if(_strata_cuda_arch_defaulted)
     # a recommendation, not a refusal: the release engine is built for 75;86;89;120, a hand build names its card

@@ -240,7 +240,13 @@ class Tokenizer:
         self.tokens = tokens
         self.pre = pre
         self.token_types = token_types
-        self.special_ids = special_ids or {}
+        self.special_ids = dict(special_ids or {})
+        # A pack exported from a GGUF names its ids by the GGUF keys ("tokenizer.ggml.eos_token_id"); the server's
+        # family branches read the short names ("eos", "eot", "bos").  Both spellings, so packs written before the
+        # exporter wrote both still give the right stop ids (#148: Glimmer's <|eot|> never matched -> finish "length").
+        for k, v in list(self.special_ids.items()):
+            if k.startswith("tokenizer.ggml.") and k.endswith("_token_id"):
+                self.special_ids.setdefault(k[len("tokenizer.ggml."):-len("_token_id")], v)
         self.ids = {t: i for i, t in enumerate(tokens)}
         if len(self.ids) != len(tokens):
             raise ValueError("vocabulary has duplicate tokens: %d entries, %d unique"

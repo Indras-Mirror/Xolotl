@@ -3014,7 +3014,13 @@ static bool flush_pack(Ds41Dense::Impl & im) {
     at.srcAccessOrder = cudaMemcpySrcAccessOrderDuringApiCall;
     size_t ai = 0;
     const cudaStream_t st = (cudaStream_t) ggml_backend_cuda_get_stream(im.backend);
+#if CUDART_VERSION >= 13000
     const cudaError_t e = cudaMemcpyBatchAsync(im.pack_dst.data(), src.data(), im.pack_sz.data(), k, &at, &ai, 1, st);
+#else
+    // #148: CUDA 12.8's form still takes the optional failIdx out-parameter (dropped in 13)
+    const cudaError_t e = cudaMemcpyBatchAsync(im.pack_dst.data(), src.data(), im.pack_sz.data(), k, &at, &ai, 1,
+                                               (size_t*) nullptr, st);
+#endif
     if (e == cudaSuccess) return true;
     // (a driver without it: the same copies one by one, synchronously, as before)
     static bool said = false;

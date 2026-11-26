@@ -85,7 +85,13 @@ const SpillApi& spill_api() {
         }
         int vmm = 0, host_vmm = 0, numa = -1;
         attr(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) a.dev);
+#if CUDA_VERSION >= 13000
         attr(&host_vmm, CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) a.dev);
+#else
+        // #138 / #148: the enum postdates the CUDA 12.x headers; ask the driver by its value.  An older driver rejects
+        // the query, host_vmm stays 0 and the spill path is off, as it should be.
+        attr(&host_vmm, (CUdevice_attribute) 141, (CUdevice) a.dev);
+#endif
         attr(&numa, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, (CUdevice) a.dev);
         if (!vmm || !host_vmm) { a.why = "this GPU/driver cannot map host memory through the virtual memory API"; return; }
         a.host.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;

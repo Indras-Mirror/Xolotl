@@ -391,5 +391,23 @@ class ByteCache(unittest.TestCase):
             self.assertEqual(list(pool.map(decode, texts)), texts)
 
 
+class SpecialIdNames(unittest.TestCase):
+    """#148: a pack exported from a GGUF carries the GGUF key names; the server's family branches read "eos"/"eot"."""
+
+    def test_short_names_from_gguf_keys(self):
+        tok = ST.Tokenizer([chr(c) for c in range(256)], [], None, "qwen35",
+                           {"tokenizer.ggml.eos_token_id": 200001, "tokenizer.ggml.eot_token_id": 200008,
+                            "tokenizer.ggml.bos_token_id": 200000})
+        self.assertEqual(tok.special_ids["eos"], 200001)
+        self.assertEqual(tok.special_ids["eot"], 200008)
+        self.assertEqual(tok.special_ids["bos"], 200000)
+        self.assertEqual(tok.special_ids["tokenizer.ggml.eos_token_id"], 200001)
+
+    def test_short_name_given_wins(self):
+        tok = ST.Tokenizer([chr(c) for c in range(256)], [], None, "qwen35",
+                           {"eos": 7, "tokenizer.ggml.eos_token_id": 200001})
+        self.assertEqual(tok.special_ids["eos"], 7)
+
+
 if __name__ == "__main__":
     unittest.main()
