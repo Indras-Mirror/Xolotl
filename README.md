@@ -14,7 +14,9 @@
 
 One line each; the detail, numbers and credits are in [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
-- **26 Nov** - [ERNIE-5.5-Flash](docs/ERNIE.md) preview: Baidu's 280B MoE on its own engine, `ernie_generate`, reading llama.cpp PR #31925 GGUFs (checked against the PR: KL 0.004). Command line only for now; speed work and the server come next.
+- **27 Nov** - [ERNIE-5.5-Flash](docs/ERNIE.md) preview, now served: OpenAI- and Anthropic-compatible server with tool calls and thinking on or off (`configs/xol-ernie.json`), ~14 tok/s decode and 115-120 tok/s prefill on one RTX 4090 with our [XQ file](https://huggingface.co/IndrasMirror/ERNIE-5.5-Flash-XQ-Uncensored) (99.9 GB). Speed work (DSpark, GPU prefill) is next.
+- **27 Nov** - Trellis-coded tensor types TQP5/6/7 in Xolotl's ggml (decode kernels, opt-in `XOLOTL_TQP_MMQ=1` prompt kernel). [more](docs/xolotl/CHANGELOG.md#trellis-coded-tensor-types-tqp567-27-nov)
+- **26 Nov** - [ERNIE-5.5-Flash](docs/ERNIE.md) preview: Baidu's 280B MoE on its own engine, `ernie_generate`, reading llama.cpp PR #31925 GGUFs (checked against the PR: KL 0.004).
 - **24 Nov** - Windows fixes for the V4.1 engine + picture reader (thanks kelheor, #144-#146) and a tool-call loop guard (from Delta / Project Maya). [more](docs/xolotl/CHANGELOG.md#windows-fixes-for-the-deepseek-v41-engine-and-its-picture-reader-a-tool-call-loop-guard-in-the-server-24-nov)
 - **24 Nov** - Inkling-2-Mini LoRA training behind the real 23K-token harness prompt, bit for bit with the engine: held-out loss -15.6 %, LiveCodeBench level. [more](docs/xolotl/CHANGELOG.md#inkling-2-mini-lora-training-behind-the-real-harness-prompt-prompt-carry-bit-for-bit-with-the-engine-24-nov)
 - **23 Nov** - [LoRA training](docs/LORA_TRAINING.md#inkling-2-mini-the-whole-model-on-one-4090) for the whole Inkling-2-Mini on one RTX 4090 (-16.7 % held-out loss in 100 steps), served with `--lora`. [more](docs/xolotl/CHANGELOG.md#lora-training-for-inkling-2-mini-the-whole-model-on-one-rtx-4090-and---lora-at-serve-time-23-nov)

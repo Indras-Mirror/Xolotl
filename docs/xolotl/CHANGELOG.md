@@ -8,6 +8,26 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Trellis-coded tensor types (TQP5/6/7) (27 Nov)
+
+- **New ggml types** `TQP5`, `TQP6`, `TQP7` (ids 147-149, about 5, 6 and 7 bits a weight), in
+  `tools/xolotl/ggml/xolotl-ggml.patch`: CPU `to_float` / `vec_dot`, CUDA matrix-vector (decode) and dequant, and
+  gguf-py ids. The ids sit well above upstream ggml's range and the file carries a GGUF metadata flag, so other
+  engines reject a TQP file cleanly instead of misreading it. Re-run `tools/xolotl/fetch-llama.sh` after pulling.
+- **Prompt path.** By default a TQP tensor is dequantised and multiplied with cuBLAS. `XOLOTL_TQP_MMQ=1` switches
+  to a tiled MMQ kernel for the TQP types only (no other type is affected even when it is set). It is faster on
+  prompts and very slightly less accurate, so it stays opt-in.
+- **Status: experimental.** On a 13.9 GB Inkling-2-Mini test file the trellis tensors came out measurably closer to the
+  parent model than our XQ file (agent-KL cross-entropy 0.19618 vs 0.19939) with benchmarks at parity, but prompts were
+  14-26 % slower. We are not releasing that file; a smaller Inkling edition at XQ quality, and an ERNIE-5.5-Flash one,
+  are being tested.
+- Thanks: trellis-coded quantisation follows [QTIP](https://arxiv.org/abs/2406.11235) (Tseng, Sun, Hou, De Sa) and
+  turboderp's [EXL3](https://github.com/turboderp-org/exllamav3); the MMQ tile loader follows the pattern of
+  [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)'s IQ*_KT types and the TQ loader in the agentionai
+  llama.cpp fork by Laurent Zuijdwijk (MIT); recipe ideas from [nari-labs](https://huggingface.co/nari-labs). The model
+  is Thinking Machines Lab's (Apache 2.0), the refusal edit nokeep's; Xolotl is built on
+  [Strata](https://github.com/Niko1221/Strata).
+
 ### Monitor: the queued count includes requests waiting beyond the engine's batch slots (24 Nov, #147)
 
 - In parallel mode a request enters the server's live set at once and its `queued` flag is cleared, so the Monitor

@@ -116,6 +116,12 @@ exactness check).
   optional). Not yet tested here; a dequantised BF16 file is ~52 GB, so on a 24 GB card use a quant or
   `--cpu-exps`.
 
+## XQT edition (experimental, not released)
+
+Xolotl's ggml now has trellis-coded expert types (TQP5 / TQP6 / TQP7). A 13.9 GB Inkling test file with 18 expert
+tensors in TQP measured closer to the parent model than the XQ file (agent-KL CE 0.19618 vs 0.19939, benchmarks at
+parity) but prompts were 14-26 % slower, so it is not released. A smaller XQT at the XQ file's quality is being tested.
+
 ## Build and run
 
 ```bash
