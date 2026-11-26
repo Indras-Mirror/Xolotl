@@ -27,6 +27,18 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME test_ds4_moe COMMAND test_ds4_moe)
 endif()
 
+# tools/ds4/pread_test.cpp: ds4_fd.hpp's pread from 8 threads on one fd, against seek + read, on a sparse file that
+# runs past 40 GiB.  No GPU, no model, nothing linked: the CPU gate's safety property holds for it too.  It makes and
+# removes one file (256 MiB of real data) under %TEMP% or /tmp; 77 is "the file system has no sparse files".
+add_executable(ds4_pread_test ${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/pread_test.cpp)
+if(TARGET Threads::Threads)
+  target_link_libraries(ds4_pread_test PRIVATE Threads::Threads)
+endif()
+if(STRATA_BUILD_TESTS)
+  add_test(NAME ds4_pread_test COMMAND ds4_pread_test)
+  set_tests_properties(ds4_pread_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+endif()
+
 if(TARGET CUDA::cudart AND TARGET strata_kernels)
   add_library(ds4_moe_cuda STATIC ${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/ds4_moe.cpp)
   target_compile_definitions(ds4_moe_cuda PRIVATE DS4_MOE_CUDA=1)

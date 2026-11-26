@@ -27,7 +27,7 @@
 #include <utility>
 
 #include <fcntl.h>
-#include <unistd.h>
+#include "ds4_fd.hpp"   // open, close, pread on Windows, unistd.h on POSIX; the header says why they have their own names
 
 #include "strata/artifact/ds4_geometry.hpp"
 
@@ -640,8 +640,8 @@ struct Ds4GgufBlobs::Impl {
     std::vector<int> dfds;
     std::vector<int> dfd[3];
     ~Impl() {
-        for (int f : fds) if (f >= 0) ::close(f);
-        for (int f : dfds) if (f >= 0) ::close(f);
+        for (int f : fds) if (f >= 0) ds4_close(f);
+        for (int f : dfds) if (f >= 0) ds4_close(f);
     }
 };
 
@@ -684,14 +684,14 @@ bool Ds4GgufBlobs::open(std::string& err) {
                 if (!std::getenv("STRATA_BLOB_MMAP")) {
                     if (im_->fds.size() < im_->model->size()) im_->fds.assign(im_->model->size(), -1);
                     int& fdv = im_->fds[at];
-                    if (fdv < 0) fdv = ::open(im_->model->shard(at).path().c_str(), O_RDONLY | O_CLOEXEC);
+                    if (fdv < 0) fdv = ds4_open(im_->model->shard(at).path().c_str(), O_RDONLY | O_CLOEXEC);
                     if (im_->fd[r].empty()) { im_->fd[r].assign((size_t) g_.n_layers, -1); im_->foff[r].assign((size_t) g_.n_layers, 0); }
                     im_->fd[r][(size_t) l] = fdv;
                     const char* dv = std::getenv("STRATA_BLOB_DIRECT");
                     if (!(dv && dv[0] == '0')) {
                         if (im_->dfds.size() < im_->model->size()) im_->dfds.assign(im_->model->size(), -2);
                         int& dfv = im_->dfds[at];
-                        if (dfv == -2) dfv = ::open(im_->model->shard(at).path().c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+                        if (dfv == -2) dfv = ds4_open(im_->model->shard(at).path().c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
                         if (im_->dfd[r].empty()) im_->dfd[r].assign((size_t) g_.n_layers, -1);
                         im_->dfd[r][(size_t) l] = dfv;
                     }
@@ -722,10 +722,10 @@ void Ds4GgufBlobs::read_span(int r, int64_t layer, int64_t expert, size_t lo, si
     if (dfv >= 0) {   // O_DIRECT: the aligned span around the range, then the range out of it
         constexpr uint64_t A = 4096;
         const uint64_t a0 = off & ~(A - 1), a1 = (off + n + A - 1) & ~(A - 1);
-        struct Bounce { uint8_t* p = nullptr; size_t n = 0; ~Bounce() { std::free(p); } };
+        struct Bounce { uint8_t* p = nullptr; size_t n = 0; ~Bounce() { ds4_free(p); } };
         thread_local Bounce bb;
         if (bb.n < a1 - a0) {
-            std::free(bb.p);
+            ds4_free(bb.p);
             bb.p = nullptr;
             bb.n = 0;
             void* q = nullptr;
@@ -734,7 +734,7 @@ void Ds4GgufBlobs::read_span(int r, int64_t layer, int64_t expert, size_t lo, si
         if (bb.p) {
             size_t got = 0;
             while (got < a1 - a0) {
-                const ssize_t k = ::pread(dfv, bb.p + got, (size_t) (a1 - a0 - got), (off_t) (a0 + got));
+                const ssize_t k = ds4_pread(dfv, bb.p + got, (size_t) (a1 - a0 - got), (int64_t) (a0 + got));
                 if (k <= 0) break;
                 got += (size_t) k;
             }
@@ -747,7 +747,7 @@ void Ds4GgufBlobs::read_span(int r, int64_t layer, int64_t expert, size_t lo, si
     if (fdv >= 0) {   // pread the range; fall back to the mmap on any short read / error
         size_t got = 0;
         while (got < n) {
-            const ssize_t k = ::pread(fdv, dst + got, n - got, (off_t) (off + got));
+            const ssize_t k = ds4_pread(fdv, dst + got, n - got, (int64_t) (off + got));
             if (k <= 0) break;
             got += (size_t) k;
         }
