@@ -1,5 +1,8 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>   // _mkdir: MSVC's sys/stat.h declares no POSIX mkdir
+#endif
 #include "strata/kernels/expert_keep.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -3029,7 +3032,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         char nm[32];
         std::snprintf(nm, sizeof nm, "/r%05lld", kva_seq++);
         g_kva_req_dir = kva.capture_dir + nm;
+#ifdef _WIN32
+        _mkdir(g_kva_req_dir.c_str());
+#else
         ::mkdir(g_kva_req_dir.c_str(), 0775);
+#endif
         kva_capture.dir = g_kva_req_dir;
         kva_capture.begin_prompt(pos0);
         if (std::FILE* pf = std::fopen((g_kva_req_dir + "/p0.txt").c_str(), "w")) {

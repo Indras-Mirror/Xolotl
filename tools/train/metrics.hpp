@@ -9,6 +9,10 @@
 #include <cstdio>
 #include <string>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>   // _mkdir: MSVC's sys/stat.h declares no POSIX mkdir
+#define mkdir(path, mode) _mkdir(path)
+#endif
 #include <utility>
 #include <vector>
 
