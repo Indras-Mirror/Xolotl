@@ -10,7 +10,7 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ### Trellis-coded tensor types (TQP5/6/7) (27 Nov)
 
-- **New ggml types** `TQP5`, `TQP6`, `TQP7` (ids 147-149, about 5, 6 and 7 bits a weight), in
+- **New ggml types** `TQP5`, `TQP6`, `TQP7` (ids 147-149; 2.625, 3.125 and 3.625 bits a weight: 128 weights in 2 + 8K bytes), in
   `tools/xolotl/ggml/xolotl-ggml.patch`: CPU `to_float` / `vec_dot`, CUDA matrix-vector (decode) and dequant, and
   gguf-py ids. The ids sit well above upstream ggml's range and the file carries a GGUF metadata flag, so other
   engines reject a TQP file cleanly instead of misreading it. Re-run `tools/xolotl/fetch-llama.sh` after pulling.
