@@ -26,7 +26,25 @@
 #include <fcntl.h>
 #include <stdexcept>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>                 // _open/_close/_read: the fd API, though MSVC has no unistd.h
+#include <stdint.h>
+#include <sys/types.h>          // declares off_t itself: read before the macro below, not again after it
+typedef long long ssize_t;      // POSIX ssize_t, MSVC has none
+#define off_t int64_t           // MSVC's off_t is 32-bit; the seek below casts a 64-bit offset through it
+// pread as seek + read: one loop in encode() reads the projector, tensor by tensor, so the two calls cannot interleave
+static inline long long pread_win(int fd, void* buf, size_t n, int64_t off) {
+    if (_lseeki64(fd, off, SEEK_SET) < 0) return -1;
+    return _read(fd, buf, (unsigned) n);
+}
+#define pread(fd, buf, n, off) pread_win((fd), (buf), (n), (off))
+static inline int open_readonly(const char* path) { return _open(path, O_RDONLY | _O_BINARY); }   // text mode would translate CRLF into the file
+static inline int close_fd(int fd) { return _close(fd); }
+#else
 #include <unistd.h>
+static inline int open_readonly(const char* path) { return ::open(path, O_RDONLY); }
+static inline int close_fd(int fd) { return ::close(fd); }
+#endif
 #include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -398,7 +416,7 @@ Encoder* load(const std::string& mmproj, ggml_backend_t gpu, ggml_backend_t cpu,
         free(e);
         return nullptr;
     }
-    e->fd = ::open(mmproj.c_str(), O_RDONLY);
+    e->fd = open_readonly(mmproj.c_str());
     if (e->fd < 0) { err = "cannot open the mmproj " + mmproj; free(e); return nullptr; }
     e->data_off = gguf_get_data_offset(e->gctx);
     ggml_backend_t bes[2] = {e->dev, e->cpu};
@@ -423,7 +441,7 @@ void free(Encoder* e) {
     if (!e) return;
     if (e->sched) ggml_backend_sched_free(e->sched);
     release_weights(*e);
-    if (e->fd >= 0) ::close(e->fd);
+    if (e->fd >= 0) close_fd(e->fd);
     if (e->gctx) gguf_free(e->gctx);
     if (e->wctx) ggml_free(e->wctx);
     delete e;
