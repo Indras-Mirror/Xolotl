@@ -43,6 +43,8 @@
 #include <map>
 #include <set>
 #include <string>
+#include <strings.h>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -392,11 +394,26 @@ static bool load_weights(ErnieGraph::Impl & im, std::string & err) {
         return is_routed(n) || n == "token_embd.weight";   // the tier reads the experts; the embedding is host-side
     };
     auto key = [&](const std::string & n) { return im.draft ? draft_name(n) : n; };
+    // STRATA_DENSE_REQUANT=<ggml type name> (q6_K, q5_K, q4_K, ...; OFF by default, the DS4.1 engine's switch): every
+    // Q8_0 dense matrix the GPU graphs read (attention, shared expert, latent projections; output.weight unless
+    // STRATA_DENSE_REQUANT_HEAD=0) is re-quantized in memory at load: rows dequantized, quantized to that type.  The
+    // file is not touched.  The VRAM it frees goes to the expert cache when --slots is 0 (auto).
+    ggml_type rq = GGML_TYPE_COUNT;
+    if (const char * e = std::getenv("STRATA_DENSE_REQUANT"); e && *e && !im.cpu)
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t)
+            if (ggml_get_type_traits((ggml_type) t)->type_name && strcasecmp(ggml_type_name((ggml_type) t), e) == 0) rq = (ggml_type) t;
+    const bool rq_head = !(std::getenv("STRATA_DENSE_REQUANT_HEAD") && std::getenv("STRATA_DENSE_REQUANT_HEAD")[0] == '0');
+    auto requant = [&](const TensorInfo & ti) {
+        return rq != GGML_TYPE_COUNT && (ggml_type) ti.type == GGML_TYPE_Q8_0 && ti.shape.size() == 2 &&
+               (int64_t) ti.shape[0] % ggml_blck_size(rq) == 0 && (rq_head || ti.name != "output.weight") &&
+               // tables read with ggml_get_rows keep their type (CUDA get_rows has no K-quant rows)
+               ti.name.find("attn_compressor_ape") == std::string::npos && ti.name.find("markov_head") == std::string::npos;
+    };
     auto make = [&](const TensorInfo & ti) {
         int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
         const int nd = (int) std::min<size_t>(ti.shape.size(), GGML_MAX_DIMS);
         for (int d = 0; d < nd; ++d) ne[d] = (int64_t) ti.shape[(size_t) d];
-        ggml_tensor * t = ggml_new_tensor(w.ctx, (ggml_type) ti.type, nd, ne);
+        ggml_tensor * t = ggml_new_tensor(w.ctx, requant(ti) ? rq : (ggml_type) ti.type, nd, ne);
         ggml_set_name(t, ti.name.c_str());
         return t;
     };
@@ -455,6 +472,7 @@ static bool load_weights(ErnieGraph::Impl & im, std::string & err) {
             return -1;
         };
         int n_edit = 0;
+        size_t rq_n = 0, rq_from = 0, rq_to = 0;
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(w.ctx, ggml_backend_get_default_buffer_type(im.backend));
         if (!buf) { err = "cannot allocate the dense weights on the backend"; return false; }
         w.bufs.push_back(buf);
@@ -463,18 +481,42 @@ static bool load_weights(ErnieGraph::Impl & im, std::string & err) {
                 if (skip(ti.name)) continue;
                 ggml_tensor * t = w.t[key(ti.name)];
                 const int al = im.draft ? -1 : abl_layer(ti.name);
-                if (al < 0) {
+                if (al < 0 && (int) t->type == (int) ti.type) {
                     ggml_backend_tensor_set(t, model.shard(s).tensor_data(ti), 0, ggml_nbytes(t));
+                    continue;
+                }
+                if (al < 0) {   // STRATA_DENSE_REQUANT: the file's rows -> t->type, threads over rows
+                    const int64_t n0 = t->ne[0], nr = ggml_nrows(t);
+                    const ggml_type st = (ggml_type) ti.type;
+                    const size_t src_row = ggml_row_size(st, n0), dst_row = ggml_row_size(t->type, n0);
+                    const uint8_t * src = model.shard(s).tensor_data(ti);
+                    std::vector<uint8_t> dst((size_t) nr * dst_row);
+                    const int nth = (int) std::max(1u, std::thread::hardware_concurrency());
+                    std::vector<std::thread> th;
+                    for (int k = 0; k < nth; ++k)
+                        th.emplace_back([&, k] {
+                            std::vector<float> f((size_t) n0);
+                            for (int64_t r = k; r < nr; r += nth) {
+                                ggml_get_type_traits(st)->to_float(src + (size_t) r * src_row, f.data(), n0);
+                                ggml_quantize_chunk(t->type, f.data(), dst.data() + (size_t) r * dst_row, 0, 1, n0, nullptr);
+                            }
+                        });
+                    for (auto & x : th) x.join();
+                    ggml_backend_tensor_set(t, dst.data(), 0, dst.size());
+                    ++rq_n;
+                    rq_from += (size_t) nr * src_row;
+                    rq_to += dst.size();
                     continue;
                 }
                 // W [in = ne0, out = ne1]: v = r^T W (length in), W[j][:] -= scale * r_j * v
                 const int64_t in = t->ne[0], out = t->ne[1];
                 if (out != im.D || ggml_nrows(t) != out) { err = "abl: " + ti.name + " does not write n_embd rows"; return false; }
-                const ggml_type ty = t->type;
-                const ggml_type_traits * tr = ggml_get_type_traits(ty);
+                const ggml_type ty = t->type;   // the stored type (a requant target when STRATA_DENSE_REQUANT is set)
+                const ggml_type sty = (ggml_type) ti.type;   // the file's type, what src holds
+                const ggml_type_traits * tr = ggml_get_type_traits(sty);
                 std::vector<float> wf((size_t) in * out);
                 const uint8_t * src = model.shard(s).tensor_data(ti);
-                if (ty == GGML_TYPE_F32) std::memcpy(wf.data(), src, wf.size() * 4);
+                if (sty == GGML_TYPE_F32) std::memcpy(wf.data(), src, wf.size() * 4);
                 else if (tr && tr->to_float) tr->to_float(src, wf.data(), (int64_t) wf.size());
                 else { err = "abl: no row reader for " + ti.name; return false; }
                 const float * r = abl.data() + (size_t) al * im.D;
@@ -500,6 +542,9 @@ static bool load_weights(ErnieGraph::Impl & im, std::string & err) {
             }
         if (!abl.empty()) std::fprintf(stderr, "ernie_graph: ablation %s, scale %.3f: %d writer matrices edited\n",
                                        im.cfg.abl_file.c_str(), im.cfg.abl_scale, n_edit);
+        if (rq != GGML_TYPE_COUNT)
+            std::fprintf(stderr, "ernie_graph%s: STRATA_DENSE_REQUANT=%s: %zu Q8_0 matrices re-quantized, %.2f -> %.2f GB (+%d edited)\n",
+                         im.draft ? " (draft)" : "", ggml_type_name(rq), rq_n, rq_from / 1e9, rq_to / 1e9, n_edit);
     }
     if (im.draft) {
         // the trunk's LM head (no copy: same backend), and each stage's wkv = its rows of context_wkv_proj (the three
