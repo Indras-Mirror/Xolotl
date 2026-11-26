@@ -82,6 +82,8 @@
 - **[jesdga95](https://github.com/jesdga95/basalt)** (Basalt, Jesus Gulfo): the Inkling-2-Mini prompt attention kernel (`attn_prompt.cu`, ported as `inkling_attn_prompt`) and the fused-decode and DSpark designs our Inkling kernels follow; the priced stream-all prefill chunk, quoted tool calls in
   string values, union/nullable tool parameters, IQ code bytes by shift, IQ1_M on MMQ, and the ideas behind the
   DeepSeek-V4.1 Engram read-ahead and late shared expert
+- **[mehzhure](https://github.com/mehzhure)**: the Windows 11 / CUDA 12.8 port report with patches (#148): the tokenizer
+  pack's special-id names (Glimmer's finish_reason), the MSVC + CUDA 12.x shared runtime, the 12.8 `cudaMemcpyBatchAsync` form
 
 ---
 
