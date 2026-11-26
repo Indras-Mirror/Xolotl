@@ -67,7 +67,7 @@ namespace inkling_stats { enum { ST_Q = 0, ST_K, ST_V, ST_O, ST_F, ST_ACT, ST_ID
 #include "inkling_vision.h"    // --mmproj: the inkling2v image encoder, in-process (GENI/ENC)
 
 #include <signal.h>
-#include <unistd.h>
+#include "strata/platform/win_compat.hpp"   // <unistd.h>; on MSVC also the 64-bit off_t, fseeko, __popcnt, M_PI, setenv
 
 #include <algorithm>
 #include <atomic>
@@ -2974,7 +2974,9 @@ int main(int argc, char** argv) {
     if (with_down_hess)
         std::fprintf(stderr, "xolotl-inkling: stats: --with-down-hess is not produced by this slice "
                              "(exp_dn_sq, the per-expert down diagonal, is); continuing with the diagonal only\n");
+#ifdef SIGPIPE                             // MSVC's signal.h has no SIGPIPE (a write to a closed pipe returns an error there)
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     if (route_log.empty()) if (const char* e = std::getenv("XOLOTL_INKLING_ROUTE_LOG")) route_log = e;
 

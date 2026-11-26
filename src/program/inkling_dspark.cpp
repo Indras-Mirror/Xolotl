@@ -24,6 +24,8 @@
 #include "ggml-cuda.h"
 #include "gguf.h"
 
+#include "strata/platform/win_compat.hpp"   // MSVC: the 64-bit off_t and fseeko the seeks below are cast through
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>

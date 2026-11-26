@@ -42,7 +42,7 @@
 #include <cuda_runtime.h>
 
 #include <signal.h>
-#include <unistd.h>
+#include "strata/platform/win_compat.hpp"   // <unistd.h>; on MSVC also the 64-bit off_t and fseeko (see the header)
 
 #include <algorithm>
 #include <atomic>
@@ -974,7 +974,9 @@ int main(int argc, char** argv) {
         else std::fprintf(stderr, "xolotl-glimmer: ignoring unknown option %s\n", a.c_str());
     }
     if (gguf_path.empty() || (!serve && !dump)) { usage(); return 2; }
+#ifdef SIGPIPE                             // MSVC's signal.h has no SIGPIPE (a write to a closed pipe returns an error there)
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     Model m;
     m.ubatch = std::max(16, ubatch);
