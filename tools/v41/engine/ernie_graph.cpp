@@ -226,6 +226,21 @@ struct ErnieGraph::Impl {
     };
     std::map<GKey, ggml_cgraph *> graphs;
     std::map<GKey, ggml_tensor *> head_out;
+    std::map<GKey, std::vector<ggml_tensor *>> draft_out;   // dspark_draft: the Markov chain's argmax nodes
+
+    // ---- DSpark (ErnieGraphConfig::dspark_trunk)
+    bool draft = false;                   // this graph runs the sidecar's draft stages
+    const Impl * trunk = nullptr;         // draft mode: the trunk (geometry, token_embd, output.weight)
+    const GgufModel * emb_model = nullptr;   // where token_embd.weight is read (the trunk's file in draft mode)
+    int64_t committed = 0;                // draft mode: positions whose window rows dspark_commit wrote
+    int64_t DM = 0;                       // draft mode: keys per block query, RAW + NC (padded to 256 off the CPU)
+    ggml_tensor * i_dmask = nullptr;      // F32 [DM, NC] the block's mask (the same for every query)
+    ggml_tensor * i_mh = nullptr;         // F32 [3 D, RAW] main_hidden rows to commit
+    ggml_tensor * i_cwpos = nullptr;      // I32 [RAW] their positions
+    ggml_tensor * i_cwslot = nullptr;     // I32 [RAW] their ring slots
+    ggml_tensor * i_anchor = nullptr;     // I32 [1]  the Markov chain's first prev token
+    struct Spec { int64_t pos0 = -1; int n = 0; std::vector<std::vector<uint8_t>> raw, kv, sc; };
+    Spec spec;                            // trunk: spec_save / spec_rollback
 
     ~Impl() {
         if (ibuf) ggml_backend_buffer_free(ibuf);
@@ -355,6 +370,18 @@ ggml_tensor * multimax(ErnieGraph::Impl & im, ggml_context * gc, ggml_tensor * l
 
 // ================================================================== weights
 
+// Draft mode: a sidecar tensor's name in the trunk's convention, so the layer graphs read the stages unchanged:
+// dspark.blk.N.* -> blk.N.*, the head mixer / norm -> output_hc_* / output_norm; the rest (main_proj, main_norm,
+// context_wkv_proj, markov_head.*, confidence_head.*) keep their dspark.* names.
+static std::string draft_name(const std::string & n) {
+    if (n.rfind("dspark.blk.", 0) == 0) return n.substr(7);
+    if (n == "dspark.hc_head_fn.weight") return "output_hc_fn.weight";
+    if (n == "dspark.hc_head_base.weight") return "output_hc_base.weight";
+    if (n == "dspark.hc_head_scale.weight") return "output_hc_scale.weight";
+    if (n == "dspark.norm.weight") return "output_norm.weight";
+    return n;
+}
+
 static bool load_weights(ErnieGraph::Impl & im, std::string & err) {
     WStore & w = im.w;
     const GgufModel & model = *im.model;
@@ -364,6 +391,7 @@ static bool load_weights(ErnieGraph::Impl & im, std::string & err) {
     auto skip = [](const std::string & n) {
         return is_routed(n) || n == "token_embd.weight";   // the tier reads the experts; the embedding is host-side
     };
+    auto key = [&](const std::string & n) { return im.draft ? draft_name(n) : n; };
     auto make = [&](const TensorInfo & ti) {
         int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
         const int nd = (int) std::min<size_t>(ti.shape.size(), GGML_MAX_DIMS);
@@ -387,14 +415,14 @@ static bool load_weights(ErnieGraph::Impl & im, std::string & err) {
                     err = "cannot bind " + ti.name;
                     return false;
                 }
-                w.t[ti.name] = t;
+                w.t[key(ti.name)] = t;
             }
         }
     } else {
         for (size_t s = 0; s < model.size(); ++s)
             for (const auto & ti : model.shard(s).tensors()) {
                 if (skip(ti.name)) continue;
-                w.t[ti.name] = make(ti);
+                w.t[key(ti.name)] = make(ti);
             }
         // --- the optional directional ablation (ErnieGraphConfig::abl_file)
         std::vector<float> abl;
@@ -433,8 +461,8 @@ static bool load_weights(ErnieGraph::Impl & im, std::string & err) {
         for (size_t s = 0; s < model.size(); ++s)
             for (const auto & ti : model.shard(s).tensors()) {
                 if (skip(ti.name)) continue;
-                ggml_tensor * t = w.t[ti.name];
-                const int al = abl_layer(ti.name);
+                ggml_tensor * t = w.t[key(ti.name)];
+                const int al = im.draft ? -1 : abl_layer(ti.name);
                 if (al < 0) {
                     ggml_backend_tensor_set(t, model.shard(s).tensor_data(ti), 0, ggml_nbytes(t));
                     continue;
@@ -473,6 +501,23 @@ static bool load_weights(ErnieGraph::Impl & im, std::string & err) {
         if (!abl.empty()) std::fprintf(stderr, "ernie_graph: ablation %s, scale %.3f: %d writer matrices edited\n",
                                        im.cfg.abl_file.c_str(), im.cfg.abl_scale, n_edit);
     }
+    if (im.draft) {
+        // the trunk's LM head (no copy: same backend), and each stage's wkv = its rows of context_wkv_proj (the three
+        // stages' wkv stacked in stage order, one GEMM in the reference's CommitKvProj)
+        w.t["output.weight"] = im.trunk->w.get("output.weight");
+        ggml_tensor * cw = w.get("dspark.context_wkv_proj.weight");
+        if (cw->ne[0] != im.D || cw->ne[1] != im.DH * im.nl) {
+            err = "dspark.context_wkv_proj is not [n_embd, n_stages * d_head]";
+            return false;
+        }
+        for (int64_t s = 0; s < im.nl; ++s) {
+            ggml_tensor * v = ggml_view_2d(w.ctx, cw, cw->ne[0], im.DH, cw->nb[1], (size_t) (s * im.DH) * cw->nb[1]);
+            if (ggml_backend_view_init(v) != GGML_STATUS_SUCCESS) { err = "cannot view context_wkv_proj"; return false; }
+            const std::string n = "blk." + std::to_string(s) + ".attn_kv.weight";
+            ggml_set_name(v, n.c_str());
+            w.t[n] = v;
+        }
+    }
     return true;
 }
 
@@ -491,6 +536,7 @@ bool ErnieGraph::Impl::gctx_room() const {
 void ErnieGraph::Impl::reset_graphs() {
     graphs.clear();
     head_out.clear();
+    draft_out.clear();
     for (Allo * al : { &allo_dec, &allo_pass }) {
         if (al->a) ggml_gallocr_free(al->a);
         al->a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
@@ -566,7 +612,7 @@ static bool alloc_state(ErnieGraph::Impl & im, std::string & err) {
         }
     }
 
-    ggml_init_params ip = { ggml_tensor_overhead() * 64, nullptr, true };
+    ggml_init_params ip = { ggml_tensor_overhead() * 80, nullptr, true };
     im.ictx = ggml_init(ip);
     auto I = [&](ggml_type t, int64_t a, int64_t b2 = 1) {
         return b2 == 1 ? ggml_new_tensor_1d(im.ictx, t, a) : ggml_new_tensor_2d(im.ictx, t, a, b2);
@@ -580,6 +626,15 @@ static bool alloc_state(ErnieGraph::Impl & im, std::string & err) {
     im.i_cslot = I(GGML_TYPE_I32, NC);
     im.i_cnvis = I(GGML_TYPE_F32, NC);
     im.i_posf = I(GGML_TYPE_F32, NC);
+    if (im.draft) {
+        im.DM = im.RAW + NC;
+        if (!im.cpu) im.DM = (im.DM + 255) / 256 * 256;   // ggml-cuda's flash-attn for d 512: keys a multiple of 256
+        im.i_dmask = I(GGML_TYPE_F32, im.DM, NC);
+        im.i_mh = I(GGML_TYPE_F32, 3 * im.D, im.RAW);
+        im.i_cwpos = I(GGML_TYPE_I32, im.RAW);
+        im.i_cwslot = I(GGML_TYPE_I32, im.RAW);
+        im.i_anchor = I(GGML_TYPE_I32, 1);
+    }
     im.ibuf = ggml_backend_alloc_ctx_tensors(im.ictx, im.backend);
     if (!im.ibuf) { err = "cannot allocate the pass inputs"; return false; }
     ggml_backend_buffer_clear(im.ibuf, 0);
@@ -610,7 +665,30 @@ bool ErnieGraph::init(const std::string & gguf, const ErnieGraphConfig & cfg, st
         err = std::string("open ") + gguf + ": " + e.what();
         return false;
     }
-    if (!im.g.load(*im.model, err)) return false;
+    if (cfg.dspark_trunk) {
+        // draft mode: the trunk's geometry with the sidecar's stage count; every stage is an HCA MoE layer
+        const Impl & T = *cfg.dspark_trunk->p_;
+        if (T.draft || T.nl < 1) { err = "dspark_trunk is not an initialised trunk"; return false; }
+        if (cfg.backend && cfg.backend != T.backend) { err = "the draft must run on the trunk's backend"; return false; }
+        int64_t ns = 0;
+        while (im.model->find("dspark.blk." + std::to_string(ns) + ".attn_norm.weight")) ++ns;
+        if (ns < 1 || !im.model->find("dspark.main_proj.weight") || !im.model->find("dspark.markov_head.embed.weight")) {
+            err = gguf + ": not an ERNIE DSpark sidecar (no dspark.blk.0 / main_proj / markov_head)";
+            return false;
+        }
+        im.draft = true;
+        im.trunk = &T;
+        im.g = T.g;
+        im.g.n_layer = ns;
+        im.g.ratio.assign((size_t) ns, kHcaRatio);
+        im.g.dense_lead = 0;
+        im.g.has_mla = false;
+        im.emb_model = T.model.get();
+        im.cfg.backend = T.backend;
+    } else {
+        if (!im.g.load(*im.model, err)) return false;
+        im.emb_model = im.model.get();
+    }
     const ErnieGeometry & G = im.g;
     im.nl = G.n_layer;
     for (int64_t l = 0; l < im.nl; ++l) {
@@ -640,12 +718,19 @@ bool ErnieGraph::init(const std::string & gguf, const ErnieGraphConfig & cfg, st
         err = "a dense-path width is not a Q8_0 block multiple";
         return false;
     }
-    for (const char * n : { "output_hc_fn.weight", "output_hc_base.weight", "output_hc_scale.weight",
-                            "output_norm.weight", "output.weight" }) {
-        if (!im.model->find(n)) { err = std::string("missing tensor ") + n; return false; }
+    if (im.draft) {
+        for (const char * n : { "dspark.hc_head_fn.weight", "dspark.hc_head_base.weight", "dspark.hc_head_scale.weight",
+                                "dspark.norm.weight", "dspark.main_norm.weight", "dspark.context_wkv_proj.weight",
+                                "dspark.markov_head.head.weight" })
+            if (!im.model->find(n)) { err = std::string("missing tensor ") + n; return false; }
+    } else {
+        for (const char * n : { "output_hc_fn.weight", "output_hc_base.weight", "output_hc_scale.weight",
+                                "output_norm.weight", "output.weight" }) {
+            if (!im.model->find(n)) { err = std::string("missing tensor ") + n; return false; }
+        }
     }
-    if (cfg.backend) {
-        im.backend = cfg.backend;
+    if (im.cfg.backend) {
+        im.backend = im.cfg.backend;
     } else {
         im.backend = ggml_backend_cpu_init();
         if (!im.backend) { err = "cannot create the CPU backend"; return false; }
@@ -683,8 +768,9 @@ bool ErnieGraph::begin(const int * tids, int np, int p0) {
         im.err = "pass of " + std::to_string(np) + " tokens (max_pass " + std::to_string(im.NC) + ")";
         return false;
     }
-    if (p0 != im.next_pos) {
-        im.err = "begin at position " + std::to_string(p0) + " but the state is at " + std::to_string(im.next_pos);
+    if (im.draft ? p0 != im.committed : p0 != im.next_pos) {
+        im.err = "begin at position " + std::to_string(p0) + " but the state is at " +
+                 std::to_string(im.draft ? im.committed : im.next_pos);
         return false;
     }
     if ((int64_t) p0 + np > im.cfg.ctx_max) { im.err = "pass past ctx_max"; return false; }
@@ -693,14 +779,14 @@ bool ErnieGraph::begin(const int * tids, int np, int p0) {
 
     // ---- the residual: the token embedding replicated over the HC streams; pre = one-hot (make_identity_pre_mix)
     size_t es = 0;
-    const TensorInfo * emb = im.model->find("token_embd.weight", &es);
+    const TensorInfo * emb = im.emb_model->find("token_embd.weight", &es);
     if (!emb) { im.err = "token_embd.weight is missing"; return false; }
     const ggml_type ety = (ggml_type) emb->type;
     const ggml_type_traits * etr = ggml_get_type_traits(ety);
     if (!etr || (ety != GGML_TYPE_F32 && !etr->to_float)) { im.err = "token_embd type has no row reader"; return false; }
     if ((size_t) im.D % ggml_blck_size(ety)) { im.err = "token_embd row is not a whole number of blocks"; return false; }
     const size_t emb_row = (size_t) im.D / ggml_blck_size(ety) * ggml_type_size(ety);
-    const uint8_t * emb_base = im.model->shard(es).tensor_data(*emb);
+    const uint8_t * emb_base = im.emb_model->shard(es).tensor_data(*emb);
     std::vector<float> xh((size_t) np * im.HC * im.D);
     std::vector<float> preh((size_t) np * im.HC, 0.0f);
     for (int t = 0; t < np; ++t) {
@@ -717,6 +803,25 @@ bool ErnieGraph::begin(const int * tids, int np, int p0) {
     }
     ggml_backend_tensor_set(im.x_state, xh.data(), 0, xh.size() * 4);
     ggml_backend_tensor_set(im.pre_state, preh.data(), 0, preh.size() * 4);
+
+    if (im.draft) {
+        // a draft block: positions p0..p0+np-1; every query sees the committed ring rows + all np block rows
+        std::vector<int32_t> pos_i((size_t) np);
+        for (int t = 0; t < np; ++t) pos_i[(size_t) t] = (int32_t) (p0 + t);
+        std::vector<float> dm((size_t) im.DM * np, NEG_INF);
+        for (int t = 0; t < np; ++t) {
+            float * col = dm.data() + (size_t) im.DM * t;
+            static const bool nowin = [] { const char * e = std::getenv("ERNIE_DSPARK_NOWIN"); return e && *e == '1'; }();
+            for (int64_t j = 0; j < im.RAW; ++j) if (!nowin && (im.committed >= im.RAW || j < im.committed)) col[j] = 0.0f;
+            for (int j = 0; j < np; ++j) col[im.RAW + j] = 0.0f;
+        }
+        ggml_backend_tensor_set(im.i_pos, pos_i.data(), 0, pos_i.size() * 4);
+        ggml_backend_tensor_set(im.i_dmask, dm.data(), 0, dm.size() * 4);
+        im.segs.clear();
+        im.nblk = 0;
+        im.ncomp = 0;
+        return true;
+    }
 
     // ---- positions / window gather / compressor bookkeeping (host, as ds41_dense's upload_inputs)
     std::vector<int32_t> pos_i((size_t) np), pslot((size_t) np), widx((size_t) im.RAW * np);
@@ -990,7 +1095,7 @@ static ggml_cgraph * build_attn(ErnieGraph::Impl & im, ggml_context * gc, int il
     kv16 = im.cfg.kv_f16 ? ggml_cast(gc, ggml_cont(gc, kv2), GGML_TYPE_F16) : ggml_cont(gc, kv2);
 
     // ---- the per-layer compressor: projections into the pending 128-block, a pool on every block that closes here
-    {
+    if (!im.draft) {
         ggml_tensor * skv = ernie_mm(gc, im.BL(il, "attn_compressor_kv.weight"), xn);     // [DH, n]
         ggml_tensor * ssc = ernie_mm(gc, im.BL(il, "attn_compressor_gate.weight"), xn);
         ggml_mul_mat_set_prec(skv, GGML_PREC_F32);
@@ -1025,6 +1130,19 @@ static ggml_cgraph * build_attn(ErnieGraph::Impl & im, ggml_context * gc, int il
 
     // ---- attention over [window | every completed compressed row], per-head sinks
     {
+        ggml_tensor * o = nullptr;
+        if (im.draft) {
+            // DSpark block: ONE key list for every query, [the committed ring | this block's rows], padded to DM
+            // (i_dmask: invalid ring rows and the padding -inf).  Non-causal inside the block, as the reference.
+            ggml_tensor * Kd = ggml_concat(gc, im.ly[(size_t) il].raw, kv16, 1);                // [DH, RAW + n]
+            if (im.DM > im.RAW + n)
+                Kd = ggml_concat(gc, Kd, ggml_fill(gc, ggml_new_tensor_2d(gc, Kd->type, DH, im.DM - im.RAW - n), 0.0f), 1);
+            ggml_tensor * k4 = ggml_reshape_4d(gc, Kd, DH, im.DM, 1, 1);
+            if (k4->type != GGML_TYPE_F16) k4 = ggml_cast(gc, k4, GGML_TYPE_F16);
+            ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, qr_rope, DH, NH, n, 1), 0, 2, 1, 3);   // [DH, n, NH, 1]
+            ggml_tensor * m4 = ggml_cast(gc, b.cols2(im.i_dmask, im.DM, n), GGML_TYPE_F16);   // [DM, n]
+            o = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
+        } else {
         ggml_tensor * wsrc = ggml_concat(gc, im.ly[(size_t) il].raw, kv16, 1);                 // [DH, RAW + n]
         ggml_tensor * Kw = ggml_reshape_3d(gc, ggml_get_rows(gc, wsrc, b.v1(im.i_widx, im.RAW * n, 0)),
                                            DH, im.RAW, n);
@@ -1054,7 +1172,8 @@ static ggml_cgraph * build_attn(ErnieGraph::Impl & im, ggml_context * gc, int il
                                                        : ggml_cast(gc, ggml_reshape_4d(gc, Kall, DH, M, 1, n), GGML_TYPE_F16);
         ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, qr_rope, DH, NH, 1, n), 0, 2, 1, 3);
         ggml_tensor * m4 = ggml_cast(gc, ggml_reshape_4d(gc, Mall, M, 1, 1, n), GGML_TYPE_F16);
-        ggml_tensor * o = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
+        o = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
+        }
         if (ernie_prec_f32()) ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
         ggml_flash_attn_ext_add_sinks(o, im.BL(il, "attn_sinks.weight"));
         o = ggml_reshape_3d(gc, o, DH, NH, n);
@@ -1141,7 +1260,7 @@ static ggml_cgraph * build_attn(ErnieGraph::Impl & im, ggml_context * gc, int il
             outs.push_back(ggml_cpy(gc, wts, b.cols2(im.o_wts, im.NU, n, 0)));
         }
         // ---- the window ring: the pass's last min(n, RAW) rows at their slots (every read of `raw` is above)
-        if (kv16) {
+        if (kv16 && !im.draft) {   // (a draft block's rows are scratch: dspark_commit writes the committed ones)
             const int64_t k = std::min<int64_t>(n, im.RAW);
             ggml_tensor * last = ggml_view_2d(gc, kv16, DH, k, kv16->nb[1], (size_t) (n - k) * kv16->nb[1]);
             late.push_back(ggml_set_rows(gc, im.ly[(size_t) il].raw, ggml_cont(gc, last), b.v1(im.i_wslot, k, 0)));
@@ -1259,7 +1378,7 @@ bool ErnieGraph::attn_router(int il, int * ids, float * wts, const float ** fn_h
     bool cached = false;
     std::vector<uint8_t> meta;
     // the graph's shape depends on the pass width, the number of visible compressed rows and the segment layout
-    const int64_t layout = (im.n == 1) ? (im.pos0 % kHcaRatio == kHcaRatio - 1 ? 1 : 0) : (im.pos0 % kHcaRatio);
+    const int64_t layout = im.draft ? 0 : (im.n == 1) ? (im.pos0 % kHcaRatio == kHcaRatio - 1 ? 1 : 0) : (im.pos0 % kHcaRatio);
     if (taps) {
         meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
         ggml_init_params p = { meta.size(), meta.data(), true };
@@ -1434,6 +1553,182 @@ bool ErnieGraph::restore(int slot) {
     im.next_pos = sn.pos;
     im.n = 0;
     im.pos0 = sn.pos;
+    return true;
+}
+
+// ================================================================== DSpark
+
+// dspark_commit's graph: main_x = main_norm(main_proj(main_hidden)); per stage s: kv = kv_a_norm(wkv_s(main_x)) +
+// the HCA rope at each row's position, written into stage s's ring at pos % 128 (the reference's CommitKvProj +
+// set_swa_key_buffer_radix_fused_norm_rope).
+static ggml_cgraph * build_commit(ErnieGraph::Impl & im, ggml_context * gc, int64_t k) {
+    B b { &im, gc, nullptr };
+    const int64_t D = im.D, DH = im.DH;
+    ggml_cgraph * gf = ggml_new_graph_custom(gc, 256, false);
+    ggml_tensor * x = ggml_view_2d(gc, im.i_mh, 3 * D, k, im.i_mh->nb[1], 0);
+    ggml_tensor * mx = b.rms_w(ernie_mm(gc, im.W("dspark.main_proj.weight"), x), im.W("dspark.main_norm.weight"));
+    ggml_tensor * pos = b.v1(im.i_cwpos, k, 0);
+    ggml_tensor * slot = b.v1(im.i_cwslot, k, 0);
+    for (int64_t s = 0; s < im.nl; ++s) {
+        ggml_tensor * kv = b.rms_w(ernie_mm(gc, im.BL(s, "attn_kv.weight"), mx), im.BL(s, "attn_kv_a_norm.weight"));
+        kv = rope_hca(gc, im.g, ggml_reshape_3d(gc, kv, DH, 1, k), pos, false);
+        ggml_tensor * kv2 = ggml_cont_2d(gc, kv, DH, k);
+        if (im.cfg.kv_f16) kv2 = ggml_cast(gc, kv2, GGML_TYPE_F16);
+        ggml_build_forward_expand(gf, ggml_set_rows(gc, im.ly[(size_t) s].raw, kv2, slot));
+    }
+    return gf;
+}
+
+// dspark_draft's graph: the head per block slot (base logits), then the Markov chain as argmax nodes (outs[t]).
+static ggml_cgraph * build_draft_head(ErnieGraph::Impl & im, ggml_context * gc, int64_t nr, std::vector<ggml_tensor *> & outs) {
+    B b { &im, gc, nullptr };
+    const int64_t D = im.D, HC = im.HC, V = im.g.vocab;
+    ggml_cgraph * gf = ggml_new_graph_custom(gc, 1024, false);
+    ggml_tensor * xs = ggml_view_3d(gc, im.x_state, D, HC, nr, im.x_state->nb[1], im.x_state->nb[2], 0);
+    ggml_tensor * h = b.rms_w(hc_head(im, gc, xs), im.W("output_norm.weight"));
+    ggml_tensor * base = multimax(im, gc, ernie_mm(gc, im.W("output.weight"), h));   // [V, nr]
+    ggml_tensor * emb = im.W("dspark.markov_head.embed.weight");                      // [rank, V]: row = a token's latent
+    ggml_tensor * head = im.W("dspark.markov_head.head.weight");                      // [rank, V]: w2, out = V
+    ggml_tensor * prev = im.i_anchor;
+    outs.clear();
+    for (int64_t t = 0; t < nr; ++t) {
+        ggml_tensor * e = ggml_get_rows(gc, emb, prev);                                // [rank, 1]
+        ggml_tensor * bias = ernie_mm(gc, head, e);                                    // [V, 1]
+        static const bool nomarkov = [] { const char * e = std::getenv("ERNIE_DSPARK_NOMARKOV"); return e && *e == '1'; }();
+        ggml_tensor * bt = ggml_view_2d(gc, base, V, 1, base->nb[1], (size_t) t * base->nb[1]);
+        ggml_tensor * lt = nomarkov ? ggml_cont(gc, bt) : ggml_add(gc, bt, bias);   // probe: base logits only
+        prev = ggml_argmax(gc, lt);                                                    // I32 [1]
+        ggml_set_output(prev);
+        ggml_build_forward_expand(gf, prev);
+        outs.push_back(prev);
+    }
+    return gf;
+}
+
+bool ErnieGraph::dspark_commit(const float * mh, int64_t pos0, int k) {
+    Impl & im = *p_;
+    if (!im.draft) { im.err = "dspark_commit: not a draft graph"; return false; }
+    if (k < 1 || k > im.RAW || !mh) { im.err = "dspark_commit: 1..128 rows"; return false; }
+    if (pos0 < 0 || !(pos0 == im.committed || k == im.RAW)) {   // in order, or a whole new ring
+        im.err = "dspark_commit: rows at " + std::to_string(pos0) + " but " + std::to_string(im.committed) +
+                 " are committed (commit in order, or a full 128-row ring)";
+        return false;
+    }
+    std::vector<int32_t> pos((size_t) k), slot((size_t) k);
+    for (int i = 0; i < k; ++i) { pos[(size_t) i] = (int32_t) (pos0 + i); slot[(size_t) i] = (int32_t) ((pos0 + i) % im.RAW); }
+    ggml_backend_tensor_set(im.i_mh, mh, 0, (size_t) k * 3 * im.D * 4);
+    ggml_backend_tensor_set(im.i_cwpos, pos.data(), 0, pos.size() * 4);
+    ggml_backend_tensor_set(im.i_cwslot, slot.data(), 0, slot.size() * 4);
+    const Impl::GKey key { -1, 7, 0, k };
+    auto it = im.graphs.find(key);
+    if (it == im.graphs.end()) {
+        if (!im.gctx_room()) im.reset_graphs();
+        it = im.graphs.emplace(key, build_commit(im, im.gctx, k)).first;
+    }
+    if (!im.compute(it->second, true)) return false;
+    im.committed = pos0 + k;
+    return true;
+}
+
+int64_t ErnieGraph::dspark_committed() const { return p_->committed; }
+
+bool ErnieGraph::dspark_draft(int anchor, int * out) {
+    Impl & im = *p_;
+    if (!im.draft) { im.err = "dspark_draft: not a draft graph"; return false; }
+    if (im.n < 1) { im.err = "dspark_draft: no block pass"; return false; }
+    if (anchor < 0 || anchor >= im.g.vocab) { im.err = "dspark_draft: anchor outside the vocabulary"; return false; }
+    const int32_t a = anchor;
+    ggml_backend_tensor_set(im.i_anchor, &a, 0, 4);
+    const Impl::GKey key { -1, 8, 0, im.n };
+    auto it = im.graphs.find(key);
+    if (it == im.graphs.end()) {
+        if (!im.gctx_room()) im.reset_graphs();
+        std::vector<ggml_tensor *> outs;
+        it = im.graphs.emplace(key, build_draft_head(im, im.gctx, im.n, outs)).first;
+        im.draft_out[key] = outs;
+    }
+    if (!im.compute(it->second, true)) return false;
+    const std::vector<ggml_tensor *> & outs = im.draft_out[key];
+    for (int t = 0; t < im.n; ++t) {
+        int32_t v = 0;
+        ggml_backend_tensor_get(outs[(size_t) t], &v, 0, 4);
+        out[t] = v;
+    }
+    return true;
+}
+
+// rows [slot0, slot0 + n) of a ring of `t->ne[1]` rows (wrapping) to / from buf
+static void ring_rows(ggml_tensor * t, int64_t slot0, int n, uint8_t * buf, bool get) {
+    const int64_t R = t->ne[1];
+    const size_t rb = t->nb[1];
+    int done = 0;
+    while (done < n) {
+        const int64_t s = (slot0 + done) % R;
+        const int take = (int) std::min<int64_t>(n - done, R - s);
+        if (get) ggml_backend_tensor_get(t, buf + (size_t) done * rb, (size_t) s * rb, (size_t) take * rb);
+        else ggml_backend_tensor_set(t, buf + (size_t) done * rb, (size_t) s * rb, (size_t) take * rb);
+        done += take;
+    }
+}
+
+bool ErnieGraph::spec_save(int64_t pos0, int n) {
+    Impl & im = *p_;
+    if (im.draft) { im.err = "spec_save: a trunk call"; return false; }
+    if (n < 1 || n > kHcaRatio || pos0 != im.next_pos) { im.err = "spec_save: 1..128 tokens at the next position"; return false; }
+    Impl::Spec & sp = im.spec;
+    sp.raw.resize(im.ly.size());
+    sp.kv.resize(im.ly.size());
+    sp.sc.resize(im.ly.size());
+    for (size_t l = 0; l < im.ly.size(); ++l) {
+        const Impl::Layer & L = im.ly[l];
+        if (!L.raw) continue;
+        sp.raw[l].resize((size_t) n * L.raw->nb[1]);
+        sp.kv[l].resize((size_t) n * L.pend_kv->nb[1]);
+        sp.sc[l].resize((size_t) n * L.pend_sc->nb[1]);
+        ring_rows(L.raw, pos0 % L.raw->ne[1], n, sp.raw[l].data(), true);
+        ring_rows(L.pend_kv, pos0 % L.pend_kv->ne[1], n, sp.kv[l].data(), true);
+        ring_rows(L.pend_sc, pos0 % L.pend_sc->ne[1], n, sp.sc[l].data(), true);
+    }
+    sp.pos0 = pos0;
+    sp.n = n;
+    return true;
+}
+
+bool ErnieGraph::spec_rollback(int64_t keep_end) {
+    Impl & im = *p_;
+    Impl::Spec & sp = im.spec;
+    if (sp.pos0 < 0 || keep_end < sp.pos0 || keep_end > sp.pos0 + sp.n) {
+        im.err = "spec_rollback: no saved verify span covers " + std::to_string(keep_end);
+        return false;
+    }
+    const int i0 = (int) (keep_end - sp.pos0), cnt = sp.n - i0;
+    if (cnt > 0)
+        for (size_t l = 0; l < im.ly.size(); ++l) {
+            const Impl::Layer & L = im.ly[l];
+            if (!L.raw) continue;
+            ring_rows(L.raw, keep_end % L.raw->ne[1], cnt, sp.raw[l].data() + (size_t) i0 * L.raw->nb[1], false);
+            ring_rows(L.pend_kv, keep_end % L.pend_kv->ne[1], cnt, sp.kv[l].data() + (size_t) i0 * L.pend_kv->nb[1], false);
+            ring_rows(L.pend_sc, keep_end % L.pend_sc->ne[1], cnt, sp.sc[l].data() + (size_t) i0 * L.pend_sc->nb[1], false);
+        }
+    im.next_pos = keep_end;
+    im.n = 0;
+    im.pos0 = (int) keep_end;
+    sp.pos0 = -1;
+    return true;
+}
+
+bool ErnieGraph::read_state_mean(int c0, int n, float * out) {
+    Impl & im = *p_;
+    if (im.n < 1 || c0 < 0 || n < 1 || c0 + n > im.n || !out) { im.err = "read_state_mean: bad rows"; return false; }
+    std::vector<float> x((size_t) (n * im.HC * im.D));
+    ggml_backend_tensor_get(im.x_state, x.data(), (size_t) c0 * im.HC * im.D * 4, x.size() * 4);
+    const float inv = 1.0f / (float) im.HC;
+    for (int t = 0; t < n; ++t)
+        for (int64_t i = 0; i < im.D; ++i) {
+            float acc = 0.0f;
+            for (int64_t h = 0; h < im.HC; ++h) acc += x[(size_t) ((t * im.HC + h) * im.D + i)];
+            out[(size_t) t * im.D + i] = acc * inv;
+        }
     return true;
 }
 

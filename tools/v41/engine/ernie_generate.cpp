@@ -80,6 +80,11 @@ struct Args {
     float abl_scale = 1.0f;
     int ds41_decode = 0;   // --ds41-decode N: the DS4.1 decode stack (see usage), N = spec_read top (0 = no spec reads)
     bool pf = false;
+    // --dspark SIDECAR: speculative decoding with ERNIE's DSpark drafter (docs/ernie/ERNIE_DSPARK_SPEC.md)
+    std::string dspark, dspark_experts = "cpu";
+    int dspark_block = 0;              // 0 = the sidecar's block_size (7)
+    int dspark_noise = 1024;           // the block's mask token (config dspark_noise_token_id)
+    double dspark_arena_gib = 11.0, dspark_slot_gib = 0.0;
 };
 
 void usage(std::FILE* out) {
@@ -121,6 +126,24 @@ void usage(std::FILE* out) {
         "  --batch-out FILE      with --batch and -n N: one line per prompt, the greedy continuation's ids then a TAB\n"
         "                        and its text with \\n escaped\n"
         "  --batch-logits FILE   with --batch: each prompt's last-row logits appended, float32 n_vocab\n"
+        "  --skip-miss W         decode: drop a VRAM-miss expert weighing < W x the token's weight sum (0 = off; measure ppl)\n"
+        "  --skip-file W         the same rule for file-tier (NVMe) experts only\n"
+        "  --vram-lru            a PCIe-share miss takes its layer's least-recently-used VRAM slot (the cache follows the chat)\n"
+        "  --arena-adapt         a file-tier read replaces its layer's least-recently-used RAM arena expert\n"
+        "  --arena-skip-resident the VRAM seed's experts stay out of the RAM arena (room for the next-ranked ones)\n"
+        "  --chunk-mmq / --chunk-prestage / --no-chunk-prefetch   prompt-chunk expert paths (see Ds41MoeConfig)\n"
+        "  --remote-device N [--remote-gib G]   a second CUDA card holds and computes the next-ranked experts\n"
+        "  --dspark FILE         speculative decoding with the DSpark sidecar (ERNIE-5.5-Flash-Preview-DSpark-*.gguf):\n"
+        "                        each step drafts a block of 7 (Markov-refined) and the trunk verifies 8 in one pass;\n"
+        "                        greedy only, the output is the trunk's own greedy text\n"
+        "  --dspark-block N      draft block (default: the sidecar's block_size)\n"
+        "  --dspark-experts cpu|gpu  the draft stages' routed experts (default cpu: read per call; gpu: own tier)\n"
+        "  --dspark-arena-gib G / --dspark-slot-gib G   the gpu draft tier's RAM arena (default 11) / VRAM cache (0)\n"
+        "  --kv-mla T            the MLA layers' KV rows (~96 %% of the KV at long context): f16 (default), q8_0 (half the\n"
+        "                        VRAM), q4_0 (a quarter; Hadamard-rotated by default)\n"
+        "  --kv-hadamard 0|1     rotate the MLA KV rows (default: on for q4_0 only)\n"
+        "  --serve               the server's engine protocol on stdin/stdout (GEN / STOP / QUIT in; READY, RESUME, PP,\n"
+        "                        T, DONE, ERR out); conversation prefixes are reused between requests\n"
         "  --stats               print the tier's counters (hits / cpu / pcie / file-tier, ms) for prefill and decode\n");
 }
 
@@ -162,6 +185,12 @@ bool parse(int argc, char** argv, Args& a) {
         else if (f == "--stats") a.stats = true;
         else if (f == "--ds41-decode") { if (!(v = next())) return false; a.ds41_decode = std::max(0, std::atoi(v)) + 1; }
         else if (f == "--pf") a.pf = true;
+        else if (f == "--dspark") { if (!(v = next())) return false; a.dspark = v; }
+        else if (f == "--dspark-block") { if (!(v = next())) return false; a.dspark_block = std::atoi(v); }
+        else if (f == "--dspark-noise") { if (!(v = next())) return false; a.dspark_noise = std::atoi(v); }
+        else if (f == "--dspark-experts") { if (!(v = next())) return false; a.dspark_experts = v; }
+        else if (f == "--dspark-arena-gib") { if (!(v = next())) return false; a.dspark_arena_gib = std::atof(v); }
+        else if (f == "--dspark-slot-gib") { if (!(v = next())) return false; a.dspark_slot_gib = std::atof(v); }
         else if (f == "--abl") { if (!(v = next())) return false; a.abl_file = v; }
         else if (f == "--abl-scale") { if (!(v = next())) return false; a.abl_scale = (float) std::atof(v); }
         else if (f == "--batch") { if (!(v = next())) return false; a.batch = v; }
@@ -333,6 +362,11 @@ int64_t g_route_experts = 0;
 int g_ds41 = 0;           // --ds41-decode N  ->  N + 1 (0 = off)
 bool g_pf = false;
 int64_t g_pred_n = 0, g_pred_in16 = 0, g_pred_in8 = 0;   // routed experts guessed / found in the top 16 / top 8
+/// DSpark main_hidden capture: when g_mh is set, run_pass writes the pass's LAST g_mh_rows columns' outputs of the
+/// target layers (mHC-stream means) as [rows][n_targets][n_embd] (token-major: one main_hidden row per position).
+std::vector<float>* g_mh = nullptr;
+int g_mh_rows = 0;
+std::vector<int> g_mh_layers;
 
 bool run_pass(ErnieGraph& eg, Ds41MoeTier* tier, int il0, int il1, const int* tids, int n, int64_t pos0,
               std::vector<ErnieGraphTap>* all_taps, std::vector<float>* out_logits, std::string& err) {
@@ -386,12 +420,204 @@ bool run_pass(ErnieGraph& eg, Ds41MoeTier* tier, int il0, int il1, const int* ti
             if (!eg.finish(il, routed.data(), want_taps ? &taps : nullptr)) { err = eg.last_error(); return false; }
         }
         if (want_taps) all_taps->insert(all_taps->end(), taps.begin(), taps.end());
+        if (g_mh)
+            for (size_t j = 0; j < g_mh_layers.size(); ++j) {
+                static const int mh_shift = [] { const char * e = std::getenv("ERNIE_DSPARK_MHSHIFT"); return e ? std::atoi(e) : 0; }();
+                if (g_mh_layers[j] != il + mh_shift) continue;   // probe: 1 = the residual entering the target layer
+                const int rows = std::min(n, g_mh_rows);
+                const int64_t D = eg.geom().n_embd, NT = (int64_t) g_mh_layers.size();
+                std::vector<float> m((size_t) rows * D);
+                if (!eg.read_state_mean(n - rows, rows, m.data())) { err = eg.last_error(); return false; }
+                g_mh->resize((size_t) rows * NT * D);
+                for (int r = 0; r < rows; ++r)
+                    std::memcpy(g_mh->data() + ((size_t) r * NT + j) * D, m.data() + (size_t) r * D, (size_t) D * 4);
+            }
     }
     if (out_logits) {
         out_logits->assign((size_t) eg.geom().vocab, 0.0f);
         if (!eg.logits(n - 1, 1, out_logits->data(), nullptr)) { err = eg.last_error(); return false; }
     }
     return true;
+}
+
+// ================================ DSpark speculative decoding ================================
+//
+// The drafter = the sidecar's 3 stages as an ErnieGraph in draft mode (same backend as the trunk) + its own routed-
+// expert tier over the sidecar's dspark.blk.N experts.  A step at P (P positions committed, `anchor` = the trunk's
+// newest token, not yet run):
+//   draft:   block [anchor, noise x 6] at P..P+6 through the stages -> 7 greedy drafts (base logits + Markov chain)
+//   verify:  the trunk runs [anchor, d0..d6] at P..P+7 in one pass; a = the longest prefix with argmax(row j) == d_j;
+//            the bonus = argmax(row a).  Emitted: anchor, d0..d(a-1); the next anchor = the bonus.
+//   commit:  the trunk's ring / pending slots of the rejected positions are put back (spec_rollback(P + a + 1)); the
+//            drafter's window gets the main_hidden rows of P..P+a (captured in the verify pass).
+// Greedy, so the emitted text is the trunk's own greedy text (up to the verify pass's width-dependent arithmetic).
+struct Drafter {
+    ErnieGraph dg;
+    Ds41MoeGeom gm;
+    std::unique_ptr<Ds41GgufBlobs> src;
+    std::unique_ptr<Ds41MoeTier> tier;
+    int block = 7, noise = 1024;
+    std::vector<int> targets;
+    int64_t steps = 0, drafted = 0, accepted = 0;
+    double draft_ms = 0, verify_ms = 0, commit_ms = 0;
+    std::vector<int64_t> hist;   // accepted-drafts histogram, 0..block
+};
+
+double ms_since(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
+
+bool drafter_init(Drafter& d, const Args& a, const ErnieGraph& trunk, const Ds41MoeGeom& trunk_gm, const ErnieGraphConfig& tcfg_graph,
+                  std::string& err) {
+    {
+        std::unique_ptr<GgufModel> m(new GgufModel(GgufModel::open(a.dspark)));
+        const MetaValue* bs = m->meta().get("ernie5_5.dspark.block_size");
+        d.block = a.dspark_block > 0 ? a.dspark_block : (bs && bs->is_num() ? (int) bs->num() : 7);
+        const MetaValue* tl = m->meta().get("ernie5_5.dspark.target_layers");
+        if (tl && tl->type == MetaType::ARRAY) for (const MetaValue& e : tl->items) d.targets.push_back((int) e.num());
+        if (d.targets.empty()) d.targets = {40, 41, 42};
+        const TensorInfo* g0 = m->find("dspark.blk.0.ffn_gate_exps.weight");
+        const TensorInfo* d0 = m->find("dspark.blk.0.ffn_down_exps.weight");
+        if (!g0 || !d0) { err = a.dspark + ": no dspark.blk.0 routed experts"; return false; }
+        d.gm = trunk_gm;
+        d.gm.n_layers = 0;
+        while (m->find("dspark.blk." + std::to_string(d.gm.n_layers) + ".ffn_gate_exps.weight")) ++d.gm.n_layers;
+        d.gm.gu_type = (int) g0->type;
+        d.gm.d_type = (int) d0->type;
+        d.gm.gate_types.clear(); d.gm.up_types.clear(); d.gm.down_types.clear();
+        d.gm.eclass.clear(); d.gm.cls_gu.clear(); d.gm.cls_d.clear();
+        d.gm.tensor_prefix = "dspark.";
+    }
+    d.noise = a.dspark_noise;
+    if (d.block < 1 || d.block > 15) { err = "--dspark-block must be 1..15"; return false; }
+    for (int t : d.targets)
+        if (t < 0 || t >= trunk.n_layer()) { err = "DSpark target layer " + std::to_string(t) + " outside the trunk"; return false; }
+    ErnieGraphConfig dc = tcfg_graph;
+    dc.dspark_trunk = &trunk;
+    dc.max_pass = d.block;
+    dc.abl_file.clear();
+    if (!d.dg.init(a.dspark, dc, err)) { err = "draft graph: " + err; return false; }
+    if (d.dg.n_layer() != d.gm.n_layers) { err = "draft stages and expert layers disagree"; return false; }
+    d.src.reset(new Ds41GgufBlobs(d.gm, a.dspark));
+    if (!d.src->open(err)) { err = "draft blobs: " + err; return false; }
+    Ds41MoeConfig c;
+    c.cpu_only = a.dspark_experts != "gpu";
+    c.threads = a.threads;
+    c.arena_gib = a.dspark_arena_gib;
+    c.max_arena_gib = a.dspark_arena_gib;
+    d.tier.reset(new Ds41MoeTier());
+    if (!d.tier->init(d.gm, d.src.get(), c, err)) { err = "draft tier: " + err; return false; }
+    if (!c.cpu_only) {
+        if (a.dspark_slot_gib > 0.0) d.tier->set_slot_gib(a.dspark_slot_gib);
+        std::vector<std::pair<int32_t, int32_t>> ranked;
+        for (int64_t l = 0; l < d.gm.n_layers; ++l)
+            for (int64_t e = 0; e < d.gm.n_experts; ++e) ranked.emplace_back((int32_t) l, (int32_t) e);
+        if (!d.tier->seed_from_ranked(ranked, err)) { err = "draft tier seed: " + err; return false; }
+    }
+    d.hist.assign((size_t) d.block + 1, 0);
+    if (!a.quiet)
+        std::printf("dspark: %lld stages, block %d, targets %d/%d/%d, draft experts %s (%s)\n", (long long) d.dg.n_layer(),
+                    d.block, d.targets[0], d.targets.size() > 1 ? d.targets[1] : -1, d.targets.size() > 2 ? d.targets[2] : -1,
+                    d.tier->mode(), c.cpu_only ? "per-call reads" : "own tier");
+    return true;
+}
+
+/// The window rows of positions [pos0, pos0 + rows) from main_hidden rows ([rows][targets][n_embd]); only the last
+/// 128 matter (the ring), so a longer span commits its tail.
+bool drafter_commit(Drafter& d, const std::vector<float>& mh, int64_t pos0, int rows, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t W = (int64_t) d.targets.size() * d.dg.geom().n_embd;
+    int r0 = std::max(0, rows - 128);
+    // a gap (nothing committed for a while, or a long span): one whole new ring
+    if (pos0 + r0 != d.dg.dspark_committed() && rows - r0 < 128) {
+        err = "drafter_commit: positions " + std::to_string(pos0 + r0) + ".. do not follow the committed " +
+              std::to_string(d.dg.dspark_committed());
+        return false;
+    }
+    if (!d.dg.dspark_commit(mh.data() + (size_t) r0 * W, pos0 + r0, rows - r0)) { err = d.dg.last_error(); return false; }
+    d.commit_ms += ms_since(t0);
+    return true;
+}
+
+/// One draft block at P from `anchor`: d.block greedy drafts into out.
+bool drafter_draft(Drafter& d, int anchor, int64_t P, int* out, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<int> blk((size_t) d.block, d.noise);
+    blk[0] = anchor;
+    if (!d.dg.begin(blk.data(), d.block, (int) P)) { err = "draft: " + d.dg.last_error(); return false; }
+    const size_t nk = (size_t) d.dg.geom().n_used;
+    const int64_t L = d.dg.geom().n_latent;
+    std::vector<int32_t> ids((size_t) d.block * nk);
+    std::vector<float> wts((size_t) d.block * nk), routed((size_t) d.block * L);
+    for (int s = 0; s < (int) d.dg.n_layer(); ++s) {
+        const float* fn = nullptr;
+        if (!d.dg.attn_router(s, ids.data(), wts.data(), &fn)) { err = "draft: " + d.dg.last_error(); return false; }
+        std::fill(routed.begin(), routed.end(), 0.0f);
+        if (!d.tier->run_multi(s, d.block, ids.data(), wts.data(), fn, routed.data())) {
+            err = "draft tier run_multi failed at stage " + std::to_string(s);
+            return false;
+        }
+        if (!d.dg.finish(s, routed.data())) { err = "draft: " + d.dg.last_error(); return false; }
+    }
+    if (!d.dg.dspark_draft(anchor, out)) { err = "draft: " + d.dg.last_error(); return false; }
+    d.draft_ms += ms_since(t0);
+    return true;
+}
+
+/// One speculative step at P: draft, verify, accept, rollback, commit.  Appends the emitted tokens (anchor first) to
+/// `emit` and returns the next anchor in *next.
+bool dspark_step(Drafter& d, ErnieGraph& eg, Ds41MoeTier* tier, int il0, int il1, int anchor, int64_t& P,
+                 std::vector<int>& emit, int* next, std::string& err) {
+    std::vector<int> dr((size_t) d.block);
+    if (!drafter_draft(d, anchor, P, dr.data(), err)) return false;
+    const int nv = d.block + 1;
+    std::vector<int> v((size_t) nv);
+    v[0] = anchor;
+    for (int j = 0; j < d.block; ++j) v[(size_t) j + 1] = dr[(size_t) j];
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!eg.spec_save(P, nv)) { err = eg.last_error(); return false; }
+    std::vector<float> mh;
+    g_mh = &mh;
+    g_mh_rows = nv;
+    g_mh_layers = d.targets;
+    const bool ok = run_pass(eg, tier, il0, il1, v.data(), nv, P, nullptr, nullptr, err);
+    g_mh = nullptr;
+    if (!ok) return false;
+    const int64_t V = eg.geom().vocab;
+    std::vector<float> lg((size_t) nv * V);
+    if (!eg.logits(0, nv, lg.data(), nullptr)) { err = eg.last_error(); return false; }
+    int acc = 0;
+    while (acc < d.block && argmax(lg.data() + (size_t) acc * V, (int) V) == dr[(size_t) acc]) ++acc;
+    *next = argmax(lg.data() + (size_t) acc * V, (int) V);
+    static const bool trace = [] { const char * e = std::getenv("ERNIE_DSPARK_TRACE"); return e && *e == '1'; }();
+    if (trace) {
+        std::fprintf(stderr, "dsp P=%lld anchor=%d acc=%d next=%d | dr", (long long) P, anchor, acc, *next);
+        for (int j = 0; j < d.block; ++j) std::fprintf(stderr, " %d", dr[(size_t) j]);
+        std::fprintf(stderr, " | argmax");
+        for (int j = 0; j < nv; ++j) std::fprintf(stderr, " %d", argmax(lg.data() + (size_t) j * V, (int) V));
+        std::fprintf(stderr, "\n");
+    }
+    if (!eg.spec_rollback(P + acc + 1)) { err = eg.last_error(); return false; }
+    d.verify_ms += ms_since(t0);
+    if (!drafter_commit(d, mh, P, acc + 1, err)) return false;
+    emit.push_back(anchor);
+    for (int j = 0; j < acc; ++j) emit.push_back(dr[(size_t) j]);
+    P += acc + 1;
+    ++d.steps;
+    d.drafted += d.block;
+    d.accepted += acc;
+    ++d.hist[(size_t) acc];
+    return true;
+}
+
+void drafter_report(const Drafter& d) {
+    if (d.steps == 0) return;
+    std::printf("dspark: %lld steps, %.2f drafts accepted per step (%.1f %%), %.2f tokens per trunk pass | draft %.1f "
+                "verify %.1f commit %.1f ms/step | accepted:",
+                (long long) d.steps, (double) d.accepted / d.steps, 100.0 * d.accepted / std::max<int64_t>(1, d.drafted),
+                (double) (d.accepted + d.steps) / d.steps, d.draft_ms / d.steps, d.verify_ms / d.steps, d.commit_ms / d.steps);
+    for (size_t i = 0; i < d.hist.size(); ++i) std::printf(" %zu:%lld", i, (long long) d.hist[i]);
+    std::printf("\n");
 }
 
 /// test_ernie_graph's dump layout: <sanitized name>.f32 plus manifest.json, which compare_ernie.py reads for the ne.
@@ -905,6 +1131,17 @@ int main(int argc, char** argv) {
         std::printf("ernie_generate: %lld layers (running %d..%d), ctx %lld, dense backend %s, prompt %zu ids\n",
                     (long long) eg.n_layer(), il0, il1, (long long) a.ctx, be, ids.size());
 
+    // ---- the DSpark drafter: its dense half takes VRAM BEFORE the tier's auto cache budget reads the free memory ----
+    std::unique_ptr<Drafter> drafter;
+    if (!a.dspark.empty()) {
+        if (a.serve || !batch_ids.empty()) { std::fprintf(stderr, "--dspark: one-shot decode only (not --serve / --batch yet)\n"); return 2; }
+        if (!tier) { std::fprintf(stderr, "--dspark needs the expert tier\n"); return 2; }
+        if (a.temp != 0.0f) { std::fprintf(stderr, "--dspark is greedy only (--temp 0)\n"); return 2; }
+        if (il0 != 0 || il1 != (int) eg.n_layer()) { std::fprintf(stderr, "--dspark needs every layer\n"); return 2; }
+        drafter.reset(new Drafter());
+        if (!drafter_init(*drafter, a, eg, gm, cfg, err)) { std::fprintf(stderr, "dspark: %s\n", err.c_str()); return 1; }
+    }
+
     // ---- the expert tier's arena and VRAM cache, after the dense graphs own their VRAM ----
     // (an auto budget measures the FREE VRAM, so it must be read once the dense half has allocated what it needs)
     if (tier && !tcfg.cpu_only) {
@@ -1088,11 +1325,18 @@ int main(int argc, char** argv) {
     while (pos < (int64_t) ids.size()) {
         const int n = (int) std::min<int64_t>(chunk, (int64_t) ids.size() - pos);
         const bool last = pos + n == (int64_t) ids.size();
-        std::vector<float> lg;
-        if (!run_pass(eg, tier.get(), il0, il1, ids.data() + pos, n, pos, last && !a.dump_taps.empty() ? &all_taps : nullptr,
-                      last ? &lg : nullptr, err)) {
+        std::vector<float> lg, mh;
+        if (drafter) { g_mh = &mh; g_mh_rows = 128; g_mh_layers = drafter->targets; }
+        const bool pok = run_pass(eg, tier.get(), il0, il1, ids.data() + pos, n, pos,
+                                  last && !a.dump_taps.empty() ? &all_taps : nullptr, last ? &lg : nullptr, err);
+        g_mh = nullptr;
+        if (!pok) {
             std::fprintf(stderr, "prefill: %s\n", err.c_str());
             return 1;
+        }
+        if (drafter) {   // the pass's last min(n, 128) positions into the drafter's window
+            const int rows = std::min(n, 128);
+            if (!drafter_commit(*drafter, mh, pos + n - rows, rows, err)) { std::fprintf(stderr, "dspark: %s\n", err.c_str()); return 1; }
         }
         if (last) logits = std::move(lg);
         pos += n;
@@ -1145,7 +1389,26 @@ int main(int argc, char** argv) {
     int next = argmax(logits.data(), (int) logits.size());
     print_stats("prefill", (int) ids.size());
     const auto t2 = std::chrono::steady_clock::now();
-    for (int k = 0; k < a.n_predict; ++k) {
+    if (drafter) {
+        int64_t P = pos;
+        while ((int) generated.size() < a.n_predict) {
+            if (P + drafter->block + 1 > a.ctx) { generated.push_back(next); text += text_of(next); break; }
+            std::vector<int> emit;
+            int nxt = -1;
+            if (!dspark_step(*drafter, eg, tier.get(), il0, il1, next, P, emit, &nxt, err)) {
+                std::fprintf(stderr, "dspark decode: %s\n", err.c_str());
+                return 1;
+            }
+            for (int id : emit) {
+                if ((int) generated.size() >= a.n_predict) break;
+                generated.push_back(id);
+                text += text_of(id);
+            }
+            next = nxt;
+        }
+        pos = P;
+    }
+    for (int k = drafter ? a.n_predict : 0; k < a.n_predict; ++k) {
         generated.push_back(next);
         text += text_of(next);
         if (pos >= a.ctx) break;
@@ -1161,6 +1424,7 @@ int main(int argc, char** argv) {
     const auto t3 = std::chrono::steady_clock::now();
     const double decode_s = std::chrono::duration<double>(t3 - t2).count();
     print_stats("decode", a.n_predict);
+    if (drafter && !a.quiet) drafter_report(*drafter);
     if (g_pred_n > 0 && !a.quiet)
         std::printf("predict: %lld routed, %.1f %% in the guessed top 8, %.1f %% in the top 16\n", (long long) g_pred_n,
                     100.0 * g_pred_in8 / g_pred_n, 100.0 * g_pred_in16 / g_pred_n);

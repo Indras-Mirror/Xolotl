@@ -2779,8 +2779,9 @@ bool Ds41GgufBlobs::open(std::string& err) {
             im_->stride[2][(size_t) l] = fl.bytes - fl.down_off;
             const int want[3] = {g_.gate_type(l), g_.up_type(l), g_.down_type(l)};
             for (int r = 0; r < 3; ++r) {
-                char name[64];
-                std::snprintf(name, sizeof name, "blk.%lld.ffn_%s_exps.weight", (long long) l, roles[r]);
+                char name[96];
+                std::snprintf(name, sizeof name, "%sblk.%lld.ffn_%s_exps.weight", g_.tensor_prefix.c_str(), (long long) l,
+                              roles[r]);
                 size_t at = 0;
                 const TensorInfo* ti = im_->model->find(name, &at);
                 if (!ti) {

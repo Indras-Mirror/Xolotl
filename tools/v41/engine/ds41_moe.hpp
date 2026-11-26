@@ -83,6 +83,10 @@ struct Ds41MoeGeom {
     /// read (`expert_latent_length`), not the trunk's `embedding_length`.
     cpu::NativeAct act = cpu::NativeAct::SwiGLU;
     float situ_beta = 4.0f, situ_beta_l = 25.0f;
+    /// Prefix of the expert tensor names (`<prefix>blk.L.ffn_{gate,up,down}_exps.weight`): empty for every model file;
+    /// "dspark." for the ERNIE-5.5 DSpark sidecar, whose 3 draft stages carry their own routed experts.  Ds41GgufBlobs
+    /// reads it; ds41_moe_geom_from_gguf leaves it empty (a draft geometry is built from the trunk's by hand).
+    std::string tensor_prefix;
     /// PER-LAYER FORMATS (MiMo-V2.6-Flash GSQ-RCO picks a format per tensor: gate, up and down independently).
     /// Empty = every layer is `gu_type`/`gu_type`/`d_type` (DeepSeek-V4: the uniform path, unchanged).  Otherwise
     /// `n_layers` entries each, indexed by the MODEL's layer number; -1 = that layer has no routed experts (MiMo's

@@ -41,6 +41,8 @@ struct ErnieGraphTap {
     std::vector<float> data;
 };
 
+class ErnieGraph;
+
 struct ErnieGraphConfig {
     ggml_backend_t backend = nullptr;   ///< NULL = create and own a CPU backend
     int      n_threads = 8;
@@ -63,6 +65,12 @@ struct ErnieGraphConfig {
     /// writer adds to the residual.
     std::string abl_file;
     float    abl_scale = 1.0f;
+    /// DSpark DRAFT mode (ERNIE-5.5's speculative drafter, docs/ernie/ERNIE_DSPARK_SPEC.md): `gguf` is then the DSpark
+    /// sidecar (`dspark.*` tensors, 3 stages) and this graph runs its stages instead of a model.  The geometry, the
+    /// token embedding and output.weight come from this trunk (initialised first, same backend; it must outlive the
+    /// draft).  The stages are HCA layers without the compressor whose window is the committed context written by
+    /// dspark_commit(); a pass (begin) is one draft block, every query sees the window + ALL block rows (non-causal).
+    const ErnieGraph * dspark_trunk = nullptr;
 };
 
 class ErnieGraph {
@@ -111,6 +119,26 @@ public:
     bool snapshot(int pos, int slot = 0);
     bool restore(int slot = 0);
     int snapshot_pos(int slot = 0) const;
+
+    // ---- DSpark speculative decoding
+    /// Draft mode only.  The window rows of COMMITTED positions [pos0, pos0 + k), k <= 128, from their main_hidden: k
+    /// rows of 3 * n_embd floats, token-major, each the trunk's target layers' outputs (mHC-stream means) concatenated.
+    /// Commits must come in position order (the ring keeps the last 128); begin(block, n, P) needs P == committed.
+    bool dspark_commit(const float * main_hidden, int64_t pos0, int k);
+    int64_t dspark_committed() const;
+    /// Draft mode, after a block pass's stages (begin + attn_router/finish for every stage): the greedy drafts.  The
+    /// head = hc_head, norm, the trunk's output.weight + MultiMax per slot, then the Markov chain from `anchor`:
+    /// prev = anchor; draft[t] = argmax(base[t] + head . embed[prev]); prev = draft[t].  out: pass_size() ids.
+    bool dspark_draft(int anchor, int * out);
+    /// Trunk side.  Before a verify pass of n tokens at pos0: keep the cache rows that pass overwrites but rejected
+    /// positions must not (the window ring and pending-block slots of positions pos0..pos0+n-1).  After the accept:
+    /// spec_rollback(keep_end) restores them for positions [keep_end, pos0 + n) and sets the next position to keep_end
+    /// (every other cache is position-indexed, or rewritten before it is read again).
+    bool spec_save(int64_t pos0, int n);
+    bool spec_rollback(int64_t keep_end);
+    /// The mHC-stream mean of the residual of pass columns [c0, c0 + n) (after finish(il): layer il's output):
+    /// n * n_embd floats, token-major.  DSpark's main_hidden rows (layers 40, 41, 42).
+    bool read_state_mean(int c0, int n, float * out);
 
     int pass_size() const;
     int pass_pos0() const;
