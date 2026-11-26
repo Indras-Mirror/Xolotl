@@ -15,6 +15,7 @@
 One line each; the detail, numbers and credits are in [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
 - **27 Nov** - [ERNIE-5.5-Flash](docs/ERNIE.md) preview, now served: OpenAI- and Anthropic-compatible server with tool calls and thinking on or off (`configs/xol-ernie.json`), ~14 tok/s decode and 115-120 tok/s prefill on one RTX 4090 with our [XQ file](https://huggingface.co/IndrasMirror/ERNIE-5.5-Flash-XQ-Uncensored) (99.9 GB). Speed work (DSpark, GPU prefill) is next.
+- **27 Nov** - Windows: the rest of #148 (POSIX shims for MSVC, positional reads in `ds4_moe`, the LFM3 speech helper, the GLM census), thanks mehzhure (#149-#154). [more](docs/xolotl/CHANGELOG.md#windows-the-rest-of-148-lands-27-nov)
 - **27 Nov** - Trellis-coded tensor types TQP5/6/7 in Xolotl's ggml (decode kernels, opt-in `XOLOTL_TQP_MMQ=1` prompt kernel). [more](docs/xolotl/CHANGELOG.md#trellis-coded-tensor-types-tqp567-27-nov)
 - **26 Nov** - [ERNIE-5.5-Flash](docs/ERNIE.md) preview: Baidu's 280B MoE on its own engine, `ernie_generate`, reading llama.cpp PR #31925 GGUFs (checked against the PR: KL 0.004).
 - **24 Nov** - Windows fixes for the V4.1 engine + picture reader (thanks kelheor, #144-#146) and a tool-call loop guard (from Delta / Project Maya). [more](docs/xolotl/CHANGELOG.md#windows-fixes-for-the-deepseek-v41-engine-and-its-picture-reader-a-tool-call-loop-guard-in-the-server-24-nov)

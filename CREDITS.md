@@ -93,3 +93,4 @@
 
 *Xolotl* is Quetzalcoatl's dark twin, who carries the dead up from the underworld - as the engine carries experts up
 from RAM and NVMe.
+ Then the rest of it as six pull requests (#149-#154): the MSVC POSIX shims, positional shard reads in `ds4_moe`, the LFM3 speech helper and helper build script, and the GLM census write-back on Windows.

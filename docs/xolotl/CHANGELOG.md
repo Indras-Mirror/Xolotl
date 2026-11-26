@@ -8,6 +8,15 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Windows: the rest of #148 lands (27 Nov)
+
+Six pull requests from [mehzhure](https://github.com/mehzhure), each one fix from the #148 report:
+`strata/platform/win_compat.hpp` for the POSIX pieces MSVC lacks (#149), the Inkling image encoder reads its mmproj
+through the fd API MSVC has (#150), `ds4_moe` reads the shards through `tools/ds4/ds4_fd.hpp` with a positional
+`ReadFile` and a pread test from 8 threads (#151), `xolotl-lfm3` starts its speech helper with `CreateProcess` (#152),
+`tools/lfm3/build-helpers-win.bat` (#153) and the GLM census write-back that now replaces the file on Windows (#154).
+Linux behaviour is unchanged (the Linux build of every touched program and the pread test pass).
+
 ### Trellis-coded tensor types (TQP5/6/7) (27 Nov)
 
 - **New ggml types** `TQP5`, `TQP6`, `TQP7` (ids 147-149; 2.625, 3.125 and 3.625 bits a weight: 128 weights in 2 + 8K bytes), in
