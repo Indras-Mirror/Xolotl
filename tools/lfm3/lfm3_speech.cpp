@@ -25,7 +25,12 @@
 #include "llama.h"
 #include "mtmd.h"
 
+#ifdef _WIN32
+#include <fcntl.h>       // _O_BINARY
+#include <io.h>          // _dup, _dup2, _setmode: dup and dup2 are POSIX, and MSVC has no unistd.h
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -170,9 +175,16 @@ void usage() {
 
 int main(int argc, char** argv) {
     // the protocol keeps the real stdout; anything a library prints goes to stderr
+#ifdef _WIN32
+    _setmode(0, _O_BINARY);        // MSVC's stdin is a text stream by default: CRLF translation would corrupt the protocol
+    const int pfd = _dup(1);
+    if (pfd < 0 || _dup2(2, 1) < 0) { std::fprintf(stderr, "xolotl-lfm3-speech: cannot set up stdout\n"); return 1; }
+    proto = _fdopen(pfd, "wb");
+#else
     const int pfd = dup(1);
     if (pfd < 0 || dup2(2, 1) < 0) { std::fprintf(stderr, "xolotl-lfm3-speech: cannot set up stdout\n"); return 1; }
     proto = fdopen(pfd, "wb");
+#endif
     std::string mmproj, model;
     bool gpu = false;
     int threads = 0;
