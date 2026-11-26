@@ -1194,7 +1194,7 @@ def plan_dspark(cfg, opts, meta_src):
     if markov_w1:
         pl.small([markov_w1], "dspark.markov_head.embed.weight", [rank, V], "Q8_0", lambda a: a[0].T.copy())
     if markov_w2:
-        pl.small([markov_w2], "dspark.markov_head.head.weight", [rank, V], "Q8_0", lambda a: a[0].T.copy())
+        pl.small([markov_w2], "dspark.markov_head.head.weight", [rank, V], "Q8_0")   # stored [V, 256] = the Linear layout already (26 Nov: the .T scrambled it)
     conf = src_name([pre + "confidence_head.projection.weight", pre + "confidence_head.proj.weight"])
     if conf:
         pl.small([conf], "dspark.confidence_head.proj.weight", [D + rank, 1], "F32")
