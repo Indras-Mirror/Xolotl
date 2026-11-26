@@ -5,7 +5,7 @@
     "  python3 tools/strata_tokenizer.py --gguf <model.gguf> --out <folder>   (pre-tokenizer ernie5)",
     "routes.bin is the routing profile: --rank-counts seeds the VRAM cache and the RAM arena hottest-first at the start,",
     "--count-routes adds every request's routing to the same file, so the next start seeds from what you actually use.",
-    "Prompt passes stay at 128 tokens (--prefill-chunk 128): larger ones run out of VRAM beside an auto-sized expert cache.",
+    "--slots 2300 --prefill-chunk 256: a fixed 2,300-expert VRAM cache leaves room for 256-token prompt passes (measured 115-120 tok/s served prefill; 512 still fails at ~25K context).",
     "--arena-gib: the RAM the routed experts may use; set it to what the machine can spare.",
     "--kv-mla q8_0 / q4_0 halves / quarters the long-context KV (q4_0 Hadamard-rotated); f16 is the reference.",
     "Sampling is Baidu's generation_config (temperature 1.0, top_p 0.95)."
@@ -18,10 +18,10 @@
   "args": [
     "-m",
     "models/ernie-5.5-flash/ERNIE-5.5-Flash-Preview.gguf",
-    "--experts", "gpu", "--cuda", "--slots", "0", "--threads", "7", "--arena-gib", "64",
+    "--experts", "gpu", "--cuda", "--slots", "2300", "--threads", "7", "--arena-gib", "80",
     "--rank-counts", "models/ernie-5.5-flash/routes.bin",
     "--count-routes", "models/ernie-5.5-flash/routes.bin",
-    "--ds41-decode", "0", "--prefill-chunk", "128", "--ctx", "65536"
+    "--ds41-decode", "0", "--prefill-chunk", "256", "--ctx", "65536"
   ],
   "tokenizer": "models/ernie-5.5-flash/tokenizer",
   "model_name": "ernie-5.5-flash",

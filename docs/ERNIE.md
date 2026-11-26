@@ -43,16 +43,17 @@ Checked against the PR's own llama.cpp build on the same file:
 `tools/ernie/README_REF.md` has the numpy reference (`ernie_ref.py`, straight from the FP8 safetensors) and the
 tensor-by-tensor comparison against the PR.
 
-## Speed (RTX 4090, Ryzen 7 5700X, 110 GB RAM, one NVMe, the 154 GB MXFP4 file)
+## Speed (RTX 4090, Ryzen 7 5700X, 110 GB RAM, one NVMe)
 
-| | tok/s |
-|---|---:|
-| decode | 4.46 |
-| prefill | 12.9 |
+| | 154 GB MXFP4 file | our [99.9 GB XQ file](https://huggingface.co/IndrasMirror/ERNIE-5.5-Flash-XQ-Uncensored) |
+|---|---:|---:|
+| decode | 4.46 | 13.4-14.4 (served 14-15) |
+| prefill | 12.9 | 94 (1.9K prompt, 128-token chunks); served 115-120 (6.5K-25K prompts, 256-token chunks) |
 
-This file is bigger than RAM plus VRAM, so about 15 % of expert reads still go to the NVMe drive, and that is where
-most of the time goes. A smaller quant that fits in RAM, and the DeepSeek-V4.1 decode stack (speculative decode,
-cache adaptation), are the next steps.
+The MXFP4 file is bigger than RAM plus VRAM, so about 15 % of its expert reads go to the NVMe drive. The XQ file fits
+in RAM plus VRAM (80 GiB arena). Per token ERNIE routes 10 experts in each of 42 layers; about 45 % of those are computed
+on the CPU, and that is now the limit. Next: DSpark speculative decoding (in progress) and GPU expert compute for prompt
+chunks.
 
 ## Build and run
 
@@ -62,15 +63,15 @@ cmake --build build --target ernie_generate -j
 
 # the best decode settings measured so far
 ./build/ernie_generate -m ERNIE-5.5-Flash.gguf -p "Write a haiku about rivers." -n 128 \
-    --experts gpu --cuda --slots 0 --threads 7 --arena-gib 64 --ds41-decode 0 --prefill-chunk 128
+    --experts gpu --cuda --slots 2300 --threads 7 --arena-gib 80 --ds41-decode 0 --prefill-chunk 256
 ```
 
 | flag | what it does |
 |---|---|
 | `--experts gpu` / `--cuda` | routed experts on the GPU tier / the dense graphs on the GPU |
 | `--arena-gib G` | RAM for routed experts (set it to what you can spare) |
-| `--slots 0` | VRAM expert slots, 0 = all free VRAM minus 1 GiB (so only one run per card) |
-| `--prefill-chunk 128` | prompt passes of at most 128 tokens (512 runs out of VRAM on a 24 GB card) |
+| `--slots N` | VRAM expert slots (2300 leaves room for 256-token prompt chunks on a 24 GB card); 0 = all free VRAM minus 1 GiB |
+| `--prefill-chunk 256` | prompt passes of at most 256 tokens (512 still runs out of memory at ~25K context) |
 | `--count-routes F` / `--rank-counts F` | record which experts a workload uses, then fill VRAM and RAM with the most used first. Without a profile the cache fills in index order and decode is about 3x slower |
 | `--ds41-decode 0` | one-token steps through the DeepSeek-V4.1 decode path, with the next layer's experts guessed ahead |
 | `--batch F`, `--batch-out F`, `--batch-logits F` | many prompts in one load (0x1E-separated), greedy continuations and last-row logits |
