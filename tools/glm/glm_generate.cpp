@@ -26,6 +26,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>       // rename() onto the census: std::rename() does not replace an existing file on MSVC
+#include <system_error>
 #include <fstream>
 #include <random>
 #include <condition_variable>
@@ -409,7 +411,14 @@ int main(int argc, char ** argv) {
             for (int64_t e = 0; e < G.n_expert; ++e)
                 if (census[(size_t) (l * G.n_expert + e)] > 0)
                     std::fprintf(cf, "%lld %lld %.0f\n", (long long) l, (long long) e, census[(size_t) (l * G.n_expert + e)]);
-        if (std::fclose(cf) == 0) std::rename(tmp.c_str(), a.census.c_str());
+        // Onto the census, in place of the file that was read at the start.  POSIX rename() replaces it; the rename()
+        // of MSVC does not (it fails and leaves the .tmp there, beside a census that then never changes: on Windows the
+        // census was written once, the first time, and never again).  std::filesystem::rename() replaces on both.
+        if (std::fclose(cf) == 0) {
+            std::error_code ec;
+            std::filesystem::rename(tmp, a.census, ec);
+            if (ec) std::fprintf(stderr, "census: %s could not be replaced (%s)\n", a.census.c_str(), ec.message().c_str());
+        }
     };
     if (!tier.init(a.model, mc, err)) { std::fprintf(stderr, "glm_generate: tier init: %s\n", err.c_str()); return 1; }
     const ds4::Ds4MoeGeom & TG = tier.geom();
