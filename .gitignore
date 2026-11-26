@@ -40,6 +40,9 @@ td.log
 # ERNIE 5.5 reference harness: llama.cpp at PR #31925's head, built standalone to smoke-test the arch before
 # the engine port.  Local-only, like the vendored pin above (tools/ernie/fetch-ernie-llama.sh recreates it).
 /third_party/llama.cpp-ernie55
+# xolotl-lfm3's helpers on Windows build against upstream llama.cpp, not the vendored pin (mtmd's LFM3 support
+# postdates it): tools/lfm3/build-helpers-win.bat clone makes it.  Local-only, like the two above.
+/third_party/llama.cpp-upstream
 /models/
 /packs/
 /mtp/
