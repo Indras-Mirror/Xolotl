@@ -882,11 +882,23 @@ static ggml_tensor * build_mla(ErnieGraph::Impl & im, ggml_context * gc, ggml_cg
                                       1.0f / std::sqrt((float) (ID * IH)));                    // [IH, n]
         b.tap("indexer_weights-" + sl, iw);
         ggml_tensor * kidx = ggml_cont(gc, ggml_view_2d(gc, cw, ID, M, cw->nb[1], (size_t) KROW * cw->nb[0]));
-        ggml_tensor * dots = ernie_mm(gc, kidx, ggml_reshape_2d(gc, iq, ID, IH * n));         // [M, IH*n]
-        ggml_mul_mat_set_prec(dots, GGML_PREC_F32);
-        dots = ggml_mul(gc, ggml_reshape_3d(gc, ggml_relu(gc, dots), M, IH, n), ggml_reshape_3d(gc, iw, 1, IH, n));
-        ggml_tensor * score = ggml_reshape_2d(gc, ggml_sum_rows(gc, ggml_cont(gc, ggml_permute(gc, dots, 1, 0, 2, 3))),
-                                              M, n);                                           // [M, n]
+        // the [M, IH, n] F32 head scores (and their relu / weighted / permuted copies) grow with the context x the
+        // chunk: at 8K cells x 256 rows they are ~2 GB, the graph failed to allocate beside the expert cache.  Build
+        // them per column block of at most ~64 MiB each (the allocator reuses one block's buffers for the next).
+        const int64_t NB = std::max<int64_t>(1, std::min<int64_t>(n, (64ll << 20) / std::max<int64_t>(1, M * IH * 4)));
+        ggml_tensor * iq2 = ggml_reshape_3d(gc, ggml_cont(gc, iq), ID, IH, n);
+        ggml_tensor * score = nullptr;
+        for (int64_t c0 = 0; c0 < n; c0 += NB) {
+            const int64_t nc = std::min<int64_t>(NB, n - c0);
+            ggml_tensor * iqb = ggml_view_2d(gc, iq2, ID, IH * nc, iq2->nb[1], (size_t) c0 * iq2->nb[2]);
+            ggml_tensor * iwb = ggml_view_3d(gc, iw, 1, IH, nc, iw->nb[0], iw->nb[1], (size_t) c0 * iw->nb[1]);
+            ggml_tensor * dots = ernie_mm(gc, kidx, iqb);                                      // [M, IH*nc]
+            ggml_mul_mat_set_prec(dots, GGML_PREC_F32);
+            dots = ggml_mul(gc, ggml_reshape_3d(gc, ggml_relu(gc, dots), M, IH, nc), iwb);
+            ggml_tensor * sb = ggml_reshape_2d(gc, ggml_sum_rows(gc, ggml_cont(gc, ggml_permute(gc, dots, 1, 0, 2, 3))),
+                                               M, nc);                                         // [M, nc]
+            score = score ? ggml_concat(gc, score, sb, 1) : sb;
+        }                                                                                      // [M, n]
         b.tap("indexer_score-" + sl, score);
         if (topk) {
             // window cells forced in, future cells out: + 1e30 * (2 s0 - s1 - 1), s1 = [d >= window]
