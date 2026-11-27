@@ -345,6 +345,13 @@ public:
     /// Gate tap: an index source layer's top-k rows of the current pass (n * K ints, token-major; K = min(cap, top-k))
     /// and their visibility mask; empty for other layers.
     bool read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K);
+    /// DFly2 drafter taps (the bound slot, after a pass): layer il's window K ring [DH, RAW] and its kv source's
+    /// compressed KV (device tensors), and for pass column `col` its top-k rows + their 0 / -inf mask (host, K each)
+    /// plus the hc state's pre mix of that column (HC floats; the state itself: read_state_cols).  il must be an
+    /// index source layer with a compressed source.
+    bool dfly2_tap(int il, int col, ggml_tensor ** raw, ggml_tensor ** comp, std::vector<int32_t> & sel,
+                   std::vector<float> & mask, int * K);
+    bool read_pre_col(int col, std::vector<float> & pre);
     /// The x state after begin (+ the Engram add of the layer `il`, when il is an Engram layer) - gate tap.
     const std::string & last_error() const;
     /// A loaded weight on the backend (nullptr if absent) - for sharing the trunk head with the DSpark draft stack.

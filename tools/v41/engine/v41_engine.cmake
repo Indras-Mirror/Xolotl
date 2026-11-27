@@ -340,7 +340,7 @@ endif()
 if(TARGET ds41_dspark AND TARGET ds41_generate)
     # the source itself, not the library: linking ds41_dspark reorders the static archives and ggml-cuda's
     # ggml-cuda.cu.o then collides with strata_mmq's ggml_cuda_host.cu.o (duplicate ggml_cuda_error & co)
-    target_sources(ds41_generate PRIVATE ${_v41_dir}/ds41_dspark.cpp)
+    target_sources(ds41_generate PRIVATE ${_v41_dir}/ds41_dspark.cpp ${_v41_dir}/ds41_dfly2.cpp)
     target_compile_definitions(ds41_generate PRIVATE DS41_HAVE_DSPARK $<$<BOOL:${STRATA_DSV41_FQ_OP}>:STRATA_DSV41_FQ_OP>)
 endif()
 # v41-dspark-shrink: requantize the DSpark routed-expert tensors of the sidecar (MXFP4 -> Q3_K / Q2_K / IQ4_XS / ...)

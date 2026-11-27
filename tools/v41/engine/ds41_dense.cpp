@@ -4182,6 +4182,35 @@ bool Ds41Dense::read_sel(int il, std::vector<int> & sel, std::vector<float> & ma
     return true;
 }
 
+bool Ds41Dense::dfly2_tap(int il, int col, ggml_tensor ** raw, ggml_tensor ** comp, std::vector<int32_t> & sel,
+                          std::vector<float> & mask, int * K) {
+    Impl & im = *p_;
+    if (il < 0 || il >= (int) im.ly.size()) { im.err = "dfly2_tap: bad layer"; return false; }
+    const auto & L = im.ly[(size_t) il];
+    if (!L.idx_src || !L.ratio || L.kvl < 0 || !L.raw || !L.sel) { im.err = "dfly2_tap: layer " + std::to_string(il) + " is not an index source"; return false; }
+    if (col < 0 || col >= im.n) { im.err = "dfly2_tap: column outside the pass"; return false; }
+    *raw = L.raw;
+    *comp = im.ly[(size_t) L.kvl].comp;
+    const int64_t cap = im.pass_cap[L.ratio];
+    const int64_t k = std::min<int64_t>(cap, im.ITOP);
+    *K = (int) k;
+    sel.assign((size_t) im.ITOP, 0);
+    mask.assign((size_t) im.ITOP, -INFINITY);
+    if (k > 0) {
+        ggml_backend_tensor_get(L.sel, sel.data(), (size_t) col * L.sel->nb[1], (size_t) k * 4);
+        ggml_backend_tensor_get(L.selm, mask.data(), (size_t) col * L.selm->nb[1], (size_t) k * 4);
+    }
+    return true;
+}
+
+bool Ds41Dense::read_pre_col(int col, std::vector<float> & pre) {
+    Impl & im = *p_;
+    if (col < 0 || col >= im.NC) { im.err = "read_pre_col: bad column"; return false; }
+    pre.resize((size_t) im.HC);
+    ggml_backend_tensor_get(im.pre_state, pre.data(), (size_t) col * (size_t) im.HC * 4, (size_t) im.HC * 4);
+    return true;
+}
+
 void Ds41Dense::set_layer_range(int64_t layer_lo, int64_t layer_hi) {
     p_->layer_lo = layer_lo;
     p_->layer_hi = layer_hi < 0 ? p_->nl : layer_hi;

@@ -55,6 +55,7 @@
 #include "ds41_pipeline.hpp"
 #if defined(DS41_HAVE_DSPARK)
 #include "ds41_dspark.hpp"
+#include "ds41_dfly2.hpp"
 #include "ds41_window_policy.hpp"
 #endif
 
@@ -1001,13 +1002,23 @@ int main(int argc, char ** argv) {
     const int dm_layers[3] = { 36, 37, 38 };   // outputs of these = inputs of the targets 37 / 38 / 39
     std::vector<float> dm_x, dm_pre, dm_row;
     int dm_tok = 0, dm_pos = 0;
+    // STRATA_DUMP_DFLY2=F (measurement only, slower): the DFly2 drafter's offline acceptance test (docs/ds4/DFLY2_SPEC.md).
+    // Every prompt token after the first and every generated token runs as a decode step; per step append
+    // {int32 token, int32 pos, int32 HC, 5 x (HC x n_embd f32 state, HC f32 pre mix)} = the raw mHC state LEAVING layers
+    // 19 / 27 / 31 / 35 / 39 and the pre mix that layer's FFN hc_mixes made for the next attention (model.py Block.forward
+    // returns it).  The harness forms attn_norm_{L+1}(hc_pre(x_L, pre_L)) = layer L+1's attention input (what AngelSpec
+    // captures, NOT the stream mean) and hc_pre(x_39, pre_39) = the pre-final-norm hidden.
+    const char * dump_dfly_path = std::getenv("STRATA_DUMP_DFLY2");
+    std::FILE * dump_dfly = dump_dfly_path ? std::fopen(dump_dfly_path, "wb") : nullptr;
+    const int df_layers[5] = { 19, 27, 31, 35, 39 };
+    std::vector<float> df_row;
     const bool file_pred = std::getenv("STRATA_FILE_PRED") != nullptr;
     // STRATA_ATTN_AHEAD=1 (decode, opt-in; needs STRATA_PIN_RB=1 + STRATA_DENSE_ASYNC=1): layer l's finish + predict
     // graph and layer l+1's attention graph go out back to back (Ds41Dense::finish_predict_attn), so the card does not
     // idle for the prediction's round trip and the next graph's launch.  Only when nothing else runs on the dense
     // object between finish(l) and attn_router(l+1): no diagnostic predictions, state dumps or stage handoffs.
     const bool attn_ahead = std::getenv("STRATA_ATTN_AHEAD") && std::getenv("STRATA_ATTN_AHEAD")[0] == '1' &&
-                            !file_pred && advise_ahead <= 0 && !dump_main && !pipe.enabled() && !mc.cpu_only;
+                            !file_pred && advise_ahead <= 0 && !dump_main && !dump_dfly && !pipe.enabled() && !mc.cpu_only;
     // STRATA_ATTN_TAIL=2 (Ds41Dense::queue_tail): the tail graph queued by the tier's after-card-side hook (=3 without
     // STRATA_RB_HOOK runs as =2; with it queue_tail has nothing to queue)
     const bool attn_tail2 = std::getenv("STRATA_ATTN_TAIL") && (std::string(std::getenv("STRATA_ATTN_TAIL")) == "2" ||
@@ -1062,6 +1073,7 @@ int main(int argc, char ** argv) {
             dm_pos = pos;
             dm_row.assign((size_t) 3 * n_embd, 0.0f);
         }
+        if (dump_dfly) { dm_tok = tok; dm_pos = pos; df_row.clear(); }
         if (dec_rlog) {
             if (dec_rlog_census) {
                 for (int l = 0; l < n_layer; ++l) {
@@ -1186,6 +1198,20 @@ int main(int argc, char ** argv) {
                 have_pred = true;
             } else if (!d.finish(l, rsum)) { ferr = d.last_error(); return false; }
             if (dprof) { const double t1 = dp_now(); dp[4] += t1 - ta; ta = t1; }
+            for (int j = 0; dump_dfly && j < 5; ++j) {
+                if (l != df_layers[j]) continue;
+                d.read_state(dm_x, dm_pre);
+                if (j == 0 && dm_x.size() % (size_t) n_embd) { ferr = "STRATA_DUMP_DFLY2: state size"; return false; }
+                df_row.insert(df_row.end(), dm_x.begin(), dm_x.end());
+                df_row.insert(df_row.end(), dm_pre.begin(), dm_pre.end());   // the next layer's attention pre mix (hc floats)
+                if (j == 4) {
+                    const int32_t hc = (int32_t) (dm_x.size() / (size_t) n_embd);
+                    std::fwrite(&dm_tok, 4, 1, dump_dfly);
+                    std::fwrite(&dm_pos, 4, 1, dump_dfly);
+                    std::fwrite(&hc, 4, 1, dump_dfly);
+                    std::fwrite(df_row.data(), 4, df_row.size(), dump_dfly);
+                }
+            }
             for (int j = 0; dump_main && j < 3; ++j) {
                 if (l != dm_layers[j]) continue;
                 d.read_state(dm_x, dm_pre);
@@ -1521,7 +1547,9 @@ int main(int argc, char ** argv) {
             lap(1);
             if (!d.finish(l, rdev ? nullptr : crouted_m.data())) { ferr = d.last_error(); return false; }
             lap(0);
-            for (int j = 0; j < 3; ++j) {
+            // STRATA_DFLY2 (one-shot) reads the trunk's caches, not DSpark's main_hidden: no taps
+            static const bool dfly_on = !a.serve && std::getenv("STRATA_DFLY2") && *std::getenv("STRATA_DFLY2");
+            for (int j = 0; j < 3 && !dfly_on; ++j) {
                 if (l != dm_layers[j]) continue;
                 if (!d.read_state(vx, vpre)) { ferr = d.last_error(); return false; }
                 const size_t HC = vx.size() / ((size_t) m * n_embd);
@@ -1606,12 +1634,36 @@ int main(int argc, char ** argv) {
     }
 #if defined(DS41_HAVE_DSPARK)
     std::unique_ptr<Ds41DSpark> dsp;
+    // STRATA_DFLY2=<sidecar> (one-shot, greedy, one GPU stage, the head on the trunk's card): the DFly2 block drafter
+    // (ds41_dfly2, AngelSpec dfly2-b6) in DSpark's place - it reads the trunk's own caches (window rings of layers
+    // 28/32/36, layer 20's compressed KV, their indexer picks) and final hidden, so it has no window to seed.
+    const char * dfly_path = a.serve ? nullptr : std::getenv("STRATA_DFLY2");
+    if (dfly_path && !*dfly_path) dfly_path = nullptr;
+    if (dfly_path && dsp_path) { std::fprintf(stderr, "ds41_generate: STRATA_DFLY2 and STRATA_DSPARK are exclusive\n"); return 2; }
+    std::unique_ptr<Ds41DFly2> dfly;
+#else
+    const char * dfly_path = nullptr;
 #endif
     auto open_cache = [&]() -> bool {
         const double toc = now_ms();
         for (int st = 0; st < pipe.n_stages(); ++st) pipe.dense(st).release_pass();
         if (std::getenv("STRATA_SEED_LOG")) std::fprintf(stderr, "seed: release_pass %.0f ms\n", now_ms() - toc);
 #if defined(DS41_HAVE_DSPARK)
+        if (dfly_path && !dfly) {
+            if (pipe.enabled()) { err = "STRATA_DFLY2 needs one GPU stage (no layer split)"; return false; }
+            Ds41DFly2Config fc;
+            fc.backend = dense.backend();
+            fc.sidecar = dfly_path;
+            fc.main_gguf = a.model;
+            // the head on another card (STRATA_REMOTE_HEAD): the drafter loads its own copy (~0.7 GB) beside the caches
+            fc.shared_head = pipe.head_offload() ? nullptr : dense.weight("output.weight");
+            fc.shared_out_norm = pipe.head_offload() ? nullptr : dense.weight("output_norm.weight");
+            dfly = std::make_unique<Ds41DFly2>();
+            const double ti = now_ms();
+            if (!dfly->init(fc, err)) { err = "DFly2 init: " + err; dfly.reset(); return false; }
+            std::fprintf(stderr, "\nDFly2: %s, %.2f GB of weights on the card (%.1f s)", dfly_path, dfly->weight_bytes() / 1e9,
+                         (now_ms() - ti) / 1000.0);
+        }
         if (dsp_path && !dsp) {
             Ds41DSparkConfig sc;
             // Layer split: the trunk head (shared output.weight) lives on the last stage; DSpark must run there too.
@@ -4633,13 +4685,14 @@ int main(int argc, char ** argv) {
     tier.reset_stats();
     const double tp0 = now_ms();
     std::vector<float> all;
-    const int dm_tail = dump_main ? std::min<int>(128, (int) prompt.size() - 1) : 0;   // DSpark's window, as steps
-    bool spec = dsp_path != nullptr;
+    const int dm_tail = dump_dfly ? (int) prompt.size() - 1   // DFly2 reads target latents over the whole context
+                      : dump_main ? std::min<int>(128, (int) prompt.size() - 1) : 0;   // DSpark's window, as steps
+    bool spec = dsp_path != nullptr || dfly_path != nullptr;
 #if !defined(DS41_HAVE_DSPARK)
     if (spec) { std::fprintf(stderr, "ds41_generate: STRATA_DSPARK: built without ds41_dspark\n"); return 2; }
 #endif
     const int spec_depth = std::getenv("STRATA_DSPARK_DEPTH") ? std::atoi(std::getenv("STRATA_DSPARK_DEPTH")) : 4;
-    if (spec && (!defer_vram || S < 17 || dump_main || spec_depth < 0 || spec_depth > 5)) {
+    if (spec && (!defer_vram || S < 17 || dump_main || dump_dfly || spec_depth < 0 || spec_depth > 5)) {
         std::fprintf(stderr, "ds41_generate: STRATA_DSPARK needs the GPU layer-major prompt path (S >= 17), depth 1..5, and no "
                              "STRATA_DUMP_MAIN\n");
         return 2;
@@ -4662,7 +4715,7 @@ int main(int argc, char ** argv) {
     if (spec && a.temp > 0) std::fprintf(stderr, "note: STRATA_DSPARK decodes greedily (temp ignored)\n");
     // the DSpark window needs per-position main_hidden, which the layer-major prompt does not produce: the last
     // min(128, L-1) prompt tokens run through pass_v (chunks of <= 16) after the VRAM cache opens
-    const int sp_tail = spec ? std::min<int>(128, (int) prompt.size() - 1) : 0;
+    const int sp_tail = spec ? std::min<int>(dfly_path ? 1 : 128, (int) prompt.size() - 1) : 0;
     // STRATA_PROFILE_PROMPT=1: nsys --capture-range=cudaProfilerApi captures exactly the layer-major prompt (as
     // STRATA_PROFILE_DECODE does the decode)
     static const bool prof_prompt = std::getenv("STRATA_PROFILE_PROMPT") != nullptr;
@@ -4681,8 +4734,57 @@ int main(int argc, char ** argv) {
 #if defined(DS41_HAVE_DSPARK)
     int sp_bonus = -1;   // the trunk's token for position L (argmax of the last prompt row) and DSpark's first drafts
     int sp_ids[5] = {0}, sp_tmp[5];
-    float sp_conf[5];
-    if (spec) {
+    float sp_conf[5] = { 10, 10, 10, 10, 10 };   // DFly2 has no confidence head: every draft passes the filters
+    // DFly2: draft after pass column `col` (= position a-1); anchor = the trunk's token for a, prevtok = the one at a-1
+    std::vector<int32_t> df_sel[3];
+    std::vector<float> df_selm[3], df_x, df_pre;
+    double df_ms = 0, df_main_ms = 0;
+    auto dfly_draft = [&](int col, int a_pos, int anchor, int prevtok, int depth, int * ids) -> bool {
+        Ds41DFly2Ctx cx;
+        const auto & tl = dfly->target_layers();
+        for (int i = 0; i < 3; ++i) {
+            if (!dense.dfly2_tap(tl[(size_t) i], col, &cx.raw[i], &cx.comp[i], df_sel[i], df_selm[i], &cx.K[i])) { ferr = dense.last_error(); return false; }
+            cx.sel[i] = df_sel[i].data();
+            cx.selm[i] = df_selm[i].data();
+        }
+        if (!dense.read_state_cols(col, 1, df_x) || !dense.read_pre_col(col, df_pre)) { ferr = dense.last_error(); return false; }
+        cx.x = df_x.data();
+        cx.pre = df_pre.data();
+        float pr[5];
+        if (!dfly->draft(cx, a_pos, anchor, prevtok, depth, ids, pr)) { ferr = dfly->last_error(); return false; }
+        for (int i = 0; i < 5; ++i) {   // as a logit, the form DSpark's confidence head gives (sig() in the cuts)
+            const float q = std::min(std::max(pr[i], 1e-6f), 1.0f - 1e-6f);
+            sp_conf[i] = std::log(q / (1.0f - q));
+            if (ids[i] < 0) sp_conf[i] = -30.0f;
+        }
+        // STRATA_DFLY2_LOG=<file> (gate tap): per draft "a anchor prev d1..d5 K28 K32 K36"
+        static FILE * dlog = std::getenv("STRATA_DFLY2_LOG") ? std::fopen(std::getenv("STRATA_DFLY2_LOG"), "w") : nullptr;
+        if (dlog) {
+            std::fprintf(dlog, "%d %d %d", a_pos, anchor, prevtok);
+            for (int i = 0; i < 5; ++i) std::fprintf(dlog, " %d", ids[i]);
+            std::fprintf(dlog, " %d %d %d\n", cx.K[0], cx.K[1], cx.K[2]);
+            std::fflush(dlog);
+        }
+        df_ms += dfly->last_ms();
+        df_main_ms += dfly->last_main_ms();
+        return true;
+    };
+    if (spec && dfly_path) {
+        if (!open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
+        bias_now = false;
+        apply_bias();
+        const int i0 = (int) prompt.size() - sp_tail;
+        if (!pass_v(prompt.data() + i0, sp_tail, i0)) { std::fprintf(stderr, "ds41_generate: DFly2 tail: %s\n", ferr.c_str()); return 1; }
+        std::copy(vlog.end() - nv, vlog.end(), last_logits.begin());
+        sp_bonus = (int) (std::max_element(last_logits.begin(), last_logits.end()) - last_logits.begin());
+        if (!forced.empty()) sp_bonus = forced[0];
+        if (!dfly_draft(sp_tail - 1, (int) prompt.size(), sp_bonus, prompt.back(), spec_depth, sp_ids)) {
+            std::fprintf(stderr, "ds41_generate: DFly2 draft: %s\n", ferr.c_str());
+            return 1;
+        }
+        bias_now = true;
+        apply_bias();
+    } else if (spec) {
         if (!open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
         bias_now = false;   // the tail is PROMPT: it routes like the rest of the prompt (no decode biases), as plain decode
         apply_bias();
@@ -4893,7 +4995,13 @@ int main(int argc, char ** argv) {
             for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;
             const int drafts[5] = { sp_ids[0], sp_ids[1], sp_ids[2], sp_ids[3], sp_ids[4] };
             const double td = now_ms();
-            if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, g[acc], sp_ids, sp_conf)) {
+            if (dfly) {   // anchor g[acc] at P+2+acc; the last accepted row = pass row r0+acc (position P+1+acc)
+                const int ptok = acc == 0 ? t : drafts[acc - 1];
+                if (!dfly_draft(r0 + acc, P + 2 + acc, g[acc], ptok, spec_depth, sp_ids)) {
+                    std::fprintf(stderr, "ds41_generate: DFly2 draft: %s\n", ferr.c_str());
+                    return 1;
+                }
+            } else if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, g[acc], sp_ids, sp_conf)) {
                 std::fprintf(stderr, "ds41_generate: DSpark step: %s\n", dsp->last_error().c_str());
                 return 1;
             }
@@ -4938,6 +5046,11 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, " k%d %ld (%.0f ms)", w, sk_pick[w], sk_ms[(size_t) w].empty() ? 0.0 : med(sk_ms[(size_t) w]));
             std::fprintf(stderr, "\n");
         }
+        if (sp_pass > 0)   // always: acceptance + the draft cost (the DFly2 gate reads these)
+            std::fprintf(stderr, "spec: %s %ld passes, drafted accepted %.3f/pass (+1 bonus), full %ld, refeed %ld, verify %.2f ms/pass, "
+                         "draft %.2f ms/pass%s\n", dfly ? "DFly2" : "DSpark", sp_pass, (double) sp_acc / sp_pass, sp_full, sp_refeed,
+                         sp_vms / sp_pass, sp_dms / sp_pass,
+                         dfly ? (" (blocks+slot1 " + std::to_string(df_main_ms / std::max(1L, sp_pass)) + " ms)").c_str() : "");
     }
 #endif
     for (; !spec && gen < a.n_predict; ++gen) {
@@ -5032,6 +5145,7 @@ int main(int argc, char ** argv) {
                      "logits %.1f ms per pass\n", pv_n, (double) pv_tok / std::max(1L, pv_n), pv_ms[0] / std::max(1L, pv_n),
                      pv_ms[1] / std::max(1L, pv_n), pv_ms[2] / std::max(1L, pv_n), pv_ms[3] / std::max(1L, pv_n));
     if (dump_main) std::fclose(dump_main);
+    if (dump_dfly) std::fclose(dump_dfly);
     if (file_pred) {
         std::fprintf(stderr, "file-pred: %lld file-tier routes", fp_miss[0]);
         for (int k = 1; k <= kFP; ++k)
