@@ -38,30 +38,40 @@ def long_prompt(words: int) -> str:
     return f"Here is a list of words:\n{body}\n\nSummarize what kinds of words appear in the list, in five sentences."
 
 
-def post(port: int, prompt: str, max_tokens: int) -> dict:
+def post(port: int, prompt: str, max_tokens: int, timeout: float = 1800) -> dict:
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps({"messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens,
                          "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}).encode(),
         headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=1800) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
 
-def wait_ready(port: int, proc: subprocess.Popen, timeout: float = 1800) -> None:
+def wait_ready(port: int, proc: subprocess.Popen, timeout: float = 1800, log_hint: str = "") -> None:
+    """Until /v1/models answers AND one short chat request completes.
+
+    The warm-up request is the load-bearing part (2026-11-27 23:10: /v1/models answered, the chat request never did, and
+    its 1800 s hang landed in a bare "server not ready" traceback).  Failures are kept and reported, not swallowed.
+    """
     t0 = time.time()
+    last = "no attempt completed"
     while time.time() - t0 < timeout:
         if proc.poll() is not None:
-            raise RuntimeError(f"server exited with {proc.returncode}")
+            raise RuntimeError(f"server exited with {proc.returncode}" + (f" (log {log_hint})" if log_hint else ""))
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=5) as r:
                 if r.status == 200:
-                    post(port, "Say hi.", 8)
-                    return
-        except Exception:
-            pass
+                    try:
+                        post(port, "Say hi.", 8, timeout=300)
+                    except Exception as e:      # a listening front end whose engine never answers
+                        last = f"/v1/models answered but the warm-up chat request failed: {type(e).__name__}: {e}"
+                    else:
+                        return
+        except Exception as e:
+            last = f"/v1/models: {type(e).__name__}: {e}"
         time.sleep(3)
-    raise TimeoutError("server not ready")
+    raise TimeoutError(f"server not ready after {timeout:.0f} s ({last})" + (f"; log {log_hint}" if log_hint else ""))
 
 
 def main() -> int:

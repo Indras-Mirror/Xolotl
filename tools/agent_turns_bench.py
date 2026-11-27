@@ -32,6 +32,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ab_engine import wait_ready  # noqa: E402
 
+
+def frontend(cfg: dict) -> list[str]:
+    """The API front end for this config's engine, as bench.py picks it: DeepSeek-V4.1 and GLM each need their own
+    tokenizer, chat template and tool-call shim (serve_ds41.py, serve_glm.py); serve/server.py does not know them, so a
+    chat request through it never finishes (2026-11-27 23:10: run hung 30 min in the warm-up "Say hi.")."""
+    exe = Path(str(cfg.get("exe") or "")).name
+    if exe == "ds41-engine.sh":
+        return [str(ROOT / "tools" / "v41" / "serve" / "serve_ds41.py")]
+    if exe == "glm-engine.sh":
+        return [str(ROOT / "tools" / "glm" / "serve" / "serve_glm.py")]
+    return ["-m", "serve.server"]
+
 SYSTEM = ("You are an autonomous coding agent working in the user's repository. You can read files, search the code, "
           "edit files and run commands with the tools below. Work step by step: read the code you need before changing "
           "it, make small and correct edits, keep the existing style, and explain briefly what you did. Never invent "
@@ -170,12 +182,17 @@ def main() -> int:
             cfg["log"] = str(Path(tempfile.gettempdir()) / f"agent_turns_{name}_r{rnd}.log")
             cpath = Path(tempfile.gettempdir()) / f"agent_turns_{name}.json"
             cpath.write_text(json.dumps(cfg, indent=1))
-            proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config",
-                                     str(cpath), "--port", str(a.port)], cwd=str(ROOT), env=dict(os.environ, **e),
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # the front end's own lines go beside the engine log: a server that never answers is diagnosed from them,
+            # not from a silent /dev/null (the 2026-11-27 23:10 run lost 30 min to that)
+            srv_log = open(Path(tempfile.gettempdir()) / f"agent_turns_{name}_r{rnd}.server.log", "w")
+            py = ROOT / ".venv" / "bin" / "python"
+            proc = subprocess.Popen([str(py if py.exists() else sys.executable), *frontend(cfg), "--engine", "strata",
+                                     "--config", str(cpath), "--host", "127.0.0.1", "--port", str(a.port)],
+                                    cwd=str(ROOT), env=dict(os.environ, **e),
+                                    stdout=srv_log, stderr=subprocess.STDOUT)
             try:
                 t0 = time.time()
-                wait_ready(a.port, proc)
+                wait_ready(a.port, proc, log_hint=str(srv_log.name))
                 print(f"round {rnd} {name}: ready in {time.time() - t0:.0f} s", flush=True)
                 for tag, msgs in work:
                     r = post(a.port, msgs, a.max_new, a.seed)
@@ -193,6 +210,7 @@ def main() -> int:
                     proc.wait(60)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                srv_log.close()
                 time.sleep(5)
     first = arms[0][0]
 
