@@ -33,6 +33,7 @@ struct Ds41DSparkConfig {
     /// Any type (a requantized dense head only moves acceptance - drafts are verified).  nullptr = load from main_gguf.
     ggml_tensor * shared_head = nullptr;
     int cuda_device = -1;   ///< CUDA ordinal for cudaSetDevice around graph compute (layer-split head GPU)
+    bool restore_device = false;   ///< put the caller's current device back after a step (the drafter on its own card)
 };
 
 class Ds41DSpark {

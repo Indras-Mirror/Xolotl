@@ -524,7 +524,12 @@ bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int *
     Impl & im = *p_;
     if (k < 1 || k > im.KM) { im.err = "DSpark step: k out of range"; return false; }
 #ifdef STRATA_ENABLE_CUDA
-    if (im.cfg.cuda_device >= 0) cudaSetDevice(im.cfg.cuda_device);
+    int prev_dev = -1;
+    if (im.cfg.cuda_device >= 0) {
+        if (im.cfg.restore_device) cudaGetDevice(&prev_dev);
+        cudaSetDevice(im.cfg.cuda_device);
+    }
+    struct DevBack { int d; ~DevBack() { if (d >= 0) cudaSetDevice(d); } } dev_back{prev_dev};
 #endif
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<int32_t> mp(pos, pos + k), ms((size_t) k);

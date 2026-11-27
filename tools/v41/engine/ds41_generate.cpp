@@ -1624,10 +1624,36 @@ int main(int argc, char ** argv) {
 #ifdef STRATA_ENABLE_CUDA
             if (pipe.head_offload()) cudaSetDevice(pipe.head->cuda_device);
             else if (pipe.enabled()) cudaSetDevice(pipe.stages[(size_t) (pipe.n_stages() - 1)].cuda_device);
+            // STRATA_DSPARK_DEVICE=<cuda ordinal>: the drafter on its own card (e.g. a second, slower GPU beside the
+            // trunk - the main card keeps its VRAM for experts).  It takes host rows in and gives ids back, so only its
+            // output head (a copy, ~0.7 GB) moves with it; leave that card room (--remote-reserve-gib with --remote-device).
+            static ggml_backend_t dsp_be = nullptr;
+            if (const char* dd = std::getenv("STRATA_DSPARK_DEVICE"); dd && *dd && !pipe.enabled()) {
+                const int dv = std::atoi(dd);
+                int ndev = 0;
+                cudaGetDeviceCount(&ndev);
+                if (dv >= 1 && dv < ndev) {
+                    if (!dsp_be) dsp_be = ggml_backend_cuda_init(dv);
+                    if (dsp_be) {
+                        sc.backend = dsp_be;
+                        sc.cuda_device = dv;
+                        sc.shared_head = nullptr;
+                        sc.restore_device = true;
+                        cudaSetDevice(dv);
+                        std::fprintf(stderr, "DSpark: on CUDA device %d (STRATA_DSPARK_DEVICE)\n", dv);
+                    }
+                } else {
+                    std::fprintf(stderr, "DSpark: STRATA_DSPARK_DEVICE=%s is not a second visible card - on the trunk's\n", dd);
+                }
+            }
 #endif
             dsp = std::make_unique<Ds41DSpark>();
             const double ti = now_ms();
-            if (!dsp->init(sc, err)) {
+            const bool dsp_ok = dsp->init(sc, err);
+#ifdef STRATA_ENABLE_CUDA
+            if (sc.restore_device) cudaSetDevice(0);   // the trunk's card (no layer split on this path)
+#endif
+            if (!dsp_ok) {
                 if (a.serve) {
                     std::fprintf(stderr, "serve: DSpark disabled (%s) — decoding without drafts\n", err.c_str());
                     dsp.reset();

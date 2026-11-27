@@ -115,3 +115,76 @@ void ds41_add_f32(float* dst, const float* src, size_t n, void* stream) {
     const int64_t grid = std::min<int64_t>(((int64_t) n + threads - 1) / threads, 4096);
     k_add_f32<<<(unsigned) grid, threads, 0, (cudaStream_t) stream>>>(dst, src, (int64_t) n);
 }
+
+namespace {
+__global__ void k_add_rows_f32(float* dst, const float* src, const int32_t* rows, int64_t m, int64_t H) {
+    const int64_t n = m * H;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        dst[(int64_t) rows[i / H] * H + i % H] += src[i];
+}
+}  // namespace
+
+void ds41_add_rows_f32(float* dst, const float* src, const int32_t* rows, size_t m, size_t H, void* stream) {
+    if (m == 0 || H == 0) return;
+    const int threads = 256;
+    const int64_t grid = std::min<int64_t>(((int64_t) (m * H) + threads - 1) / threads, 4096);
+    k_add_rows_f32<<<(unsigned) grid, threads, 0, (cudaStream_t) stream>>>(dst, src, rows, (int64_t) m, (int64_t) H);
+}
+
+namespace {
+// one block per (token, 256-column slice): out[u, c] = sum over j in [off[u], off[u+1]) of w[j] * rows[pos[j], c],
+// in j order (no atomics: the same sums every run)
+__global__ void k_gather_wsum_f32(const float* __restrict__ rows, const int32_t* __restrict__ off,
+                                  const int32_t* __restrict__ pos, const float* __restrict__ w, int64_t H,
+                                  float* __restrict__ out) {
+    const int64_t u = blockIdx.y;
+    const int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= H) return;
+    float acc = 0.0f;
+    for (int32_t j = off[u]; j < off[u + 1]; ++j) acc += w[j] * rows[(int64_t) pos[j] * H + c];
+    out[u * H + c] = acc;
+}
+}  // namespace
+
+void ds41_gather_wsum_f32(const float* rows, const int32_t* off, const int32_t* pos, const float* w, size_t m, size_t H,
+                          float* out, void* stream) {
+    if (m == 0 || H == 0) return;
+    const int threads = 256;
+    const dim3 grid((unsigned) ((H + threads - 1) / threads), (unsigned) m);
+    k_gather_wsum_f32<<<grid, threads, 0, (cudaStream_t) stream>>>(rows, off, pos, w, (int64_t) H, out);
+}
+
+namespace {
+// ds41_gather_wsum_f32 with the sum stored as bf16 (round to nearest even): half the bytes down the remote link
+__global__ void k_gather_wsum_bf16(const float* __restrict__ rows, const int32_t* __restrict__ off,
+                                   const int32_t* __restrict__ pos, const float* __restrict__ w, int64_t H,
+                                   uint16_t* __restrict__ out) {
+    const int64_t u = blockIdx.y;
+    const int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= H) return;
+    float acc = 0.0f;
+    for (int32_t j = off[u]; j < off[u + 1]; ++j) acc += w[j] * rows[(int64_t) pos[j] * H + c];
+    uint32_t b = __float_as_uint(acc);
+    b += 0x7FFFu + ((b >> 16) & 1u);
+    out[u * H + c] = (uint16_t) (b >> 16);
+}
+__global__ void k_bf16_to_f32(const uint16_t* __restrict__ src, float* __restrict__ dst, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        dst[i] = __uint_as_float((uint32_t) src[i] << 16);
+}
+}  // namespace
+
+void ds41_gather_wsum_bf16(const float* rows, const int32_t* off, const int32_t* pos, const float* w, size_t m, size_t H,
+                           uint16_t* out, void* stream) {
+    if (m == 0 || H == 0) return;
+    const int threads = 256;
+    const dim3 grid((unsigned) ((H + threads - 1) / threads), (unsigned) m);
+    k_gather_wsum_bf16<<<grid, threads, 0, (cudaStream_t) stream>>>(rows, off, pos, w, (int64_t) H, out);
+}
+
+void ds41_bf16_to_f32(const uint16_t* src, float* dst, size_t n, void* stream) {
+    if (n == 0) return;
+    const int threads = 256;
+    const int64_t grid = std::min<int64_t>(((int64_t) n + threads - 1) / threads, 4096);
+    k_bf16_to_f32<<<(unsigned) grid, threads, 0, (cudaStream_t) stream>>>(src, dst, (int64_t) n);
+}
