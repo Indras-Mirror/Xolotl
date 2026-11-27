@@ -1133,7 +1133,7 @@ struct RemoteTier {
     uint8_t* base = nullptr;             ///< the experts, on `dev`
     size_t cap = 0, used = 0;
     std::vector<int64_t> off;            ///< (layer * n_experts + e) -> byte offset in base; -1 = not held
-    static constexpr int kProxy = 8;
+    static constexpr int kProxy = 16;    ///< >= the top-k of every model the tier serves (ERNIE-5.5 routes 10, DS4.1 6)
     std::vector<int32_t> proxy;          ///< per layer, kProxy: the best-ranked non-remote experts (substitutes of last resort)
     int64_t n = 0;
     cudaStream_t s = nullptr;
@@ -1493,6 +1493,10 @@ bool remote_build(Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>
     ck(cudaSetDevice(r.dev), "remote: set device");
     struct Back { int d; ~Back() { cudaSetDevice(d); } } back{prev};
     const int64_t H = im.g.n_embd, K = im.g.top_k, NL = im.g.n_layers, NX = im.g.n_experts;
+    if (K > RemoteTier::kProxy) {   // a token whose every expert is on the card needs K substitutes (RemoteScope)
+        err = "remote tier: top-k " + std::to_string(K) + " > " + std::to_string(RemoteTier::kProxy) + " substitutes per layer";
+        return false;
+    }
     const int64_t NEB = (int64_t) RemoteTier::kRB * K;
     ck(cudaStreamCreateWithFlags(&r.s, cudaStreamNonBlocking), "remote: stream");
     ck(cudaMalloc(&r.d_x, (size_t) RemoteTier::kRB * (size_t) H * 4), "remote: d_x");
@@ -9481,7 +9485,11 @@ void shadow_q2_0_row(const float* x, uint8_t* out, int64_t n, const float* wt = 
 }
 
 std::string shadow_tname(int t) {
-    return t >= 0 && t < GGML_TYPE_COUNT ? std::string(ggml_type_name((ggml_type) t)) : t == 143 ? std::string("ptq1_0") : "type " + std::to_string(t);
+    // ggml's enum has gaps (the TQP types sit at 147-149, so GGML_TYPE_COUNT is 150 and Xolotl's own PTQ1_0 = 143 is
+    // inside the range): ggml_type_name is null for a gap, and std::string(nullptr) throws
+    const char* nm = t >= 0 && t < GGML_TYPE_COUNT ? ggml_type_name((ggml_type) t) : nullptr;
+    if (nm && *nm) return nm;
+    return t == 143 ? std::string("ptq1_0") : "type " + std::to_string(t);
 }
 bool shadow_read(ShadowFile& sf, uint64_t src_size, int64_t NL, int64_t NE, int64_t D, int64_t FF, std::string& why) {
     sf.fd = ds41_sys::open(sf.path.c_str(), O_RDONLY);
