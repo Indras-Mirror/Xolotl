@@ -8,6 +8,38 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Second-card expert tier, faster; Engram tables in IQ4_NL (27 Nov)
+
+- **Second card (`--remote-device N`) for DeepSeek-V4.1 and ERNIE.** The card that holds the next-ranked experts now
+  takes prompt work too: a compact wire (only the tokens routed to its experts go over PCIe), MMQ for prompt calls of
+  32+ tokens, one metadata copy per block, keep-warm between requests, and a free-VRAM floor before the serve loop grows
+  its buffers (fixes an out-of-memory exit on `--fast`). Measured on an RTX 4090 + RTX 3060 12 GB, DS4.1-1017, 4.1K-token
+  prompt:
+
+  | setup | prefill tok/s | decode tok/s |
+  |---|---:|---:|
+  | 4090 alone | 231 | 25.3 |
+  | 4090 + 3060, before | 139.5 | 28.2 |
+  | 4090 + 3060, `STRATA_REMOTE_HEAD=1` | 247 | 28.5 |
+  | + `STRATA_REMOTE_PIPE=1` (blocks double-buffered) | 252.9 | 27.5 |
+  | `--fast` + 3060 | 249 | 29.9 |
+
+  ERNIE-5.5-Flash with the 3060: 12.5 tok/s decode, 136 prefill (4090 alone 9.8-10.5 / 111-115).
+  `STRATA_REMOTE_HEAD=1` puts the hottest experts on the second card; it and `STRATA_REMOTE_PIPE=1` are opt-in for now.
+  Known: on our short34 logit check two cards score a little below one (top-1 75.2 % vs 76.9 %, the same with the old
+  and the new wire, so it predates this change); we are looking into it.
+- **Engram tables in IQ4_NL, one GGUF per layer** (`--engram L1.gguf:L14.gguf`). 202 GB of FP8 tables become 110 GB.
+  With a 2 GiB IQ4 hot set (`ds41_engram_hot pack --dir L1.gguf:L14.gguf`, about twice the rows of the FP8 one) and both
+  files on one NVMe: decode 29.11 vs 27.25 tok/s, prefill 244.9 vs 248.3, short34 logits level with FP8 (top-1
+  75.24 vs 74.72 %). Keep the tables on a filesystem that reads fast at random; on exFAT decode fell to ~25 tok/s.
+  Converter: `tools/v41/engram/engram_iq4nl_cuda.cu` (byte-identical to ggml's `quantize_iq4_nl`, one layer per GPU,
+  ~7 min a layer). IQ4_NL Engram idea from ISTA-DASLab's GSQ GGUFs; the GGUF table reader is NektoDron's.
+- **CPU: TQP5/6/7 AVX2 row kernel 3.3x** (bit-identical to the scalar reference, `tqp_avx2_exact_test`), and
+  `xqt_decode_bench` for the CPU expert lane.
+- **ERNIE:** DSpark speculative decoding behind `--dspark` (work in progress: acceptance is still below the reference,
+  so it stays off), the DSA indexer scores in column blocks (fixes a graph allocation failure on 25K-token prompts), and
+  `STRATA_DENSE_REQUANT=<type>` for the dense matrices.
+
 ### Windows: the rest of #148 lands (27 Nov)
 
 Six pull requests from [mehzhure](https://github.com/mehzhure), each one fix from the #148 report:

@@ -14,6 +14,7 @@
 
 One line each; the detail, numbers and credits are in [docs/xolotl/CHANGELOG.md](docs/xolotl/CHANGELOG.md).
 
+- **27 Nov** - Second card as an expert tier, faster: DS4.1 on a 4090 + 3060 prefill 231 -> 253 tok/s, decode 25 -> 28-30; Engram tables in IQ4_NL (202 -> 110 GB, decode +7 %). [more](docs/xolotl/CHANGELOG.md#second-card-expert-tier-faster-engram-tables-in-iq4_nl-27-nov)
 - **27 Nov** - [ERNIE-5.5-Flash](docs/ERNIE.md) preview, now served: OpenAI- and Anthropic-compatible server with tool calls and thinking on or off (`configs/xol-ernie.json`), ~14 tok/s decode and 115-120 tok/s prefill on one RTX 4090 with our [XQ file](https://huggingface.co/IndrasMirror/ERNIE-5.5-Flash-XQ-Uncensored) (99.9 GB). Speed work (DSpark, GPU prefill) is next.
 - **27 Nov** - Windows: the rest of #148 (POSIX shims for MSVC, positional reads in `ds4_moe`, the LFM3 speech helper, the GLM census), thanks mehzhure (#149-#154). [more](docs/xolotl/CHANGELOG.md#windows-the-rest-of-148-lands-27-nov)
 - **27 Nov** - Trellis-coded tensor types TQP5/6/7 in Xolotl's ggml (decode kernels, opt-in `XOLOTL_TQP_MMQ=1` prompt kernel). [more](docs/xolotl/CHANGELOG.md#trellis-coded-tensor-types-tqp567-27-nov)
