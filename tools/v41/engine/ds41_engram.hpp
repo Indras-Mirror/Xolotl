@@ -113,7 +113,10 @@ private:
     int qtype_ = -1;
     int64_t wrow_ = 0, srow_ = 0;
     void deq_row(const uint8_t * w, const uint8_t * s, float * out) const;   ///< one raw row -> dim_ floats
-    bool open_gguf(const std::string & path, std::string & err);
+    /// The IQ4_NL / Q5_K tables from GGUF entries: one file holding every Engram layer (ISTA-DASLab's), or one file a
+    /// layer (`--engram L1.gguf:L14.gguf`, so the tables can sit on different drives); each layer's tensor is looked up in
+    /// every given file, the first that has it wins.
+    bool open_gguf(const std::vector<std::string> & paths, std::string & err);
     // Row cache: raw rows (dim weight bytes + dim/32 scale bytes) already read, keyed (layer slot << 32 | row).  Filled
     // by every read until `cache_cap_` rows (STRATA_ENGRAM_CACHE_ROWS, default 2M ~ 0.6 GB; 0 = off), never evicted:
     // a prompt's rows are all cached as it is read, so decode n-grams that repeat the context skip the disk (the Engram

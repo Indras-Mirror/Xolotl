@@ -340,10 +340,17 @@ void Ds41Engram::deq_row(const uint8_t * w, const uint8_t * s, float * o) const 
 }
 
 // The tables from a GGUF (blk.<layer>.engram_embd.weight, [dim, rows], IQ4_NL): one fd, no scale span.
-bool Ds41Engram::open_gguf(const std::string & path, std::string & err) {
+bool Ds41Engram::open_gguf(const std::vector<std::string> & paths, std::string & err) {
     std::vector<uint64_t> loc;   // absolute byte offset per Engram layer
+    std::vector<std::string> lpath;   // the file each layer's table is in
     uint32_t format = 0;
+    std::string path = paths.empty() ? std::string() : paths[0];
     try {
+      for (size_t e = 0; e < g_->engram_layers.size(); ++e) {
+        // the first given file that holds this layer's table (or the combined per_layer_token_embd tensor)
+        const std::string want = "blk." + std::to_string(g_->engram_layers[e]) + ".engram_embd.weight";
+        for (const auto & pp : paths)
+            if (gguf_has(pp, want.c_str()) || gguf_has(pp, "per_layer_token_embd.weight")) { path = pp; break; }
         GgufFile f(path);
         const TensorInfo * combined = f.find("per_layer_token_embd.weight");
         uint64_t base_row = 0, total_rows = 0;
@@ -351,8 +358,11 @@ bool Ds41Engram::open_gguf(const std::string & path, std::string & err) {
             if (r <= 0 || total_rows > UINT64_MAX - (uint64_t) r) { err = "engram: invalid table row counts"; return false; }
             total_rows += (uint64_t) r;
         }
-        for (size_t e = 0; e < g_->engram_layers.size(); ++e) {
-            const std::string name = "blk." + std::to_string(g_->engram_layers[e]) + ".engram_embd.weight";
+        uint64_t skip_rows = 0;   // the combined tensor: the rows of the layers before this one
+        for (size_t k = 0; k < e; ++k) skip_rows += (uint64_t) g_->engram_rows[k];
+        {
+            base_row = skip_rows;
+            const std::string name = want;
             const TensorInfo * t = combined ? combined : f.find(name);
             if (!t) { err = "engram: " + name + " not in " + path; return false; }
             const uint64_t rows = combined ? total_rows : (uint64_t) g_->engram_rows[e];
@@ -375,8 +385,9 @@ bool Ds41Engram::open_gguf(const std::string & path, std::string & err) {
             // Modern PLE offsets are validated as contiguous layer-major buckets by ds41_read_geometry.
             // Local per-layer hash ids then address an exact subview of the combined quantized tensor.
             loc.push_back(f.data_start() + t->offset + (combined ? base_row * row_bytes : 0));
-            base_row += (uint64_t) g_->engram_rows[e];
+            lpath.push_back(path);
         }
+      }
     } catch (const std::exception & ex) {
         err = std::string("engram: ") + path + ": " + ex.what(); return false;
     }
@@ -384,13 +395,14 @@ bool Ds41Engram::open_gguf(const std::string & path, std::string & err) {
     wrow_ = qtype_ == kQ5K ? dim_ / 256 * kQ5KBlock : dim_ / 32 * kIq4nlBlock;
     srow_ = 0;
     for (size_t e = 0; e < loc.size(); ++e) {
-        const int fd = table_open(path);
-        if (fd < 0) { err = "engram: cannot open " + path; return false; }
+        const int fd = table_open(lpath[e]);
+        if (fd < 0) { err = "engram: cannot open " + lpath[e]; return false; }
         ds41_sys::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
-        Table t; t.fd_w = fd; t.off_w = loc[e]; t.rm_w = raw_map(path, fd); t.rows = g_->engram_rows[e];
+        Table t; t.fd_w = fd; t.off_w = loc[e]; t.rm_w = raw_map(lpath[e], fd); t.rows = g_->engram_rows[e];
         tables_.push_back(t);
     }
-    std::fprintf(stderr, "engram: %zu tables from %s (%s, %lld bytes a row)\n", tables_.size(), path.c_str(),
+    std::fprintf(stderr, "engram: %zu tables from %s%s (%s, %lld bytes a row)\n", tables_.size(), path.c_str(),
+                 paths.size() > 1 ? " and the other given files" : "",
                  qtype_ == kQ5K ? "Q5_K" : "IQ4_NL", (long long) wrow_);
     return true;
 }
@@ -565,8 +577,9 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
     wrow_ = dim_;
     srow_ = dim_ / 32;
     std::string gguf;
+    std::vector<std::string> ggufs;   // every .gguf entry (one file a layer is allowed)
     for (const auto & d : dirs)
-        if (d.size() > 5 && d.compare(d.size() - 5, 5, ".gguf") == 0) { gguf = d; break; }
+        if (d.size() > 5 && d.compare(d.size() - 5, 5, ".gguf") == 0) { if (gguf.empty()) gguf = d; ggufs.push_back(d); }
     // Q6_K tables (Unsloth's / llama.cpp #30817's per_layer_token_embd.weight): a converted GGUF says so
     // (deepseek41.engram.encoding = "q6_k_gguf"), and a .gguf entry holding that tensor is read the same way under any
     // backbone of the checkpoint (ISTA-DASLab's GSQ-RCO GGUFs: their own Engram GGUF is IQ4_NL, blk.<l>.engram_embd)
@@ -580,7 +593,7 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
             if (!index.empty()) break;
         }
         if (index.empty()) { err = "engram: no model.safetensors.index.json in the given dirs (and no .gguf entry)"; return false; }
-    } else if (!open_gguf(gguf, err)) return false;
+    } else if (!open_gguf(ggufs, err)) return false;
     for (int64_t e = 0; gguf.empty() && !q6k && e < nel; ++e) {
         const std::string base = "layers." + std::to_string(g.engram_layers[(size_t) e]) + ".engram.embed.";
         Table t;
