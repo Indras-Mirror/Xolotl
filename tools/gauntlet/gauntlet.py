@@ -143,7 +143,11 @@ def _pytest(d: Path, hidden: bool, timeout: int = 300) -> tuple[bool, str]:
     files = sorted(str(p.relative_to(d)) for p in d.rglob("test_*.py") if p.name.startswith("test_hidden_") == hidden)
     if not files:
         return True, "no tests"
-    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *files], cwd=d,
+    # -p no:hydra_pytest: hydra's pytest11 entry point imports omegaconf, which cannot load under the
+    # antlr4 4.13 installed in this env (omegaconf needs 4.9). It aborts pytest before a single test runs,
+    # scoring every task 0.0. Autoloading it earns nothing here; the tasks use no hydra fixtures.
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "no:hydra_pytest",
+                        *files], cwd=d,
                        capture_output=True, text=True, timeout=timeout, env=_child_env(d))
     return r.returncode == 0, (r.stdout + r.stderr)[-4000:]
 
