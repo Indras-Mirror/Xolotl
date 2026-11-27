@@ -4088,8 +4088,9 @@ def apply_ready_timeout(cfg: dict) -> None:
 
 def layer_split_of(cfg: dict) -> bool:
     """Several GPUs in the config are a layer split, unless the args put the later card(s) to another use: with
-    --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665)."""
-    return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
+    --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665);
+    with --remote-device (the DeepSeek-V4.1 / ERNIE engines) it holds and computes a share of the routed experts."""
+    return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"] and "--remote-device" not in cfg["args"]
 
 
 _CARD_CLASS: list = []
@@ -4394,7 +4395,7 @@ def ordered_gpus(cfg: dict, scores=None, vrams=None, archs=None) -> list[int]:
     if len(gl) < 2 or cfg.get("gpu_order") == "as_given" or gpu_roles_active(cfg):
         return gl
     args = cfg.get("args") or []
-    if "--peer-device" in args or "--layer-split" in args or layer_split_value(cfg) != "auto":
+    if "--peer-device" in args or "--remote-device" in args or "--layer-split" in args or layer_split_value(cfg) != "auto":
         return gl
     hip = cfg.get("backend") == "hip"
     if hip:
@@ -10902,7 +10903,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             event_sink = None
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
+    ap.add_argument("--engine", choices=["mock", "xolotl", "strata"], default="mock",
+                    help="xolotl = Xolotl's native engines (the config's exe); strata is the old name and still works")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
@@ -10994,6 +10996,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                          "{\"prefill_gpu\": 0, \"decode_gpu\": 1}; docs/SPLIT_SERVE.md)")
     launch_args = list(sys.argv[1:] if argv is None else argv)
     a = ap.parse_args(launch_args)
+    if a.engine == "xolotl":     # the user-facing name; inside, the native protocol keeps its old name (upstream syncs stay easy)
+        a.engine = "strata"
     if a.engine == "strata" and (_rt := rttime_limit_note()):   # #3238: say it before the first unexplained -9
         print("[strata] WARNING: " + _rt, flush=True)
     global OPENS_BROWSER
