@@ -68,6 +68,7 @@ struct Args {
     bool chunk_prefetch = true;
     int remote_device = -1;
     double remote_gib = 0.0;
+    double pcie = -1.0;                 // --pcie F: share of the single-token decode misses computed on the card (-1 = the tier's 0.25)
     std::string kv_mla = "f16";         // --kv-mla f16|q8_0|q4_0 (ErnieGraphConfig::mla_kv_type)
     int kv_hadamard = -1;               // --kv-hadamard 0|1 (-1 = auto: on for q4_0)
     bool serve = false;                 // --serve: the server's engine line protocol on stdin/stdout (serve_loop)
@@ -128,6 +129,8 @@ void usage(std::FILE* out) {
         "  --batch-logits FILE   with --batch: each prompt's last-row logits appended, float32 n_vocab\n"
         "  --skip-miss W         decode: drop a VRAM-miss expert weighing < W x the token's weight sum (0 = off; measure ppl)\n"
         "  --skip-file W         the same rule for file-tier (NVMe) experts only\n"
+        "  --pcie F              share of the decode misses (arena-resident) computed on the card instead of the CPU pool\n"
+        "                        (default 0.25)\n"
         "  --vram-lru            a PCIe-share miss takes its layer's least-recently-used VRAM slot (the cache follows the chat)\n"
         "  --arena-adapt         a file-tier read replaces its layer's least-recently-used RAM arena expert\n"
         "  --arena-skip-resident the VRAM seed's experts stay out of the RAM arena (room for the next-ranked ones)\n"
@@ -203,6 +206,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (f == "--skip-miss") { if (!(v = next())) return false; a.skip_miss = (float) std::atof(v); }
         else if (f == "--skip-file") { if (!(v = next())) return false; a.skip_file = (float) std::atof(v); }
         else if (f == "--vram-lru") a.vram_lru = true;
+        else if (f == "--pcie") { if (!(v = next())) return false; a.pcie = std::atof(v); }
         else if (f == "--no-vram-lru") a.vram_lru = false;
         else if (f == "--arena-adapt") a.arena_adapt = true;
         else if (f == "--arena-skip-resident") a.arena_skip_resident = true;
@@ -1094,6 +1098,7 @@ int main(int argc, char** argv) {
         tcfg.chunk_prefetch = a.chunk_prefetch;
         tcfg.remote_device = a.remote_device;
         tcfg.remote_gib = a.remote_gib;
+        if (a.pcie >= 0.0) tcfg.pcie_frac = a.pcie;
         tier.reset(new Ds41MoeTier());
         if (!tier->init(gm, src.get(), tcfg, err)) { std::fprintf(stderr, "tier init: %s\n", err.c_str()); return 1; }
         if (!a.count_routes.empty()) {

@@ -78,6 +78,21 @@ void gu_ggml_one(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const
     }
 }
 
+#ifndef STRATA_ROW_DOT_HALF
+// one 32-value half of row_dot: decode, then every token's sign + maddubs + madd into accumulator (2j+half)%A (a macro,
+// not a lambda: the VNNI copy's target attribute must cover it)
+#define STRATA_ROW_DOT_HALF(j, half)                                                                                   \
+    do {                                                                                                               \
+        __m256i g, sgn, sc;                                                                                            \
+        Fmt32<TY>::decode(blk, (j), (half), g, sgn, sc);                                                               \
+        const int off = 64 * (j) + 32 * (half);                                                                        \
+        for (int t = 0; t < NT; ++t) {                                                                                 \
+            const __m256i yv = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + off));                                \
+            const __m256i ys = _mm256_sign_epi8(yv, sgn);                                                              \
+            acci[t][(2 * (j) + (half)) % A] = madd_add(acci[t][(2 * (j) + (half)) % A], _mm256_maddubs_epi16(g, ys), sc); \
+        }                                                                                                              \
+    } while (0)
+#endif
 template <int TY, int NT, bool EX = false> STRATA_ROWS_FN
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
     const int pf = prefetch_distance();
@@ -92,17 +107,19 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
         __m256i acci[NT][A];
         for (int t = 0; t < NT; ++t)
             for (int a = 0; a < A; ++a) acci[t][a] = _mm256_setzero_si256();
-        for (int j = 0; j < 4; ++j) {
-            for (int half = 0; half < 2; ++half) {
-                __m256i g, sgn, sc;
-                Fmt32<TY>::decode(blk, j, half, g, sgn, sc);
-                const int off = 64 * j + 32 * half;
-                for (int t = 0; t < NT; ++t) {
-                    const __m256i yv = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + off));
-                    const __m256i ys = _mm256_sign_epi8(yv, sgn);
-                    acci[t][(2 * j + half) % A] = madd_add(acci[t][(2 * j + half) % A], _mm256_maddubs_epi16(g, ys), sc);
-                }
+        if constexpr (TY == 18 || TY == 16) {
+            // IQ3_XXS / IQ2_XXS fully unrolled: the accumulator slot (2j+half)%A is then a constant and the accumulators
+            // stay in registers (a runtime slot kept them on the stack, a load + store a half; 27 Nov, Zen 3, 8 threads
+            // from DRAM: IQ3_XXS +13 %, IQ2_XXS +4 %; IQ2_S lost 9 % unrolled, IQ2_XS / IQ3_S flat - those keep the loop).
+            // Integer sums in the same order: the same bits.
+#pragma GCC unroll 4
+            for (int j = 0; j < 4; ++j) {
+#pragma GCC unroll 2
+                for (int half = 0; half < 2; ++half) STRATA_ROW_DOT_HALF(j, half);
             }
+        } else {
+            for (int j = 0; j < 4; ++j)
+                for (int half = 0; half < 2; ++half) STRATA_ROW_DOT_HALF(j, half);
         }
         for (int t = 0; t < NT; ++t)
             for (int a = 1; a < A; ++a) acci[t][0] = _mm256_add_epi32(acci[t][0], acci[t][a]);
