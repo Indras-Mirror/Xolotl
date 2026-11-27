@@ -63,6 +63,9 @@ const char* tq_isa_name(TqIsa isa);
 
 /// The 32768 x 4 int16 state table of the fork's types (filled on first use; thread-safe).
 const int16_t* tq_state_table();
+/// TQP point table: [2048] u32, the int16 weight pair of codebook point p (low 16 bits = first weight); equal to the
+/// first pair of tq_state_table() row s for p = (s * 0x9e3779b1) >> 21.
+const uint32_t* tq_point_table();
 /// The same for the computed codebook of TQK5X / TQK4X (tq_computed.hpp).
 const int16_t* tq_state_table_computed();
 /// The table a type decodes with.

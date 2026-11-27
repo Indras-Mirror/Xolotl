@@ -1129,6 +1129,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       if(STRATA_ENABLE_HIP)
         target_compile_options(ds4_tq_test PRIVATE "$<$<COMPILE_LANGUAGE:HIP,CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/dsv41/hip_extra.h>")
       endif()
+      # the TQP AVX2 row kernel == the scalar reference, bit for bit (point table + vector state windows)
+      add_executable(tqp_avx2_exact_test tests/dsv41/tqp_avx2_exact_test.cpp)
+      target_include_directories(tqp_avx2_exact_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      target_link_libraries(tqp_avx2_exact_test PRIVATE strata_kernels_cpu)
+      add_test(NAME tqp_avx2_exact_test COMMAND tqp_avx2_exact_test)
+      # the CPU expert lane's decode speed on one ERNIE-shaped expert (2048 -> 2048x2 / 2048), TQP5 / TQP6 against the
+      # ggml low-bit types it already reads, through iq_cpu_* (the engine's own entry points).  No device, no model.
+      add_executable(xqt_decode_bench tests/dsv41/xqt_decode_bench.cpp src/dsv41/ds4_tq_cpu.cpp
+                     src/dsv41/ds4_iq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp)
+      target_include_directories(xqt_decode_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cpu)
+      target_link_libraries(xqt_decode_bench PRIVATE strata_kernels_cpu Threads::Threads)
+      target_compile_definitions(xqt_decode_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
       # the i-quant experts (ds4_iq.cu) against ggml's own decode of the same blocks + a double reference, device and CPU
       # lane, for every type the device takes: the gate a new type (IQ2_XS ..) has to pass before the engine uses it
       set_source_files_properties(tests/dsv41/iq_expert_test.cpp PROPERTIES LANGUAGE ${_ds4_test_lang})

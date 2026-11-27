@@ -26,6 +26,7 @@ namespace strata::kernels::cpu {
 namespace {
 
 alignas(64) int16_t g_table[(tq_detail::kTqStateMask + 1) * 4];
+alignas(64) uint32_t g_points[2048];   // TQP: the int16 pair of each codebook point (low half = first weight), 8 KB
 alignas(64) int16_t g_table_c[(tq_detail::kTqStateMask + 1) * 4];
 
 void fill_table() {
@@ -38,6 +39,20 @@ void fill_table() {
                 const float v = tq_detail::tq_half_to_float(tq_lut_f16[2 * pts[h] + j]) * 8192.0f;
                 g_table[4 * s + 2 * h + j] = (int16_t) (v < 0.0f ? v - 0.5f : v + 0.5f);
             }
+    }
+}
+
+// The TQP kernels read only the FIRST pair of a state's row, and that pair depends on the hashed point
+// (s * 0x9e3779b1) >> 21 alone, so 2048 entries (8 KB, L1-resident) hold exactly the same int16 numbers as the
+// 256 KB state table; same rounding as fill_table.
+void fill_points() {
+    for (uint32_t p = 0; p < 2048; ++p) {
+        int16_t v2[2];
+        for (int j = 0; j < 2; ++j) {
+            const float v = tq_detail::tq_half_to_float(tq_lut_f16[2 * p + j]) * 8192.0f;
+            v2[j] = (int16_t) (v < 0.0f ? v - 0.5f : v + 0.5f);
+        }
+        g_points[p] = (uint32_t) (uint16_t) v2[0] | ((uint32_t) (uint16_t) v2[1] << 16);
     }
 }
 
@@ -127,6 +142,12 @@ const int16_t* tq_state_table() {
     static std::once_flag once;
     std::call_once(once, fill_table);
     return g_table;
+}
+
+const uint32_t* tq_point_table() {
+    static std::once_flag once;
+    std::call_once(once, fill_points);
+    return g_points;
 }
 
 const int16_t* tq_state_table_computed() {

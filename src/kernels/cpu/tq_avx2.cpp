@@ -16,6 +16,9 @@
 
 #include <immintrin.h>
 
+#include <cstdlib>
+#include <cstring>
+
 namespace strata::kernels::cpu::tq_detail {
 namespace {
 
@@ -139,13 +142,170 @@ void rows_tqp_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a
     }
 }
 
+// ---- TQP fast kernel (25 Nov): point table, vector state windows, two passes per row --------------------------
+// State t of a TQP block = the 16 stream bits from bit (63 - t)*KB, masked to 15 bits; its two weights are the
+// pair of codebook point (s * 0x9e3779b1) >> 21 (tq_point_table, 8 KB, L1-resident; the 256 KB state table thrashed
+// L1/L2).  The 8 states t = 8h .. 8h+7 lie inside a <= 11-byte window at a compile-time byte offset: one 16-byte
+// load broadcast to both lanes, VPSHUFB (each 32-bit lane takes its 4 bytes), VPSRLVD (its bit shift), mask,
+// VPMULLD + shift = 8 hashed points.  Pass 1 writes a row's points to an L1 buffer; pass 2 loads the pairs with
+// scalar loads (Zen 3's 8-wide VPGATHERDD costs ~12 cycles, more than everything else) and does the dots.  Two
+// passes because one pass chains window -> hash -> store -> reload -> table load -> madd (~50 cycles) and the reorder
+// window holds about one block.  Same int16 numbers and the same exact int32 group sums as the scalar kernel: the
+// float results are bit-identical (tqp_avx2_exact_test).
+// Zen 3 (5700X, 1 thread, ERNIE expert 2048 -> 2x2048 + down, 1 token): 6.6 ms (state table) -> 2.0 ms; tried and
+// dropped: one 8-wide gather (3.2-3.8), two 4-wide (3.7), one pass + scalar loads (2.7), u32 index reloads (2.4-3.6),
+// pairs joined in GPRs (3.3), a block copy for the wrap (4.5: store-forwarding stalls).
+
+template <int KB>
+struct TqpCtl {
+    alignas(32) uint8_t shuf[8][32];
+    alignas(32) uint32_t sh[8][8];
+    int base[8];   // the window's first stream byte
+    int need[8];   // one past the last stream byte the window's states use (may pass 8*KB: the circular wrap)
+    constexpr TqpCtl() : shuf{}, sh{}, base{}, need{} {
+        for (int h = 0; h < 8; ++h) {
+            const int bmin = ((56 - 8 * h) * KB) >> 3;   // the lowest offset is t = 8h+7
+            base[h] = bmin;
+            int nd = 0;
+            for (int j = 0; j < 8; ++j) {
+                const int rel = (63 - 8 * h - j) * KB - 8 * bmin;
+                const int b = rel >> 3;
+                sh[h][j] = (uint32_t) (rel & 7);
+                for (int k = 0; k < 4; ++k) shuf[h][4 * j + k] = (uint8_t) (b + k);
+                const int e = bmin + ((rel + 15 + 7) >> 3);   // bytes holding bits [rel, rel+15)
+                nd = e > nd ? e : nd;
+            }
+            need[h] = nd;
+        }
+    }
+};
+
+template <int KB>
+inline constexpr TqpCtl<KB> kTqpCtl{};
+
+// the 16 stream bytes from c.base[H] - straight from the block, never outside it: a plain load where it fits, the
+// block's last 16 bytes shifted down near the end, and those with the block's first bytes appended (VPALIGNR) for the
+// circular windows.  Bytes past `need` are never used, so the zeros VPSRLDQ shifts in do not matter.
+template <int KB, int H>
+inline __m128i tqp_window(const uint8_t* qs) {
+    constexpr TqpCtl<KB> c = kTqpCtl<KB>;
+    constexpr int NB = 8 * KB, base = c.base[H];
+    if constexpr (base + 16 <= NB) {
+        return _mm_loadu_si128((const __m128i*) (qs + base));
+    } else if constexpr (c.need[H] <= NB) {
+        return _mm_srli_si128(_mm_loadu_si128((const __m128i*) (qs + NB - 16)), base - (NB - 16));
+    } else {
+        static_assert(c.need[H] - NB <= base - (NB - 16), "the wrap fits one VPALIGNR");
+        return _mm_alignr_epi8(_mm_loadu_si128((const __m128i*) qs), _mm_loadu_si128((const __m128i*) (qs + NB - 16)),
+                               base - (NB - 16));
+    }
+}
+
+template <int KB, int H>
+inline __m256i tqp_points8(const uint8_t* qs) {
+    const TqpCtl<KB>& c = kTqpCtl<KB>;
+    __m256i v = _mm256_broadcastsi128_si256(tqp_window<KB, H>(qs));
+    v = _mm256_shuffle_epi8(v, _mm256_load_si256((const __m256i*) c.shuf[H]));
+    v = _mm256_srlv_epi32(v, _mm256_load_si256((const __m256i*) c.sh[H]));
+    v = _mm256_and_si256(v, _mm256_set1_epi32(0x7fff));
+    return _mm256_srli_epi32(_mm256_mullo_epi32(v, _mm256_set1_epi32((int) 0x9e3779b1u)), 21);
+}
+
+// the 8 pairs of 8 stored points: the indices read back as u64 pairs (fewer load uops), VMOVD + unpacks
+inline __m256i tqp_pairs_from(const int* pts, const uint32_t* ix) {
+    uint64_t i0, i1, i2, i3;
+    std::memcpy(&i0, ix + 0, 8);
+    std::memcpy(&i1, ix + 2, 8);
+    std::memcpy(&i2, ix + 4, 8);
+    std::memcpy(&i3, ix + 6, 8);
+    auto ld = [pts](uint32_t i) { return _mm_cvtsi32_si128(pts[i]); };
+    const __m128i a0 = _mm_unpacklo_epi32(ld((uint32_t) i0), ld((uint32_t) (i0 >> 32)));
+    const __m128i a1 = _mm_unpacklo_epi32(ld((uint32_t) i1), ld((uint32_t) (i1 >> 32)));
+    const __m128i a2 = _mm_unpacklo_epi32(ld((uint32_t) i2), ld((uint32_t) (i2 >> 32)));
+    const __m128i a3 = _mm_unpacklo_epi32(ld((uint32_t) i3), ld((uint32_t) (i3 >> 32)));
+    return _mm256_set_m128i(_mm_unpacklo_epi64(a2, a3), _mm_unpacklo_epi64(a0, a1));
+}
+
+// per-lane pair sums of a and b as VPHADDD gives them, from two shuffles and an add (exact int32; ~3 % faster at
+// 8 tokens on Zen 3)
+inline __m256i tqp_hadd(__m256i a, __m256i b) {
+    const __m256 fa = _mm256_castsi256_ps(a), fb = _mm256_castsi256_ps(b);
+    return _mm256_add_epi32(_mm256_castps_si256(_mm256_shuffle_ps(fa, fb, 0x88)),
+                            _mm256_castps_si256(_mm256_shuffle_ps(fa, fb, 0xDD)));
+}
+
+template <int KB>
+void rows_tqp3_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt, float* const* out, int r0,
+                 int r1) {
+    const int nb = n / 128;
+    constexpr size_t bsz = 2 + 8 * KB;
+    const int* pts = (const int*) tq_point_table();
+    alignas(64) uint32_t ix[kTqMaxN / 2];
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* qs = x + (size_t) i * bsz + 2;
+            __m256i* d = (__m256i*) (ix + 64 * i);
+            _mm256_store_si256(d + 0, tqp_points8<KB, 0>(qs));
+            _mm256_store_si256(d + 1, tqp_points8<KB, 1>(qs));
+            _mm256_store_si256(d + 2, tqp_points8<KB, 2>(qs));
+            _mm256_store_si256(d + 3, tqp_points8<KB, 3>(qs));
+            _mm256_store_si256(d + 4, tqp_points8<KB, 4>(qs));
+            _mm256_store_si256(d + 5, tqp_points8<KB, 5>(qs));
+            _mm256_store_si256(d + 6, tqp_points8<KB, 6>(qs));
+            _mm256_store_si256(d + 7, tqp_points8<KB, 7>(qs));
+        }
+        __m128 acc[kTqMaxTokens];
+        for (int t = 0; t < nt; ++t) acc[t] = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* blk = x + (size_t) i * bsz;
+            const uint32_t* bi = ix + 64 * i;
+            __m256i wv[8];
+#pragma GCC unroll 8
+            for (int h = 0; h < 8; ++h) wv[h] = tqp_pairs_from(pts, bi + 8 * h);
+            const __m128 dx = _mm_set1_ps(tq_half_to_float(tq_ld16(blk)));
+            for (int t = 0; t < nt; ++t) {
+                const __m256i* q = (const __m256i*) (a[t]->q + 128 * i);
+                const __m256i p0 = _mm256_add_epi32(_mm256_madd_epi16(wv[0], _mm256_load_si256(q + 0)),
+                                                    _mm256_madd_epi16(wv[1], _mm256_load_si256(q + 1)));
+                const __m256i p1 = _mm256_add_epi32(_mm256_madd_epi16(wv[2], _mm256_load_si256(q + 2)),
+                                                    _mm256_madd_epi16(wv[3], _mm256_load_si256(q + 3)));
+                const __m256i p2 = _mm256_add_epi32(_mm256_madd_epi16(wv[4], _mm256_load_si256(q + 4)),
+                                                    _mm256_madd_epi16(wv[5], _mm256_load_si256(q + 5)));
+                const __m256i p3 = _mm256_add_epi32(_mm256_madd_epi16(wv[6], _mm256_load_si256(q + 6)),
+                                                    _mm256_madd_epi16(wv[7], _mm256_load_si256(q + 7)));
+                const __m256i hh = tqp_hadd(tqp_hadd(p0, p1), tqp_hadd(p2, p3));
+                const __m128i s4 = _mm_add_epi32(_mm256_castsi256_si128(hh), _mm256_extracti128_si256(hh, 1));
+                const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + 4 * i));
+                acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s4), sc, acc[t]);
+            }
+        }
+        for (int t = 0; t < nt; ++t) {
+            alignas(16) float v[4];
+            _mm_store_ps(v, acc[t]);
+            out[t][r] = ((v[0] + v[1]) + (v[2] + v[3])) * (1.0f / 8192.0f);
+        }
+    }
+}
+
+bool tqp_old_kernel() {
+    static const bool old = [] { const char* e = std::getenv("STRATA_TQP_OLD"); return e && *e == '1'; }();
+    return old;
+}
+
 }  // namespace
 
 void tq_rows_avx2_tqp(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                       float* const* out, int r0, int r1) {
-    if (kb == 5) rows_tqp_t<5>(w, row_bytes, n, a, nt, out, r0, r1);
-    else if (kb == 6) rows_tqp_t<6>(w, row_bytes, n, a, nt, out, r0, r1);
-    else rows_tqp_t<7>(w, row_bytes, n, a, nt, out, r0, r1);
+    if (tqp_old_kernel()) {   // A/B only: the state-table kernel (b9b4ae011)
+        if (kb == 5) rows_tqp_t<5>(w, row_bytes, n, a, nt, out, r0, r1);
+        else if (kb == 6) rows_tqp_t<6>(w, row_bytes, n, a, nt, out, r0, r1);
+        else rows_tqp_t<7>(w, row_bytes, n, a, nt, out, r0, r1);
+        return;
+    }
+    if (kb == 5) rows_tqp3_t<5>(w, row_bytes, n, a, nt, out, r0, r1);
+    else if (kb == 6) rows_tqp3_t<6>(w, row_bytes, n, a, nt, out, r0, r1);
+    else rows_tqp3_t<7>(w, row_bytes, n, a, nt, out, r0, r1);
 }
 
 void tq_rows_avx2(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
