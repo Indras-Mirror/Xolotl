@@ -893,6 +893,7 @@ struct Gpu {
     /// run_chunk's MMQ on PTQ1_0: the run's ternary matrices transcoded to Q2_0 here (ds41_transcode, lossless)
     void* m_tc = nullptr;
     size_t m_tc_cap = 0;
+    size_t m_tc_tried = 0;   ///< the largest m_tc size asked for since the last free_mmq (no retry at or below it)
 #if defined(DS4_MOE_MMQ)
     /// Created once and never destroyed: a binary that also links ggml-cuda (mimo_generate's dense backend) resolves
     /// ~ggml_backend_cuda_context to ggml-cuda's real one, which segfaults on the context strata_mmq built.
@@ -904,6 +905,7 @@ struct Gpu {
         m_gu = m_h = m_xg = m_xu = m_xd = m_bnd = m_iota = m_tc = nullptr;
         m_rows = 0;
         m_tc_cap = 0;
+        m_tc_tried = 0;
     }
 
     void close() {
@@ -8113,18 +8115,26 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         size_t tc_max = SIZE_MAX;
         if (strided && MP.SL2 > 0) {
             const size_t want = (size_t) std::max<int64_t>(1, gp.c_half / SL) * MP.SL2;
-            if (gp.m_tc_cap < want) {
+            // at most STRATA_MMQ_TC_GIB (1): taking all the free VRAM squeezed the next-layer prestage region
+            // (3.00 -> 1.37 GiB) and cost the dense half ~1.2 s on an 8K prompt; 1 GiB = ~80 transcoded experts
+            // per MMQ launch
+            static const size_t tc_cap = (size_t) ((std::getenv("STRATA_MMQ_TC_GIB") ? std::atof(std::getenv("STRATA_MMQ_TC_GIB")) : 1.0) * 1073741824.0);
+            // 28 Nov (nsys turn2): the old test `m_tc_cap < want` stayed true whenever the 1 GiB cap (or free VRAM) cut
+            // the buffer below `want` (the usual case on DS4.1 --fast), so EVERY launch freed and re-allocated it:
+            // 111 cudaFree per ~500-token turn, each a device-wide sync (1.42 s summed, up to 28 ms each) that drained
+            // the copy queue.  Now: grow only toward min(want, cap), and never retry a size already asked for since the
+            // last free_mmq.  Same stream order as the sub-runs inside one launch, so reuse is safe; per-expert MMQ
+            // results do not depend on the sub-run split.  STRATA_MMQ_TC_REALLOC=1 = the old per-launch behaviour (A/B).
+            static const bool tc_realloc = std::getenv("STRATA_MMQ_TC_REALLOC") && std::getenv("STRATA_MMQ_TC_REALLOC")[0] == '1';
+            const size_t target = std::min(want, tc_cap) / MP.SL2 * MP.SL2;
+            if (tc_realloc ? gp.m_tc_cap < want : (gp.m_tc_cap < target && target > gp.m_tc_tried)) {
+                if (!tc_realloc) gp.m_tc_tried = target;
                 if (gp.m_tc) cudaFree(gp.m_tc);
                 gp.m_tc = nullptr;
                 gp.m_tc_cap = 0;
                 size_t fr = 0, tot = 0;
                 cudaMemGetInfo(&fr, &tot);
                 const size_t keep = (size_t) 2 << 30;   // room for the dense pass buffer (grows with the prompt)
-                // at most STRATA_MMQ_TC_GIB (1): taking all the free VRAM squeezed the next-layer prestage region
-                // (3.00 -> 1.37 GiB) and cost the dense half ~1.2 s on an 8K prompt; 1 GiB = ~80 transcoded experts
-                // per MMQ launch
-                const char* tce = std::getenv("STRATA_MMQ_TC_GIB");
-                const size_t tc_cap = (size_t) ((tce ? std::atof(tce) : 1.0) * 1073741824.0);
                 size_t got = fr > keep ? std::min(std::min(want, tc_cap), fr - keep) : 0;
                 got = got / MP.SL2 * MP.SL2;
                 if (got >= MP.SL2 && cudaMalloc(&gp.m_tc, got) == cudaSuccess) gp.m_tc_cap = got;
