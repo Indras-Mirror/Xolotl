@@ -1,5 +1,6 @@
 #include <sstream>
 #include <fstream>
+#include <regex>
 // src/program/inkling_main.cpp - `xolotl-inkling --serve --native <inkling-2-mini.gguf> [--context N] [--ubatch N] [--cpu-exps L]`
 //
 // Inkling-2-Mini (Thinking Machines Lab, Apache 2.0) in Xolotl.  The forward pass is the Inkling 2 graph of llama.cpp
@@ -73,6 +74,9 @@ namespace inkling_stats { enum { ST_Q = 0, ST_K, ST_V, ST_O, ST_F, ST_ACT, ST_ID
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -221,7 +225,10 @@ struct Slot {                  // one cache slot
     ggml_type k_type = GGML_TYPE_F16, v_type = GGML_TYPE_F16;   // the full slots take --kv-type; the rings stay f16
     ggml_tensor *k_cache = nullptr, *v_cache = nullptr, *conv = nullptr;
     ggml_tensor* conv_hist = nullptr;   // --dspark: [n_conv-1+kSpecT, n_chan] = [state ; chunk inputs] of the last verify
-    int64_t cells = 0;
+    int64_t cells = 0;                  // cells in k_cache / v_cache (VRAM); a spilled global slot holds [0, cells) here
+    // --kv-vram N (spill): a global slot's cells [cells, n_ctx) live here, in pinned host RAM (same row layout,
+    // cell j at row j - cells).  Null when the slot is fully resident.
+    ggml_tensor *k_host = nullptr, *v_host = nullptr;
 };
 
 // XOLOTL_INKLING_KV_ROT: a full-context K or V leg stored as q4_0 goes through a randomised Hadamard rotation
@@ -259,7 +266,20 @@ struct Model {
     std::vector<Layer> L;
     std::vector<Slot> S;
     std::vector<ggml_tensor*> gpu_w, host_wt;   // host: the token table + --cpu-exps experts
+    // XOLOTL_INKLING_GPU2_EXPS=<layers> (28 Nov): these layers' experts on CUDA device 1 (the 3060), for a model 0.4 GB
+    // too big for the 4090 alone (the NVFP4 parent under the trainer). The engine sched + the trainer's eval graphs split
+    ggml_backend_t gpu2 = nullptr;
+    ggml_backend_buffer_t g2buf = nullptr;
+    std::vector<ggml_tensor*> gpu2_w;
+    size_t gpu2_bytes = 0;
     int64_t n_ctx = 0;
+    // --kv-vram N: the global slots keep cells [0, kv_res) in VRAM and [kv_res, n_ctx) in pinned host RAM (khbuf).
+    // 0 = every cell in VRAM (the default; nothing below changes then).  A step that reaches past kv_res runs the
+    // global layers on the chunked attention chain: host chunks on the CPU at decode, copied to the GPU by the
+    // scheduler for prompt chunks (the buffer is flagged WEIGHTS, so ggml's large-batch op offload takes it).
+    int64_t kv_vram = 0, kv_res = 0;
+    ggml_context* khctx = nullptr; ggml_backend_buffer_t khbuf = nullptr;
+    bool spill_on() const { return kv_res > 0 && kv_res < n_ctx; }
     int ubatch = 512;
     int64_t attn_budget = 1 << 25;   // n_kv * T cap for one chunk's attention scores (and for a prefill chunk)
     int64_t ring = 0;
@@ -548,7 +568,9 @@ bool setup_expert_cache(Model& m, const std::string& path) {
         size_t ksw = ggml_row_size(GGML_TYPE_F16, h.n_kgqa()), vsw = ksw;
         int n_full = 0, n_swa = 0;
         for (int s = 0; s < h.n_slot; ++s) (h.swa[h.phys_of(s)] ? n_swa : n_full)++;
-        kv = (size_t) n_full * (size_t) m.n_ctx * (kfull + vfull) + (size_t) n_swa * (size_t) cells_ring * (ksw + vsw);
+        const int64_t nc = ((m.n_ctx + 255) / 256) * 256, kr = ((m.kv_vram + 255) / 256) * 256;
+        const int64_t full_c = m.kv_vram > 0 && kr < nc ? kr : nc;   // --kv-vram: only the resident cells take VRAM
+        kv = (size_t) n_full * (size_t) full_c * (kfull + vfull) + (size_t) n_swa * (size_t) cells_ring * (ksw + vsw);
     }
     const size_t total = (size_t) m.vram_budget_mib << 20;
     const size_t reserve = 768ull << 20;   // stacked controllers/projections, CUDA context, graph + scratch
@@ -924,6 +946,39 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
     gguf_init_params gp{true, &m.wctx};
     m.gg.g = gguf_init_from_file(path.c_str(), gp);
     if (!m.gg.g) die("cannot read GGUF " + path);
+    // XOLOTL_INKLING_OVERRIDE_ONLY=<regex> (28 Nov: try a tensor swap without writing a GGUF): only tensors whose name
+    // matches come from XOLOTL_INKLING_OVERRIDE, and those may change TYPE (e.g. an XQT band read as the parent's NVFP4 /
+    // BF16 bytes). The tensor is retyped here, before anything is sized or allocated; shapes must match.
+    if (const char* only = std::getenv("XOLOTL_INKLING_OVERRIDE_ONLY"); only && *only) {
+        const char* op = std::getenv("XOLOTL_INKLING_OVERRIDE");
+        if (!op) die("XOLOTL_INKLING_OVERRIDE_ONLY needs XOLOTL_INKLING_OVERRIDE");
+        gguf_init_params og{true, nullptr};
+        ggml_context* octx = nullptr;
+        og.ctx = &octx;
+        gguf_context* ov = gguf_init_from_file(op, og);
+        if (!ov) die(std::string("XOLOTL_INKLING_OVERRIDE: cannot read ") + op);
+        const std::regex re(only);
+        int n_match = 0, n_retype = 0;
+        for (ggml_tensor* t = ggml_get_first_tensor(m.wctx); t; t = ggml_get_next_tensor(m.wctx, t)) {
+            if (!std::regex_match(t->name, re)) continue;
+            ggml_tensor* o = ggml_get_tensor(octx, t->name);
+            if (!o) die(std::string("XOLOTL_INKLING_OVERRIDE_ONLY: ") + t->name + " is not in the override file");
+            for (int d = 0; d < GGML_MAX_DIMS; ++d)
+                if (o->ne[d] != t->ne[d]) die(std::string("XOLOTL_INKLING_OVERRIDE_ONLY: ") + t->name + " differs in shape");
+            ++n_match;
+            if (o->type != t->type) {
+                t->type = o->type;
+                t->nb[0] = ggml_type_size(t->type);
+                t->nb[1] = t->nb[0] * (t->ne[0] / ggml_blck_size(t->type));
+                for (int d = 2; d < GGML_MAX_DIMS; ++d) t->nb[d] = t->nb[d - 1] * t->ne[d - 1];
+                ++n_retype;
+            }
+        }
+        if (!n_match) die(std::string("XOLOTL_INKLING_OVERRIDE_ONLY: no tensor matches ") + only);
+        std::fprintf(stderr, "xolotl-inkling: XOLOTL_INKLING_OVERRIDE_ONLY %s: %d tensors (%d retyped) from %s\n", only, n_match, n_retype, op);
+        gguf_free(ov);
+        ggml_free(octx);
+    }
     m.arch = gguf_get_val_str(m.gg.g, m.gg.key("general.architecture"));
     if (m.arch != "inkling2_loop" && m.arch != "inkling2") die("not an Inkling 2 GGUF (general.architecture = " + m.arch + ")");
     const std::string a = m.arch + ".";
@@ -1023,8 +1078,26 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
     if (!m.gpu) die("ggml CUDA backend failed to start");
     m.cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(m.cpu, threads);
+    if (m.kv_vram > 0 && !(std::getenv("XOLOTL_INKLING_SPILL_TP") && std::atoi(std::getenv("XOLOTL_INKLING_SPILL_TP")) == 0)) {
+        // --kv-vram: a decode step runs 8 small CPU splits (one per global visit); without OpenMP the CPU backend
+        // starts and joins its threads on every one.  A persistent pool keeps them (lives as long as the process).
+        ggml_threadpool_params tpp = ggml_threadpool_params_default(threads);
+        static ggml_threadpool* tp = ggml_threadpool_new(&tpp);
+        if (tp) ggml_backend_cpu_set_threadpool(m.cpu, tp);
+    }
     std::vector<bool> host_exp(h.n_phys, false);
     for (int l : parse_layers(cpu_exps, h.n_phys)) host_exp[l] = true;
+    std::vector<bool> gpu2_exp(h.n_phys, false);
+    if (const char* g2 = std::getenv("XOLOTL_INKLING_GPU2_EXPS"); g2 && *g2) {
+        if (park_copy) die("XOLOTL_INKLING_GPU2_EXPS: not with park/unpark");
+        if (m.vram_budget_mib > 0) die("XOLOTL_INKLING_GPU2_EXPS and --vram-budget-mib are mutually exclusive");
+        m.gpu2 = ggml_backend_cuda_init(1);
+        if (!m.gpu2) die("XOLOTL_INKLING_GPU2_EXPS: no CUDA device 1 (list both cards in CUDA_VISIBLE_DEVICES)");
+        for (int l : parse_layers(g2, h.n_phys)) {
+            if (host_exp[l]) die("XOLOTL_INKLING_GPU2_EXPS: layer " + std::to_string(l) + " is also in --cpu-exps");
+            gpu2_exp[l] = true;
+        }
+    }
     if (!host_exp.empty() && std::any_of(host_exp.begin(), host_exp.end(), [](bool b) { return b; }) && m.vram_budget_mib > 0)
         die("--cpu-exps and --vram-budget-mib are mutually exclusive");
     setup_expert_cache(m, path);   // --vram-budget-mib: hot VRAM + cold pinned-RAM arenas (off by default)
@@ -1032,12 +1105,29 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
         bool exp = false;
         for (int l = 0; l < h.n_phys && !exp; ++l) exp = t == m.L[l].gate_up_exps || t == m.L[l].down_exps;
         if (exp && m.ectx) continue;   // --vram-budget-mib: the arenas take these bytes (filled below)
-        bool host = t == m.tok_embd;
+        bool host = t == m.tok_embd, dev2 = false;
         for (int l = 0; l < h.n_phys && !host; ++l)
             host = host_exp[l] && (t == m.L[l].gate_up_exps || t == m.L[l].down_exps);
-        (host ? m.host_wt : m.gpu_w).push_back(t);
+        for (int l = 0; l < h.n_phys && !dev2 && !host; ++l)
+            dev2 = gpu2_exp[l] && (t == m.L[l].gate_up_exps || t == m.L[l].down_exps);
+        (host ? m.host_wt : dev2 ? m.gpu2_w : m.gpu_w).push_back(t);
     }
     alloc_gpu_weights(m);
+    if (m.gpu2) {
+        ggml_backend_buffer_type_t bt = ggml_backend_get_default_buffer_type(m.gpu2);
+        const size_t al = ggml_backend_buft_get_alignment(bt);
+        size_t total = 0;
+        for (ggml_tensor* t : m.gpu2_w) total += GGML_PAD(ggml_backend_buft_get_alloc_size(bt, t), al);
+        m.g2buf = ggml_backend_buft_alloc_buffer(bt, total + al);
+        if (!m.g2buf) die("XOLOTL_INKLING_GPU2_EXPS: cannot allocate " + std::to_string(total >> 20) + " MiB on device 1");
+        ggml_backend_buffer_set_usage(m.g2buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_tallocr ta = ggml_tallocr_new(m.g2buf);
+        for (ggml_tensor* t : m.gpu2_w)
+            if (ggml_tallocr_alloc(&ta, t) != GGML_STATUS_SUCCESS) die(std::string("cannot place device-1 weight ") + t->name);
+        m.gpu2_bytes = total;
+        std::fprintf(stderr, "xolotl-inkling: %zu expert tensors (%.0f MiB) on CUDA device 1 (XOLOTL_INKLING_GPU2_EXPS)\n",
+                     m.gpu2_w.size(), total / 1048576.0);
+    }
     {
         ggml_backend_buffer_type_t bt = ggml_backend_cpu_buffer_type();
         const size_t al = ggml_backend_buft_get_alignment(bt);
@@ -1063,6 +1153,8 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
         std::vector<size_t> at_of(gguf_get_n_tensors(m.gg.g), SIZE_MAX);
         std::vector<bool> is_host(gguf_get_n_tensors(m.gg.g), false);
         for (ggml_tensor* t : m.host_wt) is_host[gguf_find_tensor(m.gg.g, t->name)] = true;
+        std::vector<bool> is_dev2(gguf_get_n_tensors(m.gg.g), false);
+        for (ggml_tensor* t : m.gpu2_w) is_dev2[gguf_find_tensor(m.gg.g, t->name)] = true;
         // XOLOTL_INKLING_OVERRIDE=<side.gguf>: tensors of the same name, type and size are read from that file instead
         // (A/B of weight edits - e.g. other attention-output edits - without a second 14 GB model file)
         gguf_context* ov = nullptr;
@@ -1082,9 +1174,11 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
             const size_t n = ggml_nbytes(t);
             uint8_t* dst = nullptr;
             if (is_host[i]) dst = (uint8_t*) t->data;                                  // straight into the host buffer
-            else if (m.host_w) { dst = m.host_w + at; at_of[i] = at; at += GGML_PAD(n, 64); }
+            else if (m.host_w && !is_dev2[i]) { dst = m.host_w + at; at_of[i] = at; at += GGML_PAD(n, 64); }
             else { buf.resize(n); dst = buf.data(); }
-            const int64_t oi = ov ? gguf_find_tensor(ov, t->name) : -1;
+            static const char* ov_only = std::getenv("XOLOTL_INKLING_OVERRIDE_ONLY");
+            static const std::regex ov_re(ov_only && *ov_only ? ov_only : ".*");
+            const int64_t oi = ov && std::regex_match(t->name, ov_re) ? gguf_find_tensor(ov, t->name) : -1;
             if (oi >= 0) {
                 if (gguf_get_tensor_type(ov, oi) != t->type || gguf_get_tensor_size(ov, oi) != n)
                     die(std::string("XOLOTL_INKLING_OVERRIDE: ") + t->name + " differs in type or size");
@@ -1230,6 +1324,15 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
 
     // state
     m.n_ctx = ((m.n_ctx + 255) / 256) * 256;   // first: positions run to the rounded n_ctx - 1, so a ring clamped to n_ctx never wraps
+    m.kv_res = 0;
+    if (m.kv_vram > 0) {
+        const int64_t r = ((m.kv_vram + 255) / 256) * 256;   // a 256 multiple: the 256-cell windows never straddle the split
+        if (r < m.n_ctx) {
+            if (m.spec) die("--kv-vram: not with --dspark / --mtp yet (the drafter keeps its own full-context K/V in VRAM)");
+            m.kv_res = r;
+        }
+    }
+    const int64_t full_cells = m.spill_on() ? m.kv_res : m.n_ctx;   // global-slot cells in VRAM
     if (m.ubatch_auto) {
         const size_t freeb = (size_t) vram_free_mib() << 20;
         int n_full = 0, n_sw = 0;
@@ -1240,7 +1343,7 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
         for (int cand : {2048, 1024, 512}) {
             if (cand > 512 && !prompt_attn_on()) continue;   // the chain's score tensors halve big chunks anyway
             const int64_t ring_c = std::min<int64_t>(m.n_ctx, (((int64_t) h.n_swa + cand + 255) / 256) * 256);
-            const size_t need = (size_t) n_full * (size_t) m.n_ctx * kfull + (size_t) n_sw * (size_t) ring_c * ksw +
+            const size_t need = (size_t) n_full * (size_t) full_cells * kfull + (size_t) n_sw * (size_t) ring_c * ksw +
                                 (size_t) cand * (768u << 10) + m.extra_vram + (384ull << 20);   // t16: parent 16K at 512 keeps 656 MiB after an 8K prompt
             if (freeb >= need) { pick = cand; break; }
         }
@@ -1262,7 +1365,7 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
         Slot& z = m.S[s];
         z.phys = h.phys_of(s);
         z.swa = h.swa[z.phys];
-        z.cells = z.swa ? m.ring : m.n_ctx;
+        z.cells = z.swa ? m.ring : full_cells;
         // the sliding rings are small (window + ubatch cells) and read every token: keep them f16, fast and exact;
         // the full-context slots carry the long KV and take --kv-type.
         z.k_type = z.swa ? GGML_TYPE_F16 : m.kv_k;
@@ -1281,6 +1384,33 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
     m.sbuf = ggml_backend_alloc_ctx_tensors(m.sctx, m.gpu);
     if (!m.sbuf) die("cannot allocate the K/V cache in VRAM (try a smaller --context, or --cpu-exps)");
     ggml_backend_buffer_clear(m.sbuf, 0);
+    if (m.spill_on()) {   // --kv-vram: the global slots' cells [kv_res, n_ctx) in pinned host RAM
+        ggml_init_params hp{(size_t) (2 * h.n_slot + 2) * ggml_tensor_overhead(), nullptr, true};
+        m.khctx = ggml_init(hp);
+        const int64_t hc = m.n_ctx - m.kv_res;
+        for (int s = 0; s < h.n_slot; ++s) {
+            Slot& z = m.S[s];
+            if (z.swa) continue;
+            z.k_host = ggml_new_tensor_3d(m.khctx, z.k_type, h.hd, h.n_head_kv, hc);
+            z.v_host = ggml_new_tensor_3d(m.khctx, z.v_type, h.hd, h.n_head_kv, hc);
+            ggml_format_name(z.k_host, "k_host.%d", s);
+            ggml_format_name(z.v_host, "v_host.%d", s);
+        }
+        ggml_backend_buffer_type_t kh_bt = ggml_backend_cuda_host_buffer_type();
+        m.khbuf = ggml_backend_alloc_ctx_tensors_from_buft(m.khctx, kh_bt);
+        if (!m.khbuf) die("--kv-vram: cannot allocate " + std::to_string((long long) hc) + " cells of K/V in host RAM");
+        // a pageable fallback (cudaMallocHost failed) still works here: the CPU reads it, and the scheduler's copies
+        // to the GPU are only slower (nothing reads it zero-copy)
+        const bool kh_pinned = ggml_backend_buffer_get_type(m.khbuf) == kh_bt;
+        // WEIGHTS: ggml's scheduler copies a weight leaf to the GPU for a large batch (the prompt chunks) and leaves
+        // small batches (decode) on the backend that owns the buffer - the CPU, which reads it in place
+        ggml_backend_buffer_set_usage(m.khbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_clear(m.khbuf, 0);
+        std::fprintf(stderr, "xolotl-inkling: --kv-vram: %lld of %lld global K/V cells in VRAM, %lld in %s host RAM (%.2f GiB)\n",
+                     (long long) m.kv_res, (long long) m.n_ctx, (long long) hc,
+                     kh_pinned ? "pinned" : "PAGEABLE (cudaMallocHost failed)",
+                     ggml_backend_buffer_get_size(m.khbuf) / 1073741824.0);
+    }
     if (m.hrot_f) {   // M = H diag(s) / sqrt(128): Sylvester H, fixed pseudo-random signs (the same every run)
         const int n = (int) h.hd;
         std::vector<float> sg(n), f((size_t) n * n), t((size_t) n * n);
@@ -1300,8 +1430,13 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
     }
     m.state_bytes = ggml_backend_buffer_get_size(m.sbuf);
 
-    ggml_backend_t bes[2] = {m.gpu, m.cpu};
-    m.sched = ggml_backend_sched_new(bes, nullptr, 2, kGraphNodes, false, true);
+    if (m.gpu2) {
+        ggml_backend_t bes[3] = {m.gpu, m.gpu2, m.cpu};
+        m.sched = ggml_backend_sched_new(bes, nullptr, 3, kGraphNodes, false, true);
+    } else {
+        ggml_backend_t bes[2] = {m.gpu, m.cpu};
+        m.sched = ggml_backend_sched_new(bes, nullptr, 2, kGraphNodes, false, true);
+    }
     m.graph_buf.resize(ggml_tensor_overhead() * kGraphNodes + ggml_graph_overhead_custom(kGraphNodes, false));
 }
 
@@ -1329,7 +1464,57 @@ struct ChunkIn {
     ggml_tensor* mask = nullptr;   // [cells, T] F32 (0 / -inf, the causal or window test)
     ggml_tensor* rp = nullptr;     // [cells, T] I32 (the bias row: relative distance, clamped to the extent)
     int64_t j0 = 0, cells = 0;
+    // --kv-vram: host chunks.  cpuop: decode's CPU partial softmax (no mask).  far: every cell is at least the bias
+    // extent behind every query of the step, so the mask is all zero and the bias is the table's last row (no mask)
+    bool cpuop = false, far = false;
 };
+
+// --kv-vram: the CPU host-attention op's parameters (host_attn_partial)
+struct HostAttnArgs {
+    int64_t j0 = 0; int ext = 0; float scale = 1.0f; int nsplit = 1;
+    std::atomic<int64_t> next{0};   // dynamic task claiming (the last thread out resets both for the next call)
+    std::atomic<int> ndone{0};
+    // --kv-sparse: the host K tensor (summary key) and the view's first host row; phase claims, a spin barrier and
+    // the shared selection (thread 0 fills it between barriers)
+    const void* kid = nullptr; int64_t r0 = 0;
+    std::atomic<int64_t> claim0{0}, claim1{0}, claim2{0}, claim3{0};
+    std::atomic<int> bar_n{0}, bar_gen{0};
+    std::vector<float> psc;               // page scores [nkv][np]
+    std::vector<int64_t> rng;             // selected cell ranges (c0, c1, slice) triples
+    std::vector<uint8_t> sel;             // selected pages
+    std::vector<float> apx;               // SPARSE_APPROX: per-thread (acc, max, sum) of the skipped pages, [nth][nh][hd + 2]
+    void barrier(int nth) {
+        const int g = bar_gen.load(std::memory_order_acquire);
+        if (bar_n.fetch_add(1, std::memory_order_acq_rel) + 1 == nth) { bar_n.store(0); bar_gen.fetch_add(1, std::memory_order_acq_rel); }
+        else while (bar_gen.load(std::memory_order_acquire) == g) {
+#if defined(__x86_64__)
+            _mm_pause();
+#endif
+        }
+    }
+};
+// --kv-sparse N (opt-in, with --kv-vram): at plain decode the CPU op attends, per K/V head, only the N host cells
+// whose 64-cell pages score highest on an upper bound of q.k (Quest: per page and dimension the min and max of K),
+// plus the newest rel_extent + 64 cells (their position bias is not flat yet); exact attention on what it reads.
+// The page summaries live in host RAM, are built on first use and dropped from the first host row a step writes.
+constexpr int64_t kSparsePg = 64;
+static int64_t g_kv_sparse = 0;
+struct SparseSumm { int64_t valid = 0; std::vector<float> mn, mx, mean, vmean; };   // per page [nkv][hd]
+// XOLOTL_INKLING_SPARSE_SEL: 0 = Quest upper bound, 1 = ShadowKV-style landmark (q . mean K of the page),
+// 2 = landmark + Quest, each picks half the pages (default: best on Inkling, 28 Nov sweep)
+static int sparse_sel() { static const int v = std::getenv("XOLOTL_INKLING_SPARSE_SEL") ? std::atoi(std::getenv("XOLOTL_INKLING_SPARSE_SEL")) : 2; return v; }
+static std::mutex g_summ_mu;
+static std::unordered_map<const void*, SparseSumm> g_summ;
+static void sparse_invalidate(int64_t row_lo) {
+    std::lock_guard<std::mutex> lk(g_summ_mu);
+    for (auto& kv : g_summ) kv.second.valid = std::min(kv.second.valid, std::max<int64_t>(0, row_lo) / kSparsePg);
+}
+// --kv-vram CPU op: cell slices per token at decode (claimed dynamically, so a slow thread does not hold the op up);
+// XOLOTL_INKLING_SPILL_SLICES (default 32; was a fixed 16 handed out round-robin)
+static int spill_slices() {
+    static const int n = std::getenv("XOLOTL_INKLING_SPILL_SLICES") ? std::max(1, std::atoi(std::getenv("XOLOTL_INKLING_SPILL_SLICES"))) : 32;
+    return n;
+}
 
 struct Step {
     ggml_context* ctx = nullptr;
@@ -1340,6 +1525,13 @@ struct Step {
     bool pos_full = false;   // the global slots' decode attention takes the positions (idx_full): ck_full has no mask/rp
     ggml_tensor *out_ids = nullptr, *logits = nullptr;
     ggml_tensor *idx_full = nullptr, *idx_swa = nullptr;   // the cells this step writes (set_rows: fixed pointers -> CUDA graphs)
+    // --kv-vram: this step's global window reaches past kv_res.  Its tokens [0, t_lo) write VRAM cells (idx_lo =
+    // positions), [t_lo, T) write host rows (idx_hi = position - kv_res); either part may be empty.
+    bool spill = false;
+    int64_t t_lo = 0;
+    ggml_tensor *idx_lo = nullptr, *idx_hi = nullptr;
+    std::vector<std::unique_ptr<HostAttnArgs>> host_args;   // the CPU host-attention ops' parameters (live with the graph)
+    std::vector<ggml_tensor*> spill_gpu;   // the CPU op outputs' GPU copies: pinned so each visit pulls one tensor back
     std::vector<ggml_tensor*> taps;   // --dump: l_out of every slot
     std::vector<ggml_tensor*> st_taps;   // --stats: [slot][ST_NKIND] the tensors to accumulate
     std::vector<ggml_tensor*> dtaps;     // --dspark: l_out of slots 4, 28, 46 (visits 4, 22, 40) + result_norm, [n_embd, T]
@@ -1359,6 +1551,771 @@ inline bool& inkling_train_mode() { static bool v = false; return v; }
 static bool fused_on() {
     static const bool on = inkling_fused_available() && !(std::getenv("XOLOTL_INKLING_FUSED") && std::string(std::getenv("XOLOTL_INKLING_FUSED")) == "0");
     return on && !inkling_train_mode();
+}
+
+// ---- --kv-vram: the host part of a global visit's decode attention, on the CPU
+// One partial softmax per (query head, token) over the host rows, in the chain's merge form: dst [hd + 2, nh, T, S]
+// (the fused decode kernel's split-partials layout, so inkling_attn_dec_reduce_parts can merge both)
+// = (acc relative to the local max, local max, sum of exp) for S cell slices, so the graph merges each slice like one
+// more chunk.  The relative bias comes from the per-query table [nh, ext + 1, T] (sink already subtracted, row ext =
+// every distance >= ext), the causal test from the positions (posf): no [cells, T, nh] mask crosses the PCIe bus.
+// The CUDA backend refuses the op (userdata carries no CUDA custom-op magic), so the scheduler runs it on the CPU,
+// which reads the pinned rows in place.  args: Q [hd, nh, T] f32 cont, K / V row views [hd, nkv, cells] (any type
+// with a to_float), table [nh, ext+1, T] f32 cont, posf [T] f32.
+// the CPU op takes the host part of decode / verify steps; XOLOTL_INKLING_SPILL_CPUOP=0 keeps the chain (whose V
+// dequant copy the scheduler offloads to the GPU every token: the reference, slow over a narrow PCIe link)
+inline bool spill_fused_on() {
+    static const bool on = !(std::getenv("XOLOTL_INKLING_SPILL_FUSED") && std::atoi(std::getenv("XOLOTL_INKLING_SPILL_FUSED")) == 0);
+    return on;
+}
+// a spilled prompt chunk (T > 16) takes the fused prompt kernel's partials (no chain plan, no T halving)
+inline bool spill_fused_prefill(const Model& m, int T) {
+    return spill_fused_on() && T > 16 && fused_on() && !m.st && prompt_attn_on() && m.pattn_ok &&
+           kv_fused_type(m.kv_k) && kv_fused_type(m.kv_v);
+}
+inline bool spill_cpuop(int T) {
+    static const bool on = !(std::getenv("XOLOTL_INKLING_SPILL_CPUOP") && std::atoi(std::getenv("XOLOTL_INKLING_SPILL_CPUOP")) == 0);
+    return on && T <= 16;
+}
+#if defined(__x86_64__)
+// The K8V4 fast path of host_attn_partial (K q8_0, V q4_0, head dim 128, 3 query heads per K/V head): AVX2 + FMA,
+// chosen at run time.  One task = one (K/V head, token, slice); same online softmax, same block of 32 cells.
+__attribute__((target("avx2,fma,f16c"))) static inline float hsum256(__m256 v) {
+    __m128 x = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    x = _mm_add_ps(x, _mm_movehl_ps(x, x));
+    x = _mm_add_ss(x, _mm_shuffle_ps(x, x, 1));
+    return _mm_cvtss_f32(x);
+}
+__attribute__((target("avx2,fma,f16c")))
+static void host_attn_task_k8v4(const float* q3, const char* kbase, const char* vbase, size_t knb2, size_t vnb2,
+                                int64_t c0, int64_t c1, int64_t j0, int64_t p, int ext, float scale, const float* bias_row,
+                                float* acc, float* mx, float* l) {
+    constexpr int HD = 128, REP = 3, NB = 32;
+    __m256 qv[REP][16];
+    for (int r = 0; r < REP; ++r)
+        for (int i = 0; i < 16; ++i) qv[r][i] = _mm256_loadu_ps(q3 + r * HD + i * 8);
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const __m256i e8 = _mm256_set1_epi32(8);
+    float sc[REP][NB];
+    for (int64_t b0 = c0; b0 < c1; b0 += NB) {
+        const int nb = (int) std::min<int64_t>(NB, c1 - b0);
+        for (int i = 0; i < nb; ++i) {   // scores: q . k for the 3 heads, K read once
+            const char* kr = kbase + (size_t) (b0 + i) * knb2;
+            __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps(), s2 = _mm256_setzero_ps();
+            for (int b = 0; b < 4; ++b) {
+                const char* bp = kr + b * 34;
+                const __m256 d = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*) bp));
+                const __m256i x = _mm256_loadu_si256((const __m256i*) (bp + 2));
+                const __m128i lo = _mm256_castsi256_si128(x), hi = _mm256_extracti128_si256(x, 1);
+                const __m256 k0 = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)));
+                const __m256 k1 = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8))));
+                const __m256 k2 = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)));
+                const __m256 k3 = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8))));
+                const int o = b * 4;
+                s0 = _mm256_fmadd_ps(qv[0][o], k0, s0); s0 = _mm256_fmadd_ps(qv[0][o + 1], k1, s0);
+                s0 = _mm256_fmadd_ps(qv[0][o + 2], k2, s0); s0 = _mm256_fmadd_ps(qv[0][o + 3], k3, s0);
+                s1 = _mm256_fmadd_ps(qv[1][o], k0, s1); s1 = _mm256_fmadd_ps(qv[1][o + 1], k1, s1);
+                s1 = _mm256_fmadd_ps(qv[1][o + 2], k2, s1); s1 = _mm256_fmadd_ps(qv[1][o + 3], k3, s1);
+                s2 = _mm256_fmadd_ps(qv[2][o], k0, s2); s2 = _mm256_fmadd_ps(qv[2][o + 1], k1, s2);
+                s2 = _mm256_fmadd_ps(qv[2][o + 2], k2, s2); s2 = _mm256_fmadd_ps(qv[2][o + 3], k3, s2);
+            }
+            const int64_t dist = p - (j0 + b0 + i);
+            const float* br = bias_row + (dist < ext ? dist : ext) * REP;   // bias_row[row][r]: the 3 heads' biases
+            sc[0][i] = hsum256(s0) * scale + br[0];
+            sc[1][i] = hsum256(s1) * scale + br[1];
+            sc[2][i] = hsum256(s2) * scale + br[2];
+        }
+        for (int r = 0; r < REP; ++r) {
+            float bm = -INFINITY;
+            for (int i = 0; i < nb; ++i) bm = std::max(bm, sc[r][i]);
+            if (bm > mx[r]) {
+                const float f = std::exp(mx[r] - bm);
+                l[r] *= f;
+                const __m256 fv = _mm256_set1_ps(f);
+                for (int e = 0; e < HD; e += 8) _mm256_storeu_ps(acc + r * HD + e, _mm256_mul_ps(fv, _mm256_loadu_ps(acc + r * HD + e)));
+                mx[r] = bm;
+            }
+            for (int i = 0; i < nb; ++i) { sc[r][i] = std::exp(sc[r][i] - mx[r]); l[r] += sc[r][i]; }
+        }
+        for (int i = 0; i < nb; ++i) {   // acc += w * v for the 3 heads, V dequantised once
+            const char* vr = vbase + (size_t) (b0 + i) * vnb2;
+            const __m256 w0 = _mm256_set1_ps(sc[0][i]), w1 = _mm256_set1_ps(sc[1][i]), w2 = _mm256_set1_ps(sc[2][i]);
+            for (int b = 0; b < 4; ++b) {
+                const char* bp = vr + b * 18;
+                const __m256 d = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*) bp));
+                const __m128i x = _mm_loadu_si128((const __m128i*) (bp + 2));
+                const __m128i lo = _mm_and_si128(x, m4), hi = _mm_and_si128(_mm_srli_epi16(x, 4), m4);
+                __m256 v[4];
+                v[0] = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo), e8)));
+                v[1] = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(lo, 8)), e8)));
+                v[2] = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi), e8)));
+                v[3] = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(hi, 8)), e8)));
+                for (int u = 0; u < 4; ++u) {
+                    const int e = b * 32 + u * 8;
+                    _mm256_storeu_ps(acc + e, _mm256_fmadd_ps(w0, v[u], _mm256_loadu_ps(acc + e)));
+                    _mm256_storeu_ps(acc + HD + e, _mm256_fmadd_ps(w1, v[u], _mm256_loadu_ps(acc + HD + e)));
+                    _mm256_storeu_ps(acc + 2 * HD + e, _mm256_fmadd_ps(w2, v[u], _mm256_loadu_ps(acc + 2 * HD + e)));
+                }
+            }
+        }
+    }
+}
+// exp(x) for x <= 0 (Cephes expf polynomial, ~1 ulp; underflows to 0 below -87)
+__attribute__((target("avx2,fma,f16c"))) static inline __m256 exp256_neg(__m256 x) {
+    x = _mm256_max_ps(x, _mm256_set1_ps(-87.0f));
+    const __m256 n = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269504088896341f)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 f = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.693359375f), x);
+    f = _mm256_fnmadd_ps(n, _mm256_set1_ps(-2.12194440e-4f), f);
+    __m256 y = _mm256_set1_ps(1.9875691500E-4f);
+    y = _mm256_fmadd_ps(y, f, _mm256_set1_ps(1.3981999507E-3f));
+    y = _mm256_fmadd_ps(y, f, _mm256_set1_ps(8.3334519073E-3f));
+    y = _mm256_fmadd_ps(y, f, _mm256_set1_ps(4.1665795894E-2f));
+    y = _mm256_fmadd_ps(y, f, _mm256_set1_ps(1.6666665459E-1f));
+    y = _mm256_fmadd_ps(y, f, _mm256_set1_ps(5.0000001201E-1f));
+    y = _mm256_fmadd_ps(_mm256_mul_ps(y, f), f, _mm256_add_ps(f, _mm256_set1_ps(1.0f)));
+    const __m256i e = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(y, _mm256_castsi256_ps(e));
+}
+
+// All K/V heads of a slice of cells at once (one task = one token x one cell slice): each K and V row is read as one
+// contiguous run (1,088 + 576 B a cell at k8v4), so the stream is sequential; the per-head layout above read 136 + 72 B
+// of every row from 8 tasks and did not scale past 4 threads.  State: nh x 128 sums in L1.
+__attribute__((target("avx2,fma,f16c")))
+static void host_attn_slice_k8v4(const float* q, int nh, int nkv, const char* kd, const char* vd, size_t knb1, size_t knb2,
+                                 size_t vnb1, size_t vnb2, int64_t c0, int64_t c1, int64_t j0, int64_t p, int ext,
+                                 float scale, const float* tb, float* acc, float* mx, float* l) {
+    constexpr int HD = 128, NB = 16, MAXH = 64;
+    const int rep = nh / nkv;
+    float sc[MAXH][NB];
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const __m256i e8 = _mm256_set1_epi32(8);
+    for (int64_t b0 = c0; b0 < c1; b0 += NB) {
+        const int nb = (int) std::min<int64_t>(NB, c1 - b0);
+        for (int i = 0; i < nb; ++i) {
+            const char* krow = kd + (size_t) (b0 + i) * knb2;
+            const int64_t dist = p - (j0 + b0 + i);
+            const float* brow = tb + (size_t) (dist < ext ? dist : ext) * nh;
+            for (int g = 0; g < nkv; ++g) {
+                const char* kr = krow + (size_t) g * knb1;
+                __m256 k[16];
+                for (int b = 0; b < 4; ++b) {
+                    const char* bp = kr + b * 34;
+                    const __m256 d = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*) bp));
+                    const __m256i x = _mm256_loadu_si256((const __m256i*) (bp + 2));
+                    const __m128i lo = _mm256_castsi256_si128(x), hi = _mm256_extracti128_si256(x, 1);
+                    k[b * 4 + 0] = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)));
+                    k[b * 4 + 1] = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8))));
+                    k[b * 4 + 2] = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)));
+                    k[b * 4 + 3] = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8))));
+                }
+                for (int r = 0; r < rep; ++r) {
+                    const int hh = g * rep + r;
+                    const float* qh = q + (size_t) hh * HD;
+                    __m256 s0 = _mm256_mul_ps(_mm256_loadu_ps(qh), k[0]), s1 = _mm256_mul_ps(_mm256_loadu_ps(qh + 8), k[1]);
+                    for (int u = 2; u < 16; u += 2) {
+                        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(qh + u * 8), k[u], s0);
+                        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(qh + u * 8 + 8), k[u + 1], s1);
+                    }
+                    sc[hh][i] = hsum256(_mm256_add_ps(s0, s1)) * scale + brow[hh];
+                }
+            }
+        }
+        for (int hh = 0; hh < nh; ++hh) {
+            float bm = -INFINITY;
+            for (int i = 0; i < nb; ++i) bm = std::max(bm, sc[hh][i]);
+            if (bm > mx[hh]) {
+                const float f = std::exp(mx[hh] - bm);
+                l[hh] *= f;
+                const __m256 fv = _mm256_set1_ps(f);
+                float* ah = acc + (size_t) hh * HD;
+                for (int e = 0; e < HD; e += 8) _mm256_storeu_ps(ah + e, _mm256_mul_ps(fv, _mm256_loadu_ps(ah + e)));
+                mx[hh] = bm;
+            }
+            if (nb == NB) {   // the whole block: two 8-wide exps (static_assert NB == 16 below)
+                const __m256 m = _mm256_set1_ps(mx[hh]);
+                const __m256 e0 = exp256_neg(_mm256_sub_ps(_mm256_loadu_ps(&sc[hh][0]), m));
+                const __m256 e1 = exp256_neg(_mm256_sub_ps(_mm256_loadu_ps(&sc[hh][8]), m));
+                _mm256_storeu_ps(&sc[hh][0], e0); _mm256_storeu_ps(&sc[hh][8], e1);
+                l[hh] += hsum256(_mm256_add_ps(e0, e1));
+            } else {
+                for (int i = 0; i < nb; ++i) { sc[hh][i] = std::exp(sc[hh][i] - mx[hh]); l[hh] += sc[hh][i]; }
+            }
+        }
+        static_assert(NB == 16, "the vector exp takes 16 scores a head");
+        for (int i = 0; i < nb; ++i) {
+            const char* vrow = vd + (size_t) (b0 + i) * vnb2;
+            for (int g = 0; g < nkv; ++g) {
+                const char* vr = vrow + (size_t) g * vnb1;
+                __m256 v[16];
+                for (int b = 0; b < 4; ++b) {
+                    const char* bp = vr + b * 18;
+                    const __m256 d = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*) bp));
+                    const __m128i x = _mm_loadu_si128((const __m128i*) (bp + 2));
+                    const __m128i lo = _mm_and_si128(x, m4), hi = _mm_and_si128(_mm_srli_epi16(x, 4), m4);
+                    v[b * 4 + 0] = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(lo), e8)));
+                    v[b * 4 + 1] = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(lo, 8)), e8)));
+                    v[b * 4 + 2] = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(hi), e8)));
+                    v[b * 4 + 3] = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(hi, 8)), e8)));
+                }
+                for (int r = 0; r < rep; ++r) {
+                    const int hh = g * rep + r;
+                    const __m256 w = _mm256_set1_ps(sc[hh][i]);
+                    float* ah = acc + (size_t) hh * HD;
+                    for (int u = 0; u < 16; ++u) _mm256_storeu_ps(ah + u * 8, _mm256_fmadd_ps(w, v[u], _mm256_loadu_ps(ah + u * 8)));
+                }
+            }
+        }
+    }
+}
+// v2: K scale deferred to one fma per 32-block; V as 32-dim tiles with 3 heads x 4 accumulators in registers across the
+// block's cells, V scale folded into the weight, the q4_0 -8 offset applied once per tile (acc -= 8 * sum w).
+__attribute__((target("avx2,fma,f16c")))
+static void host_attn_slice_k8v4_v2(const float* q, int nh, int nkv, const char* kd, const char* vd, size_t knb1, size_t knb2,
+                                    size_t vnb1, size_t vnb2, int64_t c0, int64_t c1, int64_t j0, int64_t p, int ext,
+                                    float scale, const float* tb, float* acc, float* mx, float* l) {
+    constexpr int HD = 128, NB = 16, MAXH = 64;
+    const int rep = nh / nkv;
+    alignas(32) float sc[MAXH][NB];
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    for (int64_t b0 = c0; b0 < c1; b0 += NB) {
+        const int nb = (int) std::min<int64_t>(NB, c1 - b0);
+        for (int i = 0; i < nb; ++i) {
+            const char* krow = kd + (size_t) (b0 + i) * knb2;
+            const int64_t dist = p - (j0 + b0 + i);
+            const float* brow = tb + (size_t) (dist < ext ? dist : ext) * nh;
+            for (int g = 0; g < nkv; ++g) {
+                const char* kr = krow + (size_t) g * knb1;
+                if (rep == 3) {
+                    const float* q0 = q + (size_t) (g * 3) * HD;
+                    __m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0;
+                    for (int b = 0; b < 4; ++b) {
+                        const char* bp = kr + b * 34;
+                        const __m256 d = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*) bp));
+                        __m256 t0, t1, t2;
+                        for (int u = 0; u < 4; ++u) {
+                            const __m256 k = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*) (bp + 2 + u * 8))));
+                            const int e = b * 32 + u * 8;
+                            if (u == 0) {
+                                t0 = _mm256_mul_ps(_mm256_loadu_ps(q0 + e), k);
+                                t1 = _mm256_mul_ps(_mm256_loadu_ps(q0 + HD + e), k);
+                                t2 = _mm256_mul_ps(_mm256_loadu_ps(q0 + 2 * HD + e), k);
+                            } else {
+                                t0 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + e), k, t0);
+                                t1 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + HD + e), k, t1);
+                                t2 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + 2 * HD + e), k, t2);
+                            }
+                        }
+                        s0 = _mm256_fmadd_ps(d, t0, s0);
+                        s1 = _mm256_fmadd_ps(d, t1, s1);
+                        s2 = _mm256_fmadd_ps(d, t2, s2);
+                    }
+                    const int hh = g * 3;
+                    sc[hh][i] = hsum256(s0) * scale + brow[hh];
+                    sc[hh + 1][i] = hsum256(s1) * scale + brow[hh + 1];
+                    sc[hh + 2][i] = hsum256(s2) * scale + brow[hh + 2];
+                } else {
+                    for (int r = 0; r < rep; ++r) {
+                        const int hh = g * rep + r;
+                        const float* qh = q + (size_t) hh * HD;
+                        __m256 s = _mm256_setzero_ps();
+                        for (int b = 0; b < 4; ++b) {
+                            const char* bp = kr + b * 34;
+                            const __m256 d = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*) bp));
+                            __m256 t = _mm256_setzero_ps();
+                            for (int u = 0; u < 4; ++u)
+                                t = _mm256_fmadd_ps(_mm256_loadu_ps(qh + b * 32 + u * 8),
+                                                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*) (bp + 2 + u * 8)))), t);
+                            s = _mm256_fmadd_ps(d, t, s);
+                        }
+                        sc[hh][i] = hsum256(s) * scale + brow[hh];
+                    }
+                }
+            }
+        }
+        for (int hh = 0; hh < nh; ++hh) {
+            float bm = -INFINITY;
+            for (int i = 0; i < nb; ++i) bm = std::max(bm, sc[hh][i]);
+            if (bm > mx[hh]) {
+                const float f = std::exp(mx[hh] - bm);
+                l[hh] *= f;
+                const __m256 fv = _mm256_set1_ps(f);
+                float* ah = acc + (size_t) hh * HD;
+                for (int e = 0; e < HD; e += 8) _mm256_storeu_ps(ah + e, _mm256_mul_ps(fv, _mm256_loadu_ps(ah + e)));
+                mx[hh] = bm;
+            }
+            if (nb == NB) {
+                const __m256 m = _mm256_set1_ps(mx[hh]);
+                const __m256 e0 = exp256_neg(_mm256_sub_ps(_mm256_loadu_ps(&sc[hh][0]), m));
+                const __m256 e1 = exp256_neg(_mm256_sub_ps(_mm256_loadu_ps(&sc[hh][8]), m));
+                _mm256_storeu_ps(&sc[hh][0], e0); _mm256_storeu_ps(&sc[hh][8], e1);
+                l[hh] += hsum256(_mm256_add_ps(e0, e1));
+            } else {
+                for (int i = 0; i < nb; ++i) { sc[hh][i] = std::exp(sc[hh][i] - mx[hh]); l[hh] += sc[hh][i]; }
+            }
+        }
+        for (int g = 0; g < nkv; ++g) {
+            const char* vg = vd + (size_t) b0 * vnb2 + (size_t) g * vnb1;
+            if (rep == 3) {
+                float* a0 = acc + (size_t) (g * 3) * HD;
+                for (int b = 0; b < 4; ++b) {
+                    __m256 x0[4], x1[4], x2[4];
+                    for (int u = 0; u < 4; ++u) {
+                        x0[u] = _mm256_loadu_ps(a0 + b * 32 + u * 8);
+                        x1[u] = _mm256_loadu_ps(a0 + HD + b * 32 + u * 8);
+                        x2[u] = _mm256_loadu_ps(a0 + 2 * HD + b * 32 + u * 8);
+                    }
+                    float W0 = 0, W1 = 0, W2 = 0;
+                    for (int i = 0; i < nb; ++i) {
+                        const char* bp = vg + (size_t) i * vnb2 + b * 18;
+                        const float d = _cvtsh_ss(*(const uint16_t*) bp);
+                        const float f0 = sc[g * 3][i] * d, f1 = sc[g * 3 + 1][i] * d, f2 = sc[g * 3 + 2][i] * d;
+                        W0 += f0; W1 += f1; W2 += f2;
+                        const __m256 w0 = _mm256_set1_ps(f0), w1 = _mm256_set1_ps(f1), w2 = _mm256_set1_ps(f2);
+                        const __m128i x = _mm_loadu_si128((const __m128i*) (bp + 2));
+                        const __m128i lo = _mm_and_si128(x, m4), hi = _mm_and_si128(_mm_srli_epi16(x, 4), m4);
+#define VSTEP(U, SRC) { const __m256 v = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(SRC)); \
+                        x0[U] = _mm256_fmadd_ps(w0, v, x0[U]); x1[U] = _mm256_fmadd_ps(w1, v, x1[U]); x2[U] = _mm256_fmadd_ps(w2, v, x2[U]); }
+                        VSTEP(0, lo) VSTEP(1, _mm_srli_si128(lo, 8)) VSTEP(2, hi) VSTEP(3, _mm_srli_si128(hi, 8))
+#undef VSTEP
+                    }
+                    const __m256 c0v = _mm256_set1_ps(-8.0f * W0), c1v = _mm256_set1_ps(-8.0f * W1), c2v = _mm256_set1_ps(-8.0f * W2);
+                    for (int u = 0; u < 4; ++u) {
+                        _mm256_storeu_ps(a0 + b * 32 + u * 8, _mm256_add_ps(x0[u], c0v));
+                        _mm256_storeu_ps(a0 + HD + b * 32 + u * 8, _mm256_add_ps(x1[u], c1v));
+                        _mm256_storeu_ps(a0 + 2 * HD + b * 32 + u * 8, _mm256_add_ps(x2[u], c2v));
+                    }
+                }
+            } else {
+                for (int i = 0; i < nb; ++i) {
+                    const char* vr = vg + (size_t) i * vnb2;
+                    for (int b = 0; b < 4; ++b) {
+                        const char* bp = vr + b * 18;
+                        const float d = _cvtsh_ss(*(const uint16_t*) bp);
+                        const __m128i x = _mm_loadu_si128((const __m128i*) (bp + 2));
+                        const __m128i lo = _mm_and_si128(x, m4), hi = _mm_and_si128(_mm_srli_epi16(x, 4), m4);
+                        const __m128i parts[4] = {lo, _mm_srli_si128(lo, 8), hi, _mm_srli_si128(hi, 8)};
+                        for (int u = 0; u < 4; ++u) {
+                            const __m256 v = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(parts[u]), _mm256_set1_epi32(8)));
+                            for (int r = 0; r < rep; ++r) {
+                                const int hh = g * rep + r;
+                                float* ah = acc + (size_t) hh * HD + b * 32 + u * 8;
+                                _mm256_storeu_ps(ah, _mm256_fmadd_ps(_mm256_set1_ps(sc[hh][i] * d), v, _mm256_loadu_ps(ah)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --kv-sparse decode (T = 1): see g_kv_sparse.  All nth threads run it together (ggml hands a custom op to every
+// thread); phases are separated by the args' spin barrier.  Output: the same [hd + 2, nh, 1, S] partials.
+__attribute__((target("avx2,fma,f16c")))
+static void host_attn_sparse(HostAttnArgs& am, const ggml_tensor* Q, const ggml_tensor* K, const ggml_tensor* V,
+                             const ggml_tensor* tab, int ith, int nth, int nh, int nkv, int64_t cv, int64_t np, int64_t bpg,
+                             int64_t p, int64_t S, ggml_tensor* dst) {
+    constexpr int HD = 128;
+    const int rep = nh / nkv;
+    const int64_t pg0 = am.r0 / kSparsePg;   // host page of view cell 0
+    static SparseSumm* sm = nullptr;          // set by thread 0 before the first barrier (one op runs at a time)
+    if (ith == 0) {
+        std::lock_guard<std::mutex> lk(g_summ_mu);
+        sm = &g_summ[am.kid];
+        const size_t need = (size_t) (pg0 + np) * nkv * HD;
+        if (sm->mn.size() < need) { sm->mn.resize(need); sm->mx.resize(need); sm->mean.resize(need); sm->vmean.resize(need); }
+        am.psc.resize((size_t) nkv * np * 2);
+        am.sel.assign((size_t) np, 0);
+        am.apx.assign((size_t) nth * nh * (HD + 2), 0.0f);
+    }
+    am.barrier(nth);
+    // 1. page summaries [valid, pg0 + np): per K/V head and dimension the min and max of the dequantised K
+    const int64_t v0 = std::max<int64_t>(sm->valid, pg0);
+    for (int64_t hp; (hp = v0 + am.claim0.fetch_add(1, std::memory_order_relaxed)) < pg0 + np;) {
+        for (int g = 0; g < nkv; ++g) {
+            __m256 mn[16], mx[16], sm8[16];
+            for (int u = 0; u < 16; ++u) { mn[u] = _mm256_set1_ps(INFINITY); mx[u] = _mm256_set1_ps(-INFINITY); sm8[u] = _mm256_setzero_ps(); }
+            for (int64_t c = (hp - pg0) * kSparsePg, ce = c + kSparsePg; c < ce; ++c) {
+                const char* kr = (const char*) K->data + (size_t) c * K->nb[2] + (size_t) g * K->nb[1];
+                for (int b = 0; b < 4; ++b) {
+                    const char* bp = kr + b * 34;
+                    const __m256 d = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*) bp));
+                    for (int u = 0; u < 4; ++u) {
+                        const __m256 k = _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*) (bp + 2 + u * 8)))));
+                        mn[b * 4 + u] = _mm256_min_ps(mn[b * 4 + u], k);
+                        mx[b * 4 + u] = _mm256_max_ps(mx[b * 4 + u], k);
+                        sm8[b * 4 + u] = _mm256_add_ps(sm8[b * 4 + u], k);
+                    }
+                }
+            }
+            float* omn = sm->mn.data() + ((size_t) hp * nkv + g) * HD;
+            float* omx = sm->mx.data() + ((size_t) hp * nkv + g) * HD;
+            {   // mean V (q4_0: d * (nibble - 8)) for the skipped-page estimate
+                __m256 vs[16];
+                for (int u = 0; u < 16; ++u) vs[u] = _mm256_setzero_ps();
+                const __m128i m4 = _mm_set1_epi8(0x0F);
+                for (int64_t c = (hp - pg0) * kSparsePg, ce = c + kSparsePg; c < ce; ++c) {
+                    const char* vr = (const char*) V->data + (size_t) c * V->nb[2] + (size_t) g * V->nb[1];
+                    for (int b = 0; b < 4; ++b) {
+                        const char* bp = vr + b * 18;
+                        const __m256 d = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*) bp));
+                        const __m128i x = _mm_loadu_si128((const __m128i*) (bp + 2));
+                        const __m128i lo = _mm_and_si128(x, m4), hi = _mm_and_si128(_mm_srli_epi16(x, 4), m4);
+                        const __m128i pr[4] = {lo, _mm_srli_si128(lo, 8), hi, _mm_srli_si128(hi, 8)};
+                        for (int u = 0; u < 4; ++u)
+                            vs[b * 4 + u] = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(pr[u]), _mm256_set1_epi32(8))), vs[b * 4 + u]);
+                    }
+                }
+                float* ovm = sm->vmean.data() + ((size_t) hp * nkv + g) * HD;
+                for (int u = 0; u < 16; ++u) _mm256_storeu_ps(ovm + u * 8, _mm256_mul_ps(vs[u], _mm256_set1_ps(1.0f / kSparsePg)));
+            }
+            float* ome = sm->mean.data() + ((size_t) hp * nkv + g) * HD;
+            const __m256 inv = _mm256_set1_ps(1.0f / kSparsePg);
+            for (int u = 0; u < 16; ++u) {
+                _mm256_storeu_ps(omn + u * 8, mn[u]); _mm256_storeu_ps(omx + u * 8, mx[u]); _mm256_storeu_ps(ome + u * 8, _mm256_mul_ps(sm8[u], inv));
+            }
+        }
+    }
+    am.barrier(nth);
+    if (ith == 0) sm->valid = std::max(sm->valid, pg0 + np);
+    // 2. page scores: per K/V head the max over its query heads of sum_d max(q mn, q mx) * scale + the far bias
+    const float* q = (const float*) Q->data;
+    const float* tb = (const float*) tab->data;
+    const float scale = ((const HostAttnArgs&) am).scale;
+    const int ext = am.ext;
+    for (int64_t i; (i = am.claim1.fetch_add(1, std::memory_order_relaxed)) < np;) {
+        for (int g = 0; g < nkv; ++g) {
+            const float* pmn = sm->mn.data() + ((size_t) (pg0 + i) * nkv + g) * HD;
+            const float* pmx = sm->mx.data() + ((size_t) (pg0 + i) * nkv + g) * HD;
+            const float* pme = sm->mean.data() + ((size_t) (pg0 + i) * nkv + g) * HD;
+            float best = -INFINITY, bestl = -INFINITY;
+            for (int r = 0; r < rep; ++r) {
+                const int hh = g * rep + r;
+                const float* qh = q + (size_t) hh * HD;
+                {   // landmark: q . mean K
+                    __m256 a = _mm256_setzero_ps();
+                    for (int u = 0; u < 16; ++u) a = _mm256_fmadd_ps(_mm256_loadu_ps(qh + u * 8), _mm256_loadu_ps(pme + u * 8), a);
+                    bestl = std::max(bestl, hsum256(a) * scale + tb[(size_t) ext * nh + hh]);
+                }
+                __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+                for (int u = 0; u < 16; u += 2) {
+                    const __m256 q0 = _mm256_loadu_ps(qh + u * 8), q1 = _mm256_loadu_ps(qh + u * 8 + 8);
+                    acc0 = _mm256_add_ps(acc0, _mm256_max_ps(_mm256_mul_ps(q0, _mm256_loadu_ps(pmn + u * 8)), _mm256_mul_ps(q0, _mm256_loadu_ps(pmx + u * 8))));
+                    acc1 = _mm256_add_ps(acc1, _mm256_max_ps(_mm256_mul_ps(q1, _mm256_loadu_ps(pmn + u * 8 + 8)), _mm256_mul_ps(q1, _mm256_loadu_ps(pmx + u * 8 + 8))));
+                }
+                best = std::max(best, hsum256(_mm256_add_ps(acc0, acc1)) * scale + tb[(size_t) ext * nh + hh]);
+            }
+            am.psc[(size_t) g * np + i] = best;
+            am.psc[(size_t) (nkv + g) * np + i] = bestl;
+        }
+    }
+    am.barrier(nth);
+    // 3. thread 0: each K/V head's top bpg pages, their union as cell ranges + the tail, cut into S slices by cells
+    if (ith == 0) {
+        std::vector<uint8_t>& sel = am.sel;
+        std::vector<int64_t> idx((size_t) np);
+        const int selm = sparse_sel();
+        for (int g = 0; g < nkv; ++g) {
+            auto pick = [&](const float* sg, int64_t nb) {
+                for (int64_t i = 0; i < np; ++i) idx[i] = i;
+                std::nth_element(idx.begin(), idx.begin() + nb, idx.end(), [&](int64_t x, int64_t y) { return sg[x] > sg[y]; });
+                for (int64_t k = 0; k < nb; ++k) sel[idx[k]] = 1;
+            };
+            const float* sq = am.psc.data() + (size_t) g * np;
+            const float* sl = am.psc.data() + (size_t) (nkv + g) * np;
+            if (selm == 1) pick(sl, bpg);
+            else if (selm == 2) { pick(sl, std::max<int64_t>(1, bpg / 2)); pick(sq, std::max<int64_t>(1, bpg - bpg / 2)); }
+            else pick(sq, bpg);
+        }
+        std::vector<std::pair<int64_t, int64_t>> r;
+        for (int64_t i = 0; i < np; ++i)
+            if (sel[i]) {
+                if (!r.empty() && r.back().second == i * kSparsePg) r.back().second += kSparsePg;
+                else r.push_back({i * kSparsePg, (i + 1) * kSparsePg});
+            }
+        r.push_back({np * kSparsePg, cv});
+        int64_t tot = 0;
+        for (auto& x : r) tot += x.second - x.first;
+        am.rng.clear();
+        const int64_t per = (tot + S - 1) / S;
+        int64_t sl = 0, filled = 0;
+        for (auto x : r) {
+            while (x.first < x.second) {
+                const int64_t take = std::min(x.second - x.first, per - filled);
+                am.rng.push_back(x.first); am.rng.push_back(x.first + take); am.rng.push_back(sl);
+                x.first += take; filled += take;
+                if (filled == per) { ++sl; filled = 0; }
+            }
+        }
+        static const bool dbg = std::getenv("XOLOTL_INKLING_SPARSE_DEBUG") != nullptr;
+        if (dbg) std::fprintf(stderr, "xolotl-inkling: kv-sparse p %lld host cells %lld pages %lld -> %lld ranges, %lld cells read\n",
+                              (long long) p, (long long) cv, (long long) np, (long long) r.size(), (long long) tot);
+    }
+    am.barrier(nth);
+    // 3b. skipped pages still count (XOLOTL_INKLING_SPARSE_APPROX=0 drops them), as 64 cells at its mean K and mean V
+    //     (weight 64 exp(q . mean K * scale + far bias)); per-thread partials, merged into slice 0 below
+    static const bool apxon = !(std::getenv("XOLOTL_INKLING_SPARSE_APPROX") && std::atoi(std::getenv("XOLOTL_INKLING_SPARSE_APPROX")) == 0);
+    if (apxon) {
+        float* A = am.apx.data() + (size_t) ith * nh * (HD + 2);
+        for (int hh = 0; hh < nh; ++hh) { A[hh * (HD + 2) + HD] = -INFINITY; A[hh * (HD + 2) + HD + 1] = 0.0f; }
+        const float lnpg = std::log((float) kSparsePg);
+        for (int64_t i; (i = am.claim2.fetch_add(1, std::memory_order_relaxed)) < np;) {
+            if (am.sel[i]) continue;
+            for (int g = 0; g < nkv; ++g) {
+                const float* pme = sm->mean.data() + ((size_t) (pg0 + i) * nkv + g) * HD;
+                const float* pvm = sm->vmean.data() + ((size_t) (pg0 + i) * nkv + g) * HD;
+                for (int r = 0; r < rep; ++r) {
+                    const int hh = g * rep + r;
+                    const float* qh = q + (size_t) hh * HD;
+                    __m256 a8 = _mm256_setzero_ps();
+                    for (int u = 0; u < 16; ++u) a8 = _mm256_fmadd_ps(_mm256_loadu_ps(qh + u * 8), _mm256_loadu_ps(pme + u * 8), a8);
+                    const float sc = hsum256(a8) * scale + tb[(size_t) ext * nh + hh] + lnpg;
+                    float* ah = A + hh * (HD + 2);
+                    float w;
+                    if (sc > ah[HD]) {
+                        const float f = std::exp(ah[HD] - sc);
+                        for (int e = 0; e < HD; ++e) ah[e] *= f;
+                        ah[HD + 1] *= f; ah[HD] = sc; w = 1.0f;
+                    } else w = std::exp(sc - ah[HD]);
+                    ah[HD + 1] += w;
+                    const __m256 wv = _mm256_set1_ps(w);
+                    for (int u = 0; u < 16; ++u) _mm256_storeu_ps(ah + u * 8, _mm256_fmadd_ps(wv, _mm256_loadu_ps(pvm + u * 8), _mm256_loadu_ps(ah + u * 8)));
+                }
+            }
+        }
+    }
+    // 4. one task per slice: the exact online softmax over its ranges (the all-heads kernel), written like the dense path
+    {
+        std::vector<float> acc2((size_t) nh * HD), mx2(nh), l2(nh);
+        const int64_t nr = (int64_t) am.rng.size() / 3;
+        for (int64_t sl; (sl = am.claim3.fetch_add(1, std::memory_order_relaxed)) < S;) {
+            std::fill(acc2.begin(), acc2.end(), 0.0f);
+            std::fill(mx2.begin(), mx2.end(), -INFINITY);
+            std::fill(l2.begin(), l2.end(), 0.0f);
+            for (int64_t k = 0; k < nr; ++k)
+                if (am.rng[k * 3 + 2] == sl)
+                    host_attn_slice_k8v4_v2(q, nh, nkv, (const char*) K->data, (const char*) V->data, K->nb[1], K->nb[2], V->nb[1],
+                                            V->nb[2], am.rng[k * 3], am.rng[k * 3 + 1], am.j0, p, ext, scale, tb, acc2.data(), mx2.data(), l2.data());
+            for (int64_t hh = 0; hh < nh; ++hh) {
+                float* o = (float*) ((char*) dst->data + sl * dst->nb[3] + hh * dst->nb[1]);
+                std::copy(acc2.begin() + hh * HD, acc2.begin() + (hh + 1) * HD, o);
+                o[HD] = mx2[hh];
+                o[HD + 1] = l2[hh];
+            }
+        }
+    }
+    am.barrier(nth);
+    if (ith == 0) {
+        am.claim0 = 0; am.claim1 = 0; am.claim2 = 0; am.claim3 = 0;
+        if (apxon)
+            for (int hh = 0; hh < nh; ++hh) {
+                float* o = (float*) ((char*) dst->data + hh * dst->nb[1]);   // slice 0
+                for (int t2 = 0; t2 < nth; ++t2) {
+                    const float* A = am.apx.data() + ((size_t) t2 * nh + hh) * (HD + 2);
+                    if (!(A[HD] > -INFINITY)) continue;
+                    const float M = std::max(o[HD], A[HD]);
+                    const float fo = o[HD] > -INFINITY ? std::exp(o[HD] - M) : 0.0f, fa = std::exp(A[HD] - M);
+                    for (int e = 0; e < HD; ++e) o[e] = o[e] * fo + A[e] * fa;
+                    o[HD + 1] = o[HD + 1] * fo + A[HD + 1] * fa;
+                    o[HD] = M;
+                }
+            }
+    }
+    // XOLOTL_INKLING_SPARSE_CHECK=1 (slow, thread 0): exact attention over every host cell vs the sparse result -
+    // the share of the host softmax mass the selection kept and the relative L2 error of the host-only output,
+    // averaged over heads; a line every 64 calls.
+    static const bool chk = std::getenv("XOLOTL_INKLING_SPARSE_CHECK") != nullptr;
+    if (chk && ith == 0) {
+        std::vector<float> ad((size_t) nh * HD, 0.0f), md(nh, -INFINITY), ld(nh, 0.0f);
+        host_attn_slice_k8v4_v2(q, nh, nkv, (const char*) K->data, (const char*) V->data, K->nb[1], K->nb[2], V->nb[1], V->nb[2],
+                                0, cv, am.j0, p, ext, scale, tb, ad.data(), md.data(), ld.data());
+        static double s_mass = 0, s_min = 1, s_err = 0; static int64_t s_n = 0, s_calls = 0;
+        for (int hh = 0; hh < nh; ++hh) {
+            float M = -INFINITY;
+            for (int64_t sl = 0; sl < S; ++sl) M = std::max(M, ((const float*) ((const char*) dst->data + sl * dst->nb[3] + hh * dst->nb[1]))[HD]);
+            double L = 0; std::vector<double> o(HD, 0.0);
+            for (int64_t sl = 0; sl < S; ++sl) {
+                const float* r = (const float*) ((const char*) dst->data + sl * dst->nb[3] + hh * dst->nb[1]);
+                if (!(r[HD] > -INFINITY)) continue;
+                const double w = std::exp((double) r[HD] - M);
+                L += w * r[HD + 1];
+                for (int e = 0; e < HD; ++e) o[e] += w * r[e];
+            }
+            const double mass = L * std::exp((double) M - md[hh]) / ld[hh];
+            double num = 0, den = 0;
+            for (int e = 0; e < HD; ++e) {
+                const double od = ad[(size_t) hh * HD + e] / ld[hh], os = o[e] / L;
+                num += (os - od) * (os - od); den += od * od;
+            }
+            s_mass += mass; s_min = std::min(s_min, mass); s_err += std::sqrt(num / std::max(den, 1e-30)); ++s_n;
+        }
+        if (++s_calls % 64 == 0) {
+            std::fprintf(stderr, "xolotl-inkling: kv-sparse check (sel %d, budget %lld, %lld host cells): host mass kept mean %.4f min %.4f, "
+                         "host-output rel err %.4f\n", sparse_sel(), (long long) g_kv_sparse, (long long) cv, s_mass / s_n, s_min, s_err / s_n);
+            s_mass = 0; s_min = 1; s_err = 0; s_n = 0;
+        }
+    }
+}
+#endif
+
+// XOLOTL_INKLING_SPILL_PROF=1: time the CPU op inside the engine (per-thread busy time, thread 0's wall time, and the
+// gap between consecutive calls = the GPU work + syncs between visits); a summary every 512 calls on stderr.
+struct SpillProf {
+    std::atomic<int64_t> busy{0}, calls{0}, wall{0}, gap{0}, last_end{0}, cells{0}, t_start{0}, t_end{0}, t0_wall{0};
+    std::atomic<int> done{0};
+    static int64_t now() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+};
+static SpillProf g_spill_prof;
+static void host_attn_partial_body(ggml_tensor* dst, int ith, int nth, void* ud);
+static void host_attn_partial(ggml_tensor* dst, int ith, int nth, void* ud) {
+    static const bool prof = std::getenv("XOLOTL_INKLING_SPILL_PROF") && std::atoi(std::getenv("XOLOTL_INKLING_SPILL_PROF"));
+    if (!prof) { host_attn_partial_body(dst, ith, nth, ud); return; }
+    SpillProf& P = g_spill_prof;
+    const int64_t t0 = SpillProf::now();
+    { int64_t cur = P.t_start.load(); while ((cur == 0 || t0 < cur) && !P.t_start.compare_exchange_weak(cur, t0)) {} }
+    host_attn_partial_body(dst, ith, nth, ud);
+    const int64_t t1 = SpillProf::now();
+    P.busy += t1 - t0;
+    if (ith == 0) P.t0_wall += t1 - t0;
+    { int64_t cur = P.t_end.load(); while (t1 > cur && !P.t_end.compare_exchange_weak(cur, t1)) {} }
+    if (P.done.fetch_add(1) + 1 == nth) {   // the last thread out closes the call
+        const int64_t st = P.t_start.exchange(0), en = P.t_end.exchange(0);
+        P.done = 0;
+        P.wall += en - st;
+        if (P.last_end.load() > 0) P.gap += st - P.last_end.load();
+        P.last_end = en;
+        P.cells += dst->src[1]->ne[2] * dst->src[0]->ne[2];
+        if (++P.calls % 512 == 0) {
+            const double n = 512.0;
+            std::fprintf(stderr, "xolotl-inkling: spill-prof %lld calls: op wall %.3f ms/call (first in -> last out; thread0 %.3f), busy %.3f ms/call "
+                         "over %d threads, gap %.3f ms/call, %.0f cells/call, %.1f ns/cell thread-time\n", (long long) P.calls.load(),
+                         P.wall.load() / n / 1e6, P.t0_wall.load() / n / 1e6, P.busy.load() / n / 1e6, nth, P.gap.load() / n / 1e6,
+                         P.cells.load() / n, (double) P.busy.load() / std::max<int64_t>(1, P.cells.load()));
+            P.wall = 0; P.busy = 0; P.gap = 0; P.cells = 0; P.t0_wall = 0;
+        }
+    }
+}
+static void host_attn_partial_body(ggml_tensor* dst, int ith, int nth, void* ud) {
+    const HostAttnArgs& a = *(const HostAttnArgs*) ud;
+    const ggml_tensor *Q = dst->src[0], *K = dst->src[1], *V = dst->src[2], *tab = dst->src[3], *pos = dst->src[4];
+    const int64_t hd = Q->ne[0], nh = Q->ne[1], T = Q->ne[2], nkv = K->ne[1], cells = K->ne[2];
+    const int64_t rep = nh / nkv, R = tab->ne[1], S = a.nsplit;
+    const auto* ktr = ggml_get_type_traits(K->type);
+    const auto* vtr = ggml_get_type_traits(V->type);
+#if defined(__x86_64__)
+    {   // K8V4 fast path: one task = (token, cell slice) over all heads (sequential rows); XOLOTL_INKLING_SPILL_SIMD=0
+        // = the scalar per-head path below, =2 = the per-head AVX2 path (the first SIMD version, kept for A/B), =3 = the first
+        // all-heads kernel (host_attn_slice_k8v4); default 1 = host_attn_slice_k8v4_v2 (V accumulators in registers, ~1.4x)
+        static const int simd = std::getenv("XOLOTL_INKLING_SPILL_SIMD") ? std::atoi(std::getenv("XOLOTL_INKLING_SPILL_SIMD")) : 1;
+        static const bool cpu_ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
+        if ((simd == 1 || simd == 3) && cpu_ok && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 && hd == 128 && nh <= 64 && nh % nkv == 0) {
+            std::vector<float> acc2((size_t) nh * hd), mx2(nh), l2(nh);
+            HostAttnArgs& am = *(HostAttnArgs*) ud;
+            if (g_kv_sparse > 0 && T == 1 && am.kid && am.r0 % kSparsePg == 0) {
+                const int64_t p = (int64_t) ((const float*) pos->data)[0];
+                const int64_t cv = std::min<int64_t>(cells, std::max<int64_t>(0, p - a.j0 + 1));   // visible host cells
+                const int64_t tail = a.ext + kSparsePg;                                          // always attended
+                const int64_t np = std::max<int64_t>(0, cv - tail) / kSparsePg;                  // selectable pages
+                const int64_t bpg = std::max<int64_t>(1, g_kv_sparse / kSparsePg);              // pages per K/V head
+                if (np > 2 * bpg) {
+                    host_attn_sparse(am, Q, K, V, tab, ith, nth, (int) nh, (int) nkv, cv, np, bpg, p, S, dst);
+                    return;
+                }
+            }
+            for (int64_t task; (task = am.next.fetch_add(1, std::memory_order_relaxed)) < T * S;) {
+                const int64_t t = task % T, sl = task / T;
+                const int64_t p = (int64_t) ((const float*) pos->data)[t];
+                const int64_t per = (cells + S - 1) / S, c0 = sl * per;
+                const int64_t c1 = std::min<int64_t>(std::min(cells, c0 + per), std::max<int64_t>(0, p - a.j0 + 1));
+                std::fill(acc2.begin(), acc2.end(), 0.0f);
+                std::fill(mx2.begin(), mx2.end(), -INFINITY);
+                std::fill(l2.begin(), l2.end(), 0.0f);
+                if (c0 < c1)
+                    (simd == 3 ? host_attn_slice_k8v4 : host_attn_slice_k8v4_v2)((const float*) Q->data + (size_t) t * nh * hd, (int) nh, (int) nkv, (const char*) K->data,
+                                         (const char*) V->data, K->nb[1], K->nb[2], V->nb[1], V->nb[2], c0, c1, a.j0, p, a.ext, a.scale,
+                                         (const float*) tab->data + (size_t) t * R * nh, acc2.data(), mx2.data(), l2.data());
+                for (int64_t hh = 0; hh < nh; ++hh) {
+                    float* o = (float*) ((char*) dst->data + sl * dst->nb[3] + t * dst->nb[2] + hh * dst->nb[1]);
+                    std::copy(acc2.begin() + hh * hd, acc2.begin() + (hh + 1) * hd, o);
+                    o[hd] = mx2[hh];
+                    o[hd + 1] = l2[hh];
+                }
+            }
+            if (am.ndone.fetch_add(1, std::memory_order_acq_rel) + 1 == nth) { am.next.store(0); am.ndone.store(0); }
+            return;
+        }
+    }
+#endif
+    const int64_t n_task = nkv * T * S;
+    constexpr int64_t B = 32;   // cells per block: one max / rescale per block
+    std::vector<float> kf((size_t) hd * B), vf((size_t) hd), sc((size_t) rep * B), acc((size_t) rep * hd);
+    for (int64_t task = ith; task < n_task; task += nth) {
+        const int64_t g = task % nkv, t = (task / nkv) % T, sl = task / (nkv * T);
+        const int64_t p = (int64_t) ((const float*) pos->data)[t];
+        // this slice's cells, clipped to the causal limit (cells past p are masked: skip them)
+        const int64_t per = (cells + S - 1) / S, c0 = sl * per;
+        const int64_t c1 = std::min<int64_t>(std::min(cells, c0 + per), std::max<int64_t>(0, p - a.j0 + 1));
+        std::vector<float> mx(rep, -INFINITY), l(rep, 0.0f);
+        std::fill(acc.begin(), acc.end(), 0.0f);
+        const float* q = (const float*) Q->data + (size_t) t * nh * hd;
+#if defined(__x86_64__)
+        static const bool avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c") &&
+                                 std::getenv("XOLOTL_INKLING_SPILL_SIMD") && std::atoi(std::getenv("XOLOTL_INKLING_SPILL_SIMD")) == 2;
+        if (avx2 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 && hd == 128 && rep == 3) {
+            // the 3 heads' bias rows for this token, as [row][r] (the table is [nh, R, T])
+            std::vector<float> br((size_t) (a.ext + 1) * rep);
+            const float* tb = (const float*) tab->data + (size_t) t * R * nh;
+            for (int64_t row = 0; row <= a.ext; ++row)
+                for (int64_t r = 0; r < rep; ++r) br[row * rep + r] = tb[row * nh + g * rep + r];
+            if (c0 < c1)
+                host_attn_task_k8v4(q + g * rep * hd, (const char*) K->data + g * K->nb[1], (const char*) V->data + g * V->nb[1],
+                                    K->nb[2], V->nb[2], c0, c1, a.j0, p, a.ext, a.scale, br.data(), acc.data(), mx.data(), l.data());
+        } else
+#endif
+        for (int64_t b0 = c0; b0 < c1; b0 += B) {
+            const int64_t nb = std::min(B, c1 - b0);
+            for (int64_t i = 0; i < nb; ++i)
+                ktr->to_float((const char*) K->data + (b0 + i) * K->nb[2] + g * K->nb[1], kf.data() + i * hd, hd);
+            for (int64_t r = 0; r < rep; ++r) {
+                const int64_t hh = g * rep + r;
+                const float* qh = q + hh * hd;
+                float bm = -INFINITY;
+                for (int64_t i = 0; i < nb; ++i) {
+                    const float* kr = kf.data() + i * hd;
+                    float d = 0.0f;
+                    for (int64_t e = 0; e < hd; ++e) d += qh[e] * kr[e];
+                    const int64_t dist = p - (a.j0 + b0 + i);
+                    const int64_t row = dist < a.ext ? dist : a.ext;
+                    const float bias = ((const float*) tab->data)[((size_t) t * R + row) * nh + hh];
+                    const float s = d * a.scale + bias;
+                    sc[r * B + i] = s;
+                    bm = std::max(bm, s);
+                }
+                if (bm > mx[r]) {   // rescale the running sums to the new max
+                    const float f = std::exp(mx[r] - bm);
+                    l[r] *= f;
+                    for (int64_t e = 0; e < hd; ++e) acc[r * hd + e] *= f;
+                    mx[r] = bm;
+                }
+                for (int64_t i = 0; i < nb; ++i) { sc[r * B + i] = std::exp(sc[r * B + i] - mx[r]); l[r] += sc[r * B + i]; }
+            }
+            for (int64_t i = 0; i < nb; ++i) {
+                vtr->to_float((const char*) V->data + (b0 + i) * V->nb[2] + g * V->nb[1], vf.data(), hd);
+                for (int64_t r = 0; r < rep; ++r) {
+                    const float w = sc[r * B + i];
+                    float* ar = acc.data() + r * hd;
+                    for (int64_t e = 0; e < hd; ++e) ar[e] += w * vf[e];
+                }
+            }
+        }
+        for (int64_t r = 0; r < rep; ++r) {
+            const int64_t hh = g * rep + r;
+            float* o = (float*) ((char*) dst->data + sl * dst->nb[3] + t * dst->nb[2] + hh * dst->nb[1]);
+            std::copy(acc.begin() + r * hd, acc.begin() + (r + 1) * hd, o);
+            o[hd] = mx[r];      // -inf when every cell of the slice is in the future
+            o[hd + 1] = l[r];
+        }
+    }
 }
 
 struct G {                     // graph-building context
@@ -1502,6 +2459,19 @@ struct G {                     // graph-building context
         ggml_tensor* gain = ggml_tanh(c, ggml_mul_mat(c, y.ctrl_gain[k], g));
         ggml_tensor* forget = ggml_tanh(c, ggml_mul_mat(c, y.ctrl_forget[k], g));
         return ggml_add(c, ggml_sub(c, cur, ggml_mul(c, forget, cur)), ggml_mul(c, gain, msg));
+    }
+
+    // --kv-vram: a global store split at kv_res (s.t_lo tokens to VRAM, the rest to the host rows)
+    void store_kv_split(ggml_tensor* src, ggml_tensor* vram, ggml_tensor* host) {
+        ggml_tensor* s2 = ggml_reshape_2d(c, ggml_is_contiguous(src) ? src : ggml_cont(c, src), src->ne[0] * src->ne[1], T);
+        auto part = [&](ggml_tensor* dst, ggml_tensor* idx, int64_t r0, int64_t n) {
+            if (!idx || n <= 0) return;
+            ggml_tensor* d2 = ggml_reshape_2d(c, dst, dst->ne[0] * dst->ne[1], dst->ne[2]);
+            ggml_tensor* rows = ggml_view_2d(c, s2, s2->ne[0], n, s2->nb[1], (size_t) r0 * s2->nb[1]);
+            ggml_build_forward_expand(gf, ggml_set_rows(c, d2, rows, idx));
+        };
+        part(vram, s.idx_lo, 0, s.t_lo);
+        part(host, s.idx_hi, s.t_lo, T - s.t_lo);
     }
 
     ggml_tensor* store_kv(ggml_tensor* src, ggml_tensor* dst, bool swa) {   // returns the store (a consumer that reads
@@ -1710,7 +2680,7 @@ struct G {                     // graph-building context
             if (out3f) for (int j = 0; j < 3; ++j) in[j] = ggml_view_2d(c, out3f, E, T, out3f->nb[1], (size_t) j * out3f->nb[2]);
         }
         if (out3f) {
-        } else if (messages && y.c3_down && (swa || y.n3)) {   // the three controllers as one batched chain: [E, T, 3]
+        } else if (messages && y.c3_down && (swa || y.n3) && !inkling_train_mode()) {   // the three controllers as one batched chain: [E, T, 3]
             ggml_tensor* cur3;
             if (mxq && !swa) cur3 = ggml_cont(c, ggml_permute(c, mxq, 0, 2, 1, 3));                       // [E,3,T] -> [E,T,3]
             else {
@@ -1743,7 +2713,7 @@ struct G {                     // graph-building context
         // one token: q/rel/gate (and k/v on sliding layers fed one input) as one stacked mat-vec, sliced by row views
         ggml_tensor *Q, *R, *Kp = nullptr, *Vp = nullptr, *Gp = nullptr;
         const bool one_in = in[1] == in[0] && in[2] == in[0];
-        if (T == 1 && y.pqrg && !lora) {   // --lora: per-weight projections, so each adapter applies
+        if (T == 1 && y.pqrg && !lora && !inkling_train_mode()) {   // --lora: per-weight projections, so each adapter applies
             const bool all = y.pall && one_in;
             ggml_tensor* P = ggml_mul_mat(c, all ? y.pall : y.pqrg, in[0]);
             const int64_t nq = y.wq->ne[1], nr = y.rel->ne[1], ng = y.gate->ne[1];
@@ -1771,7 +2741,8 @@ struct G {                     // graph-building context
             ggml_tensor* x2 = ggml_reshape_2d(c, ggml_is_contiguous(x) ? x : ggml_cont(c, x), hd, ggml_nelements(x) / hd);
             return ggml_reshape_3d(c, ggml_mul_mat(c, M, x2), hd, x->ne[1], x->ne[2]);
         };
-        if (fused_on() && !prep_ref && !st && T <= 16 && !(rot && prep_rot_ref)) {   // decode + verify (the per-token loop is serial in T)
+        const bool spill = !swa && s.spill;   // --kv-vram: this global visit reads / writes host rows (the chain only)
+        if (fused_on() && !prep_ref && !st && T <= 16 && !(rot && prep_rot_ref) && !spill) {   // decode + verify (the per-token loop is serial in T)
             ggml_tensor* dk = swa ? nullptr : ggml_mul_mat(c, y.k_conv_proj, in[1]);
             ggml_tensor* dv = swa ? nullptr : ggml_mul_mat(c, y.v_conv_proj, in[2]);
             ggml_tensor* hview = nullptr;
@@ -1816,10 +2787,20 @@ struct G {                     // graph-building context
         }
         if (rot_k) { Q = hrot(Q, m.hrot_f); if (!prepped) Kc = hrot(Kc, m.hrot_f); }
         ggml_tensor *kst = nullptr, *vst = nullptr;   // the cache stores (the prompt attention orders itself after them)
+        ggml_tensor *defer_k = nullptr, *defer_v = nullptr;   // --kv-vram decode: host stores made next to the CPU op
         if (!prepped) {
             Vc = ggml_rms_norm(c, ggml_reshape_3d(c, Vc, hd, nkv, T), h.eps);
             if (rot_v) Vc = hrot(Vc, m.hrot_f);
-            if (!train) {
+            if (!train && spill && spill_cpuop((int) T) && s.t_lo == 0) {
+                // decode past kv_res: the stores are host-only, deferred to just before the CPU op (one CPU split per
+                // visit: store K, store V, attend); K and V are finished on the GPU here
+                defer_k = ggml_cont(c, Kc); defer_v = ggml_cont(c, Vc);
+                ggml_build_forward_expand(gf, defer_k); ggml_build_forward_expand(gf, defer_v);
+            } else if (!train && spill) {   // tokens below kv_res -> VRAM cells, the rest -> host rows (no reader of the
+                                     // prompt kernel's kst / vst ordering on this path: the chain reads views after both)
+                store_kv_split(Kc, z.k_cache, z.k_host);
+                store_kv_split(Vc, z.v_cache, z.v_host);
+            } else if (!train) {
                 kst = store_kv(Kc, z.k_cache, swa);
                 vst = store_kv(Vc, z.v_cache, swa);
             }
@@ -1881,12 +2862,74 @@ struct G {                     // graph-building context
             if (at32) ggml_prec_set_acc(at, GGML_PREC_F32);
             o = ggml_cont_2d(c, ggml_permute(c, at, 0, 2, 1, 3), (int64_t) hd * nh, T);
         }
-        if (!o && pattn_use(m, (int) T) && kst && vst && y.rel_bias_pad && kv_fused_type(z.k_cache->type) && kv_fused_type(z.v_cache->type)) {
+        if (!o && !spill && pattn_use(m, (int) T) && kst && vst && y.rel_bias_pad && kv_fused_type(z.k_cache->type) && kv_fused_type(z.v_cache->type)) {
             ggml_tensor* pa = inkling_attn_prompt(c, Q, z.k_cache, z.v_cache, R, sinks, y.rel_bias_pad, kst, vst, p0,
                                                   swa ? h.n_swa : 0, 1.0f / std::sqrt((float) hd));
             if (pa) o = ggml_reshape_2d(c, pa, (int64_t) hd * nh, T);
         }
-        if (!o && plan.empty()) GGML_ABORT("xolotl-inkling: prompt attention refused a layer that pattn_use() admitted (a bug; XOLOTL_INKLING_PROMPT_ATTN=0 works around it)");
+        if (!o && plan.empty() && !(spill && spill_fused_prefill(m, (int) T)))   // a fused spilled prompt chunk has no plan
+            GGML_ABORT("xolotl-inkling: prompt attention refused a layer that pattn_use() admitted (a bug; XOLOTL_INKLING_PROMPT_ATTN=0 works around it)");
+        // --kv-vram decode past kv_res: the fused decode kernel's split partials over the VRAM cells [0, kv_res)
+        // (positional: cell j = position j), the CPU op's over the host rows, concatenated and merged by the fused
+        // op's own reduce (zero sink + gate).  XOLOTL_INKLING_SPILL_FUSED=0: the chain for the VRAM part instead.
+        const bool spill_fused = spill_fused_on();
+        if (!o && spill && spill_fused && spill_cpuop((int) T) && s.t_lo == 0 && fused_on() && !m.st && y.rel_bias_pad &&
+            kv_fused_type(z.k_cache->type) && kv_fused_type(z.v_cache->type) && plan.size() >= 2 && plan.back().cpuop) {
+            const ChunkIn& hc = plan.back();
+            const int S = (int) std::max<int64_t>(1, spill_slices() / T);   // CPU op cell slices (claimed dynamically)
+            ggml_tensor* Kd = ggml_view_3d(c, z.k_cache, hd, nkv, z.cells, z.k_cache->nb[1], z.k_cache->nb[2], 0);
+            ggml_tensor* Vd = ggml_view_3d(c, z.v_cache, hd, nkv, z.cells, z.v_cache->nb[1], z.v_cache->nb[2], 0);
+            ggml_tensor* gp = inkling_attn_dec_rel_pos_part(c, Q, Kd, Vd, y.rel_bias_pad, R, sinks, s.idx_full, (int) h.rel_extent,
+                                                            1.0f / std::sqrt((float) hd), inkling_attn_dec_max_split() - S);
+            if (gp) {
+                ggml_tensor* Gt = rot_v ? nullptr : (Gp ? Gp : mm(y.gate, in[0]));
+                ggml_tensor* Qc = ggml_cont(c, Q);
+                ggml_tensor* tab = get_table();
+                for (ggml_tensor* t : {gp, Qc, tab}) ggml_build_forward_expand(gf, t);
+                if (Gt) ggml_build_forward_expand(gf, Gt);
+                if (defer_k) {   // the host stores, next to the CPU op (one CPU split)
+                    store_kv_split(defer_k, z.k_cache, z.k_host);
+                    store_kv_split(defer_v, z.v_cache, z.v_host);
+                    defer_k = defer_v = nullptr;
+                }
+                auto& ha = s.host_args.emplace_back(new HostAttnArgs);
+                ha->j0 = hc.j0; ha->ext = (int) h.rel_extent; ha->scale = 1.0f / std::sqrt((float) hd); ha->nsplit = S;
+                const int64_t r0 = hc.j0 - z.cells;
+                ha->kid = z.k_host; ha->r0 = r0;   // --kv-sparse: the page summaries' key and first host row
+                ggml_tensor* Kh = ggml_view_3d(c, z.k_host, hd, nkv, hc.cells, z.k_host->nb[1], z.k_host->nb[2], (size_t) r0 * z.k_host->nb[2]);
+                ggml_tensor* Vh = ggml_view_3d(c, z.v_host, hd, nkv, hc.cells, z.v_host->nb[1], z.v_host->nb[2], (size_t) r0 * z.v_host->nb[2]);
+                ggml_tensor* args[5] = {Qc, Kh, Vh, tab, s.posf};
+                ggml_tensor* hp0 = ggml_custom_4d(c, GGML_TYPE_F32, hd + 2, nh, T, S, args, 5, host_attn_partial, GGML_N_TASKS_MAX, ha.get());
+                ggml_build_forward_expand(gf, hp0);
+                ggml_tensor* hp = ggml_cont(c, hp0);   // pinned to the GPU in run()
+                s.spill_gpu.push_back(hp);
+                ggml_tensor* yo = inkling_attn_dec_reduce_parts(c, ggml_concat(c, gp, hp, 3), Gt);
+                GGML_ASSERT(yo && "--kv-vram: the decode reduce refused the concatenated partials");
+                o = ggml_reshape_2d(c, yo, (int64_t) hd * nh, T);
+                gated = Gt != nullptr;
+            }
+        }
+        // --kv-vram prompt chunk past kv_res: the fused prompt kernel's partials over the VRAM keys [0, kv_res) and over
+        // each host chunk (32K cells, pinned to the GPU so the scheduler stages its rows once), merged by the decode
+        // reduce (the partials carry max - sink: the zero-sink convention).  XOLOTL_INKLING_SPILL_FUSED=0: the chain.
+        if (!o && spill && spill_fused_prefill(m, (int) T) && y.rel_bias_pad) {
+            const float sc = 1.0f / std::sqrt((float) hd);
+            constexpr int64_t HC = 32768;
+            ggml_tensor* parts = inkling_attn_prompt_part(c, Q, z.k_cache, z.v_cache, R, sinks, y.rel_bias_pad, p0, 0, z.cells, sc);
+            if (parts) s.spill_gpu.push_back(parts);
+            for (int64_t j0 = z.cells; parts && j0 < s.n_kv_full; j0 += HC) {
+                const int64_t j1 = std::min(j0 + HC, s.n_kv_full), r0 = j0 - z.cells;
+                ggml_tensor* Kh = ggml_view_3d(c, z.k_host, hd, nkv, j1 - j0, z.k_host->nb[1], z.k_host->nb[2], (size_t) r0 * z.k_host->nb[2]);
+                ggml_tensor* Vh = ggml_view_3d(c, z.v_host, hd, nkv, j1 - j0, z.v_host->nb[1], z.v_host->nb[2], (size_t) r0 * z.v_host->nb[2]);
+                ggml_tensor* hp = inkling_attn_prompt_part(c, Q, Kh, Vh, R, sinks, y.rel_bias_pad, p0, j0, j1, sc);
+                if (!hp) { parts = nullptr; break; }
+                s.spill_gpu.push_back(hp);
+                parts = ggml_concat(c, parts, hp, 3);
+            }
+            ggml_tensor* yo = parts ? inkling_attn_dec_reduce_parts(c, parts, nullptr) : nullptr;
+            if (!yo) GGML_ABORT("--kv-vram: the fused spilled prompt attention refused a layer (XOLOTL_INKLING_SPILL_FUSED=0 works around it)");
+            o = ggml_reshape_2d(c, yo, (int64_t) hd * nh, T);
+        }
         if (!o && decattn && !fa_ok(m, (int) T) && T <= 16 && plan.size() == 1 && !m.st &&
             kv_fused_type(z.k_cache->type) && kv_fused_type(z.v_cache->type)) {
             const ChunkIn& ci = plan[0];
@@ -1931,16 +2974,67 @@ struct G {                     // graph-building context
         }
         for (const ChunkIn& ci : plan) {
             if (o) break;
-            ggml_tensor* mask_h = fused_mask(ci, GGML_TYPE_F32);
+            if (spill && ci.cpuop) {   // --kv-vram decode: the host rows' partial softmax on the CPU
+                GGML_ASSERT(mx && "the VRAM chunk [0, kv_res) comes first");
+                auto& ha = s.host_args.emplace_back(new HostAttnArgs);
+                ha->j0 = ci.j0; ha->ext = (int) h.rel_extent; ha->scale = 1.0f / std::sqrt((float) hd);
+                ha->nsplit = (int) std::max<int64_t>(1, 16 / T);
+                const int64_t r0 = ci.j0 - z.cells;
+                ggml_tensor* Kh = ggml_view_3d(c, z.k_host, hd, nkv, ci.cells, z.k_host->nb[1], z.k_host->nb[2], (size_t) r0 * z.k_host->nb[2]);
+                ggml_tensor* Vh = ggml_view_3d(c, z.v_host, hd, nkv, ci.cells, z.v_host->nb[1], z.v_host->nb[2], (size_t) r0 * z.v_host->nb[2]);
+                // graph order = split order: everything the GPU owes this visit (the VRAM chunks' sums, q, the bias
+                // table), then on the CPU the deferred host stores and the op, then one copy back
+                ggml_tensor* Qc = ggml_cont(c, Q);
+                ggml_tensor* tab = get_table();
+                for (ggml_tensor* t : {acc, lse, mx, Qc, tab}) ggml_build_forward_expand(gf, t);
+                if (defer_k) {
+                    store_kv_split(defer_k, z.k_cache, z.k_host);
+                    store_kv_split(defer_v, z.v_cache, z.v_host);
+                    defer_k = defer_v = nullptr;
+                }
+                ggml_tensor* args[5] = {Qc, Kh, Vh, tab, s.posf};
+                ggml_tensor* part0 = ggml_custom_4d(c, GGML_TYPE_F32, hd + 2, nh, T, ha->nsplit, args, 5, host_attn_partial,
+                                                    GGML_N_TASKS_MAX, ha.get());
+                ggml_build_forward_expand(gf, part0);
+                ggml_tensor* part = ggml_cont(c, part0);   // pinned to the GPU in run(): one input copy for the merge
+                s.spill_gpu.push_back(part);
+                for (int sl = 0; sl < ha->nsplit; ++sl) {   // each slice merges like one more chunk
+                    const size_t o3 = (size_t) sl * part->nb[3];
+                    // part is [hd+2, nh, T, S]: the chain's [hd, T, nh] / [1, T, nh] as strided views (T stride nb2, head nb1)
+                    ggml_tensor* a2 = ggml_view_3d(c, part, hd, T, nh, part->nb[2], part->nb[1], o3);
+                    ggml_tensor* m2 = ggml_cont(c, ggml_view_3d(c, part, 1, T, nh, part->nb[2], part->nb[1], o3 + (size_t) hd * 4));
+                    ggml_tensor* l2 = ggml_cont(c, ggml_view_3d(c, part, 1, T, nh, part->nb[2], part->nb[1], o3 + (size_t) (hd + 1) * 4));
+                    ggml_tensor* m_new = ggml_pool_1d(c, ggml_concat(c, mx, m2, 0), GGML_OP_POOL_MAX, 2, 2, 0);
+                    ggml_tensor* f1 = ggml_exp(c, ggml_sub(c, mx, m_new));
+                    ggml_tensor* f2 = ggml_exp(c, ggml_sub(c, m2, m_new));
+                    lse = ggml_add(c, ggml_mul(c, lse, f1), ggml_mul(c, l2, f2));
+                    acc = ggml_add(c, ggml_mul(c, acc, f1), ggml_mul(c, a2, f2));
+                    mx = m_new;
+                }
+                continue;
+            }
+            ggml_tensor* mask_h = nullptr;
+            if (ci.far) {   // --kv-vram: no mask, the far bias row broadcast over the chunk's cells: [1, T, nh]
+                ggml_tensor* tb = get_table();                                              // [nh, Ext+1, T]
+                ggml_tensor* row = ggml_view_3d(c, tb, nh, 1, T, tb->nb[1], tb->nb[2], (size_t) h.rel_extent * tb->nb[1]);
+                mask_h = ggml_cont(c, ggml_permute(c, row, 2, 0, 1, 3));                    // [1, T, nh]
+            }
+            if (!mask_h) mask_h = fused_mask(ci, GGML_TYPE_F32);
             if (!mask_h) {
                 ggml_tensor* kq_b = ggml_get_rows(c, get_table(), ci.rp);                   // [nh, cells, T]
                 kq_b = ggml_cont(c, ggml_permute(c, ggml_reshape_4d(c, kq_b, nh, ci.cells, T, 1), 2, 0, 1, 3));   // [cells, T, nh]
                 mask_h = ggml_add(c, kq_b, ci.mask);
             }
-            ggml_tensor* Kv = ggml_permute(c, ggml_view_3d(c, z.k_cache, hd, nkv, ci.cells, z.k_cache->nb[1], z.k_cache->nb[2],
-                                                          (size_t) ci.j0 * z.k_cache->nb[2]), 0, 2, 1, 3);
-            ggml_tensor* Vv = ggml_permute(c, ggml_view_3d(c, z.v_cache, hd, nkv, ci.cells, z.v_cache->nb[1], z.v_cache->nb[2],
-                                                          (size_t) ci.j0 * z.v_cache->nb[2]), 0, 2, 1, 3);
+            // --kv-vram: a chunk at or past the VRAM cells reads the host rows (cell j = row j - z.cells)
+            const bool on_host = spill && ci.j0 >= z.cells;
+            ggml_tensor* kt = on_host ? z.k_host : z.k_cache;
+            ggml_tensor* vt0 = on_host ? z.v_host : z.v_cache;
+            const int64_t r0 = on_host ? ci.j0 - z.cells : ci.j0;
+            GGML_ASSERT(r0 >= 0 && r0 + ci.cells <= kt->ne[2]);
+            ggml_tensor* Kv = ggml_permute(c, ggml_view_3d(c, kt, hd, nkv, ci.cells, kt->nb[1], kt->nb[2],
+                                                          (size_t) r0 * kt->nb[2]), 0, 2, 1, 3);
+            ggml_tensor* Vv = ggml_permute(c, ggml_view_3d(c, vt0, hd, nkv, ci.cells, vt0->nb[1], vt0->nb[2],
+                                                          (size_t) r0 * vt0->nb[2]), 0, 2, 1, 3);
             ggml_tensor* vt;
             if (z.v_type == GGML_TYPE_F16) {
                 vt = ggml_cont(c, ggml_transpose(c, Vv));                                   // [cells, hd, nkv]
@@ -1973,6 +3067,7 @@ struct G {                     // graph-building context
                 mx = m_new;
             }
         }
+        GGML_ASSERT(!defer_k && "--kv-vram: a deferred host store was never made (no CPU-op chunk in the plan)");
         if (!o) {
             o = lse ? ggml_div(c, acc, lse) : acc;                                             // [hd, T, nh]  (normalise once)
             o = ggml_cont_2d(c, ggml_permute(c, o, 0, 2, 1, 3), (int64_t) hd * nh, T);
@@ -2070,10 +3165,10 @@ bool decattn_on() {
 // ONE chunk at any context (split by --attn-budget, a 477K-cell window became several chunks, which the kernel refuses,
 // and the chain fallback asked for a 17 GB graph buffer)
 bool dec_kernel_use(const Model& m, int T) {
-    return decattn_on() && fa_ok(m, T) == false && T <= 16 && !m.st && kv_fused_type(m.kv_k) && kv_fused_type(m.kv_v);
+    return decattn_on() && !inkling_train_mode() && fa_ok(m, T) == false && T <= 16 && !m.st && kv_fused_type(m.kv_k) && kv_fused_type(m.kv_v);
 }
 bool pattn_use(const Model& m, int T) {
-    return prompt_attn_on() && T > 16 && !m.st && m.pattn_ok && kv_fused_type(m.kv_k) && kv_fused_type(m.kv_v);
+    return prompt_attn_on() && !inkling_train_mode() && T > 16 && !m.st && m.pattn_ok && kv_fused_type(m.kv_k) && kv_fused_type(m.kv_v);
 }
 
 // T tokens at positions p0 .. p0+T-1; logits for the last n_out of them
@@ -2106,7 +3201,8 @@ Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = fals
         // positional global slots: the decode kernel derives mask and distance from idx_full, so the plan carries no
         // [cells, T] host arrays for them (3.8 MB of fill + upload a token at 477K)
         static const bool rel_in_env = !(std::getenv("XOLOTL_INKLING_DECATTN_REL") && std::atoi(std::getenv("XOLOTL_INKLING_DECATTN_REL")) == 0);
-        s.pos_full = dec_kernel_use(m, T) && rel_in_env && !m.L.empty() && m.L[0].rel_bias_pad &&
+        s.spill = m.spill_on() && s.n_kv_full > m.kv_res;
+        s.pos_full = !s.spill && dec_kernel_use(m, T) && rel_in_env && !m.L.empty() && m.L[0].rel_bias_pad &&
                      inkling_dec_pos_ok(h.hd, h.n_head, h.n_head_kv, m.kv_k, m.kv_v, h.n_rel, ggml_row_size(m.kv_k, h.hd),
                                         ggml_row_size(m.kv_k, h.hd) * h.n_head_kv);
         auto plan = [&](int64_t nk, bool positional) {
@@ -2129,6 +3225,39 @@ Step build(Model& m, int T, int64_t p0, int n_out, bool dump, bool dspark = fals
         if (!pattn_use(m, T)) {
             s.ck_full = plan(s.n_kv_full, s.pos_full);
             s.ck_swa = plan(s.n_kv_swa, false);
+        }
+        if (s.spill) {   // --kv-vram: the global window as the chain's masked chunks, split at kv_res (a chunk reads
+                         // one tensor: the VRAM cache or the host rows), so plan.size() >= 2 keeps every fused path off
+            // chunk size from the score budget alone ([C, T, nh] f32 per chunk); attn_cell_chunk's n_kv/32 floor
+            // would build multi-GB score tensors for a 2048-token prompt chunk deep in the context
+            const int64_t C = std::min<int64_t>(s.n_kv_full, std::max<int64_t>(64, (m.attn_budget / std::max<int64_t>(1, (int64_t) T * h.n_head)) / 64 * 64));
+            s.ck_full.clear();
+            for (int part = 0; part < 2 && !spill_fused_prefill(m, T); ++part) {
+                const int64_t a = part ? m.kv_res : 0, b = part ? s.n_kv_full : m.kv_res;
+                if (part == 1 && spill_cpuop(T)) {   // the CPU op: one chunk, causal test + bias in the op
+                    ChunkIn ci;
+                    ci.j0 = a; ci.cells = b - a; ci.cpuop = true;
+                    s.ck_full.push_back(ci);
+                    continue;
+                }
+                // the lowest p0 this graph can run at (the key is T and n_kv_full = p0 + T rounded up to 256): a
+                // chunk whose last cell is the extent behind it is "far" for every reuse of the graph
+                const int64_t p_min = s.n_kv_full - 255 - T;
+                for (int64_t j0 = a; j0 < b; j0 += C) {
+                    ChunkIn ci;
+                    ci.j0 = j0; ci.cells = std::min(C, b - j0);
+                    static const bool far_on = !(std::getenv("XOLOTL_INKLING_SPILL_FAR") && std::atoi(std::getenv("XOLOTL_INKLING_SPILL_FAR")) == 0);
+                    ci.far = far_on && ci.j0 + ci.cells - 1 <= p_min - (int64_t) h.rel_extent;
+                    if (!ci.far) {
+                        ci.mask = ggml_new_tensor_2d(c, GGML_TYPE_F32, ci.cells, T); ggml_set_input(ci.mask);
+                        ci.rp = ggml_new_tensor_2d(c, GGML_TYPE_I32, ci.cells, T); ggml_set_input(ci.rp);
+                    }
+                    s.ck_full.push_back(ci);
+                }
+            }
+            s.t_lo = std::clamp<int64_t>(m.kv_res - p0, 0, T);
+            if (s.t_lo > 0) { s.idx_lo = ggml_new_tensor_1d(c, GGML_TYPE_I64, s.t_lo); ggml_set_input(s.idx_lo); }
+            if (s.t_lo < T) { s.idx_hi = ggml_new_tensor_1d(c, GGML_TYPE_I64, T - s.t_lo); ggml_set_input(s.idx_hi); }
         }
     }
     if (n_out < T) { s.out_ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_out); ggml_set_input(s.out_ids); }
@@ -2285,8 +3414,8 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
         gs = &m.vg[(size_t) T];
         if (!gs->sched) {   // its own CUDA backend too: ggml-cuda keeps one CUDA graph per backend (no re-capture on switch)
             if (!gs->gpu) gs->gpu = ggml_backend_cuda_init(0);
-            ggml_backend_t bes[2] = {gs->gpu ? gs->gpu : m.gpu, m.cpu};
-            gs->sched = ggml_backend_sched_new(bes, nullptr, 2, kGraphNodes, false, true);
+            ggml_backend_t bes[3] = {gs->gpu ? gs->gpu : m.gpu, m.gpu2 ? m.gpu2 : m.cpu, m.cpu};
+            gs->sched = ggml_backend_sched_new(bes, nullptr, m.gpu2 ? 3 : 2, kGraphNodes, false, true);
             gs->buf.resize(m.graph_buf.size());
         }
     }
@@ -2308,8 +3437,10 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
     const bool vision = media_rows != nullptr;
     // the prompt attention kernel bakes pos0 into its op params, so its graph is only reusable at the same p0 (a chunk
     // with the same T in the same 256-cell bucket reran with the old position: wrong attention, 22 Nov S13)
+    // --kv-vram: a step whose tokens straddle kv_res splits its stores at kv_res - p0, so it keys on p0 as well
+    const bool straddle = m.spill_on() && p0 < m.kv_res && p0 + T > m.kv_res;
     const int64_t key[9] = {T, n_out, n_kv_full, n_kv_swa, taps != nullptr, m.st != nullptr, dtap != nullptr, vision,
-                            pattn_use(m, T) ? p0 : -1};
+                            pattn_use(m, T) || straddle ? p0 : -1};
     const auto tb = Clock::now();
     const bool reuse = m.last && std::equal(key, key + 9, m.last_key);
     if (!reuse) {
@@ -2329,6 +3460,7 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
             for (ggml_tensor* t : m.last->cold_stage) ggml_backend_sched_set_tensor_backend(m.sched, t, m.gpu);
             for (ggml_tensor* t : m.last->cold_ops) ggml_backend_sched_set_tensor_backend(m.sched, t, m.gpu);
         }
+        for (ggml_tensor* t : m.last->spill_gpu) ggml_backend_sched_set_tensor_backend(m.sched, t, m.gpu);
         if (!ggml_backend_sched_alloc_graph(m.sched, m.last->gf)) { drop_graph(m); throw AllocFail(); }
         std::copy(key, key + 9, m.last_key);
     }
@@ -2350,12 +3482,21 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
     {
         std::vector<int64_t> a(T), b(T);
         for (int t = 0; t < T; ++t) { a[t] = p0 + t; b[t] = (p0 + t) % m.ring; }
-        ggml_backend_tensor_set(s.idx_full, a.data(), 0, a.size() * sizeof(int64_t));
+        // a spilled step's global visits write through idx_lo / idx_hi, so nothing may read idx_full (unallocated)
+        if (s.idx_full->buffer) ggml_backend_tensor_set(s.idx_full, a.data(), 0, a.size() * sizeof(int64_t));
         ggml_backend_tensor_set(s.idx_swa, b.data(), 0, b.size() * sizeof(int64_t));
+        if (s.spill) {   // --kv-vram: positions below kv_res are VRAM cells, the rest host rows
+            GGML_ASSERT(s.t_lo == std::clamp<int64_t>(m.kv_res - p0, 0, T));
+            for (int t = (int) s.t_lo; t < T; ++t) a[t] -= m.kv_res;
+            if (s.idx_lo && s.idx_lo->buffer) ggml_backend_tensor_set(s.idx_lo, a.data(), 0, (size_t) s.t_lo * sizeof(int64_t));
+            if (s.idx_hi && s.idx_hi->buffer) ggml_backend_tensor_set(s.idx_hi, a.data() + s.t_lo, 0, (size_t) (T - s.t_lo) * sizeof(int64_t));
+            if (g_kv_sparse > 0 && s.t_lo < T) sparse_invalidate(a[s.t_lo]);   // host rows from here are rewritten
+        }
     }
     const Hp& h = m.hp;
     for (const ChunkIn& ci : s.ck_full) {   // global slots: cell j = position j, masked when j > p0 + t
-        if (!ci.mask) continue;   // positional (the kernel derives both from idx_full)
+        if (!ci.mask || !ci.mask->buffer) continue;   // positional (the kernel derives both from idx_full), or unused
+                                                       // (--kv-vram: the fused partial paths read no masks)
         std::vector<float> mk((size_t) ci.cells * T);
         std::vector<int32_t> rp((size_t) ci.cells * T);
         const int32_t ext = h.rel_extent;
@@ -2601,6 +3742,17 @@ int chunk_len(const Model& m, int64_t p, int64_t left) {
     while (!pattn_use(m, T) && T > 16 && ((p + T + 255) / 256) * 256 * (int64_t) T > m.attn_budget) T /= 2;   // no score tensor with it
     // a chunk's sliding keys (n_swa - 1 before it + its T) must all be in the ring at once
     if (m.ring < m.n_ctx) T = (int) std::min<int64_t>(T, std::max<int64_t>(1, m.ring - m.hp.n_swa + 1));
+    // --kv-vram: a spilled prompt chunk runs the global layers on the chain in budget-sized cell chunks
+    // (C = attn_budget / (T * n_head)); keep each visit at <= 224 of them, or 8 visits x ~12 nodes a chunk
+    // overflow the graph (kGraphNodes) deep in a long context: halve T until it fits
+    if (m.spill_on() && p + T > m.kv_res && T > 16 && !spill_fused_prefill(m, T)) {
+        auto chunks = [&](int t) {
+            const int64_t nk = ((p + t + 255) / 256) * 256;
+            const int64_t C = std::min<int64_t>(nk, std::max<int64_t>(64, (m.attn_budget / ((int64_t) t * m.hp.n_head)) / 64 * 64));
+            return (nk + C - 1) / C;
+        };
+        while (T > 64 && chunks(T) > 224) T /= 2;
+    }
     return std::max(1, T);
 }
 
@@ -2831,14 +3983,19 @@ void load_lora(Model& m, const std::string& path, float user_scale) {
 void usage() {
     std::fprintf(stderr,
                  "usage: xolotl-inkling --serve --native <inkling-2-mini.gguf> [--context N] [--ubatch N] [--threads N]\n"
-                 "       [--cpu-exps L] [--kv-type f16|q8_0|k8v4] [--dspark F | --mtp] [--attn-budget N] [--park-idle SECS] [--peer-vram URL]\n"
+                 "       [--cpu-exps L] [--kv-type f16|q8_0|k8v4|q4_0] [--dspark F | --mtp] [--attn-budget N] [--park-idle SECS] [--peer-vram URL] [--kv-vram N [--kv-sparse N]]\n"
                  "       [--no-park-copy] [--route-log PATH] [--lora ADAPTER.gguf [--lora-scale S]]\n"
                  "  --lora applies a LoRA adapter (as written by --train) to the attention projections at serve time.\n"
                  "  --route-log appends per-visit routing records (slot, phys, pass, ids, w) for expert-usage analysis;\n"
                  "  off by default, and off costs nothing (no tap tensor is marked).  XOLOTL_INKLING_ROUTE_LOG=PATH too.\n"
                  "  --vram-budget-mib N (off by default) keeps each layer's most-routed experts in VRAM and the rest in\n"
                  "  pinned host RAM, so a 12 GB card runs the 14 GB quant; the loop core (visited 3x) is kept first.\n"
-                 "  --kv-type quantises the full-context K/V cache (k8v4 = K q8_0, V q4_0; the sliding-window rings stay f16).\n"
+                 "  --kv-type quantises the full-context K/V cache (k8v4 = K q8_0, V q4_0; q4_0 = both, rotated; the sliding-window rings stay f16).\n"
+                 "  --kv-vram N keeps the first N cells of the full-context K/V in VRAM and the rest in pinned host RAM\n"
+                 "  (opt-in; e.g. --context 524288 --kv-vram 32768).  Past N the global layers take the chunked attention:\n"
+                 "  the host part on the CPU at decode, copied to the GPU for prompt chunks.  Not with --dspark / --mtp yet.\n"
+                 "  --kv-sparse N (with --kv-vram; opt-in, not exact): decode attends only the N host cells per K/V head on the\n"
+                 "  64-cell pages with the highest q.k upper bound (per-page K min/max) plus the newest cells.\n"
                  "  --attn-budget caps one prefill chunk's n_kv*T scores and sizes the attention cell chunks (default 33554432).\n"
                  "       [--mmproj <mmproj.gguf> [--vision-device gpu|cpu]]\n"
                  "  --mmproj loads Inkling-2-Mini's image tower (convert_hf_to_gguf.py --mmproj, inkling2v) and answers\n"
@@ -2876,6 +4033,7 @@ int main(int argc, char** argv) {
     std::string peer_vram, route_log, lora_path;
     float lora_user_scale = 1.0f;
     int64_t vram_budget_mib = 0;
+    int64_t kv_vram = 0;   // --kv-vram N: global K/V cells kept in VRAM (the rest in pinned host RAM); 0 = all
     // --stats
     bool stats = false, per_visit = false, with_down_hess = false, dump_eval = true;
     std::string tokens_path, stats_out, meta_path;
@@ -2916,6 +4074,8 @@ int main(int argc, char** argv) {
         else if (a == "--threads") threads = std::atoi(val().c_str());
         else if (a == "--cpu-exps") cpu_exps = val();
         else if (a == "--vram-budget-mib") vram_budget_mib = std::atoll(val().c_str());
+        else if (a == "--kv-vram") kv_vram = std::max<int64_t>(0, std::atoll(val().c_str()));
+        else if (a == "--kv-sparse") g_kv_sparse = std::max<int64_t>(0, std::atoll(val().c_str()));
         else if (a == "--attn-budget") attn_budget = std::max<int64_t>(4096, std::atoll(val().c_str()));
         else if (a == "--park-idle") park_idle_s = std::atof(val().c_str());
         else if (a == "--peer-vram") peer_vram = val();
@@ -2942,7 +4102,8 @@ int main(int argc, char** argv) {
             if (v == "f16") { kv_k = kv_v = GGML_TYPE_F16; }
             else if (v == "q8_0") { kv_k = kv_v = GGML_TYPE_Q8_0; }
             else if (v == "k8v4") { kv_k = GGML_TYPE_Q8_0; kv_v = GGML_TYPE_Q4_0; }
-            else { std::fprintf(stderr, "xolotl-inkling: --kv-type takes f16, q8_0 or k8v4 (got %s)\n", v.c_str()); return 2; }
+            else if (v == "q4_0") { kv_k = kv_v = GGML_TYPE_Q4_0; }   // 28 Nov: both legs Hadamard-rotated (the 4-bit K/V some 12 GB setups use for 262K)
+            else { std::fprintf(stderr, "xolotl-inkling: --kv-type takes f16, q8_0, k8v4 or q4_0 (got %s)\n", v.c_str()); return 2; }
         }
         else if (a == "-h" || a == "--help") { usage(); return 0; }
         else std::fprintf(stderr, "xolotl-inkling: ignoring unknown option %s\n", a.c_str());
@@ -2991,6 +4152,10 @@ int main(int argc, char** argv) {
     m.kv_k = kv_k;
     m.kv_v = kv_v;
     m.vram_budget_mib = vram_budget_mib;
+    m.kv_vram = kv_vram;
+    if (g_kv_sparse > 0 && kv_vram <= 0) die("--kv-sparse needs --kv-vram (it selects among the host cells)");
+    if (g_kv_sparse > 0) std::fprintf(stderr, "xolotl-inkling: --kv-sparse %lld: decode reads the top %lld host cells per K/V head "
+                                      "(64-cell pages) + the newest ones; opt-in, not exact\n", (long long) g_kv_sparse, (long long) g_kv_sparse);
     if (!route_log.empty()) {   // --route-log: file header, then route_consume() appends one record per slot visit
         m.route_fp = std::fopen(route_log.c_str(), "wb");
         if (!m.route_fp) { std::fprintf(stderr, "xolotl-inkling: cannot write --route-log %s\n", route_log.c_str()); return 2; }

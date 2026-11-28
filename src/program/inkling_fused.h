@@ -77,6 +77,20 @@ bool inkling_dec_pos_ok(int hd, int nh, int nkv, ggml_type kt, ggml_type vt, int
 ggml_tensor* inkling_attn_dec_rel_pos(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* relb,
                                       ggml_tensor* Rt, ggml_tensor* sinks, ggml_tensor* pos, int ext, float scale,
                                       ggml_tensor* gate = nullptr);
+// --kv-vram: the two halves of inkling_attn_dec_rel_pos.  _part returns the split partials [hd + 2, nh, T, nsplit]
+// ((acc, max, sum) per split, no sink) with at most max_split splits; inkling_attn_dec_reduce_parts merges any such
+// tensor (more partials concatenated on dim 3, e.g. the CPU host rows') with the zero sink and the optional gate,
+// exactly the reduce the fused op ends with.  nullptr where the fused op would refuse.
+ggml_tensor* inkling_attn_dec_rel_pos_part(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* relb,
+                                           ggml_tensor* Rt, ggml_tensor* sinks, ggml_tensor* pos, int ext, float scale,
+                                           int max_split);
+ggml_tensor* inkling_attn_dec_reduce_parts(ggml_context* c, ggml_tensor* part, ggml_tensor* gate = nullptr);
+// --kv-vram prefill: inkling_attn_prompt over the keys [kbeg, kend) only, as partials [130, nh, T, 1] for
+// inkling_attn_dec_reduce_parts.  k/v = the VRAM cache (kbeg 0, rows = positions) or a staged host chunk holding
+// exactly [kbeg, kend).  kbeg / kend multiples of 256.  GPU only: the caller pins the op to CUDA.
+ggml_tensor* inkling_attn_prompt_part(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* R,
+                                      ggml_tensor* sinks, ggml_tensor* relb, int64_t pos0, int64_t kbeg, int64_t kend, float scale);
+int inkling_attn_dec_max_split();
 
 // attention prepare (key/value side) in one kernel: K and V convolutions (xk/xv [C, T] rows, C = hd*nkv; state = the
 // slot's whole conv state, K at row 0 and V at row off_v; dynk/dynv = the global layers' dynamic taps or nullptr), the

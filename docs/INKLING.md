@@ -102,6 +102,58 @@ Mean perplexity is unchanged in every arm (within one standard error). `XOLOTL_I
 `=2` rotates every leg (f16 and q8_0 too; with f16 it matches the unrotated cache within the floor, the
 exactness check).
 
+## Long context with little VRAM: `--kv-vram` and `--kv-sparse` (opt-in)
+
+`--kv-vram N` keeps the first N cells of the global layers' K/V on the card and the rest in pinned host RAM, so the
+context is no longer capped by VRAM: `--context 524288 --kv-vram 32768` runs 512K on a 12 GB card at the VRAM of a
+32K context (k8v4: ~10.5 KB a token; the host part of 512K is 6.1 GiB). Prompts stream the host part through the fused
+prompt kernel in 32K-cell chunks and merge the partial softmax sums with the VRAM part. Decode runs the host part on
+the CPU (AVX2 k8v4 kernel, cell slices claimed by a persistent thread pool) while the GPU does the VRAM part, and the
+two merge in the existing split-K reduce. Before the boundary the result is identical to the all-VRAM path; past it,
+greedy output matched on our checks and per-token NLL stayed within the engine's own precision noise. Not with
+`--dspark` / `--mtp` yet.
+
+With exact attention, decode past the resident part is bound by host RAM bandwidth: every token reads the whole host
+K/V once per global-layer visit (8 per token). Measured with a 10.98 GB XQT build (same recipe as the released 10.94 GB
+file), `--context 524288 --kv-vram 32768`, before the current CPU kernel and slice scheduling (+12-17 % and +16 %
+decode at 34K in our A/B runs):
+
+| prompt | RTX 4090 prefill / decode tok/s | RTX 3060 12 GB prefill / decode tok/s |
+| --- | ---: | ---: |
+| 8.9K | 3,988 / 132 | 725 / 48.6 |
+| 34.6K | 5,187 / 86 | 726 / 37.4 |
+| 137.7K | 3,969 / 10.5 | 445 / 8.0 |
+| 267.9K | 2,909 / 5.3 | 289 / 4.1 |
+| 495.3K | 1,955 / 2.7 | |
+
+VRAM stays at 13.6-14.5 GB on the 4090 and 11.0-11.6 GB on the 3060 at every depth. Needle found at 32K, 128K, 256K
+and 500K (498,925 tokens). A follow-up turn on a cached 495K prompt answers in 1.7 s. (Ryzen 7 5700X, DDR4; the
+3060 is on a PCIe 3.0 x4 slot.)
+
+`--kv-sparse N` (needs `--kv-vram`; **not exact**) makes decode read only part of the host K/V: per K/V head the N
+cells on the 64-cell pages that score highest, half by a landmark (q · the page's mean key, as in ShadowKV) and half
+by an upper bound on q · k (the page's per-dimension key min / max, as in Quest), plus the newest 1,088 cells (their
+position bias is not flat yet). Pages it skips still count, as 64 cells at their mean key and mean value. Attention
+over the pages it reads is exact. The page summaries are built on first use and rebuilt from wherever a step writes.
+Measured on a 34.5K prompt with 1K cells resident (33.5K in host RAM), RTX 3060, against exact attention over the
+host part:
+
+| `--kv-sparse` | host-output rel. error | greedy 128 tokens vs exact | decode tok/s |
+| --- | ---: | --- | ---: |
+| off (exact) | 0 | | 21.3 |
+| 1024 | 0.157 | identical | |
+| 2048 | 0.110 | identical | 30.5 |
+| 4096 | 0.078 | identical | |
+
+Inkling's global heads spread their attention widely, so the error is higher than these methods report on other
+models; treat it as an option for long documents where exact decode is too slow. `XOLOTL_INKLING_SPARSE_SEL=0|1|2`
+picks Quest / landmark / both (default), `XOLOTL_INKLING_SPARSE_APPROX=0` drops the skipped-page estimate,
+`XOLOTL_INKLING_SPARSE_CHECK=1` prints the error against exact attention (slow).
+
+Spill switches (default on, `=0` off): `XOLOTL_INKLING_SPILL_FUSED`, `_SPILL_CPUOP`, `_SPILL_FAR`, `_SPILL_TP`,
+`_SPILL_SIMD` (`=3` the previous CPU kernel); `XOLOTL_INKLING_SPILL_SLICES` (default 32) sets the CPU slices per
+token; `XOLOTL_INKLING_SPILL_PROF=1` prints the CPU op's time and the gap between visits.
+
 ## Get a GGUF
 
 - **Exact parent (what the numbers above use):** the official checkpoint keeps its experts in NVFP4 (layers 0-19)
@@ -116,11 +168,13 @@ exactness check).
   optional). Not yet tested here; a dequantised BF16 file is ~52 GB, so on a 24 GB card use a quant or
   `--cpu-exps`.
 
-## XQT edition (experimental, not released)
+## XQT edition: the 12 GB card file
 
-Xolotl's ggml now has trellis-coded expert types (TQP5 / TQP6 / TQP7). A 13.9 GB Inkling test file with 18 expert
-tensors in TQP measured closer to the parent model than the XQ file (agent-KL CE 0.19618 vs 0.19939, benchmarks at
-parity) but prompts were 14-26 % slower, so it is not released. A smaller XQT at the XQ file's quality is being tested.
+[IndrasMirror/Inkling-2-Mini-XQT-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQT-Uncensored)
+(28 Nov 2026): Unbound v3 in 10.94 GB, with part of the routed experts in Xolotl's trellis-coded types (TQP5 / TQP6 /
+TQP7), so the whole model and 32K of context fit a 12 GB card. RTX 3060 12 GB, k8v4, 8K prompt: 32K context 10.9 GB
+VRAM, 765 tok/s prefill, 48.3 tok/s decode; 64K context 11.3 GB, 516 / 48.4. MMLU-100 77 %, HumanEval-21 21/21,
+tool 10/10, agent 3/3, MATH-24 91.7 / 91.7 / 83.3 %. Xolotl only (other engines refuse the TQP types).
 
 ## Build and run
 

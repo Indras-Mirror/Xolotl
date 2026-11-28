@@ -22,6 +22,8 @@ using xolotl::train::LoraTensorPair;
 // ---- one graph on the GPU backend: a no-alloc context, host inputs uploaded after allocation (QFN trainer's G1) -
 static ggml_gallocr_t g_alloc = nullptr;
 static size_t g_alloc_peak = 0;
+// XOLOTL_INKLING_GPU2_EXPS: eval graphs (no loss) run through a scheduler over {gpu, gpu2, cpu}, as weights sit on two cards
+static ggml_backend_sched_t g_sched2 = nullptr;
 struct G1 {
     ggml_context* c = nullptr;
     ggml_cgraph* gf = nullptr;
@@ -59,6 +61,14 @@ struct G1 {
                 if (ggml_tensor* gr = ggml_graph_get_grad(gf, t)) ggml_set_output(gr);
             }
         }
+        if (g_sched2) {
+            if (loss) die("--train: XOLOTL_INKLING_GPU2_EXPS is eval only (--steps 0)");
+            ggml_backend_sched_reset(g_sched2);
+            if (!ggml_backend_sched_alloc_graph(g_sched2, gf)) die("--train: graph allocation failed (two-card sched)");
+            for (auto& h : up) if (h.first->buffer) ggml_backend_tensor_set(h.first, h.second.data(), 0, h.second.size());
+            if (ggml_backend_sched_graph_compute(g_sched2, gf) != GGML_STATUS_SUCCESS) die("--train: graph compute failed");
+            return;
+        }
         if (!g_alloc) g_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
         if (!ggml_gallocr_alloc_graph(g_alloc, gf)) die("--train: graph allocation failed (VRAM)");
         const size_t bs = ggml_gallocr_get_buffer_size(g_alloc, 0);
@@ -88,6 +98,7 @@ static void addto(std::vector<float>& a, const std::vector<float>& b) {
 
 struct Args {
     std::string gguf, data, eval, out = "runs", run = "inkling-lora", save, targets = "q,k,v,o,gate,rel", init_from, resume, prefix_file;
+    std::string cpu_exps;   // --cpu-exps L (28 Nov): these layers' experts in host RAM, as the serve engine's flag (a file that is 0.5 GB too big)
     int rank = 16, steps = 0, warmup = 10, max_t = 2048, threads = 8, eval_every = 0, eval_n = 16, save_every = 0, seed = 0, ce_chunk = 256;
     int check = 0, fd = 0, overfit = 0, check_prefix = 0, max_prefix = 0, shuffle = 1;
     float alpha = 32.0f, lr = 1e-4f, clip = 1.0f, init_b = 0.0f, lr_min = 0.1f;
@@ -516,7 +527,9 @@ struct Trainer {
     }
 
     // mean CE over the loss positions (row t predicts ids[t+1] where mask[t+1]); dxf (optional) = d loss / d xf
+    int margin_win = -1;   // XOLOTL_INKLING_MARGINS: index of the eval window being scored (eval order = file order)
     double head_ce(const Window& w, const std::vector<float>& xf, std::vector<float>* dxf) {
+        if (!dxf) ++margin_win;
         const int T = (int) w.ids.size();
         const int64_t E = h.n_embd, V = h.n_vocab;
         std::vector<int> rows;
@@ -536,10 +549,28 @@ struct Trainer {
             ggml_tensor* tx = gg.f32(xs.data(), E, n);
             if (dxf) ggml_set_param(tx);
             ggml_tensor* tl = gg.f32(lab.data(), V, n);
-            ggml_tensor* ce = ggml_scale(gg.c, ggml_cross_entropy_loss(gg.c, logits_of(gg.c, ggml_reshape_2d(gg.c, tx, E, n)), ggml_reshape_2d(gg.c, tl, V, n)),
+            ggml_tensor* lgt = logits_of(gg.c, ggml_reshape_2d(gg.c, tx, E, n));
+            ggml_tensor* ce = ggml_scale(gg.c, ggml_cross_entropy_loss(gg.c, lgt, ggml_reshape_2d(gg.c, tl, V, n)),
                                          (float) (n / N));
-            gg.run(be, dxf ? ce : nullptr, {ce}, dxf ? std::vector<ggml_tensor*>{tx} : std::vector<ggml_tensor*>{});
+            // XOLOTL_INKLING_MARGINS=<file> (eval only, 28 Nov, margin probes): per loss position, the label's
+            // log-prob and its margin = logit(label) - max other logit (< 0: greedy writes another token here)
+            static FILE* mfp = [] { const char* p = std::getenv("XOLOTL_INKLING_MARGINS"); return p && *p ? std::fopen(p, "w") : nullptr; }();
+            const bool want_m = mfp != nullptr && dxf == nullptr;
+            gg.run(be, dxf ? ce : nullptr, want_m ? std::vector<ggml_tensor*>{ce, lgt} : std::vector<ggml_tensor*>{ce},
+                   dxf ? std::vector<ggml_tensor*>{tx} : std::vector<ggml_tensor*>{});
             loss += fetch(ce)[0];
+            if (want_m) {
+                const std::vector<float> L = fetch(lgt);
+                for (int i = 0; i < n; ++i) {
+                    const float* r = &L[(size_t) i * V];
+                    const int y = w.ids[rows[r0 + i] + 1];
+                    float mx = -INFINITY, mo = -INFINITY;
+                    for (int64_t v = 0; v < V; ++v) { mx = std::max(mx, r[v]); if (v != y) mo = std::max(mo, r[v]); }
+                    double se = 0; for (int64_t v = 0; v < V; ++v) se += std::exp((double) (r[v] - mx));
+                    const double lp = (double) (r[y] - mx) - std::log(se);
+                    std::fprintf(mfp, "%d %d %d %.6f %.6f\n", margin_win, rows[r0 + i] + 1, y, lp, (double) (r[y] - mo));
+                }
+            }
             if (dxf) {
                 const std::vector<float> g = gg.grad(tx);
                 for (int i = 0; i < n; ++i) std::memcpy(&(*dxf)[(size_t) rows[r0 + i] * E], &g[(size_t) i * E], E * sizeof(float));
@@ -874,6 +905,7 @@ int inkling_train_main(int argc, char** argv) {
         else if (k == "--clip") a.clip = (float) std::atof(v().c_str());
         else if (k == "--init-b") a.init_b = (float) std::atof(v().c_str());
         else if (k == "--ce-chunk") a.ce_chunk = std::max(16, std::atoi(v().c_str()));
+        else if (k == "--cpu-exps") a.cpu_exps = v();
         else if (k == "--check") a.check = std::atoi(v().c_str());
         else if (k == "--init-from") a.init_from = v();
         else if (k == "--resume") a.resume = v();
@@ -896,11 +928,21 @@ int inkling_train_main(int argc, char** argv) {
     }
     // the reference graph only: every fused (custom) op off, controllers on their base tensors
     inkling_train_mode() = true;
-    setenv("XOLOTL_INKLING_CTRL_REF", "1", 1);
-    setenv("XOLOTL_INKLING_FUSED", "0", 1);
-    setenv("XOLOTL_INKLING_PROMPT_ATTN", "0", 1);
-    setenv("XOLOTL_INKLING_DECATTN", "0", 1);
-    setenv("XOLOTL_INKLING_STACKQ", "0", 1);
+    // XOLOTL_INKLING_EVAL_SERVED=1 (28 Nov, eval only): the context prefill (engine, served=true) keeps the serve engine's
+    // fused / prompt-attention / stacked paths - ~2x faster margin evals. The window graphs still take the reference
+    // chains: every one of those paths is gated off by inkling_train_mode() (fused_on, pattn_use, dec_kernel_use, the
+    // stacked controllers and projections). Margins differ slightly from the reference prefill: compare like with like.
+    const char* es = std::getenv("XOLOTL_INKLING_EVAL_SERVED");
+    if (es && std::string(es) == "1") {
+        if (a.steps > 0) die("--train: XOLOTL_INKLING_EVAL_SERVED=1 is eval only (--steps 0)");
+        std::fprintf(stderr, "[train] XOLOTL_INKLING_EVAL_SERVED=1: the prefill runs the serve kernels\n");
+    } else {
+        setenv("XOLOTL_INKLING_CTRL_REF", "1", 1);
+        setenv("XOLOTL_INKLING_FUSED", "0", 1);
+        setenv("XOLOTL_INKLING_PROMPT_ATTN", "0", 1);
+        setenv("XOLOTL_INKLING_DECATTN", "0", 1);
+        setenv("XOLOTL_INKLING_STACKQ", "0", 1);
+    }
     try {
         Model m;
         m.ubatch = std::max(512, std::min(a.max_t, 4096));   // prefill chunks / check windows (the ring holds n_swa + this)
@@ -909,8 +951,13 @@ int inkling_train_main(int argc, char** argv) {
         const int ub0 = m.ubatch;
         if (a.check && a.check_prefix > 0) m.ubatch = std::max<int>(m.ubatch, a.check_prefix + std::min(a.max_t, 4096));
         // the engine holds prefixes (prefill chunks) + a check window; windows themselves never enter its cache
-        load(m, a.gguf, std::max<int64_t>(4096, (int64_t) a.max_prefix + std::max(a.check_prefix, 0) + 2 * std::min(a.max_t, 4096) + 512), a.threads, "", false);
+        load(m, a.gguf, std::max<int64_t>(4096, (int64_t) a.max_prefix + std::max(a.check_prefix, 0) + 2 * std::min(a.max_t, 4096) + 512), a.threads, a.cpu_exps, false);
         m.ubatch = ub0;
+        if (m.gpu2) {
+            ggml_backend_t bes[3] = {m.gpu, m.gpu2, m.cpu};
+            g_sched2 = ggml_backend_sched_new(bes, nullptr, 3, 1 << 18, false, true);
+            if (a.steps > 0) die("--train: XOLOTL_INKLING_GPU2_EXPS is eval only (--steps 0)");
+        }
         if (a.check && a.check_prefix > 0) {   // gate: short prefill chunks (few attention chunks a slot over the big ring) and a
             m.ubatch = std::min(ub0, 1024);     // budget that keeps the check window's attention one softmax, like the train side
             m.attn_budget = std::max<int64_t>(m.attn_budget, ((int64_t) a.check_prefix + a.check + 255) / 256 * 256 * a.check * 32);
@@ -966,6 +1013,7 @@ int inkling_train_main(int argc, char** argv) {
                                        (long long) tr.prefill_tok, tr.prefill_s);
                 s += l;
             }
+            if (const char* mp = std::getenv("XOLOTL_INKLING_MARGINS")) (void) mp, std::fflush(nullptr);
             return s / n;
         };
         if (a.overfit) { a.steps = a.overfit; tr.a.steps = a.overfit; }

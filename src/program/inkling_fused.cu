@@ -1912,6 +1912,9 @@ struct Args {
     long long pos0, cap, k_nb1, k_nb2, v_nb1, v_nb2;
     int nh, ext, window, ktype, vtype;   // ktype/vtype: 0 f16, 1 q8_0, 2 q4_0
     float scale;
+    // --kv-vram partial mode (kend > 0): only keys in [kbeg, kend); out = [130][nh][T] per row: the unnormalised sum,
+    // the max (natural log units, minus the row's sink: the decode reduce's zero-sink convention) and the exp sum
+    long long kbeg = 0, kend = 0;
 };
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void ldsm_x2(unsigned& r0, unsigned& r1, const void* p) {
@@ -1997,8 +2000,10 @@ __global__ void __launch_bounds__(kThreads, 1) k_attn_prompt(const Args a, const
     const long long pw = q0 + jw;
     const int ia = i0 + jw + g, ib = ia + 8;
     const bool va = ia < rows, vb = ib < rows;
-    const long long hi = a.pos0 + min(rows, i0 + kPos) - 1;
-    const long long lo = a.window > 0 ? max(0LL, q0 - a.window + 1) : 0;
+    const bool part = a.kend > 0;
+    const long long hi = part ? min(a.pos0 + min(rows, i0 + kPos) - 1, a.kend - 1) : a.pos0 + min(rows, i0 + kPos) - 1;
+    const long long lo = part ? max(a.window > 0 ? max(0LL, q0 - a.window + 1) : 0LL, a.kbeg)
+                              : (a.window > 0 ? max(0LL, q0 - a.window + 1) : 0);
     const int ext = a.ext;
 
     uint32_t qf[kHD / 16][4], rf[4];
@@ -2061,7 +2066,8 @@ __global__ void __launch_bounds__(kThreads, 1) k_attn_prompt(const Args a, const
         __syncthreads();
         const long long p_first = pw, p_last = pw + 15;
         if (k0 > p_last || (a.window > 0 && k0 + kKeys - 1 <= p_first - a.window)) continue;
-        const bool whole = k0 + kKeys - 1 <= p_first && (a.window <= 0 || k0 > p_last - a.window);
+        const bool whole = k0 + kKeys - 1 <= p_first && (a.window <= 0 || k0 > p_last - a.window) &&
+                           (!part || (k0 >= a.kbeg && k0 + kKeys <= a.kend));
         float s[kKeys / 8][4];
 #pragma unroll
         for (int n = 0; n < kKeys / 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.f;
@@ -2112,7 +2118,7 @@ __global__ void __launch_bounds__(kThreads, 1) k_attn_prompt(const Args a, const
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     const long long key = k0 + n * 8 + 2 * tq + (e & 1), p = pw + g + (e >> 1) * 8;
-                    if (key > p || (a.window > 0 && key <= p - a.window)) s[n][e] = -INFINITY;
+                    if (key > p || (a.window > 0 && key <= p - a.window) || (part && (key < a.kbeg || key >= a.kend))) s[n][e] = -INFINITY;
                 }
         }
         float mx_a = m_a, mx_b = m_b;
@@ -2152,6 +2158,21 @@ __global__ void __launch_bounds__(kThreads, 1) k_attn_prompt(const Args a, const
             }
     }
     l_a = quad_sum(l_a); l_b = quad_sum(l_b);
+    if (part) {   // (acc, max - sink, sum) in natural-log units: exp2(s - m) == exp((s - m) ln 2)
+        constexpr float kLn2 = 0.6931471805599453f;
+        const float ska = va ? a.sink[(size_t) ia * nh + head] : 0.f, skb = vb ? a.sink[(size_t) ib * nh + head] : 0.f;
+#pragma unroll
+        for (int n = 0; n < kHD / 8; ++n) {
+            const int col = n * 8 + 2 * tq;
+            if (va) *reinterpret_cast<float2*>(out + ((size_t) ia * nh + head) * (kHD + 2) + col) = make_float2(o[n][0], o[n][1]);
+            if (vb) *reinterpret_cast<float2*>(out + ((size_t) ib * nh + head) * (kHD + 2) + col) = make_float2(o[n][2], o[n][3]);
+        }
+        if (tq == 0) {
+            if (va) { float* r = out + ((size_t) ia * nh + head) * (kHD + 2); r[kHD] = m_a == -INFINITY ? -INFINITY : m_a * kLn2 - ska; r[kHD + 1] = l_a; }
+            if (vb) { float* r = out + ((size_t) ib * nh + head) * (kHD + 2); r[kHD] = m_b == -INFINITY ? -INFINITY : m_b * kLn2 - skb; r[kHD + 1] = l_b; }
+        }
+        return;
+    }
     const float sa = va ? a.sink[(size_t) ia * nh + head] * kLog2e : 0.f;
     const float sb = vb ? a.sink[(size_t) ib * nh + head] * kLog2e : 0.f;
     const float ma = fmaxf(m_a, sa), mb = fmaxf(m_b, sb);
@@ -2178,6 +2199,13 @@ void attn_prompt_cuda(ggml_tensor* dst, void* stream, void*) {
     a.ktype = param<int>(dst, 5); a.vtype = param<int>(dst, 6);
     a.pos0 = param<int>(dst, 0); a.cap = param<int>(dst, 1); a.window = param<int>(dst, 2); a.ext = param<int>(dst, 3);
     a.scale = param<float>(dst, 4); a.nh = (int) q->ne[1];
+    {   // slot 7 (the last one: kP + 8 = 16 ints): kbeg / 256 in the low 16 bits, kend / 256 in the high 16 (0 = not partial)
+        const uint32_t r = (uint32_t) param<int>(dst, 7);
+        a.kbeg = (long long) (r & 0xFFFF) * 256; a.kend = (long long) (r >> 16) * 256;
+    }
+    if (a.kend > 0 && a.kbeg > 0) {   // a staged chunk: its row 0 holds position kbeg (no ring: cap never wraps)
+        a.k -= a.kbeg * a.k_nb2; a.v -= a.kbeg * a.v_nb2; a.cap = (long long) 1 << 40;
+    }
     const int rows = (int) q->ne[2], nkv = (int) k->ne[1];
     static const bool sized = [] { cudaFuncSetAttribute(pa::k_attn_prompt, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(pa::Smem)); return true; }();
     (void) sized;
@@ -2192,6 +2220,7 @@ void attn_prompt_cpu(ggml_tensor* dst, int ith, int nth, void*) {
     const long long pos0 = param<int>(dst, 0), cap = param<int>(dst, 1);
     const int window = param<int>(dst, 2), ext = param<int>(dst, 3);
     const float scale = param<float>(dst, 4);
+    if (param<int>(dst, 7) != 0) GGML_ABORT("inkling_attn_prompt_part has no CPU path: the engine pins it to the GPU");
     std::vector<float> sc;
     for (int u = ith; u < T * nh; u += nth) {
         const int t = u / nh, h = u % nh, g = h / G;
@@ -2485,6 +2514,19 @@ ggml_tensor* inkling_attn_prompt(ggml_context* c, ggml_tensor* q, ggml_tensor* k
     return y;
 }
 
+ggml_tensor* inkling_attn_prompt_part(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* R,
+                                      ggml_tensor* sinks, ggml_tensor* relb, int64_t pos0, int64_t kbeg, int64_t kend, float scale) {
+    if (kbeg < 0 || kend <= kbeg || kbeg % 256 || kend % 256 || kend / 256 > 0xFFFF) return nullptr;
+    if (kbeg > 0 && k->ne[2] != kend - kbeg) return nullptr;   // a staged chunk holds exactly [kbeg, kend)
+    if (kbeg == 0 && k->ne[2] < kend) return nullptr;          // the VRAM cache: cells [0, kend) at row = position
+    ggml_tensor* y0 = inkling_attn_prompt(c, q, k, v, R, sinks, relb, nullptr, nullptr, pos0, 0, scale);
+    if (!y0) return nullptr;
+    // the same op and params, partial output [130, nh, T]: re-shape the result tensor (built by the call above)
+    ggml_tensor* y = ggml_custom_4d(c, GGML_TYPE_F32, 130, y0->ne[1], y0->ne[2], 1, y0->src, 6, attn_prompt_cpu, GGML_N_TASKS_MAX, &g_attn_prompt);
+    std::memcpy(&y->op_params[kP], &y0->op_params[kP], sizeof(int32_t) * 7);
+    set_param<int>(y, 7, (int) ((uint32_t) (kbeg / 256) | ((uint32_t) (kend / 256) << 16)));
+    return y;
+}
 bool inkling_dec_pos_ok(int hd, int nh, int nkv, ggml_type kt, ggml_type vt, int nrel, size_t knb1, size_t knb2) {
     return dec_pos_on() && nkv > 0 && nh % nkv == 0 &&
            dec_lane_takes(hd, nh / nkv, kv_type_id(kt), kv_type_id(vt), nrel, knb1, knb2) && kv_type_id(kt) >= 0 && kv_type_id(vt) >= 0;
@@ -2515,6 +2557,39 @@ ggml_tensor* inkling_attn_dec_rel_pos(ggml_context* c, ggml_tensor* q, ggml_tens
     set_param<int>(y, 0, gate ? 1 : 0);
     return y;
 }
+ggml_tensor* inkling_attn_dec_rel_pos_part(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* relb,
+                                           ggml_tensor* Rt, ggml_tensor* sinks, ggml_tensor* pos, int ext, float scale,
+                                           int max_split) {
+    const int64_t HD = q->ne[0], nh = q->ne[1], T = q->ne[2], nkv = k->ne[1], cells = k->ne[2];
+    if (q->type != GGML_TYPE_F32 || !ggml_is_contiguous(q) || pos->type != GGML_TYPE_I64 || !ggml_is_contiguous(pos) || pos->ne[0] != T ||
+        v->ne[1] != nkv || v->ne[2] != cells || k->ne[0] != HD || v->ne[0] != HD || T > 64 || cells < 1 || max_split < 1 ||
+        !inkling_dec_pos_ok((int) HD, (int) nh, (int) nkv, k->type, v->type, (int) relb->ne[0], k->nb[1], k->nb[2]) ||
+        v->nb[1] % 4 != 0 || v->nb[2] % 4 != 0 ||
+        relb->type != GGML_TYPE_F32 || !ggml_is_contiguous(relb) || Rt->type != GGML_TYPE_F32 || !ggml_is_contiguous(Rt) ||
+        Rt->ne[0] != relb->ne[0] || ggml_nelements(Rt) != relb->ne[0] * nh * T ||
+        sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) || ggml_nelements(sinks) != nh * T ||
+        relb->ne[1] < ext + 1) return nullptr;
+    const int64_t nsplit = std::min<int64_t>(dec_nsplit(cells), max_split);
+    ggml_tensor* a1[7] = {q, k, v, pos, relb, Rt, sinks};
+    ggml_tensor* part = ggml_custom_4d(c, GGML_TYPE_F32, HD + 2, nh, T, nsplit, a1, 7, attn_dec_part_cpu, GGML_N_TASKS_MAX, &g_attn_dec_part);
+    set_param<float>(part, 0, scale);
+    set_param<int>(part, 1, 0);
+    set_param<int>(part, 2, 2);
+    set_param<int>(part, 3, kv_type_id(k->type));
+    set_param<int>(part, 4, kv_type_id(v->type));
+    set_param<int>(part, 5, ext);
+    return part;
+}
+ggml_tensor* inkling_attn_dec_reduce_parts(ggml_context* c, ggml_tensor* part, ggml_tensor* gate) {
+    const int64_t HD = part->ne[0] - 2, nh = part->ne[1], T = part->ne[2];
+    if (part->type != GGML_TYPE_F32 || !ggml_is_contiguous(part) || part->ne[3] > kDecMaxSplit || (HD != 64 && HD != 128 && HD != 256)) return nullptr;
+    if (gate && (gate->type != GGML_TYPE_F32 || gate->nb[0] != sizeof(float) || gate->ne[0] != HD * nh || gate->ne[1] != T)) return nullptr;
+    ggml_tensor* a2[2] = {part, gate};
+    ggml_tensor* y = ggml_custom_4d(c, GGML_TYPE_F32, HD, nh, T, 1, a2, gate ? 2 : 1, attn_dec_reduce_cpu, GGML_N_TASKS_MAX, &g_attn_dec_reduce);
+    set_param<int>(y, 0, gate ? 1 : 0);
+    return y;
+}
+int inkling_attn_dec_max_split() { return (int) kDecMaxSplit; }
 ggml_tensor* inkling_attn_dec_rel(ggml_context* c, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* relb,
                                   ggml_tensor* Rt, ggml_tensor* sinks, ggml_tensor* rp, ggml_tensor* mask, float scale,
                                   ggml_tensor* gate) {
@@ -2586,6 +2661,10 @@ ggml_tensor* inkling_relbias(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_ten
 ggml_tensor* inkling_attn_dec(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, float, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_attn_dec_rel(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, float, ggml_tensor*) { return nullptr; }
 bool inkling_dec_pos_ok(int, int, int, ggml_type, ggml_type, int, size_t, size_t) { return false; }
+ggml_tensor* inkling_attn_dec_rel_pos_part(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int, float, int) { return nullptr; }
+ggml_tensor* inkling_attn_prompt_part(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int64_t, int64_t, int64_t, float) { return nullptr; }
+ggml_tensor* inkling_attn_dec_reduce_parts(ggml_context*, ggml_tensor*, ggml_tensor*) { return nullptr; }
+int inkling_attn_dec_max_split() { return 0; }
 ggml_tensor* inkling_attn_dec_rel_pos(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int, float, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_attn_prep(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int, ggml_tensor*, ggml_tensor*, int, float, ggml_tensor*, ggml_tensor*, ggml_tensor*, float, float, ggml_tensor*, ggml_tensor*, ggml_tensor*) { return nullptr; }
 ggml_tensor* inkling_attn_prompt(ggml_context*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*, int64_t, int, float) { return nullptr; }

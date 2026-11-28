@@ -8,6 +8,37 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
 
 ## November 2026
 
+### Inkling-2-Mini: 512K context with 32K of K/V on the card (`--kv-vram`, `--kv-sparse`); the 12 GB XQT file (28 Nov)
+
+- **`--kv-vram N`** keeps the first N cells of the global layers' K/V in VRAM and the rest in pinned host RAM (opt-in;
+  nothing changes without it). `--context 524288 --kv-vram 32768` runs 512K on an RTX 3060 12 GB at 11.0-11.6 GB of
+  VRAM. Prefill streams the host part through the fused prompt kernel (new partial mode: keys `[kbeg, kend)`, output
+  `(acc, max, sum)`), decode runs it on the CPU (AVX2 k8v4 kernel with the V sums in registers, cell slices claimed
+  dynamically by a persistent thread pool) beside the fused decode kernel's split partials over the VRAM part, merged
+  in the existing reduce. Identical to the all-VRAM path before the boundary; greedy output matched past it, per-token
+  NLL within the engine's precision noise. Needle found at 32K, 128K, 256K and 500K (498,925 tokens).
+
+  | prompt | RTX 4090 prefill / decode tok/s | RTX 3060 prefill / decode tok/s |
+  |---|---:|---:|
+  | 34.6K | 5,187 / 86 | 726 / 37.4 |
+  | 137.7K | 3,969 / 10.5 | 445 / 8.0 |
+  | 267.9K | 2,909 / 5.3 | 289 / 4.1 |
+  | 495.3K | 1,955 / 2.7 | |
+
+  (10.98 GB XQT build, Ryzen 7 5700X + DDR4, measured before the last two CPU-side speedups: +12-17 % and +16 %
+  decode at 34K.) Exact decode past the resident part is bound by host RAM bandwidth.
+- **`--kv-sparse N`** (with `--kv-vram`, not exact): decode reads per K/V head only the N host cells on the 64-cell
+  pages that score highest (half by a ShadowKV-style landmark, q · mean key; half by a Quest-style bound from the
+  page's key min / max), plus the newest 1,088 cells; skipped pages count as 64 cells at their mean key and value.
+  34.5K prompt, 33.5K cells in host RAM, RTX 3060: `--kv-sparse 2048` decodes 30.5 tok/s vs 21.3 exact, host-output
+  error 0.110, greedy 128 tokens identical. [Details](../INKLING.md#long-context-with-little-vram---kv-vram-and---kv-sparse-opt-in).
+- **The 12 GB card file:** [Inkling-2-Mini-XQT-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQT-Uncensored)
+  now holds Unbound v3 in 10.94 GB (trellis TQP experts): 32K context in 10.9 GB on an RTX 3060, 48.3 tok/s decode,
+  765 tok/s prefill; MMLU-100 77 %, HumanEval-21 21/21, MATH-24 91.7 / 91.7 / 83.3 %.
+- Also: `XOLOTL_INKLING_GPU2_EXPS=<layers>` puts those layers' experts on a second card; `--cpu-exps` for the trainer;
+  `XOLOTL_INKLING_OVERRIDE_ONLY=<regex>` reads the named tensors from another GGUF (their type may differ);
+  `XOLOTL_INKLING_MARGINS` / `XOLOTL_INKLING_EVAL_SERVED` eval probes.
+
 ### Second-card expert tier, faster; Engram tables in IQ4_NL (27 Nov)
 
 - **Second card (`--remote-device N`) for DeepSeek-V4.1 and ERNIE.** The card that holds the next-ranked experts now
