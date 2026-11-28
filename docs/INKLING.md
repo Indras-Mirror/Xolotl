@@ -51,7 +51,8 @@ visits 5, 23, 41 and the final norm, and propose up to 7 tokens per step through
 [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)); `xolotl-inkling-dspark` runs the
 drafter alone against saved target taps.
 
-- Greedy requests decode speculatively; sampled requests decode normally and keep the drafter fed.
+- Greedy and sampled requests both decode speculatively (sampled speculation is exact: the target's own sample decides each
+  token; `XOLOTL_SPEC_SAMPLED=0` limits it to greedy).
 - The short convolutions make the model recurrent, so a rejected draft is undone exactly: every verify keeps its
   `[conv state ; chunk inputs]` and the state after the accepted prefix is copied back (no second forward). Sliding
   ring cells of rejected positions are marked empty; global K/V is positional.
@@ -153,7 +154,18 @@ At long context on the same 3060 (`--context 524288 --kv-vram 32768 --kv-sparse 
 137.5K prompt 448 / **24.5** tok/s prefill / decode (exact: 8.0 decode), 267.2K prompt 291 / **18.8** (exact: 4.1).
 
 Inkling's global heads spread their attention widely, so the error is higher than these methods report on other
-models; treat it as an option for long documents where exact decode is too slow. `XOLOTL_INKLING_SPARSE_SEL=0|1|2`
+models; treat it as an option for long documents where exact decode is too slow. **Not for agent loops:** two
+coding-agent runs (QuetzaCodetl worker, 32.6K-token prompt, 32K cells resident, RTX 3060) derailed with
+`--kv-sparse 2048` (a 33K-token thinking loop on a one-line bug; a reply that ran past 20K tokens without a tool call),
+while the same task with exact attention finished and passed its tests in 4 minutes.
+
+DSpark on a 12 GB card next to the 10.94 GB file: the BF16 drafter with its buffers (one compute buffer per verify
+length) needs about 1 GB more than the RTX 3060 has. It fits with the Q8_0 drafter
+(`tools/inkling/quant_dspark.py`, 402 MB; same acceptance and identical output as BF16 on our check),
+`XOLOTL_DSPARK_WINDOW=8192` and `XOLOTL_DSPARK_MAXD=3` (11.6 GB), but it did not pay there: served greedy 700-token
+answers ran 47.9 / 49.7 / 43.3 tok/s with it against 49.1 / 49.5 / 49.8 without (two code prompts, one prose). A
+drafter step takes ~17 ms on the 3060 and a 3-4 token verify costs about two plain steps, so we leave it off on 12 GB
+cards. `XOLOTL_INKLING_SPARSE_SEL=0|1|2`
 picks Quest / landmark / both (default), `XOLOTL_INKLING_SPARSE_APPROX=0` drops the skipped-page estimate,
 `XOLOTL_INKLING_SPARSE_CHECK=1` prints the error against exact attention (slow).
 

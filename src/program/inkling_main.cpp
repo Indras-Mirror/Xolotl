@@ -1908,6 +1908,161 @@ static void host_attn_slice_k8v4_v2(const float* q, int nh, int nkv, const char*
     }
 }
 
+// --dspark verify chunks (T <= 16 tokens): the same kernel, but each 16-cell K/V block is read once and used by every
+// token while it sits in L1/L2 (the per-token loop above streams the slice T times).  Per token: its own causal end
+// c1s[t], position ps[t], bias rows tball + t * tbstride, and online-softmax state; the math per token is unchanged.
+__attribute__((target("avx2,fma,f16c")))
+static void host_attn_slice_k8v4_mt(int T, const float* qall, int nh, int nkv, const char* kd, const char* vd, size_t knb1,
+                                    size_t knb2, size_t vnb1, size_t vnb2, int64_t c0, const int64_t* c1s, int64_t j0,
+                                    const int64_t* ps, int ext, float scale, const float* tball, size_t tbstride,
+                                    float* accall, float* mxall, float* lall) {
+    constexpr int HD = 128, NB = 16, MAXH = 64;
+    const int rep = nh / nkv;
+    alignas(32) float sc[MAXH][NB];
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    int64_t c1max = c0;
+    for (int t = 0; t < T; ++t) c1max = std::max(c1max, c1s[t]);
+    for (int64_t b0 = c0; b0 < c1max; b0 += NB)
+    for (int t = 0; t < T; ++t) {
+        const int64_t c1 = c1s[t];
+        if (b0 >= c1) continue;
+        const float* q = qall + (size_t) t * nh * HD;
+        const int64_t p = ps[t];
+        const float* tb = tball + (size_t) t * tbstride;
+        float* acc = accall + (size_t) t * nh * HD;
+        float* mx = mxall + (size_t) t * nh;
+        float* l = lall + (size_t) t * nh;
+        const int nb = (int) std::min<int64_t>(NB, c1 - b0);
+        for (int i = 0; i < nb; ++i) {
+            const char* krow = kd + (size_t) (b0 + i) * knb2;
+            const int64_t dist = p - (j0 + b0 + i);
+            const float* brow = tb + (size_t) (dist < ext ? dist : ext) * nh;
+            for (int g = 0; g < nkv; ++g) {
+                const char* kr = krow + (size_t) g * knb1;
+                if (rep == 3) {
+                    const float* q0 = q + (size_t) (g * 3) * HD;
+                    __m256 s0 = _mm256_setzero_ps(), s1 = s0, s2 = s0;
+                    for (int b = 0; b < 4; ++b) {
+                        const char* bp = kr + b * 34;
+                        const __m256 d = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*) bp));
+                        __m256 t0, t1, t2;
+                        for (int u = 0; u < 4; ++u) {
+                            const __m256 k = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*) (bp + 2 + u * 8))));
+                            const int e = b * 32 + u * 8;
+                            if (u == 0) {
+                                t0 = _mm256_mul_ps(_mm256_loadu_ps(q0 + e), k);
+                                t1 = _mm256_mul_ps(_mm256_loadu_ps(q0 + HD + e), k);
+                                t2 = _mm256_mul_ps(_mm256_loadu_ps(q0 + 2 * HD + e), k);
+                            } else {
+                                t0 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + e), k, t0);
+                                t1 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + HD + e), k, t1);
+                                t2 = _mm256_fmadd_ps(_mm256_loadu_ps(q0 + 2 * HD + e), k, t2);
+                            }
+                        }
+                        s0 = _mm256_fmadd_ps(d, t0, s0);
+                        s1 = _mm256_fmadd_ps(d, t1, s1);
+                        s2 = _mm256_fmadd_ps(d, t2, s2);
+                    }
+                    const int hh = g * 3;
+                    sc[hh][i] = hsum256(s0) * scale + brow[hh];
+                    sc[hh + 1][i] = hsum256(s1) * scale + brow[hh + 1];
+                    sc[hh + 2][i] = hsum256(s2) * scale + brow[hh + 2];
+                } else {
+                    for (int r = 0; r < rep; ++r) {
+                        const int hh = g * rep + r;
+                        const float* qh = q + (size_t) hh * HD;
+                        __m256 s = _mm256_setzero_ps();
+                        for (int b = 0; b < 4; ++b) {
+                            const char* bp = kr + b * 34;
+                            const __m256 d = _mm256_set1_ps(_cvtsh_ss(*(const uint16_t*) bp));
+                            __m256 t = _mm256_setzero_ps();
+                            for (int u = 0; u < 4; ++u)
+                                t = _mm256_fmadd_ps(_mm256_loadu_ps(qh + b * 32 + u * 8),
+                                                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i*) (bp + 2 + u * 8)))), t);
+                            s = _mm256_fmadd_ps(d, t, s);
+                        }
+                        sc[hh][i] = hsum256(s) * scale + brow[hh];
+                    }
+                }
+            }
+        }
+        for (int hh = 0; hh < nh; ++hh) {
+            float bm = -INFINITY;
+            for (int i = 0; i < nb; ++i) bm = std::max(bm, sc[hh][i]);
+            if (bm > mx[hh]) {
+                const float f = std::exp(mx[hh] - bm);
+                l[hh] *= f;
+                const __m256 fv = _mm256_set1_ps(f);
+                float* ah = acc + (size_t) hh * HD;
+                for (int e = 0; e < HD; e += 8) _mm256_storeu_ps(ah + e, _mm256_mul_ps(fv, _mm256_loadu_ps(ah + e)));
+                mx[hh] = bm;
+            }
+            if (nb == NB) {
+                const __m256 m = _mm256_set1_ps(mx[hh]);
+                const __m256 e0 = exp256_neg(_mm256_sub_ps(_mm256_loadu_ps(&sc[hh][0]), m));
+                const __m256 e1 = exp256_neg(_mm256_sub_ps(_mm256_loadu_ps(&sc[hh][8]), m));
+                _mm256_storeu_ps(&sc[hh][0], e0); _mm256_storeu_ps(&sc[hh][8], e1);
+                l[hh] += hsum256(_mm256_add_ps(e0, e1));
+            } else {
+                for (int i = 0; i < nb; ++i) { sc[hh][i] = std::exp(sc[hh][i] - mx[hh]); l[hh] += sc[hh][i]; }
+            }
+        }
+        for (int g = 0; g < nkv; ++g) {
+            const char* vg = vd + (size_t) b0 * vnb2 + (size_t) g * vnb1;
+            if (rep == 3) {
+                float* a0 = acc + (size_t) (g * 3) * HD;
+                for (int b = 0; b < 4; ++b) {
+                    __m256 x0[4], x1[4], x2[4];
+                    for (int u = 0; u < 4; ++u) {
+                        x0[u] = _mm256_loadu_ps(a0 + b * 32 + u * 8);
+                        x1[u] = _mm256_loadu_ps(a0 + HD + b * 32 + u * 8);
+                        x2[u] = _mm256_loadu_ps(a0 + 2 * HD + b * 32 + u * 8);
+                    }
+                    float W0 = 0, W1 = 0, W2 = 0;
+                    for (int i = 0; i < nb; ++i) {
+                        const char* bp = vg + (size_t) i * vnb2 + b * 18;
+                        const float d = _cvtsh_ss(*(const uint16_t*) bp);
+                        const float f0 = sc[g * 3][i] * d, f1 = sc[g * 3 + 1][i] * d, f2 = sc[g * 3 + 2][i] * d;
+                        W0 += f0; W1 += f1; W2 += f2;
+                        const __m256 w0 = _mm256_set1_ps(f0), w1 = _mm256_set1_ps(f1), w2 = _mm256_set1_ps(f2);
+                        const __m128i x = _mm_loadu_si128((const __m128i*) (bp + 2));
+                        const __m128i lo = _mm_and_si128(x, m4), hi = _mm_and_si128(_mm_srli_epi16(x, 4), m4);
+#define VSTEP(U, SRC) { const __m256 v = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(SRC)); \
+                        x0[U] = _mm256_fmadd_ps(w0, v, x0[U]); x1[U] = _mm256_fmadd_ps(w1, v, x1[U]); x2[U] = _mm256_fmadd_ps(w2, v, x2[U]); }
+                        VSTEP(0, lo) VSTEP(1, _mm_srli_si128(lo, 8)) VSTEP(2, hi) VSTEP(3, _mm_srli_si128(hi, 8))
+#undef VSTEP
+                    }
+                    const __m256 c0v = _mm256_set1_ps(-8.0f * W0), c1v = _mm256_set1_ps(-8.0f * W1), c2v = _mm256_set1_ps(-8.0f * W2);
+                    for (int u = 0; u < 4; ++u) {
+                        _mm256_storeu_ps(a0 + b * 32 + u * 8, _mm256_add_ps(x0[u], c0v));
+                        _mm256_storeu_ps(a0 + HD + b * 32 + u * 8, _mm256_add_ps(x1[u], c1v));
+                        _mm256_storeu_ps(a0 + 2 * HD + b * 32 + u * 8, _mm256_add_ps(x2[u], c2v));
+                    }
+                }
+            } else {
+                for (int i = 0; i < nb; ++i) {
+                    const char* vr = vg + (size_t) i * vnb2;
+                    for (int b = 0; b < 4; ++b) {
+                        const char* bp = vr + b * 18;
+                        const float d = _cvtsh_ss(*(const uint16_t*) bp);
+                        const __m128i x = _mm_loadu_si128((const __m128i*) (bp + 2));
+                        const __m128i lo = _mm_and_si128(x, m4), hi = _mm_and_si128(_mm_srli_epi16(x, 4), m4);
+                        const __m128i parts[4] = {lo, _mm_srli_si128(lo, 8), hi, _mm_srli_si128(hi, 8)};
+                        for (int u = 0; u < 4; ++u) {
+                            const __m256 v = _mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(parts[u]), _mm256_set1_epi32(8)));
+                            for (int r = 0; r < rep; ++r) {
+                                const int hh = g * rep + r;
+                                float* ah = acc + (size_t) hh * HD + b * 32 + u * 8;
+                                _mm256_storeu_ps(ah, _mm256_fmadd_ps(_mm256_set1_ps(sc[hh][i] * d), v, _mm256_loadu_ps(ah)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // --kv-sparse decode (T = 1): see g_kv_sparse.  All nth threads run it together (ggml hands a custom op to every
 // thread); phases are separated by the args' spin barrier.  Output: the same [hd + 2, nh, 1, S] partials.
 __attribute__((target("avx2,fma,f16c")))
@@ -2097,6 +2252,32 @@ static void host_attn_sparse(HostAttnArgs& am, const ggml_tensor* Q, const ggml_
         }
     }
     // 4. one task per slice: the exact online softmax over its ranges (the all-heads kernel), written like the dense path
+    static const bool mt_on = std::getenv("XOLOTL_INKLING_SPILL_MT") && std::atoi(std::getenv("XOLOTL_INKLING_SPILL_MT")) == 1;   // opt-in: slower on Zen 3 (28 Nov)
+    if (mt_on && T > 1) {   // verify chunk: one task per slice, each K/V block read once for all T tokens
+        std::vector<float> accT((size_t) T * nh * HD), mxT((size_t) T * nh), lT((size_t) T * nh);
+        const int64_t nr = (int64_t) am.rng.size() / 3;
+        int64_t c1s[16];
+        for (int64_t sl; (sl = am.claim3.fetch_add(1, std::memory_order_relaxed)) < S;) {
+            std::fill(accT.begin(), accT.end(), 0.0f);
+            std::fill(mxT.begin(), mxT.end(), -INFINITY);
+            std::fill(lT.begin(), lT.end(), 0.0f);
+            for (int64_t k = 0; k < nr; ++k)
+                if (am.rng[k * 3 + 2] == sl) {
+                    const int64_t c0 = am.rng[k * 3];
+                    for (int t = 0; t < T; ++t) c1s[t] = std::min(am.rng[k * 3 + 1], cvt[t]);
+                    host_attn_slice_k8v4_mt(T, q, nh, nkv, (const char*) K->data, (const char*) V->data, K->nb[1], K->nb[2], V->nb[1],
+                                            V->nb[2], c0, c1s, am.j0, pt, ext, scale, tb, (size_t) R * nh, accT.data(), mxT.data(), lT.data());
+                }
+            for (int t = 0; t < T; ++t)
+                for (int64_t hh = 0; hh < nh; ++hh) {
+                    float* o = (float*) ((char*) dst->data + sl * dst->nb[3] + t * dst->nb[2] + hh * dst->nb[1]);
+                    const float* src = accT.data() + ((size_t) t * nh + hh) * HD;
+                    std::copy(src, src + HD, o);
+                    o[HD] = mxT[t * nh + hh];
+                    o[HD + 1] = lT[t * nh + hh];
+                }
+        }
+    } else
     {
         std::vector<float> acc2((size_t) nh * HD), mx2(nh), l2(nh);
         const int64_t nr = (int64_t) am.rng.size() / 3;
@@ -2239,6 +2420,34 @@ static void host_attn_partial_body(ggml_tensor* dst, int ith, int nth, void* ud)
                     host_attn_sparse(am, Q, K, V, tab, pos, ith, nth, (int) nh, (int) nkv, (int) T, cv, np, bpg, S, dst);
                     return;
                 }
+            }
+            static const bool mt_on = std::getenv("XOLOTL_INKLING_SPILL_MT") && std::atoi(std::getenv("XOLOTL_INKLING_SPILL_MT")) == 1;   // opt-in: slower on Zen 3 (28 Nov)
+            if (simd == 1 && mt_on && T > 1 && T <= 16) {   // verify chunk: one task per slice, all T tokens per K/V block
+                std::vector<float> accT((size_t) T * nh * hd), mxT((size_t) T * nh), lT((size_t) T * nh);
+                int64_t ps[16], c1s[16];
+                for (int64_t sl; (sl = am.next.fetch_add(1, std::memory_order_relaxed)) < S;) {
+                    const int64_t per = (cells + S - 1) / S, c0 = sl * per;
+                    for (int t = 0; t < T; ++t) {
+                        ps[t] = (int64_t) ((const float*) pos->data)[t];
+                        c1s[t] = std::min<int64_t>(std::min(cells, c0 + per), std::max<int64_t>(0, ps[t] - a.j0 + 1));
+                    }
+                    std::fill(accT.begin(), accT.end(), 0.0f);
+                    std::fill(mxT.begin(), mxT.end(), -INFINITY);
+                    std::fill(lT.begin(), lT.end(), 0.0f);
+                    host_attn_slice_k8v4_mt((int) T, (const float*) Q->data, (int) nh, (int) nkv, (const char*) K->data, (const char*) V->data,
+                                            K->nb[1], K->nb[2], V->nb[1], V->nb[2], c0, c1s, a.j0, ps, a.ext, a.scale,
+                                            (const float*) tab->data, (size_t) R * nh, accT.data(), mxT.data(), lT.data());
+                    for (int64_t t = 0; t < T; ++t)
+                        for (int64_t hh = 0; hh < nh; ++hh) {
+                            float* o = (float*) ((char*) dst->data + sl * dst->nb[3] + t * dst->nb[2] + hh * dst->nb[1]);
+                            const float* src = accT.data() + ((size_t) t * nh + hh) * hd;
+                            std::copy(src, src + hd, o);
+                            o[hd] = mxT[t * nh + hh];
+                            o[hd + 1] = lT[t * nh + hh];
+                        }
+                }
+                if (am.ndone.fetch_add(1, std::memory_order_acq_rel) + 1 == nth) { am.next.store(0); am.ndone.store(0); }
+                return;
             }
             for (int64_t task; (task = am.next.fetch_add(1, std::memory_order_relaxed)) < T * S;) {
                 const int64_t t = task % T, sl = task / T;

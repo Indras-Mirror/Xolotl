@@ -38,6 +38,12 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
   without the drafter on a 34.5K prompt with 33.5K host cells; no speed gain there yet (the CPU op costs about the
   same per verify token as per single step). Fixes a `GGML_ASSERT(backend_index ...)` when verify chunks met the
   spill or `--vram-budget-mib` pinning (they schedule on their own CUDA backend).
+- `tools/inkling/quant_dspark.py`: the DSpark drafter with its FFN / attention matrices in Q8_0 (402 MB vs 648 MB, same
+  acceptance). With it, `XOLOTL_DSPARK_WINDOW=8192` and `XOLOTL_DSPARK_MAXD=3`, DSpark fits an RTX 3060 beside the 12 GB
+  file but does not speed it up (47.9 / 49.7 / 43.3 vs 49.1 / 49.5 / 49.8 tok/s), so it stays off there.
+- `XOLOTL_INKLING_SPILL_MT=1` (opt-in): verify chunks read each host K/V block once for all their tokens. Slower on a
+  Ryzen 7 5700X (the CPU op is compute bound): exact verify 166 vs 127 ms.
+- `--kv-sparse` is not for agent loops: 2 of 2 coding-agent runs derailed with it, exact finished the task in 4 min.
 - **The 12 GB card file:** [Inkling-2-Mini-XQT-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQT-Uncensored)
   now holds Unbound v3 in 10.94 GB (trellis TQP experts): 32K context in 10.9 GB on an RTX 3060, 48.3 tok/s decode,
   765 tok/s prefill; MMLU-100 77 %, HumanEval-21 21/21, MATH-24 91.7 / 91.7 / 83.3 %.
