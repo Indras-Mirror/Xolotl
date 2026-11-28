@@ -706,6 +706,22 @@ struct Gpu {
     std::unordered_map<int, bool> p2p_nofile;                               ///< shards that cannot be read raw
     int p2p_spec_slots = 0;                    ///< window slots after the ring's: the P2P spec stash
     std::unique_ptr<P2PSpec> pspec;            ///< (declared last: its readers use p2p_files, so it goes first)
+    // STRATA_P2P_PROMPT=1 (28 Nov): the prompt path's file tier NVMe -> VRAM.  One window (STRATA_P2P_PROMPT_MIB, default
+    // 1024) holds a whole layer's file-tier blobs as raw role slices; p2p_layer_start reads them at the layer's start (as
+    // layer_ra_start does into the pinned bounce), run_chunk assembles each into its device half by three D2D copies.
+    struct P2PLayer {
+        int64_t layer = -1;
+        std::vector<int32_t> idx;                  ///< expert -> its index here (-1 = not in the window)
+        std::vector<P2PPlan> plan;
+        std::vector<size_t> base;                  ///< index -> its raw area's offset in the window
+        std::unique_ptr<std::atomic<int>[]> left, failed;   ///< index -> 1 MiB reads still running / one failed
+        double gb = 0, t0 = 0;
+        std::atomic<double> t_last{0};
+    };
+    std::unique_ptr<xolp2p::Window> p2pp;
+    bool p2pp_tried = false;
+    std::unique_ptr<P2PLayer> p2pl;
+    std::unique_ptr<ReadPool> p2pl_pool;       ///< (after the window: its readers stop first)
 #endif
     void *d_x = nullptr, *d_xq = nullptr, *d_parts = nullptr, *d_grp_ptr = nullptr, *d_grp_start = nullptr,
          *d_ngroups = nullptr, *d_ent_dst = nullptr, *d_ent_tok = nullptr, *d_scratch = nullptr, *d_stage = nullptr;
@@ -3991,7 +4007,8 @@ static const xolp2p::RawFile* p2p_file(Gpu& gp, int fd) {
     return (gp.p2p_files[fd] = std::move(rf)).get();
 }
 /// (layer, e)'s three slices as raw reads into one slot's raw area; false = not this way (the host path reads it).
-static bool p2p_plan(Ds41MoeImpl& im, Gpu& gp, int64_t layer, int64_t e, P2PPlan& p) {
+static bool p2p_plan(Ds41MoeImpl& im, Gpu& gp, int64_t layer, int64_t e, P2PPlan& p, size_t lim = 0) {
+    if (lim == 0) lim = gp.p2p_raw;
     const Ds41FileBlobs* fb = dynamic_cast<const Ds41FileBlobs*>(im.blobs);
     const Ds41GgufBlobs* gg = fb ? nullptr : dynamic_cast<const Ds41GgufBlobs*>(im.blobs);
     if (!fb && !gg) return false;
@@ -4003,7 +4020,7 @@ static bool p2p_plan(Ds41MoeImpl& im, Gpu& gp, int64_t layer, int64_t e, P2PPlan
         const xolp2p::RawFile* rf = p2p_file(gp, fd);
         if (!rf) return false;
         const uint64_t a0 = off & ~4095ull, a1 = (off + n + 4095) & ~4095ull;
-        if (raw_at + (a1 - a0) > gp.p2p_raw) return false;
+        if (raw_at + (a1 - a0) > lim) return false;
         p.rf[p.nr] = rf; p.a0[p.nr] = a0; p.a1[p.nr] = a1;
         p.raw_off[p.nr] = raw_at; p.src_off[p.nr] = raw_at + (size_t) (off - a0);
         p.at[p.nr] = roff; p.n[p.nr] = n;
@@ -4013,6 +4030,7 @@ static bool p2p_plan(Ds41MoeImpl& im, Gpu& gp, int64_t layer, int64_t e, P2PPlan
     }
     return roff == (size_t) im.bl[(size_t) im.g.cls(layer, e)];
 }
+
 #endif
 
 void Ds41MoeTier::spec_read_any(int64_t layer, const int32_t* ids, int n) {
@@ -7240,6 +7258,122 @@ struct ChunkProf { double file_gb = 0, rd_busy = 0; double wall = 0, file = 0, f
                    double kern_cls[64] = {}; int64_t ent_cls[64] = {}; };   // per format class: kernel ms, routed entries
 ChunkProf g_cprof;
 bool chunk_prof() { static const bool on = [] { const char* e = std::getenv("MIMO_CHUNK_PROF"); return e && *e == '1'; }(); return on; }
+#if defined(DS4_MOE_CUDA) && defined(STRATA_XOLP2P)
+// ---- STRATA_P2P_PROMPT: the prompt path's per-layer file tier straight into VRAM (see Gpu::P2PLayer) ----
+static std::atomic<long> g_p2pl_blobs{0}, g_p2pl_fail{0}, g_p2pl_checked{0}, g_p2pl_bad{0}, g_p2pl_layers{0}, g_p2pl_host{0};
+static std::atomic<double> g_p2pl_gb{0};
+static bool p2p_prompt_on() { static const bool on = p2p_env("STRATA_P2P_PROMPT"); return on; }
+static bool p2pp_ready(Ds41MoeImpl& im, Gpu& gp) {
+    if (gp.p2pp_tried) return (bool) gp.p2pp;
+    gp.p2pp_tried = true;
+    if (!im.blobs || (!dynamic_cast<const Ds41FileBlobs*>(im.blobs) && !dynamic_cast<const Ds41GgufBlobs*>(im.blobs))) {
+        std::fprintf(stderr, "ds41: STRATA_P2P_PROMPT unavailable (blob source has no raw spans) - host path\n");
+        return false;
+    }
+    const double mib = std::getenv("STRATA_P2P_PROMPT_MIB") ? std::max(64.0, std::atof(std::getenv("STRATA_P2P_PROMPT_MIB"))) : 1024.0;
+    std::string why;
+    gp.p2pp = xolp2p::Window::open((size_t) (mib * 1048576.0), &why);
+    if (!gp.p2pp) {
+        std::fprintf(stderr, "ds41: STRATA_P2P_PROMPT unavailable (%s) - prompt file tier stays on the host path\n", why.c_str());
+        return false;
+    }
+    gp.p2pl = std::make_unique<Gpu::P2PLayer>();
+    gp.p2pl_pool = std::make_unique<ReadPool>();
+    std::fprintf(stderr, "ds41: STRATA_P2P_PROMPT on - prompt file tier NVMe -> VRAM window %.0f MiB, BAR1 0x%llx%s\n",
+                 gp.p2pp->size() / 1048576.0, (unsigned long long) gp.p2pp->bus(),
+                 p2p_env("STRATA_P2P_PROMPT_VERIFY") ? "; STRATA_P2P_PROMPT_VERIFY: every blob checked against the host read" : "");
+    return true;
+}
+/// Waits for the layer's P2P reads and switches it off (the window may then be refilled).
+static void p2p_layer_stop(Gpu& gp) {
+    if (!gp.p2pl || gp.p2pl->layer < 0) return;
+    gp.p2pl_pool->wait();
+    Gpu::P2PLayer& L = *gp.p2pl;
+    if (chunk_prof() && !L.plan.empty()) {
+        g_cprof.file_rd += now_ms() - L.t0;
+        g_cprof.rd_busy += std::max(0.0, L.t_last.load() - L.t0);
+        g_cprof.file_gb += L.gb;
+    }
+    L.layer = -1;
+}
+/// Starts reading `layer`'s file-tier blobs (routed, not VRAM-resident, not in the RAM arena, not the CPU's / helper's)
+/// NVMe -> the VRAM window.  False = not started (the layer read-ahead / per-pass host readers take them).
+static bool p2p_layer_start(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const char* rmask) {
+    Gpu& gp = *im.gpu;
+    if (!p2p_prompt_on() || !p2pp_ready(im, gp)) return false;
+    p2p_layer_stop(gp);
+    const int64_t NX = im.g.n_experts, NE = (int64_t) n * im.g.top_k;
+    std::vector<char> seen((size_t) NX, 0);
+    std::vector<std::pair<int, int32_t>> fe;
+    for (int64_t j = 0; j < NE; ++j) {
+        const int32_t e = ids[j];
+        if (e < 0 || e >= NX || seen[(size_t) e] || (rmask && rmask[e])) continue;
+        seen[(size_t) e] = 1;
+        if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
+        if (gp.arena.ptr(layer, e)) continue;
+        fe.push_back({ im.g.cls(layer, e), e });
+    }
+    if (fe.empty()) return false;
+    std::sort(fe.begin(), fe.end());
+    Gpu::P2PLayer& L = *gp.p2pl;
+    L.idx.assign((size_t) NX, -1);
+    L.plan.clear();
+    L.base.clear();
+    L.gb = 0;
+    size_t at = 0;
+    const size_t lim = ((size_t) im.blob + 3 * 8192 + 65535) & ~(size_t) 65535;
+    for (const auto& ce : fe) {
+        P2PPlan p;
+        if (!p2p_plan(im, gp, layer, ce.second, p, lim)) { ++g_p2pl_host; return false; }   // a shard not raw-readable
+        size_t need = 0;
+        for (int r = 0; r < p.nr; ++r) need += (size_t) (p.a1[r] - p.a0[r]);
+        need = (need + 65535) & ~(size_t) 65535;
+        if (at + need > gp.p2pp->size()) { ++g_p2pl_host; return false; }   // the layer's file tier does not fit: host path
+        L.idx[(size_t) ce.second] = (int32_t) L.plan.size();
+        L.plan.push_back(p);
+        L.base.push_back(at);
+        L.gb += (double) im.bl[(size_t) ce.first] / 1e9;
+        at += need;
+    }
+    // the previous layer's D2D copies out of the window must be done before the NVMe overwrites it
+    ck(cudaStreamSynchronize(gp.s_cp), "p2p layer: window free");
+    struct Job { const xolp2p::RawFile* rf; uint64_t off, len; uint8_t* dst; int32_t k; };
+    auto jobs = std::make_shared<std::vector<Job>>();
+    const size_t nb = L.plan.size();
+    L.left.reset(new std::atomic<int>[nb]);
+    L.failed.reset(new std::atomic<int>[nb]);
+    for (size_t k = 0; k < nb; ++k) {
+        const P2PPlan& p = L.plan[k];
+        int cnt = 0;
+        for (int r = 0; r < p.nr; ++r)
+            for (uint64_t c = p.a0[r]; c < p.a1[r]; c += (1ull << 20)) {
+                jobs->push_back({ p.rf[r], c, std::min<uint64_t>(1ull << 20, p.a1[r] - c),
+                                  gp.p2pp->dma_target() + L.base[k] + p.raw_off[r] + (c - p.a0[r]), (int32_t) k });
+                ++cnt;
+            }
+        L.left[k].store(cnt, std::memory_order_relaxed);
+        L.failed[k].store(0, std::memory_order_relaxed);
+    }
+    L.t0 = now_ms();
+    L.t_last.store(L.t0);
+    L.layer = layer;
+    g_p2pl_layers.fetch_add(1);
+    g_p2pl_blobs.fetch_add((long) nb);
+    { double g = g_p2pl_gb.load(); while (!g_p2pl_gb.compare_exchange_weak(g, g + L.gb)) {} }
+    Gpu::P2PLayer* Lp = &L;
+    gp.p2pl_pool->start(jobs->size(), [jobs, Lp](size_t r) {
+        const Job& j = (*jobs)[r];
+        std::string why;
+        if (!j.rf->read(j.off, j.len, j.dst, &why) && Lp->failed[(size_t) j.k].exchange(1) == 0)
+            std::fprintf(stderr, "ds41: STRATA_P2P_PROMPT read failed (%s) - host read for that blob\n", why.c_str());
+        if (Lp->left[(size_t) j.k].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            Lp->t_last.store(now_ms());
+            Lp->left[(size_t) j.k].notify_all();
+        }
+    });
+    return true;
+}
+#endif
 
 #if defined(DS4_MOE_MMQ)
 // MmqPlan / mmq_plan / mmq_eff: ds41_mmq_plan.hpp (shared with ds41_helper)
@@ -8330,6 +8464,16 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         for (size_t k = 0; k < nF && use_ra; ++k) use_ra = ra.idx[(size_t) order[2][k]] >= 0;
         if (!use_ra) layer_ra_stop(gp);   // a blob it does not have: the per-pass reader for the rest of the layer
     }
+    bool use_p2p = false;
+#ifdef STRATA_XOLP2P
+    Gpu::P2PLayer* p2l = gp.p2pl.get();
+    if (nF && pf_slab < 0 && !use_ra && p2l && p2l->layer == layer) {
+        use_p2p = true;
+        for (size_t k = 0; k < nF && use_p2p; ++k) use_p2p = p2l->idx[(size_t) order[2][k]] >= 0;
+        if (!use_p2p) p2p_layer_stop(gp);   // a blob it does not have: the per-pass reader for the rest of the layer
+    }
+    static const bool p2p_verify = p2p_env("STRATA_P2P_PROMPT_VERIFY");
+#endif
     const int64_t per_half = std::max<int64_t>(1, gp.c_half / SL);
     // bounce slots 4 KiB apart (the halves are page-aligned): a whole-blob or part read lands in place (wave_buffered)
     const int64_t BLA = (BL + 4095) & ~(int64_t) 4095;
@@ -8378,7 +8522,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                 }
             });
     };
-    if (nF && pf_slab < 0 && !use_ra) {
+    if (nF && pf_slab < 0 && !use_ra && !use_p2p) {
         // the bounce slots are shared by every class pass: the previous pass returned (non-last passes do not
         // sync) with its DMAs out of them possibly still queued on s_cp - the readers must not overwrite them yet
         ck(cudaStreamSynchronize(gp.s_cp), "bounce free");
@@ -8403,7 +8547,45 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                 const int32_t q = im.cstage->idx[pf_slab][(size_t) order[2][k]];
                 src = im.cstage->slab[pf_slab] + im.cstage->off[pf_slab][(size_t) q];
                 ++g_pf.used;
-            } else if (use_ra) {
+            }
+#ifdef STRATA_XOLP2P
+            else if (use_p2p) {   // STRATA_P2P_PROMPT: the blob's role slices sit in the VRAM window
+                const int32_t e = order[2][i - nA];
+                const int32_t q = p2l->idx[(size_t) e];
+                if (p2l->left[(size_t) q].load(std::memory_order_acquire) != 0) {
+                    const double tw = now_ms();
+                    for (int v; (v = p2l->left[(size_t) q].load(std::memory_order_acquire)) != 0;) p2l->left[(size_t) q].wait(v, std::memory_order_acquire);
+                    t_file += now_ms() - tw;
+                }
+                uint8_t* d = (uint8_t*) gp.c_stage[h] + (i - b0) * (size_t) SL;
+                if (p2l->failed[(size_t) q].load()) {   // rare: the host read, synchronous
+                    std::vector<uint8_t> hb((size_t) BL);
+                    im.blobs->read(layer, e, hb.data());
+                    ck(cudaStreamSynchronize(gp.s_cp), "p2p fallback");
+                    ck(cudaMemcpy(d, hb.data(), (size_t) BL, cudaMemcpyHostToDevice), "p2p fallback copy");
+                    g_p2pl_fail.fetch_add(1);
+                } else {
+                    if (!xolp2p::flush()) { std::fprintf(stderr, "ds41: STRATA_P2P_PROMPT: cuFlushGPUDirectRDMAWrites failed\n"); std::abort(); }
+                    const P2PPlan& pl = p2l->plan[(size_t) q];
+                    for (int r = 0; r < pl.nr; ++r)
+                        ck(cudaMemcpyAsync(d + pl.at[r], (const void*) (gp.p2pp->dev() + p2l->base[(size_t) q] + pl.src_off[r]), pl.n[r],
+                                           cudaMemcpyDeviceToDevice, gp.s_cp), "p2p d2d");
+                    if (p2p_verify) {
+                        std::vector<uint8_t> want((size_t) BL), got((size_t) BL);
+                        im.blobs->read(layer, e, want.data());
+                        ck(cudaStreamSynchronize(gp.s_cp), "p2p verify sync");
+                        ck(cudaMemcpy(got.data(), d, (size_t) BL, cudaMemcpyDeviceToHost), "p2p verify d2h");
+                        g_p2pl_checked.fetch_add(1);
+                        if (std::memcmp(want.data(), got.data(), (size_t) BL) != 0 && g_p2pl_bad.fetch_add(1) < 5)
+                            std::fprintf(stderr, "ds41: STRATA_P2P_PROMPT_VERIFY: layer %lld expert %d DIFFERS\n", (long long) layer, e);
+                    }
+                }
+                es.push_back(e);
+                ps.push_back((unsigned long long) d);
+                continue;
+            }
+#endif
+            else if (use_ra) {
                 Gpu::LayerRA& ra = *rap;
                 const int32_t q = ra.idx[(size_t) order[2][i - nA]];
                 if (!ra.ready[(size_t) q].load(std::memory_order_acquire)) {
@@ -8617,15 +8799,25 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     }
     std::sort(cl.begin(), cl.end());
     // the layer's whole file tier starts streaming now (all class passes); off with a prefetch slab or STRATA_LAYER_RA=0
-    if (layer_ra_on() && !im.cstage)
+    bool p2pl = false;
+#ifdef STRATA_XOLP2P
+    p2pl = !im.cstage && p2p_layer_start(im, layer, n, ids, skip);   // STRATA_P2P_PROMPT: NVMe -> VRAM instead
+#endif
+    if (!p2pl && layer_ra_on() && !im.cstage)
         layer_ra_start(im, layer, n, ids, skip);
     for (size_t i = 0; i < cl.size(); ++i)
         if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev, cl[i], i == 0, i + 1 == cl.size(), x_dev)) {
             layer_ra_stop(*im.gpu);
+#ifdef STRATA_XOLP2P
+            p2p_layer_stop(*im.gpu);
+#endif
             chunk_cpu_drop(*im.gpu);
             return false;
         }
     layer_ra_stop(*im.gpu);
+#ifdef STRATA_XOLP2P
+    p2p_layer_stop(*im.gpu);
+#endif
     chunk_pstage_next(im, layer, n);
     return true;
 }
@@ -9285,6 +9477,14 @@ void Ds41MoeTier::release_chunk() {
         g_cprof = ChunkProf{};
         if (im_->remote) remote_prof_print(*im_->remote, "prompt");
     }
+#ifdef STRATA_XOLP2P
+    if (g_p2pl_layers.load()) {
+        std::fprintf(stderr, "p2p prompt: %ld layers, %ld blobs (%.1f GB) NVMe -> VRAM, %ld host fallbacks, %ld layers left on the host"
+                             "%s\n", g_p2pl_layers.load(), g_p2pl_blobs.load(), g_p2pl_gb.load(), g_p2pl_fail.load(), g_p2pl_host.load(),
+                     g_p2pl_checked.load() ? (", verify " + std::to_string(g_p2pl_checked.load()) + " checked / " + std::to_string(g_p2pl_bad.load()) + " differ").c_str() : "");
+        g_p2pl_layers = 0; g_p2pl_blobs = 0; g_p2pl_gb = 0; g_p2pl_fail = 0; g_p2pl_host = 0;
+    }
+#endif
     if (im_->gpu->ccpu && im_->gpu->ccpu->layers) {
         ChunkCpu& c = *im_->gpu->ccpu;
         std::fprintf(stderr, "chunk cpu: %lld layers, %lld entries, %.1f GB of arena experts on the CPU in %.0f ms (pool), "

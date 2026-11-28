@@ -32,11 +32,15 @@ struct xp_win { u32 magic; u64 bus, len; u32 npages; void **kva; bool mapped; };
 static DEFINE_MUTEX(xp_lock);
 static struct pci_dev *gpu;
 
-static struct pci_dev *find_gpu(void)
+/* 28 Nov 2026: the NVIDIA display device whose BAR1 holds [bus, bus+len) - with two cards (3060 + 4090) the first one
+ * on the bus was the wrong one and every map of a 4090 window failed with -ERANGE */
+static struct pci_dev *find_gpu(u64 bus, u64 len)
 {
     struct pci_dev *d = NULL;
     while ((d = pci_get_device(PCI_VENDOR_ID_NVIDIA, PCI_ANY_ID, d)))
-        if ((d->class >> 16) == PCI_BASE_CLASS_DISPLAY) return d;   // reference held
+        if ((d->class >> 16) == PCI_BASE_CLASS_DISPLAY && bus >= pci_resource_start(d, 1) &&
+            bus + len <= pci_resource_start(d, 1) + pci_resource_len(d, 1))
+            return d;   // reference held
     return NULL;
 }
 
@@ -65,7 +69,7 @@ static long xp_map_ioctl(struct file *f, unsigned long arg)
     if (copy_from_user(&r, (void __user *) arg, sizeof(r))) return -EFAULT;
     if (!r.len || (r.bus | r.len) & (PAGE_SIZE - 1)) return -EINVAL;
     mutex_lock(&xp_lock);
-    if (!gpu) gpu = find_gpu();
+    if (!gpu) gpu = find_gpu(r.bus, r.len);
     if (!gpu) { rc = -ENODEV; goto out; }
     r.bar_start = pci_resource_start(gpu, 1); r.bar_len = pci_resource_len(gpu, 1);
     if (r.bus < r.bar_start || r.bus + r.len > r.bar_start + r.bar_len) { rc = -ERANGE; goto out; }
