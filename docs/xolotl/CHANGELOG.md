@@ -32,6 +32,12 @@ What landed in Xolotl, newest first. The README keeps a one-line summary of each
   page's key min / max), plus the newest 1,088 cells; skipped pages count as 64 cells at their mean key and value.
   34.5K prompt, 33.5K cells in host RAM, RTX 3060: `--kv-sparse 2048` decodes 30.5 tok/s vs 21.3 exact, host-output
   error 0.110, greedy 128 tokens identical. [Details](../INKLING.md#long-context-with-little-vram---kv-vram-and---kv-sparse-opt-in).
+  At 137.5K / 267.2K on the 3060: 24.5 / 18.8 tok/s decode (exact 8.0 / 4.1).
+- **`--dspark` with `--kv-vram`** (and `--kv-sparse`): speculative verify chunks run the host part per token up to its
+  own position (sparse: one page set per chunk, the union over its tokens). Greedy 128 tokens identical with and
+  without the drafter on a 34.5K prompt with 33.5K host cells; no speed gain there yet (the CPU op costs about the
+  same per verify token as per single step). Fixes a `GGML_ASSERT(backend_index ...)` when verify chunks met the
+  spill or `--vram-budget-mib` pinning (they schedule on their own CUDA backend).
 - **The 12 GB card file:** [Inkling-2-Mini-XQT-Uncensored](https://huggingface.co/IndrasMirror/Inkling-2-Mini-XQT-Uncensored)
   now holds Unbound v3 in 10.94 GB (trellis TQP experts): 32K context in 10.9 GB on an RTX 3060, 48.3 tok/s decode,
   765 tok/s prefill; MMLU-100 77 %, HumanEval-21 21/21, MATH-24 91.7 / 91.7 / 83.3 %.

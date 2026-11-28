@@ -110,8 +110,12 @@ context is no longer capped by VRAM: `--context 524288 --kv-vram 32768` runs 512
 prompt kernel in 32K-cell chunks and merge the partial softmax sums with the VRAM part. Decode runs the host part on
 the CPU (AVX2 k8v4 kernel, cell slices claimed by a persistent thread pool) while the GPU does the VRAM part, and the
 two merge in the existing split-K reduce. Before the boundary the result is identical to the all-VRAM path; past it,
-greedy output matched on our checks and per-token NLL stayed within the engine's own precision noise. Not with
-`--dspark` / `--mtp` yet.
+greedy output matched on our checks and per-token NLL stayed within the engine's own precision noise. Works with
+`--dspark`: a speculative verify chunk (up to 16 tokens) reads the host part per token up to its own position, and with
+`--kv-sparse` picks one page set for the whole chunk (the union of what each token wants). 34.5K prompt, 33.5K cells in
+host RAM, RTX 4090: greedy 128 tokens with the drafter identical to without it, exact and sparse; no speed gain yet
+(22.1 vs 23.0 tok/s exact, 44.0 vs 44.5 sparse) because the CPU op costs about the same per token in a verify chunk as
+in a single step.
 
 With exact attention, decode past the resident part is bound by host RAM bandwidth: every token reads the whole host
 K/V once per global-layer visit (8 per token). Measured with a 10.98 GB XQT build (same recipe as the released 10.94 GB
@@ -144,6 +148,9 @@ host part:
 | 1024 | 0.157 | identical | |
 | 2048 | 0.110 | identical | 30.5 |
 | 4096 | 0.078 | identical | |
+
+At long context on the same 3060 (`--context 524288 --kv-vram 32768 --kv-sparse 2048`, the released 10.94 GB file):
+137.5K prompt 448 / **24.5** tok/s prefill / decode (exact: 8.0 decode), 267.2K prompt 291 / **18.8** (exact: 4.1).
 
 Inkling's global heads spread their attention widely, so the error is higher than these methods report on other
 models; treat it as an option for long documents where exact decode is too slow. `XOLOTL_INKLING_SPARSE_SEL=0|1|2`

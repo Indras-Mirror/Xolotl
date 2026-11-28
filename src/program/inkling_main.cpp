@@ -1328,8 +1328,7 @@ void load(Model& m, const std::string& path, int64_t want_ctx, int threads, cons
     if (m.kv_vram > 0) {
         const int64_t r = ((m.kv_vram + 255) / 256) * 256;   // a 256 multiple: the 256-cell windows never straddle the split
         if (r < m.n_ctx) {
-            if (m.spec) die("--kv-vram: not with --dspark / --mtp yet (the drafter keeps its own full-context K/V in VRAM)");
-            m.kv_res = r;
+            m.kv_res = r;   // --dspark works too: the drafter's global layer keeps its own ring (XOLOTL_DSPARK_WINDOW, 32K)
         }
     }
     const int64_t full_cells = m.spill_on() ? m.kv_res : m.n_ctx;   // global-slot cells in VRAM
@@ -1913,10 +1912,19 @@ static void host_attn_slice_k8v4_v2(const float* q, int nh, int nkv, const char*
 // thread); phases are separated by the args' spin barrier.  Output: the same [hd + 2, nh, 1, S] partials.
 __attribute__((target("avx2,fma,f16c")))
 static void host_attn_sparse(HostAttnArgs& am, const ggml_tensor* Q, const ggml_tensor* K, const ggml_tensor* V,
-                             const ggml_tensor* tab, int ith, int nth, int nh, int nkv, int64_t cv, int64_t np, int64_t bpg,
-                             int64_t p, int64_t S, ggml_tensor* dst) {
+                             const ggml_tensor* tab, const ggml_tensor* pos, int ith, int nth, int nh, int nkv, int T,
+                             int64_t cv, int64_t np, int64_t bpg, int64_t S, ggml_tensor* dst) {
     constexpr int HD = 128;
     const int rep = nh / nkv;
+    // T tokens (a speculative verify chunk): one page selection for all of them (the union of what each wants),
+    // each token reads it up to its own position.  pt[t] = position, cvt[t] = its visible host cells.
+    int64_t pt[16], cvt[16];
+    for (int t = 0; t < T; ++t) {
+        pt[t] = (int64_t) ((const float*) pos->data)[t];
+        cvt[t] = std::min<int64_t>(K->ne[2], std::max<int64_t>(0, pt[t] - am.j0 + 1));
+    }
+    const int64_t p = pt[0];
+    const int64_t cvmax = cvt[T - 1];
     const int64_t pg0 = am.r0 / kSparsePg;   // host page of view cell 0
     static SparseSumm* sm = nullptr;          // set by thread 0 before the first barrier (one op runs at a time)
     if (ith == 0) {
@@ -1926,7 +1934,7 @@ static void host_attn_sparse(HostAttnArgs& am, const ggml_tensor* Q, const ggml_
         if (sm->mn.size() < need) { sm->mn.resize(need); sm->mx.resize(need); sm->mean.resize(need); sm->vmean.resize(need); }
         am.psc.resize((size_t) nkv * np * 2);
         am.sel.assign((size_t) np, 0);
-        am.apx.assign((size_t) nth * nh * (HD + 2), 0.0f);
+        am.apx.assign((size_t) nth * T * nh * (HD + 2), 0.0f);
     }
     am.barrier(nth);
     // 1. page summaries [valid, pg0 + np): per K/V head and dimension the min and max of the dequantised K
@@ -1979,8 +1987,9 @@ static void host_attn_sparse(HostAttnArgs& am, const ggml_tensor* Q, const ggml_
     am.barrier(nth);
     if (ith == 0) sm->valid = std::max(sm->valid, pg0 + np);
     // 2. page scores: per K/V head the max over its query heads of sum_d max(q mn, q mx) * scale + the far bias
-    const float* q = (const float*) Q->data;
-    const float* tb = (const float*) tab->data;
+    const float* q = (const float*) Q->data;            // [hd, nh, T]
+    const float* tb = (const float*) tab->data;         // [nh, R, T]
+    const int64_t R = tab->ne[1];
     const float scale = ((const HostAttnArgs&) am).scale;
     const int ext = am.ext;
     for (int64_t i; (i = am.claim1.fetch_add(1, std::memory_order_relaxed)) < np;) {
@@ -1989,13 +1998,15 @@ static void host_attn_sparse(HostAttnArgs& am, const ggml_tensor* Q, const ggml_
             const float* pmx = sm->mx.data() + ((size_t) (pg0 + i) * nkv + g) * HD;
             const float* pme = sm->mean.data() + ((size_t) (pg0 + i) * nkv + g) * HD;
             float best = -INFINITY, bestl = -INFINITY;
+            for (int t = 0; t < T; ++t)
             for (int r = 0; r < rep; ++r) {
                 const int hh = g * rep + r;
-                const float* qh = q + (size_t) hh * HD;
+                const float* qh = q + ((size_t) t * nh + hh) * HD;
+                const float fb = tb[((size_t) t * R + ext) * nh + hh];
                 {   // landmark: q . mean K
                     __m256 a = _mm256_setzero_ps();
                     for (int u = 0; u < 16; ++u) a = _mm256_fmadd_ps(_mm256_loadu_ps(qh + u * 8), _mm256_loadu_ps(pme + u * 8), a);
-                    bestl = std::max(bestl, hsum256(a) * scale + tb[(size_t) ext * nh + hh]);
+                    bestl = std::max(bestl, hsum256(a) * scale + fb);
                 }
                 __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
                 for (int u = 0; u < 16; u += 2) {
@@ -2003,7 +2014,7 @@ static void host_attn_sparse(HostAttnArgs& am, const ggml_tensor* Q, const ggml_
                     acc0 = _mm256_add_ps(acc0, _mm256_max_ps(_mm256_mul_ps(q0, _mm256_loadu_ps(pmn + u * 8)), _mm256_mul_ps(q0, _mm256_loadu_ps(pmx + u * 8))));
                     acc1 = _mm256_add_ps(acc1, _mm256_max_ps(_mm256_mul_ps(q1, _mm256_loadu_ps(pmn + u * 8 + 8)), _mm256_mul_ps(q1, _mm256_loadu_ps(pmx + u * 8 + 8))));
                 }
-                best = std::max(best, hsum256(_mm256_add_ps(acc0, acc1)) * scale + tb[(size_t) ext * nh + hh]);
+                best = std::max(best, hsum256(_mm256_add_ps(acc0, acc1)) * scale + fb);
             }
             am.psc[(size_t) g * np + i] = best;
             am.psc[(size_t) (nkv + g) * np + i] = bestl;
@@ -2033,7 +2044,7 @@ static void host_attn_sparse(HostAttnArgs& am, const ggml_tensor* Q, const ggml_
                 if (!r.empty() && r.back().second == i * kSparsePg) r.back().second += kSparsePg;
                 else r.push_back({i * kSparsePg, (i + 1) * kSparsePg});
             }
-        r.push_back({np * kSparsePg, cv});
+        r.push_back({np * kSparsePg, cvmax});
         int64_t tot = 0;
         for (auto& x : r) tot += x.second - x.first;
         am.rng.clear();
@@ -2056,21 +2067,22 @@ static void host_attn_sparse(HostAttnArgs& am, const ggml_tensor* Q, const ggml_
     //     (weight 64 exp(q . mean K * scale + far bias)); per-thread partials, merged into slice 0 below
     static const bool apxon = !(std::getenv("XOLOTL_INKLING_SPARSE_APPROX") && std::atoi(std::getenv("XOLOTL_INKLING_SPARSE_APPROX")) == 0);
     if (apxon) {
-        float* A = am.apx.data() + (size_t) ith * nh * (HD + 2);
-        for (int hh = 0; hh < nh; ++hh) { A[hh * (HD + 2) + HD] = -INFINITY; A[hh * (HD + 2) + HD + 1] = 0.0f; }
+        float* A0 = am.apx.data() + (size_t) ith * T * nh * (HD + 2);
+        for (int th = 0; th < T * nh; ++th) { A0[th * (HD + 2) + HD] = -INFINITY; A0[th * (HD + 2) + HD + 1] = 0.0f; }
         const float lnpg = std::log((float) kSparsePg);
         for (int64_t i; (i = am.claim2.fetch_add(1, std::memory_order_relaxed)) < np;) {
             if (am.sel[i]) continue;
             for (int g = 0; g < nkv; ++g) {
                 const float* pme = sm->mean.data() + ((size_t) (pg0 + i) * nkv + g) * HD;
                 const float* pvm = sm->vmean.data() + ((size_t) (pg0 + i) * nkv + g) * HD;
+                for (int t = 0; t < T; ++t)
                 for (int r = 0; r < rep; ++r) {
                     const int hh = g * rep + r;
-                    const float* qh = q + (size_t) hh * HD;
+                    const float* qh = q + ((size_t) t * nh + hh) * HD;
                     __m256 a8 = _mm256_setzero_ps();
                     for (int u = 0; u < 16; ++u) a8 = _mm256_fmadd_ps(_mm256_loadu_ps(qh + u * 8), _mm256_loadu_ps(pme + u * 8), a8);
-                    const float sc = hsum256(a8) * scale + tb[(size_t) ext * nh + hh] + lnpg;
-                    float* ah = A + hh * (HD + 2);
+                    const float sc = hsum256(a8) * scale + tb[((size_t) t * R + ext) * nh + hh] + lnpg;
+                    float* ah = A0 + ((size_t) t * nh + hh) * (HD + 2);
                     float w;
                     if (sc > ah[HD]) {
                         const float f = std::exp(ah[HD] - sc);
@@ -2088,16 +2100,21 @@ static void host_attn_sparse(HostAttnArgs& am, const ggml_tensor* Q, const ggml_
     {
         std::vector<float> acc2((size_t) nh * HD), mx2(nh), l2(nh);
         const int64_t nr = (int64_t) am.rng.size() / 3;
-        for (int64_t sl; (sl = am.claim3.fetch_add(1, std::memory_order_relaxed)) < S;) {
+        for (int64_t task; (task = am.claim3.fetch_add(1, std::memory_order_relaxed)) < (int64_t) T * S;) {
+            const int t = (int) (task % T); const int64_t sl = task / T;
             std::fill(acc2.begin(), acc2.end(), 0.0f);
             std::fill(mx2.begin(), mx2.end(), -INFINITY);
             std::fill(l2.begin(), l2.end(), 0.0f);
             for (int64_t k = 0; k < nr; ++k)
-                if (am.rng[k * 3 + 2] == sl)
-                    host_attn_slice_k8v4_v2(q, nh, nkv, (const char*) K->data, (const char*) V->data, K->nb[1], K->nb[2], V->nb[1],
-                                            V->nb[2], am.rng[k * 3], am.rng[k * 3 + 1], am.j0, p, ext, scale, tb, acc2.data(), mx2.data(), l2.data());
+                if (am.rng[k * 3 + 2] == sl) {
+                    const int64_t c0 = am.rng[k * 3], c1 = std::min(am.rng[k * 3 + 1], cvt[t]);   // causal: up to this token
+                    if (c0 < c1)
+                        host_attn_slice_k8v4_v2(q + (size_t) t * nh * HD, nh, nkv, (const char*) K->data, (const char*) V->data, K->nb[1],
+                                                K->nb[2], V->nb[1], V->nb[2], c0, c1, am.j0, pt[t], ext, scale, tb + (size_t) t * R * nh,
+                                                acc2.data(), mx2.data(), l2.data());
+                }
             for (int64_t hh = 0; hh < nh; ++hh) {
-                float* o = (float*) ((char*) dst->data + sl * dst->nb[3] + hh * dst->nb[1]);
+                float* o = (float*) ((char*) dst->data + sl * dst->nb[3] + t * dst->nb[2] + hh * dst->nb[1]);
                 std::copy(acc2.begin() + hh * HD, acc2.begin() + (hh + 1) * HD, o);
                 o[HD] = mx2[hh];
                 o[HD + 1] = l2[hh];
@@ -2108,10 +2125,11 @@ static void host_attn_sparse(HostAttnArgs& am, const ggml_tensor* Q, const ggml_
     if (ith == 0) {
         am.claim0 = 0; am.claim1 = 0; am.claim2 = 0; am.claim3 = 0;
         if (apxon)
+            for (int t = 0; t < T; ++t)
             for (int hh = 0; hh < nh; ++hh) {
-                float* o = (float*) ((char*) dst->data + hh * dst->nb[1]);   // slice 0
+                float* o = (float*) ((char*) dst->data + t * dst->nb[2] + hh * dst->nb[1]);   // slice 0
                 for (int t2 = 0; t2 < nth; ++t2) {
-                    const float* A = am.apx.data() + ((size_t) t2 * nh + hh) * (HD + 2);
+                    const float* A = am.apx.data() + (((size_t) t2 * T + t) * nh + hh) * (HD + 2);
                     if (!(A[HD] > -INFINITY)) continue;
                     const float M = std::max(o[HD], A[HD]);
                     const float fo = o[HD] > -INFINITY ? std::exp(o[HD] - M) : 0.0f, fa = std::exp(A[HD] - M);
@@ -2125,7 +2143,7 @@ static void host_attn_sparse(HostAttnArgs& am, const ggml_tensor* Q, const ggml_
     // the share of the host softmax mass the selection kept and the relative L2 error of the host-only output,
     // averaged over heads; a line every 64 calls.
     static const bool chk = std::getenv("XOLOTL_INKLING_SPARSE_CHECK") != nullptr;
-    if (chk && ith == 0) {
+    if (chk && ith == 0 && T == 1) {
         std::vector<float> ad((size_t) nh * HD, 0.0f), md(nh, -INFINITY), ld(nh, 0.0f);
         host_attn_slice_k8v4_v2(q, nh, nkv, (const char*) K->data, (const char*) V->data, K->nb[1], K->nb[2], V->nb[1], V->nb[2],
                                 0, cv, am.j0, p, ext, scale, tb, ad.data(), md.data(), ld.data());
@@ -2211,14 +2229,14 @@ static void host_attn_partial_body(ggml_tensor* dst, int ith, int nth, void* ud)
         if ((simd == 1 || simd == 3) && cpu_ok && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 && hd == 128 && nh <= 64 && nh % nkv == 0) {
             std::vector<float> acc2((size_t) nh * hd), mx2(nh), l2(nh);
             HostAttnArgs& am = *(HostAttnArgs*) ud;
-            if (g_kv_sparse > 0 && T == 1 && am.kid && am.r0 % kSparsePg == 0) {
-                const int64_t p = (int64_t) ((const float*) pos->data)[0];
-                const int64_t cv = std::min<int64_t>(cells, std::max<int64_t>(0, p - a.j0 + 1));   // visible host cells
+            if (g_kv_sparse > 0 && T <= 16 && am.kid && am.r0 % kSparsePg == 0) {   // decode + speculative verify
+                const int64_t p = (int64_t) ((const float*) pos->data)[0];                     // the first (lowest) position
+                const int64_t cv = std::min<int64_t>(cells, std::max<int64_t>(0, p - a.j0 + 1));   // its visible host cells
                 const int64_t tail = a.ext + kSparsePg;                                          // always attended
                 const int64_t np = std::max<int64_t>(0, cv - tail) / kSparsePg;                  // selectable pages
                 const int64_t bpg = std::max<int64_t>(1, g_kv_sparse / kSparsePg);              // pages per K/V head
                 if (np > 2 * bpg) {
-                    host_attn_sparse(am, Q, K, V, tab, ith, nth, (int) nh, (int) nkv, cv, np, bpg, p, S, dst);
+                    host_attn_sparse(am, Q, K, V, tab, pos, ith, nth, (int) nh, (int) nkv, (int) T, cv, np, bpg, S, dst);
                     return;
                 }
             }
@@ -3455,12 +3473,15 @@ void forward(Model& m, const int32_t* ids, int T, int64_t p0, int n_out, std::ve
         // and (staged mode) the copy nodes with their graph-allocated VRAM destinations.  With all of them on one
         // backend the scheduler inserts no copy of its own and the cold path never falls to the CPU backend, which
         // is what the pinning is for; the regime (zero-copy at T == 1, staged at T >= 2) is chosen in G::moe().
+        // a speculative verify slot schedules on its own CUDA backend (gs->gpu): pin to that one, m.gpu is not in
+        // its scheduler (GGML_ASSERT backend_index with --kv-vram + --dspark, 28 Nov s14)
+        ggml_backend_t pin_be = gs && gs->gpu ? gs->gpu : m.gpu;
         if (!m.last->cold_ops.empty()) {
-            for (ggml_tensor* t : m.last->cold_w) ggml_backend_sched_set_tensor_backend(m.sched, t, m.gpu);
-            for (ggml_tensor* t : m.last->cold_stage) ggml_backend_sched_set_tensor_backend(m.sched, t, m.gpu);
-            for (ggml_tensor* t : m.last->cold_ops) ggml_backend_sched_set_tensor_backend(m.sched, t, m.gpu);
+            for (ggml_tensor* t : m.last->cold_w) ggml_backend_sched_set_tensor_backend(m.sched, t, pin_be);
+            for (ggml_tensor* t : m.last->cold_stage) ggml_backend_sched_set_tensor_backend(m.sched, t, pin_be);
+            for (ggml_tensor* t : m.last->cold_ops) ggml_backend_sched_set_tensor_backend(m.sched, t, pin_be);
         }
-        for (ggml_tensor* t : m.last->spill_gpu) ggml_backend_sched_set_tensor_backend(m.sched, t, m.gpu);
+        for (ggml_tensor* t : m.last->spill_gpu) ggml_backend_sched_set_tensor_backend(m.sched, t, pin_be);
         if (!ggml_backend_sched_alloc_graph(m.sched, m.last->gf)) { drop_graph(m); throw AllocFail(); }
         std::copy(key, key + 9, m.last_key);
     }
@@ -3993,7 +4014,7 @@ void usage() {
                  "  --kv-type quantises the full-context K/V cache (k8v4 = K q8_0, V q4_0; q4_0 = both, rotated; the sliding-window rings stay f16).\n"
                  "  --kv-vram N keeps the first N cells of the full-context K/V in VRAM and the rest in pinned host RAM\n"
                  "  (opt-in; e.g. --context 524288 --kv-vram 32768).  Past N the global layers take the chunked attention:\n"
-                 "  the host part on the CPU at decode, copied to the GPU for prompt chunks.  Not with --dspark / --mtp yet.\n"
+                 "  the host part on the CPU at decode, copied to the GPU for prompt chunks.  Works with --dspark.\n"
                  "  --kv-sparse N (with --kv-vram; opt-in, not exact): decode attends only the N host cells per K/V head on the\n"
                  "  64-cell pages with the highest q.k upper bound (per-page K min/max) plus the newest cells.\n"
                  "  --attn-budget caps one prefill chunk's n_kv*T scores and sizes the attention cell chunks (default 33554432).\n"
